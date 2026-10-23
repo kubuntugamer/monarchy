@@ -1,0 +1,40 @@
+# Build directories (out-of-source trees, whatever they are named)
+/build/
+/build-*/
+/ui/build/
+
+# CMake in-source leftovers, should any appear
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+compile_commands.json
+
+# Qt
+moc_*.cpp
+qrc_*.cpp
+ui_*.h
+*.moc
+*.user
+.qmake.stash
+
+# Compiled objects and binaries
+*.o
+*.a
+*.so
+monarchy-ui
+monarchy-provision
+monarchy-*-probe
+monarchy-*-tests
+monarchy-rpc-*
+rpcinline_test
+
+# Python
+__pycache__/
+*.pyc
+
+# Editors and OS noise
+*.swp
+*~
+.DS_Store

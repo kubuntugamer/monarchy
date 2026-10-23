@@ -1,0 +1,21 @@
+<!-- SPDX-FileCopyrightText: 2026 Monarchy contributors -->
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<RCC>
+    <qresource prefix="/">
+        <file>styles/mmc.qss</file>
+    </qresource>
+    <!-- Icons: use Qt standard icons for now.
+         Bundle custom MMC-style icons here when available:
+         <qresource prefix="/icons">
+             <file>icons/16x16/back.png</file>
+             ...
+         </qresource>
+    -->
+    <!-- Fonts: bundle Selawik TTFs here when available -->
+    <!--
+    <qresource prefix="/fonts">
+        <file>fonts/Selawik-Regular.ttf</file>
+        <file>fonts/Selawik-Bold.ttf</file>
+    </qresource>
+    -->
+</RCC>
