@@ -104,11 +104,18 @@ private:
     struct Connection;
 
     QByteArray handleMessage(Connection *connection, const QByteArray &message);
+    // The SMB2 negotiate response a classic SMB1 wildcard client must be
+    // answered with ([MS-SMB2] 3.3.5.3.1, SMB1 disabled); empty when the
+    // message is not that packet, in which case handleMessage takes it.
+    QByteArray wildcardAnswer(Connection *connection, const QByteArray &message);
     QByteArray negotiate(Connection *connection, const QByteArray &body, quint32 status);
     QByteArray sessionSetup(Connection *connection, const QByteArray &body, quint32 *status);
     QByteArray treeConnect(Connection *connection, const QByteArray &body, quint32 *status);
     QByteArray create(Connection *connection, const QByteArray &body, quint32 *status);
     QByteArray write(Connection *connection, const QByteArray &body, quint32 *status);
+    // FSCTL_PIPE_TRANSCEIVE (the write+read every client writes pipe PDUs with)
+    // and friends; rpcclient uses it for every \pipe read and write.
+    QByteArray ioctlMessage(Connection *connection, const QByteArray &body, quint32 *status);
     QByteArray read(Connection *connection, const QByteArray &body, quint32 *status);
     QByteArray closePipe(Connection *connection, const QByteArray &body, quint32 *status);
 

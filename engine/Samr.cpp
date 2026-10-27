@@ -57,13 +57,15 @@ void putLe32(QByteArray &out, quint32 value)
 }
 
 // A varying, conformant UTF-16 string as NDR writes it: max_count, offset,
-// actual_count, then the characters padded to a 4-byte boundary.
+// actual_count, then the characters padded to a 4-byte boundary. Every SAMR
+// caller pairs this with an lsa_String header whose size excludes the
+// terminator, so the maximum count must too (see Lsad's appendVaryingChars).
 void appendVaryingString(QByteArray &out, const QString &text)
 {
     const QByteArray utf16 = Ndr::utf16le(text);
-    putLe32(out, quint32(text.size() + 1));
-    putLe32(out, 0);
-    putLe32(out, quint32(text.size()));
+    putLe32(out, quint32(text.size())); // MaximumCount
+    putLe32(out, 0);                    // Offset
+    putLe32(out, quint32(text.size())); // ActualCount
     out.append(utf16);
     while (out.size() % 4 != 0)
         out.append('\0');
@@ -201,7 +203,7 @@ void appendCountedString(QByteArray &out, QByteArray &deferred, const QString &t
     const bool present = !text.isEmpty();
     const QByteArray utf16 = Ndr::utf16le(text);
     putLe16(out, quint16(utf16.size()));
-    putLe16(out, quint16(utf16.size() + (present ? 2 : 0)));
+    putLe16(out, quint16(utf16.size()));
     putLe32(out, present ? referent : 0u);
     if (present)
         appendVaryingString(deferred, text);
@@ -887,6 +889,35 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
             emit requestReceived(QStringLiteral("QueryInformationDomain(password)"));
             return fixed;
         }
+        case 2: { // DomainGeneralInformation: what rpcclient's `querydominfo`
+            // asks for — the domain clock policy, names, role and populations.
+            // This DC is the PDC and never forces logoff; the OEM comment, the
+            // BDC's PDC name and the sequence number carry established empty
+            // defaults rather than values the directory does not keep.
+            beginArm(2);
+            putLe32(fixed, 0xffffffffu); // ForceLogoff: never (NTTIME -1)
+            putLe32(fixed, 0x7fffffffu);
+            appendCountedString(fixed, deferred, QString(), 0); // OemInformation
+            appendCountedString(fixed, deferred, m_config.netbios, 0x0002e430u);
+            appendCountedString(fixed, deferred, QString(), 0); // Primary (BDC only)
+            // udlong (hyper): NDR aligns 8-byte primitives, so pad after the
+            // 12-byte string headers.
+            while (fixed.size() % 8)
+                fixed.append(char(0));
+            putLe32(fixed, 1u); // sequence_num
+            putLe32(fixed, 0u);
+            // Both enums are [v1_enum] in the IDL: four bytes on the wire.
+            putLe32(fixed, 1u); // domain_server_state: DOMAIN_SERVER_ENABLED
+            putLe32(fixed, 3u); // role: DOMAIN_SERVER_ROLE_PRIMARY
+            putLe32(fixed, 0u); // unknown3
+            putLe32(fixed, quint32(users().size()));
+            putLe32(fixed, quint32(groups().size()));
+            putLe32(fixed, 0u); // aliases
+            fixed.append(deferred);
+            putLe32(fixed, kStatusSuccess);
+            emit requestReceived(QStringLiteral("QueryInformationDomain(general)"));
+            return fixed;
+        }
         case 5: { // DomainNameInformation: the NetBIOS name, as AD reports it
             const QByteArray utf16 = Ndr::utf16le(m_config.netbios);
             beginArm(5);
@@ -1121,6 +1152,9 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
         putLe32(fixed, kStatusNoSuchUser);
         return fixed;
     }
+    // Opnum 36 (SamrQueryInformationUser) is byte-for-byte the same call on
+    // the wire as opnum 47: handle + u16 class, Buffer union + NTSTATUS back.
+    case Samr::OpQueryInformationUser:
     case Samr::OpQueryInformationUser2: {
         QByteArray handle;
         if (!reader.bytes(kHandleSize, &handle))

@@ -20,15 +20,6 @@ class ConsoleView;
 class AdminService;
 class ConnectionService;
 class DirectoryService;
-class DnsServer;
-class SamrServer;
-class LsadServer;
-class NetlogonServer;
-class EpmServer;
-class DrsServer;
-class Smb2Server;
-class Kdc;
-class LdapServer;
 
 class MainWindow : public QMainWindow
 {
@@ -86,6 +77,7 @@ private:
     void createCentralWidget();
     // Naming context of the directory the console is connected to.
     QString namingContext() const;
+    QString connectedDnsZone() const;
     void loadSettings();
     void saveSettings();
     void saveConsoleTo(const QString &fileName);
@@ -97,18 +89,6 @@ private:
     ConnectionService *m_connectionService = nullptr;
     DirectoryService *m_directoryService = nullptr;
     AdminService *m_adminService = nullptr;
-    LdapServer *m_ldapServer = nullptr;
-    DnsServer *m_dnsServer = nullptr;
-    Kdc *m_kdc = nullptr;
-    SamrServer *m_samrServer = nullptr;
-    LsadServer *m_lsadServer = nullptr;
-    NetlogonServer *m_netlogonServer = nullptr;
-    DrsServer *m_drsServer = nullptr;
-    EpmServer *m_epmServer = nullptr;
-    Smb2Server *m_smbServer = nullptr;
-    // Store and zone locations resolved from dc.conf at start-up.
-    QString m_storePath;
-    QString m_zonePath;
     QString m_consoleFilePath;
     QPrinter *m_printer = nullptr;
     QTimer *m_refreshTimer = nullptr;

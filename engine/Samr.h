@@ -72,6 +72,9 @@ enum Opnum : quint16 {
     OpOpenUser = 34,
     OpGetGroupsForUser = 39,
     OpDeleteUser = 35,
+    // SamrQueryInformationUser (36) is the pre-revision form of the (2) call:
+    // same [in] handle + [in] class, same [out] Buffer union + NTSTATUS.
+    OpQueryInformationUser = 36,
     OpQueryInformationUser2 = 47,
     OpCreateUser2 = 50,
     // Both set-information calls take the same union: 37 is

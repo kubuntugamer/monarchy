@@ -36,6 +36,8 @@ add_library(monarchy-ui-core STATIC
     ../backend/AdminService.cpp
     ../engine/LdapServer.h
     ../engine/LdapServer.cpp
+    ../engine/DcService.h
+    ../engine/DcService.cpp
     ../engine/DnsServer.h
     ../engine/DnsServer.cpp
     ../engine/Provisioner.h
@@ -112,6 +114,10 @@ add_executable(monarchy-ui
 )
 
 target_link_libraries(monarchy-ui PRIVATE monarchy-ui-core)
+
+# Headless domain controller: the engine without the console. See dcd_main.
+add_executable(monarchy-dcd ../engine/dcd_main.cpp)
+target_link_libraries(monarchy-dcd PRIVATE monarchy-ui-core)
 
 # Development probe for the RPC interface (SAMR); not shipped.
 add_executable(monarchy-rpc-probe ../engine/samr_probe_main.cpp)

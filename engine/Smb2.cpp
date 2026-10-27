@@ -249,7 +249,8 @@ void Smb2Server::onReadyRead()
             break;
         const QByteArray message = connection->buffer.mid(4, int(length));
         connection->buffer.remove(0, int(4 + length));
-        out.append(handleMessage(connection, message));
+        const QByteArray wildcard = wildcardAnswer(connection, message);
+        out.append(!wildcard.isEmpty() ? wildcard : handleMessage(connection, message));
     }
     if (!out.isEmpty())
         socket->write(out);
@@ -292,9 +293,40 @@ QByteArray Smb2Server::feed(const QByteArray &nbss)
             break;
         const QByteArray message = scratch.buffer.mid(4, int(length));
         scratch.buffer.remove(0, int(4 + length));
-        out.append(handleMessage(&scratch, message));
+        const QByteArray wildcard = wildcardAnswer(&scratch, message);
+        out.append(!wildcard.isEmpty() ? wildcard : handleMessage(&scratch, message));
     }
     return out;
+}
+
+QByteArray Smb2Server::wildcardAnswer(Connection *connection, const QByteArray &message)
+{
+    // The classic SMB1 wildcard negotiate (\xffSMB -- "SMB 2.???"), the
+    // opening packet of impacket, rpcclient and every older Samba. With SMB1
+    // disabled this must still be answered — exactly as a Windows DC answers
+    // it on 445 — with the raw SMB2 negotiate response on the same NBSS
+    // session, which flips the client into speaking SMB2-only. Dropping this
+    // packet makes such clients hang until timeout before their first bind
+    // ever goes out; both the socket and the feed paths share this answer.
+    if (message.left(4) != QByteArray("\377SMB", 4)
+        || quint8(message.at(4)) != 0x72   // SMB_COM_NEGOTIATE
+        || message.indexOf("SMB 2.???") < 0)
+        return QByteArray();
+
+    // A minimal (fake-client) SMB2 negotiate *body*, parsed by the very same
+    // negotiate() the pure-SMB2 path uses, wrapped in an SMB2 header so it
+    // flows through handleMessage as a normal packet.
+    QByteArray smb2Body = QByteArray(64, '\0');
+    setLe16(smb2Body, 0, 64);         // Negotiate StructureSize
+    setLe16(smb2Body, 2, 2);          // DialectCount
+    setLe16(smb2Body, 4, 1);          // SecurityMode
+    setLe16(smb2Body, 36, Smb2::Dialect202);
+    setLe16(smb2Body, 38, Smb2::Dialect210);
+    QByteArray smb2Packet = QByteArray(int(Smb2::kHeaderSize), '\0');
+    smb2Packet.replace(0, 4, QByteArray("\376SMB", 4)); // SMB2 ProtocolId
+    // Command 0 = CmdNegotiate.
+    smb2Packet.append(smb2Body);
+    return handleMessage(connection, smb2Packet);
 }
 
 QByteArray Smb2Server::handleMessage(Connection *connection, const QByteArray &message)
@@ -304,6 +336,7 @@ QByteArray Smb2Server::handleMessage(Connection *connection, const QByteArray &m
 
     const quint16 command = readLe16(message, 12);
     const quint64 messageId = readLe64(message, 24);
+    emit requestReceived(QStringLiteral("SMB2 cmd %1").arg(command));
     // A signed request is verified before it is believed. The session key is only
     // known after session setup, which is itself unsigned.
     if ((readLe16(message, 16) & 0x0008) && !connection->sessionKey.isEmpty()) {
@@ -345,6 +378,9 @@ QByteArray Smb2Server::handleMessage(Connection *connection, const QByteArray &m
         break;
     case Smb2::CmdWrite:
         body = write(connection, message.mid(int(Smb2::kHeaderSize)), &status);
+        break;
+    case Smb2::CmdIoctl:
+        body = ioctlMessage(connection, message.mid(int(Smb2::kHeaderSize)), &status);
         break;
     case Smb2::CmdRead:
         body = read(connection, message.mid(int(Smb2::kHeaderSize)), &status);
@@ -401,6 +437,10 @@ QByteArray Smb2Server::handleMessage(Connection *connection, const QByteArray &m
         hmac.addData(reply);
         reply.replace(48, 16, hmac.result().left(16));
     }
+    if (!qEnvironmentVariableIsEmpty("MONARCHY_SMB_TRACE"))
+        qWarning("SMB2 out cmd=%d status=0x%08x bytes=%d body=%s",
+                 command, status, reply.size(),
+                 qPrintable(reply.mid(int(Smb2::kHeaderSize)).left(160).toHex()));
     return nbtFrame(reply);
 }
 
@@ -624,6 +664,102 @@ QByteArray Smb2Server::write(Connection *connection, const QByteArray &body, qui
     putLe16(out, 0);      // WriteChannelInfoOffset
     putLe16(out, 0);      // WriteChannelInfoLength
     return out;
+}
+
+// File-system controls a DC's SMB server must process (MS-SMB2 2.2.1.5): the
+// named-pipe transceive clients use for every \pipe\ write+read, and the
+// negotiate-validation fsctl modern Samba sends right after Negotiate.
+constexpr quint32 kFsctlPipeTransceive = 0x0011c017u;
+constexpr quint32 kFsctlValidateNegotiate = 0x00140204u;
+
+QByteArray Smb2Server::ioctlMessage(Connection *connection, const QByteArray &body, quint32 *status)
+{
+    if (body.size() < 48) {
+        *status = Smb2::StatusInvalidParameter;
+        QByteArray out;
+        putLe16(out, 49);
+        out.append(QByteArray(46, '\0'));
+        return out;
+    }
+    // Request (MS-SMB2 2.2.31): StructureSize(2)=57, Reserved(2), CtlCode(4),
+    // FileId(16), InputOffset(4), InputCount(4), MaxInputResponse(4),
+    // OutputOffset(4), OutputCount(4), MaxOutputResponse(4), Flags(4).
+    const quint32 ctlCode = readLe32(body, 4);
+    const QByteArray fileId = body.mid(8, 16);
+    const quint32 inputOffset = readLe32(body, 24);
+    const quint32 inputCount = readLe32(body, 28);
+    const quint32 maxOutputResponse = readLe32(body, 44);
+    emit requestReceived(QStringLiteral("SMB2 ioctl 0x%1")
+                             .arg(ctlCode, 8, 16, QLatin1Char('0')));
+
+    // Response (MS-SMB2 2.2.32): StructureSize(2)=49, Reserved(2), CtlCode(4),
+    // FileId(16), InputOffset(4), InputCount(4), OutputOffset(4), OutputCount(4),
+    // Flags(4), Reserved(4) — 48 bytes, so the reply buffer starts at header+48.
+    QByteArray out;
+    putLe16(out, 49);                 // StructureSize
+    putLe16(out, 0);                  // Reserved
+    putLe32(out, ctlCode);            // @4
+    out.append(fileId);               // FileId: echo the request's persistent+volatile @8
+    putLe32(out, 0);                  // InputOffset: no input in the response @24
+    putLe32(out, 0);                  // InputCount @28
+    putLe32(out, quint32(Smb2::kHeaderSize + 48)); // OutputOffset (from SMB2 header) @32
+    // OutputCount @36, Flags @40 and Reserved @44 follow; for a transceive
+    // they are followed by the reply data, which lands at header+48.
+
+    switch (ctlCode) {
+    case kFsctlPipeTransceive: {
+        const quint64 id = readLe64(fileId, 0);
+        auto it = connection->handles.find(id);
+        if (it == connection->handles.end() || !it->channel) {
+            *status = Smb2::StatusFileClosed;
+            out.clear();
+            putLe16(out, 49);
+            out.append(QByteArray(46, '\0'));
+            return out;
+        }
+        // Same hand-off as the Write path: incoming bytes may pack more than
+        // one PDU, split on frag_length, answers queued for the read back.
+        QByteArray data;
+        if (inputOffset >= Smb2::kHeaderSize && inputCount > 0)
+            data = body.mid(int(inputOffset) - int(Smb2::kHeaderSize), int(inputCount));
+        while (data.size() >= 16) {
+            const quint16 fragLength = readLe16(data, 8);
+            if (fragLength < 16 || data.size() < fragLength)
+                break;
+            const QByteArray pdu = data.left(fragLength);
+            data.remove(0, fragLength);
+            it->pending.append(it->channel->feed(pdu));
+        }
+        const int take = int(qMin(maxOutputResponse > 0 ? maxOutputResponse : quint32(65536),
+                                  quint32(it->pending.size())));
+        const QByteArray outBytes = it->pending.left(take);
+        it->pending.remove(0, take);
+
+        putLe32(out, quint32(outBytes.size()));      // OutputCount
+        putLe32(out, 0);                             // Flags
+        putLe32(out, 0);                             // Reserved
+        out.append(outBytes);
+        *status = Smb2::StatusSuccess;
+        emit requestReceived(QStringLiteral("SMB2 transceive %1 (%2 in, %3 out)")
+                                 .arg(it->name).arg(inputCount).arg(outBytes.size()));
+        return out;
+    }
+    case kFsctlValidateNegotiate:
+        // The client asked to re-confirm the dialect. Windows answers that it
+        // will not validate when support is absent, and Samba then trusts the
+        // original negotiate — STATUS_NOT_SUPPORTED is the conforming reply.
+        *status = Smb2::StatusNotSupported;
+        out.clear();
+        putLe16(out, 49);
+        out.append(QByteArray(46, '\0'));
+        return out;
+    default:
+        *status = Smb2::StatusNotSupported;
+        QByteArray refused;
+        putLe16(refused, 49);
+        refused.append(QByteArray(46, '\0'));
+        return refused;
+    }
 }
 
 QByteArray Smb2Server::read(Connection *connection, const QByteArray &body, quint32 *status)

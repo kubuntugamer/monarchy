@@ -161,6 +161,26 @@ send
 EOF
 ```
 
+### Running as boot-started system services
+
+The same daemon turns into the machine's directory services: `scripts/
+install-dc-services.sh` installs `monarchy-dcd` and the provisioner under
+`/usr/local/bin`, creates a `monarchy-dc` service account, and enables the
+`packaging/monarchy-dcd.service` unit so the LDAP, KDC, DNS, SAMR, LSAD,
+Netlogon, DRSUAPI, EPM and SMB2 endpoints all start at boot under `/var/lib/`
+monarchy/Monarchy` — the way a Windows DC starts them:
+
+```sh
+sudo scripts/install-dc-services.sh
+sudo -u monarchy-dc /usr/local/bin/monarchy-provision \
+    /var/lib/monarchy/Monarchy --realm MONARCHY.EXAMPLE.COM --adminpass '…'
+sudo systemctl restart monarchy-dcd
+```
+
+The unit carries `AmbientCapabilities=CAP_NET_BIND_SERVICE`, so once `dc.conf`
+lists the real-DC ports (DNS 53, LDAP 389, Kerberos 88, SMB 445, epm 135) the
+service binds them the same way `lsass.exe` does.
+
 The application starts its local directory on **LDAP 1389**, the KDC on
 **8888** and **DNS 1053**, serves the DCE/RPC endpoints on `samrPort` 1035,
 `lsadPort` 1036 and `drsPort` 1038 (loopback), the endpoint mapper on

@@ -1,0 +1,36 @@
+# Monarchy domain controller as a system service: the directory services
+# (LDAP, KDC, DNS, SAMR, LSAD, Netlogon, DRSUAPI, EPM and SMB2) start before
+# logins are accepted, exactly like lsass.exe hosts them on a Windows DC.
+#
+# The daemon serves the ports dc.conf lists, so the same unit works for the
+# unprivileged defaults (1389/8888/…) and, once PortRange is granted through
+# AmbientCapabilities, for a real deployment's privileged ones
+# (dnsPort 53, ldapPort 389, kdcPort 88, smbPort 445, epmPort 135).
+
+[Unit]
+Description=Monarchy domain controller
+Documentation=file:///usr/share/doc/monarchy/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/monarchy-dcd --dcdir /var/lib/monarchy/Monarchy
+# A system account, not root: the only privilege it needs is binding the
+# privileged service ports, which AmbientCapabilities grants to the process.
+User=monarchy-dc
+Group=monarchy-dc
+StateDirectory=monarchy
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+Restart=on-failure
+RestartSec=2
+
+# A domain controller is written to be long-running; log to the journal the
+# way every other service does.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
