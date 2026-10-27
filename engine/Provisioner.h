@@ -16,11 +16,21 @@ struct ProvisionConfig {
     QString targetDir;
     // Address published in the domain's DNS zone for this DC.
     QString dcIp = QStringLiteral("127.0.0.1");
-    // Port the KDC listens on (88 unless a test or a non-root run needs another).
-    // 8888, not AD's well-known 88: the console is an unprivileged desktop app
-    // and cannot bind a port below 1024. `--kdc-port 88` still serves the
-    // faithful port when run with CAP_NET_BIND_SERVICE or root.
-    quint16 kdcPort = 8888;
+    // The ports the daemon serves. Provisioning defaults to AD's native
+    // bindings — DNS 53, LDAP 389, Kerberos 88, SMB 445, the endpoint mapper
+    // 135 and, like real DCs register SAMR/LSAD in Windows' dynamic-RPC
+    // range, 49152/49153 — because a domain controller is a root service
+    // with CAP_NET_BIND_SERVICE. `--dev-ports` provisions the unprivileged
+    // set (1389/1053/8888/1035/1036; epm and SMB stay on 135/445) that a
+    // rootless console or test run can bind instead.
+    quint16 ldapPort = 389;
+    quint16 dnsPort = 53;
+    quint16 kdcPort = 88;
+    quint16 samrPort = 49152;
+    quint16 lsadPort = 49153;
+    quint16 epmPort = 135;
+    quint16 smbPort = 445;
+    bool devPorts = false;
     bool force = false;
 };
 

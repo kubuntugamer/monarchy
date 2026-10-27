@@ -2,10 +2,11 @@
 # (LDAP, KDC, DNS, SAMR, LSAD, Netlogon, DRSUAPI, EPM and SMB2) start before
 # logins are accepted, exactly like lsass.exe hosts them on a Windows DC.
 #
-# The daemon serves the ports dc.conf lists, so the same unit works for the
-# unprivileged defaults (1389/8888/…) and, once PortRange is granted through
-# AmbientCapabilities, for a real deployment's privileged ones
-# (dnsPort 53, ldapPort 389, kdcPort 88, smbPort 445, epmPort 135).
+# The provisioner defaults dc.conf to AD's native ports (dnsPort 53,
+# ldapPort 389, kdcPort 88, smbPort 445, epmPort 135, SAMR/LSAD 49152/49153);
+# the AmbientCapabilities grant below makes those binds legal for the
+# service user. A domain provisioned with `--dev-ports` works the same way
+# on the unprivileged set.
 
 [Unit]
 Description=Monarchy domain controller

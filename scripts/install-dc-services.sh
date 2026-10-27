@@ -66,7 +66,7 @@ Monarchy's domain controller is installed and enabled at boot.
   State:     $DCDIR
   Provision: sudo -u $SERVICE_USER /usr/local/bin/monarchy-provision \\
                  $DCDIR --realm MONARCHY.EXAMPLE.COM --adminpass '…' [--force]
-  After editing dc.conf (real-DC ports: dnsPort 53, ldapPort 389, kdcPort 88,
-  smbPort 445, epmPort 135):
+  Provisioning defaults to the native DC ports (53/389/88/135/445). Only for a
+  rootless dev machine add --dev-ports. After re-provisioning (dc.conf changes):
              sudo systemctl restart monarchy-dcd
 EOF

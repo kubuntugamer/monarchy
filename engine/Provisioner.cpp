@@ -723,6 +723,8 @@ ProvisionResult provisionDomain(const ProvisionConfig &config)
     }
 
     // --- Server configuration --------------------------------------------
+    // Native or dev ports: a DC answers on AD's well-known bindings; the tests
+    // provisioning their own store go through ProvisionConfig.devPorts instead.
     QSettings conf(result.configPath, QSettings::IniFormat);
     conf.setValue(QStringLiteral("realm"), b.dnsDomain.toUpper());
     // The KDC puts this in every PAC as the logon domain's SID.
@@ -730,21 +732,16 @@ ProvisionResult provisionDomain(const ProvisionConfig &config)
     conf.setValue(QStringLiteral("dnsDomain"), b.dnsDomain);
     conf.setValue(QStringLiteral("netbiosDomain"), b.netbios);
     conf.setValue(QStringLiteral("baseDn"), b.baseDn);
-    conf.setValue(QStringLiteral("ldapPort"), 1389);
-    conf.setValue(QStringLiteral("dnsPort"), 1053);
-    // The DC serves SAMR on this port, on the loopback address, until RPC
-    // authentication exists.
-    conf.setValue(QStringLiteral("samrPort"), 1035);
-    // LSAD publishes the domain identity on the next port up, on the same
-    // loopback address and with the same authentication.
-    conf.setValue(QStringLiteral("lsadPort"), 1036);
-    // The endpoint mapper, where a client asks which port an interface is on.
-    // 135 is the well-known port and needs CAP_NET_BIND_SERVICE; a console that
-    // cannot bind it says so and the endpoints stay reachable by explicit port.
-    conf.setValue(QStringLiteral("epmPort"), 135);
-    // SMB2, where a Windows client looks for \\dc\pipe\samr. 445 needs the same
-    // privilege as 135; the pipes stay reachable on any port a client is told.
-    conf.setValue(QStringLiteral("smbPort"), 445);
+    conf.setValue(QStringLiteral("ldapPort"), config.ldapPort);
+    conf.setValue(QStringLiteral("dnsPort"), config.dnsPort);
+    // The DC serves SAMR, LSAD, the endpoint mapper and SMB2 the way a Windows
+    // DC does: dynamic-RPC ports for the two SAM/LSA interfaces, well-known
+    // 135/445 for the mapper and the pipe host. Under `--dev-ports` the
+    // unprivileged pair keeps a rootless console or test run bindable.
+    conf.setValue(QStringLiteral("samrPort"), config.samrPort);
+    conf.setValue(QStringLiteral("lsadPort"), config.lsadPort);
+    conf.setValue(QStringLiteral("epmPort"), config.epmPort);
+    conf.setValue(QStringLiteral("smbPort"), config.smbPort);
     conf.setValue(QStringLiteral("kdcPort"), config.kdcPort);
     conf.setValue(QStringLiteral("krb5ConfPath"), result.krb5ConfPath);
     conf.setValue(QStringLiteral("dcName"), b.dcName);

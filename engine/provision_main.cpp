@@ -41,8 +41,12 @@ int main(int argc, char *argv[])
                                                "(default: 127.0.0.1)."),
                                 QStringLiteral("address"), QStringLiteral("127.0.0.1"));
     QCommandLineOption kdcPortOption(QStringLiteral("kdc-port"),
-                                QStringLiteral("Port the KDC serves (default: 8888)."),
-                                QStringLiteral("port"), QStringLiteral("8888"));
+                                QStringLiteral("Port the KDC serves (default: native 88)."),
+                                QStringLiteral("port"));
+    QCommandLineOption devPortsOption(QStringLiteral("dev-ports"),
+                                QStringLiteral("Provision the unprivileged port set "
+                                               "(1389/1053/8888/1035/1036) a rootless "
+                                               "console run can bind."));
     QCommandLineOption forceOption(QStringLiteral("force"),
                                    QStringLiteral("Overwrite an existing domain store."));
 
@@ -52,6 +56,7 @@ int main(int argc, char *argv[])
     parser.addOption(dirOption);
     parser.addOption(ipOption);
     parser.addOption(kdcPortOption);
+    parser.addOption(devPortsOption);
     parser.addOption(forceOption);
     parser.addPositionalArgument(QStringLiteral("targetdir"),
                                  QStringLiteral("Target directory (same as --targetdir)."),
@@ -68,7 +73,12 @@ int main(int argc, char *argv[])
     config.targetDir = parser.isSet(dirOption) ? parser.value(dirOption)
                                                : parser.positionalArguments().value(0);
     config.dcIp = parser.value(ipOption);
-    config.kdcPort = quint16(parser.value(kdcPortOption).toUInt());
+    config.kdcPort = parser.isSet(kdcPortOption)
+        ? quint16(parser.value(kdcPortOption).toUInt())
+        : config.kdcPort; // default: native 88 with the rest of the well-known set
+    config.devPorts = parser.isSet(devPortsOption);
+    if (config.devPorts && !parser.isSet(kdcPortOption))
+        config.kdcPort = 8888; // rootless development binding
     config.force = parser.isSet(forceOption);
 
     QTextStream out(stdout);

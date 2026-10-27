@@ -83,10 +83,10 @@ void ProvisionerTest::buildsDomainFromScratch()
     QCOMPARE(conf.value(QStringLiteral("baseDn")).toString(), result.baseDn);
     QCOMPARE(conf.value(QStringLiteral("realm")).toString(), QStringLiteral("TEST.EXAMPLE.ORG"));
     QCOMPARE(conf.value(QStringLiteral("netbiosDomain")).toString(), QStringLiteral("TEST"));
-    // The config the console reads publishes the SAMR and LSAD endpoints it will
-    // serve.
-    QCOMPARE(conf.value(QStringLiteral("samrPort")).toInt(), 1035);
-    QCOMPARE(conf.value(QStringLiteral("lsadPort")).toInt(), 1036);
+    // The config the console reads publishes the endpoints it will serve, on
+    // AD's native bindings by default (dynamic-RPC ports for SAMR/LSAD).
+    QCOMPARE(conf.value(QStringLiteral("samrPort")).toInt(), 49152);
+    QCOMPARE(conf.value(QStringLiteral("lsadPort")).toInt(), 49153);
 
     LdapServer store;
     QVERIFY(store.loadFromFile(result.storePath));
@@ -151,7 +151,7 @@ void ProvisionerTest::buildsDomainFromScratch()
     QVERIFY(krb5Text.contains(QStringLiteral("kdc = 127.0.0.1:%1")
                                   .arg(conf.value(QStringLiteral("kdcPort")).toInt())
                                   .toUtf8()));
-    QCOMPARE(conf.value(QStringLiteral("kdcPort")).toInt(), 8888);
+    QCOMPARE(conf.value(QStringLiteral("kdcPort")).toInt(), 88); // native default
 
     QVERIFY(admin->memberOf.contains(
         QStringLiteral("CN=Enterprise Admins,CN=Users,%1").arg(result.baseDn)));

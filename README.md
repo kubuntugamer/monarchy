@@ -37,11 +37,12 @@ exactly as it would to a remote domain controller. Ordinary Kerberos clients
   names and every `memberOf` is derived from the groups that list the object,
   so a forged `memberOf` is ignored and deleting an object removes it from
   every group.
-- **KDC (`engine/`)** — a Kerberos 5 KDC (RFC 4120) serving TCP and UDP on
-  **8888** (provisioned domains use `kdcPort` from `dc.conf`; 8888 rather than
-  AD's well-known 88, which an unprivileged console cannot bind — run
-  `monarchy-provision --kdc-port 88` as root or with `CAP_NET_BIND_SERVICE` to
-  serve the faithful port). Accounts carry
+- **KDC (`engine/`)** — a Kerberos 5 KDC (RFC 4120) serving TCP and UDP on **88**
+  for a provisioned domain (`kdcPort` from `dc.conf`; provisioning defaults to
+  AD's native bindings — DNS 53, LDAP 389, Kerberos 88, SMB 445, epm 135,
+  SAMR/LSAD 49152/49153 — because the daemon runs as a root service with
+  `CAP_NET_BIND_SERVICE`; `--dev-ports` provisions the unprivileged set a
+  rootless console run can bind). Accounts carry
   AES-128/AES-256 (RFC 3962, PBKDF2 + n-fold string-to-key) and RC4-HMAC
   (etype 23, derived from the same NT hash the directory already stores) keys,
   so one password drives simple bind, NTLMv2 and Kerberos with no second
@@ -177,9 +178,10 @@ sudo -u monarchy-dc /usr/local/bin/monarchy-provision \
 sudo systemctl restart monarchy-dcd
 ```
 
-The unit carries `AmbientCapabilities=CAP_NET_BIND_SERVICE`, so once `dc.conf`
-lists the real-DC ports (DNS 53, LDAP 389, Kerberos 88, SMB 445, epm 135) the
-service binds them the same way `lsass.exe` does.
+The unit carries `AmbientCapabilities=CAP_NET_BIND_SERVICE`, and provisioning
+itself defaults to the real-DC ports (DNS 53, LDAP 389, Kerberos 88, SMB 445,
+epm 135), so the service binds them right away the same way `lsass.exe` does.
+Provision with `--dev-ports` only for a rootless machine.
 
 The application starts its local directory on **LDAP 1389**, the KDC on
 **8888** and **DNS 1053**, serves the DCE/RPC endpoints on `samrPort` 1035,
