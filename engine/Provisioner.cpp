@@ -162,6 +162,22 @@ QString firstLabel(const QString &dnsDomain)
     return dnsDomain.section(QLatin1Char('.'), 0, 0);
 }
 
+bool validDnsLabel(const QString &label)
+{
+    if (label.isEmpty() || label.size() > 63)
+        return false;
+    if (label.startsWith(QLatin1Char('-')) || label.endsWith(QLatin1Char('-')))
+        return false;
+    for (const QChar c : label) {
+        const ushort u = c.unicode();
+        const bool alnum = (u >= 'a' && u <= 'z') || (u >= 'A' && u <= 'Z')
+                           || (u >= '0' && u <= '9');
+        if (!alnum && u != '-')
+            return false;
+    }
+    return true;
+}
+
 } // namespace
 
 bool generateSelfSignedCertificate(const QString &certPath, const QString &keyPath,
@@ -319,6 +335,38 @@ ProvisionResult provisionDomain(const ProvisionConfig &config)
         return result;
     }
 
+    // The DC's computer account, DNS records, TLS certificate and SPNs all use
+    // the same host. Callers may name it explicitly; otherwise keep the
+    // historical <domain-label>DC1 name.
+    QString dcLabel;
+    QString dcHost;
+    const QString requestedHost = config.dcHost.trimmed().toLower();
+    if (requestedHost.isEmpty()) {
+        dcLabel = firstLabel(result.dnsDomain).toUpper() + QStringLiteral("DC1");
+        dcHost = dcLabel.toLower() + QLatin1Char('.') + result.dnsDomain;
+    } else {
+        const QString suffix = QLatin1Char('.') + result.dnsDomain;
+        dcHost = requestedHost.contains(QLatin1Char('.')) ? requestedHost
+                                                          : requestedHost + suffix;
+        if (!dcHost.endsWith(suffix)) {
+            result.error = QStringLiteral("domain controller FQDN %1 must end in %2")
+                               .arg(config.dcHost, suffix);
+            return result;
+        }
+        dcLabel = dcHost.left(dcHost.size() - suffix.size());
+        if (dcLabel.contains(QLatin1Char('.')) || !validDnsLabel(dcLabel)) {
+            result.error = QStringLiteral("domain controller host must be one DNS label: %1")
+                               .arg(config.dcHost);
+            return result;
+        }
+        if (dcLabel.size() > 15) {
+            result.error = QStringLiteral("domain controller host must be 15 characters or fewer: %1")
+                               .arg(dcLabel);
+            return result;
+        }
+        dcLabel = dcLabel.toUpper();
+    }
+
     // `--dev-ports` selects the unprivileged binding set. A caller that set a
     // port explicitly keeps it; epm (135) and SMB (445) have no unprivileged
     // equivalent and stay native.
@@ -381,10 +429,10 @@ ProvisionResult provisionDomain(const ProvisionConfig &config)
     b.dnsDomain = result.dnsDomain;
     b.netbios = config.netbiosDomain.toUpper();
     b.sid = domainSid();
-    b.dcName = firstLabel(b.dnsDomain).toUpper() + QStringLiteral("DC1");
+    b.dcName = dcLabel;
     b.whenCreated = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
     result.domainSid = b.sid;
-    result.dcHost = b.dcName.toLower() + QLatin1Char('.') + b.dnsDomain;
+    result.dcHost = dcHost;
 
     // --- Domain NC -------------------------------------------------------
     DirectoryObject &domain = b.add(result.baseDn, b.netbios, QStringLiteral("domainDNS"),

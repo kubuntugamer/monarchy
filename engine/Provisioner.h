@@ -35,6 +35,10 @@ struct ProvisionConfig {
     // Upstream resolvers for out-of-zone DNS (address or address:port). Empty
     // leaves detection to the host's resolv.conf at runtime.
     QStringList forwarders;
+    // Optional domain controller host, as a host label ("dc01") or a full
+    // FQDN ("dc01.example.com"). Empty keeps the legacy
+    // <domain-label>DC1.<domain> name.
+    QString dcHost;
     bool force = false;
 };
 

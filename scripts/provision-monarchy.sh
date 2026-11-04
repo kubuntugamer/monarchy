@@ -43,6 +43,7 @@ Options (forwarded to monarchy-provision):
   --adminpass <password> Administrator password
   --forwarder <address>  Upstream DNS resolver (repeatable)
   --dc-ip <address>      Address published in the DNS zone
+  --dc-host <host>       Domain controller hostname or FQDN
   --dev-ports            Provision the unprivileged port set
   --force                Overwrite an existing domain store
   -h, --help             Show this help
@@ -116,8 +117,8 @@ for arg in "${args[@]}"; do
     case "$arg" in
         --adminpass) have_pass=true; skip_next=true ;;
         --adminpass=*) have_pass=true ;;
-        --realm|--domain|--forwarder|--dc-ip|--kdc-port) skip_next=true ;;
-        --realm=*|--domain=*|--forwarder=*|--dc-ip=*|--kdc-port=*) ;;
+        --realm|--domain|--forwarder|--dc-ip|--dc-host|--kdc-port) skip_next=true ;;
+        --realm=*|--domain=*|--forwarder=*|--dc-ip=*|--dc-host=*|--kdc-port=*) ;;
         --dev-ports|--force) ;;
         --targetdir) have_target=true; skip_next=true ;;
         --targetdir=*) have_target=true ;;

@@ -29,6 +29,7 @@ REALM="MONARCHY.EXAMPLE.COM"
 DOMAIN=""
 ADMINPASS=""
 DC_IP=""
+DC_HOST=""
 JOBS=""
 WITH_LDAP=0
 RUN_TESTS=1
@@ -76,20 +77,22 @@ Install mode
   --user              Rootless install: ~/.local, development ports,
                       no systemd (default for a non-root run)
   --wizard, --dcpromo Interactively promote this machine to a new forest:
-                      asks for the domain, NetBIOS name, DC address and
-                      Administrator password, then shows a summary.
+                      asks for the DNS domain, domain NetBIOS name,
+                      computer name/FQDN, DC address and Administrator
+                      password, then shows a summary.
                       Also starts automatically when run with no options
                       on a terminal
 
 Domain
   --realm REALM       Kerberos realm (default: MONARCHY.EXAMPLE.COM)
-  --domain NAME       NetBIOS name (wizard default: the hostname;
-                      otherwise the first realm label)
+  --domain NAME       Domain NetBIOS name (default: first realm label)
   --adminpass PASS    Administrator password (prompted for when omitted;
                       required for unattended runs)
   --dcdir DIR         Domain store directory (default: /var/lib/monarchy/
                       Monarchy as root, the user data directory otherwise)
   --dc-ip ADDRESS     Address published in the domain DNS zone
+  --dc-host HOST      Domain controller hostname or FQDN (default:
+                      <domain-label>DC1)
   --dev-ports         Provision unprivileged ports (default for --user)
   --native-ports      Provision the AD port set (default for the service)
   --fix-dns53         Disable systemd-resolved's port 53 stub listener
@@ -126,6 +129,8 @@ while [[ $# -gt 0 ]]; do
         --dcdir=*)      DCDIR="${1#*=}"; shift ;;
         --dc-ip)        DC_IP="${2:?--dc-ip needs an address}"; DC_IP_GIVEN=1; shift 2 ;;
         --dc-ip=*)      DC_IP="${1#*=}"; DC_IP_GIVEN=1; shift ;;
+        --dc-host)      DC_HOST="${2:?--dc-host needs a hostname}"; shift 2 ;;
+        --dc-host=*)    DC_HOST="${1#*=}"; shift ;;
         --dev-ports)    DEV_PORTS=1; shift ;;
         --native-ports) DEV_PORTS=0; shift ;;
         --fix-dns53)    FIX_DNS53=1; shift ;;
@@ -463,6 +468,7 @@ provision_domain() {
     local args=(--realm "$REALM" --adminpass "$ADMINPASS" --targetdir "$DCDIR")
     [[ -n "$DOMAIN" ]] && args+=(--domain "$DOMAIN")
     [[ -n "$DC_IP" ]] && args+=(--dc-ip "$DC_IP")
+    [[ -n "$DC_HOST" ]] && args+=(--dc-host "$DC_HOST")
     [[ $DEV_PORTS -eq 1 ]] && args+=(--dev-ports)
     [[ $FORCE -eq 1 ]] && args+=(--force)
 
@@ -537,7 +543,7 @@ wizard_valid_ipv4() {
     return 0
 }
 
-detect_netbios_name() {
+detect_host_label() {
     local name=""
     if command -v hostname >/dev/null 2>&1; then
         name="$(hostname -s 2>/dev/null || hostname 2>/dev/null || true)"
@@ -597,6 +603,9 @@ Monarchy Domain Controller Promotion Wizard
 This creates a NEW forest on this machine. It does not join an existing
 domain, add a replica domain controller, or offer RODC/DSRM options.
 
+The computer name defaults to this host's short hostname, and its FQDN is
+<computer>.<domain> (for example LAPTOP.domainname.lan).
+
 EOF
 
     if [[ -f "$DCDIR/dc.conf" && $FORCE -eq 0 ]]; then
@@ -607,34 +616,70 @@ EOF
         FORCE=1
     fi
 
-    local fqdn="" netbios="" ip="" answer="" password_note=""
-    local fqdn_default=""
-    [[ $REALM_GIVEN -eq 1 ]] && fqdn_default="$REALM"
+    local domain_name="" netbios="" ip="" answer="" password_note=""
+    local domain_default=""
+    [[ $REALM_GIVEN -eq 1 ]] && domain_default="$REALM"
     while :; do
-        fqdn="$(wizard_ask "Domain name (FQDN)" "$fqdn_default")"
-        wizard_valid_fqdn "$fqdn" && break
-        warn "'$fqdn' is not a valid DNS domain name (example: domainname.lan)"
-        fqdn_default=""
+        domain_name="$(wizard_ask "DNS domain name (domain only, e.g. domainname.lan)" "$domain_default")"
+        wizard_valid_fqdn "$domain_name" && break
+        warn "'$domain_name' is not a valid DNS domain name (example: domainname.lan)"
+        domain_default=""
     done
-    REALM="${fqdn^^}"
+    local dns_domain="${domain_name,,}"
+    REALM="${dns_domain^^}"
 
-    local netbios_default=""
-    if [[ $DOMAIN_GIVEN -eq 1 ]]; then
-        netbios_default="$DOMAIN"
-    else
-        netbios_default="$(detect_netbios_name)"
-        [[ -n "$netbios_default" ]] || netbios_default="${REALM%%.*}"
-        netbios_default="${netbios_default:0:15}"
-    fi
+    local netbios_default="${dns_domain%%.*}"
+    [[ $DOMAIN_GIVEN -eq 1 ]] && netbios_default="$DOMAIN"
     while :; do
-        netbios="$(wizard_ask "NetBIOS name" "$netbios_default")"
+        netbios="$(wizard_ask "Domain NetBIOS name" "$netbios_default")"
         if [[ "$netbios" =~ ^[A-Za-z0-9-]{1,15}$ ]]; then
             DOMAIN="${netbios^^}"
             break
         fi
-        warn "NetBIOS name must be 1-15 letters, digits or hyphens"
+        warn "domain NetBIOS name must be 1-15 letters, digits or hyphens"
         netbios_default=""
     done
+
+    local host_default="" dc_host_input="" dc_label="" dc_fqdn=""
+    if [[ -n "$DC_HOST" ]]; then
+        host_default="${DC_HOST,,}"
+    else
+        host_default="$(detect_host_label)"
+        host_default="${host_default,,}"
+    fi
+    [[ -n "$host_default" ]] || host_default="dc1"
+    while :; do
+        dc_host_input="$(wizard_ask "Computer name (NetBIOS name of this host, or its FQDN)" "$host_default")"
+        dc_host_input="${dc_host_input,,}"
+        if [[ "$dc_host_input" == *.* ]]; then
+            if [[ "$dc_host_input" != *."$dns_domain" ]]; then
+                warn "the FQDN must end in .$dns_domain"
+                host_default=""
+                continue
+            fi
+            dc_label="${dc_host_input%."$dns_domain"}"
+        else
+            dc_label="$dc_host_input"
+        fi
+        if [[ "$dc_label" == *.* ]]; then
+            warn "use one host label before .$dns_domain"
+            host_default=""
+            continue
+        fi
+        if [[ ! "$dc_label" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]]; then
+            warn "the host label may contain only letters, digits and hyphens"
+            host_default=""
+            continue
+        fi
+        if (( ${#dc_label} > 15 )); then
+            warn "the host label must be 15 characters or fewer"
+            host_default=""
+            continue
+        fi
+        break
+    done
+    dc_fqdn="$dc_label.$dns_domain"
+    DC_HOST="$dc_fqdn"
 
     local ip_default="$DC_IP"
     [[ -z "$ip_default" ]] && ip_default="$(detect_primary_ipv4)"
@@ -663,8 +708,6 @@ EOF
         DNS53_DECLINED=1
     fi
 
-    local dc_name="${REALM%%.*}DC1"
-    local dns_domain="${REALM,,}"
     local service_note="monarchy-dcd at boot"
     [[ $SERVICE -eq 1 ]] || service_note="not installed (--no-service)"
     local resolver_note="unchanged"
@@ -676,11 +719,12 @@ EOF
 
 Promotion summary
 -----------------
-  Domain (FQDN):    $dns_domain
-  NetBIOS name:     $DOMAIN
-  Kerberos realm:   $REALM
-  DC DNS name:      ${dc_name,,}.$dns_domain
-  DC IPv4 address:  $DC_IP
+  Domain (DNS):      $dns_domain
+  Domain NetBIOS:    $DOMAIN
+  Computer name:     ${dc_label^^}
+  Computer FQDN:     $dc_fqdn
+  Kerberos realm:    $REALM
+  DC IPv4 address:   $DC_IP
   Administrator:    $password_note
   Domain store:     $DCDIR
   Install prefix:   $PREFIX

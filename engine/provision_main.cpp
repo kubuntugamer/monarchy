@@ -40,6 +40,10 @@ int main(int argc, char *argv[])
                                 QStringLiteral("Address published in the domain DNS zone "
                                                "(default: 127.0.0.1)."),
                                 QStringLiteral("address"), QStringLiteral("127.0.0.1"));
+    QCommandLineOption hostOption(QStringLiteral("dc-host"),
+                                  QStringLiteral("Domain controller hostname or FQDN "
+                                                 "(default: <domain-label>DC1.<realm>)."),
+                                  QStringLiteral("host"));
     QCommandLineOption kdcPortOption(QStringLiteral("kdc-port"),
                                 QStringLiteral("Port the KDC serves (default: native 88)."),
                                 QStringLiteral("port"));
@@ -59,6 +63,7 @@ int main(int argc, char *argv[])
     parser.addOption(passOption);
     parser.addOption(dirOption);
     parser.addOption(ipOption);
+    parser.addOption(hostOption);
     parser.addOption(kdcPortOption);
     parser.addOption(devPortsOption);
     parser.addOption(forwarderOption);
@@ -78,6 +83,7 @@ int main(int argc, char *argv[])
     config.targetDir = parser.isSet(dirOption) ? parser.value(dirOption)
                                                : parser.positionalArguments().value(0);
     config.dcIp = parser.value(ipOption);
+    config.dcHost = parser.value(hostOption);
     config.kdcPort = parser.isSet(kdcPortOption)
         ? quint16(parser.value(kdcPortOption).toUInt())
         : config.kdcPort; // default: native 88 with the rest of the well-known set

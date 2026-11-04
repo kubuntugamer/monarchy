@@ -116,13 +116,16 @@ the service:
 sudo scripts/install-monarchy.sh
 ```
 
-It asks for the domain FQDN, NetBIOS name, domain controller IPv4 address,
-Administrator password and resolver choice, then prints a promotion summary
-before touching the machine. The NetBIOS name defaults to this machine's short
-hostname (uppercased and limited to 15 characters); you can edit it. The
-password is required and confirmed; it is never generated automatically. This build creates a **new forest only**; the
-wizard states that it cannot join an existing domain or add a replica DC.
-`sudo scripts/dcpromo` and `--wizard` open the same wizard directly.
+It asks for the DNS domain, the domain's NetBIOS name, the computer name or
+FQDN, the DC IPv4 address, Administrator password and resolver choice, then
+prints a promotion summary before touching the machine. The computer name
+defaults to this machine's short hostname, so its FQDN becomes
+`<hostname>.<domain>` (for example `LAPTOP.domainname.lan`); the domain's own
+NetBIOS name defaults to the first domain label. The password is required and
+confirmed; it is never generated automatically. This build creates a **new
+forest only**; the wizard states that it cannot join an existing domain or add
+a replica DC. `sudo scripts/dcpromo` and `--wizard` open the same wizard
+directly.
 
 For unattended installs, supply the answers as flags instead:
 
@@ -147,9 +150,10 @@ scripts/install-monarchy.sh
 Other options: `--with-ldap` (system OpenLDAP client backend),
 `--install-deps` (installs build packages for Debian/Ubuntu, Fedora, Arch or
 openSUSE), `--fix-dns53` (disable systemd-resolved's port 53 stub listener and
-make the DC the host's caching/forwarding resolver), `--wizard`/`--dcpromo`,
-`--skip-tests`, `--no-service`, `--no-provision`, `--prefix`, `--build-dir`,
-`--jobs`. See `scripts/install-monarchy.sh --help`.
+make the DC the host's caching/forwarding resolver), `--dc-host` (computer
+name or FQDN), `--wizard`/`--dcpromo`, `--skip-tests`, `--no-service`,
+`--no-provision`, `--prefix`, `--build-dir`, `--jobs`. See
+`scripts/install-monarchy.sh --help`.
 
 ## Uninstall
 

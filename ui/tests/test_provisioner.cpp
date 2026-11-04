@@ -60,6 +60,7 @@ private slots:
     void refusesExistingTargetWithoutForce();
     void servesProvisionedDomainOverLdap();
     void rejectsWrongCredentials();
+    void usesConfiguredControllerHost();
 };
 
 void ProvisionerTest::buildsDomainFromScratch()
@@ -360,6 +361,34 @@ void ProvisionerTest::rejectsWrongCredentials()
     QVERIFY2(probe.error.isEmpty(), qPrintable(probe.error));
     QVERIFY(!probe.wrongPasswordAccepted);
     QVERIFY(!probe.unknownUserAccepted);
+}
+
+void ProvisionerTest::usesConfiguredControllerHost()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+
+    ProvisionConfig config = testConfig(dir.path());
+    config.dcHost = QStringLiteral("Laptop.Test.Example.Org");
+    const ProvisionResult result = provisionDomain(config);
+    QVERIFY2(result.ok, qPrintable(result.error));
+    QCOMPARE(result.dcHost, QStringLiteral("laptop.test.example.org"));
+
+    QSettings conf(result.configPath, QSettings::IniFormat);
+    QCOMPARE(conf.value(QStringLiteral("dcName")).toString(), QStringLiteral("LAPTOP"));
+    QCOMPARE(conf.value(QStringLiteral("dcHost")).toString(),
+             QStringLiteral("laptop.test.example.org"));
+
+    LdapServer store;
+    QVERIFY(store.loadFromFile(result.storePath));
+    const DirectoryObject *dc =
+        findByDn(store.objects(),
+                 QStringLiteral("CN=LAPTOP,OU=Domain Controllers,%1").arg(result.baseDn));
+    QVERIFY(dc);
+    QCOMPARE(dc->attributes.value(QStringLiteral("dNSHostName")),
+             QStringLiteral("laptop.test.example.org"));
+    QVERIFY(dc->attributes.value(QStringLiteral("servicePrincipalName"))
+                .contains(QStringLiteral("ldap/laptop.test.example.org")));
 }
 
 QTEST_GUILESS_MAIN(ProvisionerTest)
