@@ -37,11 +37,21 @@ private slots:
     void addsObjectThroughDirectory();
     void accountTabWritesUserAccountControl();
     void loadsLiveDirectory();
+    void discoversNamingContextFromRootDse();
 };
+
+// The console no longer seeds itself: it shows what the directory answers.
+// Fixtures load the sample objects explicitly, the way the application loads a
+// real domain.
+static void seedSampleDirectory(ConsoleView &view)
+{
+    view.resultsModel()->setObjects(sampleObjects());
+}
 
 void ConsoleViewTest::filtersByContainer()
 {
     ConsoleView view;
+    seedSampleDirectory(view);
 
     QCOMPARE(view.resultsModel()->objectCount(), 12);
 
@@ -119,6 +129,7 @@ void ConsoleViewTest::switchesViewMode()
 void ConsoleViewTest::exportsVisibleRows()
 {
     ConsoleView view;
+    seedSampleDirectory(view);
     view.navigateTo(QStringLiteral("Users"));
 
     QBuffer buffer;
@@ -388,8 +399,8 @@ void ConsoleViewTest::loadsLiveDirectory()
     view.setConnectionService(&connection);
     view.setDirectoryService(&directory);
 
-    // The console opens with 12 sample objects; the live directory has 13.
-    QCOMPARE(view.resultsModel()->objectCount(), 12);
+    // The console opens empty; the live directory has 13 objects.
+    QCOMPARE(view.resultsModel()->objectCount(), 0);
 
     auto connectFuture = connection.connect(profile);
     QTRY_VERIFY_WITH_TIMEOUT(connectFuture.isFinished(), 5000);
@@ -413,6 +424,33 @@ void ConsoleViewTest::loadsLiveDirectory()
     QCOMPARE(view.resultsModel()->objectCount(), 5);
     view.navigateTo(QStringLiteral("Domain Controllers"));
     QCOMPARE(view.resultsModel()->objectCount(), 1);
+}
+
+void ConsoleViewTest::discoversNamingContextFromRootDse()
+{
+    // A console given no base DN asks the server for its naming context — the
+    // root DSE is the only place a real domain publishes one. Nothing about the
+    // directory is assumed in the client.
+    LdapServer server;
+    QVERIFY(server.listen(0));
+    server.setObjects(sampleObjects());
+
+    ConnectionService connection;
+    ConnectionProfile profile;
+    profile.server = QStringLiteral("127.0.0.1");
+    profile.port = server.serverPort();
+
+    DirectoryService directory(&connection);
+    ConsoleView view;
+    view.setConnectionService(&connection);
+    view.setDirectoryService(&directory);
+
+    auto connectFuture = connection.connect(profile);
+    QTRY_VERIFY_WITH_TIMEOUT(connectFuture.isFinished(), 5000);
+    QVERIFY(connectFuture.result());
+    QCOMPARE(connection.baseDn(), QStringLiteral("DC=corp,DC=example,DC=com"));
+
+    QTRY_COMPARE_WITH_TIMEOUT(view.resultsModel()->objectCount(), 12, 5000);
 }
 
 QTEST_MAIN(ConsoleViewTest)

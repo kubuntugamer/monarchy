@@ -192,7 +192,7 @@ Either `cmake -S .` or the historical `cmake -S ui -B ui/build` layout works.
 ./build/ui/monarchy-ui
 ```
 
-To create a fresh domain instead of browsing the sample directory:
+The console shows only what a directory answers. To create a fresh domain:
 
 ```sh
 ./build/ui/monarchy-provision --realm CORP.EXAMPLE.COM --domain CORP \
@@ -264,13 +264,15 @@ or edit `dc.conf` directly. Set `forwarding=false` in `dc.conf` to answer
 out-of-zone queries with REFUSED instead, which is the standalone engine's
 default.
 
-The application starts its local directory on **LDAP 1389**, the KDC on
-**8888** and **DNS 1053**, serves the DCE/RPC endpoints on `samrPort` 1035,
-`lsadPort` 1036 and `drsPort` 1038 (loopback), the endpoint mapper on
-`epmPort` and SMB2 on `smbPort`, then connects to it automatically. Use **File →
-Connect to Directory…** to point the console at a remote LDAP server (the local
-engine keeps running). **File → Disconnect** returns to the offline sample
-directory. Outbound LDAPS and Kerberos/GSSAPI binds to a *remote* server require
+The daemon serves the provisioned domain on **LDAP 389**, the KDC on
+**88** and **DNS 53**, the DCE/RPC endpoints on `samrPort` 49152,
+`lsadPort` 49153 and `drsPort` 1038 (loopback), the endpoint mapper on
+`epmPort` and SMB2 on `smbPort`. The console is a pure client: it reads the
+provisioned domain's `dc.conf` (or `MONARCHY_DCDIR`) for the port, asks the
+server's root DSE for the naming context when none is configured, and connects
+automatically. Use **File → Connect to Directory…** to point it at a remote LDAP
+server. **File → Disconnect** clears the console; no sample objects are
+invented in their place. Outbound LDAPS and Kerberos/GSSAPI binds to a *remote* server require
 the `MONARCHY_WITH_LDAP=ON` build; the default build reports an error instead of
 silently falling back to plaintext. The engine's own KDC needs no external
 library — any Kerberos client can use it:
@@ -291,10 +293,10 @@ per-direction key usages, sequence numbers and checksums those documents
 define. `gss_unwrap` on the client side verifies each one.
 
 The local store is written on exit to the platform application-data directory.
-Without a provisioned domain that path is
-`~/.local/share/monarchy/Monarchy/directory.json` with the sample objects and the
-naming context `DC=corp,DC=example,DC=com`; a provisioned domain stores its
-directory under `private/` and uses the realm you chose.
+A provisioned domain stores its directory under `private/` and uses the realm
+you chose. Without one there is nothing to serve: `monarchy-dcd` says so and
+exits rather than starting on a demo store, and the console stays empty until a
+directory is provisioned or connected.
 
 ## Tests
 

@@ -28,10 +28,9 @@ class DcService : public QObject
     Q_OBJECT
 
 public:
-    // A client-side host (tests, tooling) may fall back to the sample
-    // directory when no domain is provisioned; the daemon never serves a demo
-    // store, so it passes false and refuses to start without one.
-    explicit DcService(bool allowSampleFallback = true, QObject *parent = nullptr);
+    // The service refuses to start without a provisioned domain: it never
+    // serves a demo store.
+    explicit DcService(QObject *parent = nullptr);
 
     // dcDir names the provisioned domain directory (dc.conf next to it).
     // Empty means the platform application-data directory, the same location
@@ -43,7 +42,7 @@ public:
     // disk, so this is the last flush for uncommitted session edits.
     void stop();
 
-    // Naming context of the provisioned domain (or the sample fallback).
+    // Naming context of the provisioned domain.
     QString baseDn() const { return m_baseDn; }
 
     // The DNS zone the engine serves, empty when there is none.
@@ -63,7 +62,6 @@ private:
     EpmServer *m_epmServer = nullptr;
     Smb2Server *m_smbServer = nullptr;
 
-    const bool m_allowSampleFallback = true;
     bool m_started = false;
     // Store and zone locations resolved from dc.conf at start-up.
     QString m_storePath;

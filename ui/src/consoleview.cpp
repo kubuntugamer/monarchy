@@ -4,7 +4,6 @@
 #include "consoleview.h"
 
 #include "propertysheet.h"
-#include "../backend/SampleData.h"
 
 #include <QAbstractItemView>
 #include <QDialog>
@@ -46,7 +45,8 @@ ConsoleView::ConsoleView(QWidget *parent)
     layout->setSpacing(0);
     layout->addWidget(m_splitter);
 
-    populateSampleData();
+    // The pane starts empty: it shows what the directory answers, and nothing
+    // until one does.
     applyViewMode(Details);
     navigateTo(QStringLiteral("Console Root"));
 }
@@ -205,11 +205,6 @@ void ConsoleView::createResultsPane()
             [showResultsContextMenu, this](const QPoint &pos) {
                 showResultsContextMenu(m_iconView, pos);
             });
-}
-
-void ConsoleView::populateSampleData()
-{
-    m_resultsModel->setObjects(sampleObjects());
 }
 
 void ConsoleView::setViewMode(ViewMode mode)
@@ -628,12 +623,13 @@ void ConsoleView::addObject(const DirectoryObject &object)
 
 void ConsoleView::refresh()
 {
-    // Requery the connected directory; fall back to seed data when standalone.
+    // Requery the connected directory. With no backend there is nothing to
+    // show, so the pane is emptied rather than filled with invented objects.
     if (m_directoryService) {
         loadFromBackend();
         return;
     }
-    m_resultsModel->setObjects(sampleObjects());
+    m_resultsModel->setObjects({});
     updateSelectionState();
     updateStatus();
     emit statusMessage(tr("%1: %n object(s) refreshed.", nullptr,
@@ -659,7 +655,7 @@ void ConsoleView::setConnectionService(ConnectionService *service)
             if (connected)
                 loadFromBackend();
             else
-                populateSampleData();
+                m_resultsModel->setObjects({});
         });
     }
 }

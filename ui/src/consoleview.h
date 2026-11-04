@@ -85,7 +85,6 @@ signals:
 private:
     void createTreePane();
     void createResultsPane();
-    void populateSampleData();
     void applyViewMode(ViewMode mode);
 
     void onTreeSelectionChanged();

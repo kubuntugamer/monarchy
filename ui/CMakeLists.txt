@@ -24,8 +24,6 @@ add_library(monarchy-ui-core STATIC
     src/consoleview.cpp
     src/propertysheet.h
     src/propertysheet.cpp
-    ../backend/SampleData.h
-    ../backend/SampleData.cpp
     ../backend/ConnectionService.h
     ../backend/ConnectionService.cpp
     ../backend/DirectoryService.h
@@ -150,12 +148,22 @@ include(CTest)
 if(BUILD_TESTING)
     find_package(Qt6 6.5 REQUIRED COMPONENTS Test)
 
+    # The sample directory is fixture data, not part of the product: the console
+    # shows what a server answers, never an invented one. Only the suites that
+    # need deterministic objects link this.
+    add_library(monarchy-test-fixtures STATIC
+        ../backend/SampleData.h
+        ../backend/SampleData.cpp
+    )
+    target_link_libraries(monarchy-test-fixtures PUBLIC monarchy-ui-core)
+
     add_executable(monarchy-ui-tests
         tests/test_consoleview.cpp
     )
 
     target_link_libraries(monarchy-ui-tests PRIVATE
         monarchy-ui-core
+        monarchy-test-fixtures
         Qt6::Test
     )
 
@@ -170,6 +178,7 @@ if(BUILD_TESTING)
 
     target_link_libraries(monarchy-backend-tests PRIVATE
         monarchy-ui-core
+        monarchy-test-fixtures
         Qt6::Test
     )
 
@@ -198,6 +207,7 @@ if(BUILD_TESTING)
 
     target_link_libraries(monarchy-ntlm-tests PRIVATE
         monarchy-ui-core
+        monarchy-test-fixtures
         Qt6::Test
     )
 
@@ -339,6 +349,7 @@ if(BUILD_TESTING)
 
     target_link_libraries(monarchy-ldap-tests PRIVATE
         monarchy-ui-core
+        monarchy-test-fixtures
         Qt6::Test
     )
 
@@ -355,6 +366,7 @@ if(BUILD_TESTING)
 
     target_link_libraries(monarchy-tls-tests PRIVATE
         monarchy-ui-core
+        monarchy-test-fixtures
         Qt6::Test
     )
 

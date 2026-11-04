@@ -12,7 +12,6 @@
 #include "../backend/AdminService.h"
 #include "../backend/DirectoryService.h"
 
-#include "../backend/SampleData.h"
 #include <QAction>
 #include <QClipboard>
 #include <QActionGroup>
@@ -51,6 +50,51 @@
 #include <QListView>
 #include <QTreeView>
 #include <QToolButton>
+
+namespace {
+
+// An installed domain keeps its dc.conf under its state directory. The console
+// is a pure client and reads only the connection parameters — the LDAP port and
+// the naming context — never the store or the secrets.
+QString findDomainConfig()
+{
+    QStringList candidates;
+    const QByteArray overrideDir = qgetenv("MONARCHY_DCDIR");
+    if (!overrideDir.isEmpty())
+        candidates.append(QString::fromLocal8Bit(overrideDir) + QStringLiteral("/dc.conf"));
+    candidates.append(QStringLiteral("/var/lib/monarchy/Monarchy/dc.conf"));
+    const QString dataHome = qEnvironmentVariableIsSet("XDG_DATA_HOME")
+                                 ? QString::fromLocal8Bit(qgetenv("XDG_DATA_HOME"))
+                                 : QDir::homePath() + QStringLiteral("/.local/share");
+    candidates.append(dataHome + QStringLiteral("/monarchy/Monarchy/dc.conf"));
+
+    for (const QString &candidate : candidates) {
+        if (QFileInfo::exists(candidate))
+            return candidate;
+    }
+    return QString();
+}
+
+// Defaults for “connect to the directory”: the provisioned domain when there is
+// one, otherwise the plain LDAP port with no naming context guessed.
+struct DomainDefaults {
+    int ldapPort = 389;
+    QString baseDn;
+};
+
+DomainDefaults domainDefaults()
+{
+    DomainDefaults defaults;
+    const QString path = findDomainConfig();
+    if (path.isEmpty())
+        return defaults;
+    const QSettings dcConfig(path, QSettings::IniFormat);
+    defaults.ldapPort = dcConfig.value(QStringLiteral("ldapPort"), 389).toInt();
+    defaults.baseDn = dcConfig.value(QStringLiteral("baseDn")).toString();
+    return defaults;
+}
+
+} // namespace
 
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
@@ -576,12 +620,13 @@ void MainWindow::createCentralWidget()
     m_consoleView->setDirectoryService(m_directoryService);
     m_consoleView->setAdminService(m_adminService);
 
-    // Auto-connect using the saved profile (talks real LDAP to the local DC).
+    // Auto-connect using the saved profile, which defaults to the domain
+    // provisioned on this machine (talks real LDAP to the local DC).
+    const DomainDefaults domain = domainDefaults();
     ConnectionProfile profile;
     profile.server = QSettings().value(QStringLiteral("connection/server"), QStringLiteral("localhost")).toString();
-    profile.port = QSettings().value(QStringLiteral("connection/port"), 1389).toInt();
-    profile.baseDn = QSettings().value(QStringLiteral("connection/baseDn"),
-                                       QStringLiteral("DC=corp,DC=example,DC=com")).toString();
+    profile.port = QSettings().value(QStringLiteral("connection/port"), domain.ldapPort).toInt();
+    profile.baseDn = QSettings().value(QStringLiteral("connection/baseDn"), domain.baseDn).toString();
     profile.bindDn = QSettings().value(QStringLiteral("connection/bindDn"), QString()).toString();
     profile.useKerberos = QSettings().value(QStringLiteral("connection/kerberos"), false).toBool();
     profile.useTls = QSettings().value(QStringLiteral("connection/tls"), false).toBool();
@@ -921,7 +966,7 @@ QString MainWindow::namingContext() const
         if (!base.isEmpty())
             return base;
     }
-    return QStringLiteral("DC=corp,DC=example,DC=com");
+    return domainDefaults().baseDn;
 }
 
 QString MainWindow::connectedDnsZone() const
@@ -940,7 +985,7 @@ QString MainWindow::connectedDnsZone() const
         zone += nc.mid(at + 3, (end == -1 ? nc.size() : end) - at - 3);
         at = (end == -1) ? -1 : nc.indexOf(QLatin1String("DC="), end + 1);
     }
-    return zone.isEmpty() ? QStringLiteral("corp.example.com") : zone;
+    return zone;
 }
 
 void MainWindow::onNewUser()
@@ -1307,7 +1352,8 @@ void MainWindow::onConnectToDirectory()
     form->addRow(tr("Port:"), portSpin);
 
     QLineEdit *baseDnEdit = new QLineEdit(&dialog);
-    baseDnEdit->setText(QSettings().value(QStringLiteral("connection/baseDn"), QStringLiteral("DC=corp,DC=example,DC=com")).toString());
+    baseDnEdit->setText(QSettings().value(QStringLiteral("connection/baseDn"),
+                                          domainDefaults().baseDn).toString());
     form->addRow(tr("Base DN:"), baseDnEdit);
 
     QLineEdit *bindDnEdit = new QLineEdit(&dialog);

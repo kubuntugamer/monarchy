@@ -14,7 +14,6 @@
 #include "Ntlm.h"
 #include "Samr.h"
 #include "Smb2.h"
-#include "../backend/SampleData.h"
 
 #include <QDir>
 #include <QFileInfo>
@@ -22,9 +21,8 @@
 #include <QSettings>
 #include <QStandardPaths>
 
-DcService::DcService(bool allowSampleFallback, QObject *parent)
+DcService::DcService(QObject *parent)
     : QObject(parent)
-    , m_allowSampleFallback(allowSampleFallback)
 {
 }
 
@@ -79,17 +77,13 @@ bool DcService::start(const QString &dcDir)
     m_zonePath = dcConfig.value(QStringLiteral("zonePath"),
                                 resolvedDcDir + QStringLiteral("/private/dnszone.json")).toString();
     if (!m_ldapServer->loadFromFile(m_storePath)) {
-        if (!m_allowSampleFallback) {
-            emit statusMessage(tr("No provisioned domain under %1; refusing to serve a demo store.")
-                                   .arg(resolvedDcDir));
-            return false;
-        }
-        m_ldapServer->setObjects(sampleObjects());
-    } else {
-        m_ldapServer->loadSecretsFromFile(
-            dcConfig.value(QStringLiteral("secretsPath"),
-                           resolvedDcDir + QStringLiteral("/private/secrets.json")).toString());
+        emit statusMessage(tr("No provisioned domain under %1; refusing to serve a demo store.")
+                               .arg(resolvedDcDir));
+        return false;
     }
+    m_ldapServer->loadSecretsFromFile(
+        dcConfig.value(QStringLiteral("secretsPath"),
+                       resolvedDcDir + QStringLiteral("/private/secrets.json")).toString());
 
     // TLS for StartTLS: the certificate the provisioner created for this DC. A
     // domain provisioned without one still serves plaintext LDAP and refuses the

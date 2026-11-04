@@ -18,6 +18,7 @@ ConnectionService::ConnectionService(QObject *parent)
 QFuture<bool> ConnectionService::connect(const ConnectionProfile &profile)
 {
     return QtConcurrent::run([this, profile]() {
+        QString baseDn = profile.baseDn;
 #ifdef MONARCHY_WITH_LDAP
         LDAP *ld = nullptr;
         int rc = ldap_initialize(&ld, (profile.useTls ? QStringLiteral("ldaps://") : QStringLiteral("ldap://"))
@@ -62,8 +63,7 @@ QFuture<bool> ConnectionService::connect(const ConnectionProfile &profile)
         m_port = profile.port;
         m_bindDn = profile.bindDn;
         m_password = profile.password;
-        m_baseDn = profile.baseDn.isEmpty() ? QStringLiteral("DC=corp,DC=example,DC=com")
-                                           : profile.baseDn;
+        m_baseDn = baseDn;
         m_connected = true;
         QMetaObject::invokeMethod(this, [this] { emit connectedChanged(true); },
                                   Qt::QueuedConnection);
@@ -92,14 +92,36 @@ QFuture<bool> ConnectionService::connect(const ConnectionProfile &profile)
                 client.close();
                 return false;
             }
+            if (baseDn.isEmpty()) {
+                // Take the naming context from the root DSE, the way AD's own
+                // tools do, instead of guessing a DN that may not exist here.
+                const QList<LdapClient::Entry> rootDse =
+                    client.search(QString(), 0, QStringLiteral("(objectClass=*)"),
+                                  {QStringLiteral("defaultNamingContext")}, &err);
+                const QStringList naming = rootDse.isEmpty()
+                                               ? QStringList()
+                                               : rootDse.first().attrs.value(
+                                                     QStringLiteral("defaultNamingContext"));
+                if (naming.isEmpty() || naming.first().isEmpty()) {
+                    const QString message =
+                        QStringLiteral("The server at %1:%2 publishes no naming context; "
+                                       "enter a base DN to browse it.")
+                            .arg(profile.server)
+                            .arg(profile.port);
+                    QMetaObject::invokeMethod(this, [this, message] { emit error(message); },
+                                              Qt::QueuedConnection);
+                    client.close();
+                    return false;
+                }
+                baseDn = naming.first();
+            }
             client.close();
         }
         m_server = profile.server;
         m_port = profile.port;
         m_bindDn = profile.bindDn;
         m_password = profile.password;
-        m_baseDn = profile.baseDn.isEmpty() ? QStringLiteral("DC=corp,DC=example,DC=com")
-                                           : profile.baseDn;
+        m_baseDn = baseDn;
         m_connected = true;
         QMetaObject::invokeMethod(this, [this] { emit connectedChanged(true); },
                                   Qt::QueuedConnection);

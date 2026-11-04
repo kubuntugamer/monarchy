@@ -131,7 +131,7 @@ int main(int argc, char *argv[])
                          app.quit();
                      });
 
-    DcService service(false);
+    DcService service;
     QObject::connect(&service, &DcService::statusMessage,
                      [](const QString &message) { std::printf("%s\n", qPrintable(message)); });
     QObject::connect(&app, &QCoreApplication::aboutToQuit, &service, &DcService::stop);
