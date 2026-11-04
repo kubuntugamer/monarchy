@@ -183,6 +183,33 @@ QByteArray createTrustStub(const QByteArray &handle, const QString &partner,
     return stub;
 }
 
+// LsarSetInformationTrustedDomain level 7: the trust handle, the level, and a
+// pointer to the union whose arm is lsa_TrustDomainInfoAuthInfo.
+QByteArray setTrustAuthStub(const QByteArray &handle, const QByteArray &secret)
+{
+    QByteArray stub = handle;
+    appendLe16(stub, 7);
+    alignTo(stub, 4);
+    appendLe32(stub, 0x00020030); // union pointer
+    appendLe16(stub, 7);
+    alignTo(stub, 4);
+    appendLe32(stub, 1);          // incoming_count
+    appendLe32(stub, 0x00020031); // incoming_current
+    appendLe32(stub, 0);          // incoming_previous
+    appendLe32(stub, 0);          // outgoing_count
+    appendLe32(stub, 0);
+    appendLe32(stub, 0);
+    alignTo(stub, 8);
+    stub.append(QByteArray(8, '\0')); // last_update_time
+    appendLe32(stub, 2);              // TRUST_AUTH_TYPE_CLEAR
+    appendLe32(stub, quint32(secret.size()));
+    appendLe32(stub, 0x00020032);
+    appendLe32(stub, quint32(secret.size()));
+    stub.append(secret);
+    alignTo(stub, 4);
+    return stub;
+}
+
 // An lsa_String the way a client marshals it: the header, the varying buffer
 // it points at, and only then the following scalar.
 void appendInlineString(QByteArray &out, const QString &text, quint32 referent)
@@ -439,6 +466,17 @@ void LsadTest::createsQueriesEnumeratesAndDeletesATrust()
         store.append(*object);
         return true;
     };
+    writes.updateTrust = [&store](const QString &dn,
+                                  const QMap<QString, QString> &attributes, QString *) {
+        for (DirectoryObject &object : store) {
+            if (object.id != dn)
+                continue;
+            for (auto it = attributes.constBegin(); it != attributes.constEnd(); ++it)
+                object.attributes.insert(it.key(), it.value());
+            return true;
+        }
+        return false;
+    };
     writes.removeTrust = [&store](const QString &dn, QString *) {
         for (int i = 0; i < store.size(); ++i) {
             if (store.at(i).id == dn) {
@@ -463,7 +501,7 @@ void LsadTest::createsQueriesEnumeratesAndDeletesATrust()
     // The trust is the trustedDomain object under CN=System that a Windows DC
     // stores, with the partner, direction and SID the call carried.
     QCOMPARE(store.size(), 1);
-    const DirectoryObject &trust = store.first();
+    const DirectoryObject trust = store.first();
     QCOMPARE(trust.id, QStringLiteral("CN=FABRIKAM,CN=System,DC=corp,DC=example,DC=com"));
     QVERIFY(trust.attributes.value(QStringLiteral("objectClass"))
                 .contains(QLatin1String("trustedDomain")));
@@ -523,6 +561,17 @@ void LsadTest::createsQueriesEnumeratesAndDeletesATrust()
     QCOMPARE(readLe32At(list, 4), 1u); // count
     QVERIFY(readLe32At(list, 8) != 0); // array pointer
     QVERIFY(list.contains(utf16Bytes(QStringLiteral("fabrikam.local"))));
+
+    // A password rollover writes the new clear secret and the keys derived
+    // from it, so the partner's next ticket uses the new key.
+    const QString oldAes = trust.attributes.value(QStringLiteral("aes128Key"));
+    QVERIFY(!oldAes.isEmpty());
+    QCOMPARE(lastWord(server.handleCall(Lsad::OpSetInformationTrustedDomain,
+                                        setTrustAuthStub(trustHandle, QByteArray("n3wpass")))),
+             0u);
+    QCOMPARE(store.first().attributes.value(QStringLiteral("trustAuthIncoming")),
+             QStringLiteral("2:") + QString::fromLatin1(QByteArray("n3wpass").toHex()));
+    QVERIFY(store.first().attributes.value(QStringLiteral("aes128Key")) != oldAes);
 
     // Delete by SID removes the object; the enumeration then reports no more
     // entries rather than an empty success.

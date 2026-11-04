@@ -471,7 +471,8 @@ incoming `krbtgt/OURS@PEER` TGT is opened with the same key. That object is
 what `LsarCreateTrustedDomainEx` over `lsarpc` writes, secret and keys
 included, so a trust can be created over the protocol rather than by editing
 the store. Not implemented: transited-realm encoding beyond one hop, SID
-filtering and selective authentication, and trust-password rotation.
+filtering, selective authentication and automatic trust-password rollover;
+`LsarSetInformationTrustedDomain` rewrites the secret and keys on request.
 
 Both SASL security layers are implemented: RFC 4752/4121/1964 for GSSAPI and
 MS-NLMP §3.4 signing and sealing for NTLM, each carried in the RFC 4422
@@ -583,7 +584,8 @@ restart), secrets and private data, `LsarGetUserName`, the policy security
 descriptor, and the trusted-domain calls — create (`…Ex`/`…Ex2`), open by SID or
 name, query (name and info-ex), enumerate and delete. A trust is the
 `trustedDomain` object under `CN=System` a Windows DC stores, and its clear
-secret becomes the inter-realm `krbtgt` keys. The
+secret becomes the inter-realm `krbtgt` keys (rewritable through
+`LsarSetInformationTrustedDomain`). The
 independent check is `scripts/lsad-conformance.py`: 50 checks against a live
 endpoint through Samba's `samba.dcerpc.lsa` (pidl's decoder, the reference the
 layout is written against) and through impacket's `lsad`/`lsat` clients.

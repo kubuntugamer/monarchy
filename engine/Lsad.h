@@ -124,6 +124,10 @@ struct WriteBackend {
     // the trust calls report, and it survives a restart with the rest of the
     // store.
     std::function<bool(DirectoryObject *object, QString *error)> createTrust;
+    // Trust secrets are rewritten in place when a password rolls over.
+    std::function<bool(const QString &dn, const QMap<QString, QString> &attributes,
+                       QString *error)>
+        updateTrust;
     std::function<bool(const QString &dn, QString *error)> removeTrust;
 };
 

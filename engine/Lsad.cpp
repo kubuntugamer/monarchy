@@ -1481,11 +1481,73 @@ QByteArray LsadServer::handleCall(quint16 opnum, const QByteArray &stub,
         return result(kStatusSuccess);
     }
     case Lsad::OpSetInformationTrustedDomain:
-    case Lsad::OpSetTrustedDomainInfoByName:
-        // Writing trust secrets is how a trust password rollover happens; a
-        // client that asks for it gets a refusal, not a success that would
-        // leave the agreed secret unchanged.
-        return result(kStatusNotSupported);
+    case Lsad::OpSetTrustedDomainInfoByName: {
+        Handle trust;
+        QString name;
+        if (opnum == Lsad::OpSetInformationTrustedDomain) {
+            // This call takes the trust handle itself, not the policy handle.
+            QByteArray handleBytes;
+            if (!reader.bytes(kHandleSize, &handleBytes))
+                return {};
+            if (!lookupHandle(handleBytes, Handle::TrustedDomain, &trust))
+                return result(kStatusInvalidHandle);
+        } else {
+            Handle policy;
+            if (!readPolicy(&policy))
+                return {};
+            if (!readStringInline(reader, &name))
+                return {};
+        }
+        quint16 level = 0;
+        if (!reader.u16(&level))
+            return {};
+        reader.align(4);
+        // The information is a pointer to a union: the referent, the union's
+        // own copy of the discriminant, then the arm.
+        bool present = false;
+        if (!reader.referent(&present) || !present)
+            return result(kStatusInvalidParameter);
+        quint16 discriminant = 0;
+        if (!reader.u16(&discriminant))
+            return {};
+        reader.align(4);
+        if (level != 7 || discriminant != 7)
+            return result(kStatusInvalidInfoClass);
+        QMap<QString, QString> attributes;
+        if (!readAuthInfo(&attributes, false))
+            return result(kStatusInvalidParameter);
+
+        const DirectoryObject object = name.isEmpty() ? findTrustByName(trust.name)
+                                                      : findTrustByName(name);
+        if (object.id.isEmpty())
+            return result(kStatusObjectNameNotFound);
+        // The clear secret replaces the old one and derives the new inter-realm
+        // keys, which is what a rollover has to do on both sides at once.
+        const QString incoming = attributes.value(QStringLiteral("trustAuthIncoming"));
+        if (!m_writes.updateTrust)
+            return result(kStatusNotSupported);
+        QMap<QString, QString> updates;
+        updates.insert(QStringLiteral("trustAuthIncoming"), incoming);
+        updates.insert(QStringLiteral("trustAuthOutgoing"),
+                       attributes.value(QStringLiteral("trustAuthOutgoing")));
+        if (incoming.startsWith(QStringLiteral("2:"))) {
+            const QByteArray clear = QByteArray::fromHex(incoming.mid(2).toLatin1());
+            DirectoryObject derived;
+            Krb5::storeTrustKeys(derived, QString::fromUtf8(clear), m_config.realm,
+                                 object.attributes.value(QStringLiteral("trustPartner")));
+            for (auto it = derived.attributes.constBegin();
+                 it != derived.attributes.constEnd(); ++it)
+                updates.insert(it.key(), it.value());
+        }
+        QString error;
+        if (!m_writes.updateTrust(object.id, updates, &error)) {
+            emit requestReceived(QStringLiteral("Trust secret write refused: %1").arg(error));
+            return result(kStatusObjectNameNotFound);
+        }
+        emit requestReceived(QStringLiteral("SetInformationTrustedDomain(%1)")
+                                 .arg(object.attributes.value(QStringLiteral("flatName"))));
+        return result(kStatusSuccess);
+    }
     case Lsad::OpQueryForestTrustInfo: {
         Handle policy;
         if (!readPolicy(&policy))

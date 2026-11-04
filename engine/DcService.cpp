@@ -333,6 +333,16 @@ bool DcService::start(const QString &dcDir)
         persist();
         return true;
     };
+    lsadWrites.updateTrust = [this, persist](const QString &dn,
+                                              const QMap<QString, QString> &attributes,
+                                              QString *error) {
+        const bool ok = m_ldapServer->modifyObject(dn, attributes);
+        if (!ok && error)
+            *error = QStringLiteral("trust not found (%1)").arg(dn);
+        if (ok)
+            persist();
+        return ok;
+    };
     lsadWrites.removeTrust = [this, persist](const QString &dn, QString *error) {
         if (!m_ldapServer->removeObject(dn)) {
             if (error)
