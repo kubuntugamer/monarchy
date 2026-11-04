@@ -4,6 +4,7 @@
 #include <QtTest>
 
 #include "Lsad.h"
+#include "Ntlm.h"
 
 namespace {
 
@@ -462,8 +463,13 @@ void LsadTest::createsQueriesEnumeratesAndDeletesATrust()
     QList<DirectoryObject> store;
     server.setObjectProvider([&store]() { return store; });
     Lsad::WriteBackend writes;
+    DirectoryObject trustAccount;
     writes.createTrust = [&store](DirectoryObject *object, QString *) {
         store.append(*object);
+        return true;
+    };
+    writes.createTrustAccount = [&trustAccount](DirectoryObject *object, QString *) {
+        trustAccount = *object;
         return true;
     };
     writes.updateTrust = [&store](const QString &dn,
@@ -516,6 +522,16 @@ void LsadTest::createsQueriesEnumeratesAndDeletesATrust()
     // uses are derived from it, exactly as a Windows DC does.
     QCOMPARE(trust.attributes.value(QStringLiteral("kerberosSalt")),
              QStringLiteral("CORP.EXAMPLE.COM+FABRIKAM.LOCAL"));
+    // The disabled trust account a Windows DC keeps beside the trust is what
+    // NetrLogonGetTrustRid reports and the trust channel can authenticate as.
+    QCOMPARE(trustAccount.id,
+             QStringLiteral("CN=FABRIKAM$,CN=Users,DC=corp,DC=example,DC=com"));
+    QCOMPARE(trustAccount.attributes.value(QStringLiteral("sAMAccountName")),
+             QStringLiteral("FABRIKAM$"));
+    QCOMPARE(trustAccount.attributes.value(QStringLiteral("userAccountControl")),
+             QStringLiteral("546")); // ACCOUNTDISABLE|PASSWD_NOTREQD|NORMAL_ACCOUNT
+    QCOMPARE(trustAccount.attributes.value(QStringLiteral("ntHash")),
+             QString::fromLatin1(Ntlm::ntowfV1(QStringLiteral("s3cret")).toHex()));
     QVERIFY(!trust.attributes.value(QStringLiteral("aes128Key")).isEmpty());
     QVERIFY(!trust.attributes.value(QStringLiteral("aes256Key")).isEmpty());
 

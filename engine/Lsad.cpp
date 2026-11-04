@@ -12,6 +12,7 @@
 
 #include "Krb5.h"
 #include "Ndr.h"
+#include "Ntlm.h"
 
 namespace {
 
@@ -1635,10 +1636,11 @@ QByteArray LsadServer::handleCall(quint16 opnum, const QByteArray &stub,
         // over lsarpc usable by the KDC without a second enrollment step.
         const QString incoming =
             attributes.value(QStringLiteral("trustAuthIncoming"));
+        QByteArray clearSecret;
         if (incoming.startsWith(QStringLiteral("2:"))) {
-            const QByteArray clear = QByteArray::fromHex(incoming.mid(2).toLatin1());
-            if (!clear.isEmpty())
-                Krb5::storeTrustKeys(trust, QString::fromUtf8(clear), m_config.realm,
+            clearSecret = QByteArray::fromHex(incoming.mid(2).toLatin1());
+            if (!clearSecret.isEmpty())
+                Krb5::storeTrustKeys(trust, QString::fromUtf8(clearSecret), m_config.realm,
                                      attributes.value(QStringLiteral("trustPartner")));
         }
         QString error;
@@ -1646,6 +1648,41 @@ QByteArray LsadServer::handleCall(quint16 opnum, const QByteArray &stub,
             fixed.append(QByteArray(kHandleSize, '\0'));
             emit requestReceived(QStringLiteral("CreateTrustedDomain refused: %1").arg(error));
             return result(kStatusObjectNameCollision);
+        }
+        // The disabled `FABRIKAM$` account a Windows DC keeps beside the trust,
+        // with the trust password, is the account NetrLogonGetTrustRid names and
+        // the principal the trust channel authenticates as. A trust whose secret
+        // arrived as an opaque blob has no clear password to install and is left
+        // without one; its channel still uses the trustedDomain object.
+        if (!clearSecret.isEmpty() && m_writes.createTrustAccount) {
+            DirectoryObject account;
+            account.id = QStringLiteral("CN=%1$,CN=Users,%2").arg(flat, m_config.baseDn);
+            account.name = flat + QLatin1Char('$');
+            account.type = QStringLiteral("User");
+            account.kind = ObjectKind::User;
+            account.container = QStringLiteral("Users");
+            account.description =
+                QStringLiteral("Trust account for %1")
+                    .arg(attributes.value(QStringLiteral("trustPartner")));
+            account.attributes.insert(QStringLiteral("distinguishedName"), account.id);
+            account.attributes.insert(QStringLiteral("cn"), account.name);
+            account.attributes.insert(QStringLiteral("objectClass"),
+                                      QStringLiteral("top;person;organizationalPerson;user"));
+            account.attributes.insert(QStringLiteral("sAMAccountName"), account.name);
+            // ACCOUNTDISABLE | PASSWD_NOTREQD | NORMAL_ACCOUNT: usable for a
+            // channel, never for an interactive logon, as Windows keeps it.
+            account.attributes.insert(QStringLiteral("userAccountControl"),
+                                      QStringLiteral("546"));
+            account.attributes.insert(QStringLiteral("pwdLastSet"), QStringLiteral("0"));
+            account.attributes.insert(
+                QStringLiteral("ntHash"),
+                QString::fromLatin1(Ntlm::ntowfV1(QString::fromUtf8(clearSecret)).toHex()));
+            QString accountError;
+            if (!m_writes.createTrustAccount(&account, &accountError)) {
+                emit requestReceived(
+                    QStringLiteral("Trust account for %1 not created: %2")
+                        .arg(flat, accountError));
+            }
         }
         fixed.append(newHandle(Handle::TrustedDomain, QString(), flat, access));
         emit requestReceived(QStringLiteral("CreateTrustedDomain(%1, direction %2)")

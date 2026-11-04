@@ -343,6 +343,12 @@ bool DcService::start(const QString &dcDir)
             persist();
         return ok;
     };
+    lsadWrites.createTrustAccount = [this, persist](DirectoryObject *object, QString *error) {
+        if (!m_ldapServer->addAccount(object, error))
+            return false;
+        persist();
+        return true;
+    };
     lsadWrites.removeTrust = [this, persist](const QString &dn, QString *error) {
         if (!m_ldapServer->removeObject(dn)) {
             if (error)

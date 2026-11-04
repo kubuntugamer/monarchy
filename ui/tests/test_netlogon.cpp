@@ -323,6 +323,7 @@ private slots:
     void rejectsAChannelCredentialFromTheWrongPassword();
     void dcLocatorNamesThisDc();
     void trustChannelUsesTheTrustSecret();
+    void reportsTheTrustAccountRid();
 };
 
 void NetlogonTest::secureChannelNegotiatesCrypto_data()
@@ -690,6 +691,58 @@ void NetlogonTest::trustChannelUsesTheTrustSecret()
         authenticateRequest(QStringLiteral("FABRIKAM$"), QStringLiteral("PARTNERDC"),
                             expectedCredential(clientChallenge, outboundKey, flags), flags));
     QCOMPARE(readLe32(refused, refused.size() - 4), quint32(0xc0000064u)); // NO_SUCH_USER
+}
+
+// NetrLogonGetTrustRid names the disabled account kept for an inbound trust;
+// a domain this DC has no trust with gets ERROR_NO_SUCH_DOMAIN.
+void NetlogonTest::reportsTheTrustAccountRid()
+{
+    NetlogonServer server;
+    Netlogon::Config config;
+    config.netbios = QStringLiteral("CORP");
+    config.realm = QStringLiteral("CORP.EXAMPLE.COM");
+    config.domainSid = QStringLiteral("S-1-5-21-1-2-3");
+    server.setConfig(config);
+
+    DirectoryObject trust;
+    trust.id = QStringLiteral("CN=FABRIKAM,CN=System,DC=corp,DC=example,DC=com");
+    trust.attributes.insert(QStringLiteral("objectClass"),
+                            QStringLiteral("top;leaf;trustedDomain"));
+    trust.attributes.insert(QStringLiteral("flatName"), QStringLiteral("FABRIKAM"));
+    trust.attributes.insert(QStringLiteral("trustPartner"), QStringLiteral("fabrikam.local"));
+    trust.attributes.insert(QStringLiteral("trustDirection"), QStringLiteral("3"));
+
+    DirectoryObject account;
+    account.id = QStringLiteral("CN=FABRIKAM$,CN=Users,DC=corp,DC=example,DC=com");
+    account.attributes.insert(QStringLiteral("sAMAccountName"), QStringLiteral("FABRIKAM$"));
+    account.attributes.insert(QStringLiteral("objectSid"),
+                              QStringLiteral("S-1-5-21-1-2-3-1001"));
+    server.setObjectProvider([trust, account]() {
+        return QList<DirectoryObject>{trust, account};
+    });
+
+    const auto request = [](const QString &domain) {
+        QByteArray stub;
+        appendLe32(stub, 0);          // server_name: NULL
+        appendLe32(stub, 0x00020001); // domain_name present
+        appendStringArray(stub, domain);
+        return stub;
+    };
+
+    const QByteArray reply =
+        server.handleCall(Netlogon::OpLogonGetTrustRid, request(QStringLiteral("FABRIKAM")));
+    QCOMPARE(reply.size(), 8);
+    QCOMPARE(readLe32(reply, 0), quint32(1001));
+    QCOMPARE(readLe32(reply, 4), quint32(0));
+
+    // The partner's DNS name names the same trust.
+    const QByteArray byDns = server.handleCall(Netlogon::OpLogonGetTrustRid,
+                                               request(QStringLiteral("fabrikam.local")));
+    QCOMPARE(readLe32(byDns, 0), quint32(1001));
+
+    const QByteArray unknown =
+        server.handleCall(Netlogon::OpLogonGetTrustRid, request(QStringLiteral("CONTOSO")));
+    QCOMPARE(readLe32(unknown, unknown.size() - 4), quint32(1355)); // ERROR_NO_SUCH_DOMAIN
 }
 
 void NetlogonTest::dcLocatorNamesThisDc()

@@ -125,6 +125,9 @@ struct WriteBackend {
     // store.
     std::function<bool(DirectoryObject *object, QString *error)> createTrust;
     // Trust secrets are rewritten in place when a password rolls over.
+    // The disabled account a Windows DC keeps for a trust (`FABRIKAM$`), whose
+    // RID NetrLogonGetTrustRid reports.
+    std::function<bool(DirectoryObject *object, QString *error)> createTrustAccount;
     std::function<bool(const QString &dn, const QMap<QString, QString> &attributes,
                        QString *error)>
         updateTrust;

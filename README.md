@@ -373,7 +373,8 @@ directory is provisioned or connected.
   `logonCount` and the 14-day `lastLogonTimestamp`), `NetrServerPasswordSet2`
   writing only the new machine hash, a forged credential and unknown account
   refused, a partner DC's trust channel authenticating with the stored trust
-  secret (an outbound-only trust is not an account), and the DC locator's
+  secret (an outbound-only trust is not an account), `NetrLogonGetTrustRid`
+  naming the disabled trust account LSAD creates, and the DC locator's
   `NetrGetDCName`/`NetrDSRGetDcNameEx2` answers.
 - `monarchy-drs-tests` — the DRSR bind extensions, a whole V6
   `DsGetNCChanges` reply walked field by field (every object, its attribute
@@ -585,8 +586,9 @@ account's `userRight` in the directory (LDAP shows them, they survive a
 restart), secrets and private data, `LsarGetUserName`, the policy security
 descriptor, and the trusted-domain calls — create (`…Ex`/`…Ex2`), open by SID or
 name, query (name and info-ex), enumerate and delete. A trust is the
-`trustedDomain` object under `CN=System` a Windows DC stores, and its clear
-secret becomes the inter-realm `krbtgt` keys (rewritable through
+`trustedDomain` object under `CN=System` a Windows DC stores, with the disabled
+`FABRIKAM$` trust account beside it, and its clear secret becomes the
+inter-realm `krbtgt` keys (rewritable through
 `LsarSetInformationTrustedDomain`). The
 independent check is `scripts/lsad-conformance.py`: 50 checks against a live
 endpoint through Samba's `samba.dcerpc.lsa` (pidl's decoder, the reference the

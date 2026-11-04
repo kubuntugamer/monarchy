@@ -1225,6 +1225,48 @@ QByteArray NetlogonServer::samLogon(const QByteArray &stub, bool withAuthenticat
     return out;
 }
 
+// NetrLogonGetTrustRid (MS-NRPC 3.5.4.4.6): the RID of the account the trust
+// keeps in this domain, which is the `FABRIKAM$` account LSAD created beside
+// the trustedDomain object. A caller that names a domain this DC has no trust
+// with gets ERROR_NO_SUCH_DOMAIN, as Windows answers.
+QByteArray NetlogonServer::logonGetTrustRid(const QByteArray &stub)
+{
+    constexpr quint32 kErrorNoSuchDomain = 1355;
+    Ndr::Reader reader(stub);
+    QString serverName;
+    QString domainName;
+    if (!readUniqueString(reader, &serverName) || !readUniqueString(reader, &domainName))
+        return statusOnly(kStatusInvalidParameter);
+    Q_UNUSED(serverName)
+    QString flat;
+    for (const DirectoryObject &object : directory()) {
+        if (!object.attributes.value(QStringLiteral("objectClass"))
+                 .contains(QLatin1String("trustedDomain"), Qt::CaseInsensitive))
+            continue;
+        flat = object.attributes.value(QStringLiteral("flatName"));
+        const QString partner = object.attributes.value(QStringLiteral("trustPartner"));
+        if (flat.compare(domainName, Qt::CaseInsensitive) == 0
+            || partner.compare(domainName, Qt::CaseInsensitive) == 0
+            || partner.section(QLatin1Char('.'), 0, 0)
+                   .compare(domainName, Qt::CaseInsensitive)
+                   == 0)
+            break;
+        flat.clear();
+    }
+    if (flat.isEmpty())
+        return statusOnly(kErrorNoSuchDomain);
+    const DirectoryObject account = findAccount(flat + QLatin1Char('$'));
+    if (account.id.isEmpty()) {
+        emit requestReceived(QStringLiteral("GetTrustRid(%1): no trust account").arg(flat));
+        return statusOnly(kErrorNoSuchDomain);
+    }
+    QByteArray out;
+    putLe32(out, ridOf(account));
+    putLe32(out, kStatusSuccess);
+    emit requestReceived(QStringLiteral("GetTrustRid(%1) = %2").arg(flat).arg(ridOf(account)));
+    return out;
+}
+
 QByteArray NetlogonServer::getDcName(const QByteArray &stub)
 {
     Ndr::Reader reader(stub);
@@ -1325,6 +1367,8 @@ QByteArray NetlogonServer::handleCall(quint16 opnum, const QByteArray &stub,
         return serverPasswordSet2(stub);
     case Netlogon::OpLogonSamLogonEx:
         return samLogon(stub, false, true);
+    case Netlogon::OpLogonGetTrustRid:
+        return logonGetTrustRid(stub);
     case Netlogon::OpGetDcName:
         return getDcName(stub);
     case Netlogon::OpDsRGetDcNameEx2:
