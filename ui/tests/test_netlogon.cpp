@@ -376,6 +376,18 @@ void NetlogonTest::legacySamLogonAuthenticatesSecureChannel()
     user.attributes.insert(QStringLiteral("displayName"), QStringLiteral("Alice Example"));
     server.setObjectProvider([machine, user]() { return QList<DirectoryObject>{machine, user}; });
 
+    QString writtenDn;
+    QMap<QString, QString> writtenAttributes;
+    Netlogon::WriteBackend writes;
+    writes.updateAccount = [&writtenDn, &writtenAttributes](
+                               const QString &dn, const QMap<QString, QString> &attributes,
+                               QString *) {
+        writtenDn = dn;
+        writtenAttributes = attributes;
+        return true;
+    };
+    server.setWriteBackend(writes);
+
     const QByteArray clientChallenge = QByteArray::fromHex("1112131415161718");
     const QByteArray challengeReply = server.handleCall(
         Netlogon::OpServerReqChallenge, challengeRequest(QStringLiteral("DC1"), clientChallenge));
@@ -423,6 +435,14 @@ void NetlogonTest::legacySamLogonAuthenticatesSecureChannel()
     const int statusOffset = withFlags ? 32 : 28;
     QCOMPARE(readLe32(reply, statusOffset), quint32(0));
     QVERIFY(reply.contains(Ndr::utf16le(QStringLiteral("alice"))));
+
+    // A validated logon is recorded on the account: the DC that answered also
+    // writes down that it did.
+    QCOMPARE(writtenDn, user.id);
+    QVERIFY(writtenAttributes.value(QStringLiteral("lastLogon")).toULongLong() != 0);
+    QCOMPARE(writtenAttributes.value(QStringLiteral("logonCount")), QStringLiteral("1"));
+    // The previous logon was never recorded, so the replicated stamp is due.
+    QVERIFY(writtenAttributes.contains(QStringLiteral("lastLogonTimestamp")));
 }
 
 void NetlogonTest::secureChannelNegotiatesCrypto()

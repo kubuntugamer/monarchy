@@ -354,6 +354,18 @@ bool DcService::start(const QString &dcDir)
             persist();
         return ok;
     };
+    // A validated logon is recorded on the account, so the directory shows the
+    // same lastLogon, lastLogonTimestamp and logonCount a Windows DC would.
+    netlogonWrites.updateAccount = [this, persist](const QString &dn,
+                                                    const QMap<QString, QString> &attributes,
+                                                    QString *error) {
+        const bool ok = m_ldapServer->modifyObject(dn, attributes);
+        if (!ok && error)
+            *error = QStringLiteral("account not found (%1)").arg(dn);
+        if (ok)
+            persist();
+        return ok;
+    };
     m_netlogonServer->setWriteBackend(netlogonWrites);
     connect(m_netlogonServer, &NetlogonServer::requestReceived, this,
             [this](const QString &operation) { emit statusMessage(operation); });

@@ -7,6 +7,7 @@
 #include <QByteArray>
 #include <QHash>
 #include <QList>
+#include <QMap>
 #include <QObject>
 #include <QString>
 
@@ -48,6 +49,12 @@ struct Config {
 // all the directory ever keeps.
 struct WriteBackend {
     std::function<bool(const QString &dn, const QByteArray &ntHash, QString *error)> setNtHash;
+    // What a successful validation records on the account: lastLogon, the
+    // replicated lastLogonTimestamp when it is due, and the logon count. A DC
+    // that validates a logon but records nothing reports a stale directory.
+    std::function<bool(const QString &dn, const QMap<QString, QString> &attributes,
+                       QString *error)>
+        updateAccount;
 };
 
 // Opnums from MS-NRPC (Samba's netlogon.idl carries the same numbering in its

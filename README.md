@@ -369,9 +369,10 @@ directory is provisioned or connected.
   secure-channel handshake at every crypto level the server negotiates
   (legacy DES, strong-key MD4, AES), the original and flags-carrying
   authenticate opnums, an independently computed client walking the
-  credential chain into `NetrLogonSamLogon`, `NetrServerPasswordSet2` writing
-  only the new machine hash, a forged credential and unknown account refused,
-  and the DC locator's `NetrGetDCName`/`NetrDSRGetDcNameEx2` answers.
+  credential chain into `NetrLogonSamLogon` (whose success stamps `lastLogon`,
+  `logonCount` and the 14-day `lastLogonTimestamp`), `NetrServerPasswordSet2`
+  writing only the new machine hash, a forged credential and unknown account
+  refused, and the DC locator's `NetrGetDCName`/`NetrDSRGetDcNameEx2` answers.
 - `monarchy-drs-tests` — the DRSR bind extensions, a whole V6
   `DsGetNCChanges` reply walked field by field (every object, its attribute
   list and its values), level-2 DC info, FQDN→canonical name cracking, and

@@ -1062,6 +1062,32 @@ QByteArray NetlogonServer::samLogon(const QByteArray &stub, bool withAuthenticat
     if (!Ntlm::verifyNtlmv2(ntHash, logon.account, domain, logon.challenge, logon.ntResponse))
         return statusOnly(kStatusWrongPassword);
 
+    // Record the logon the way a DC does. lastLogon is per-DC and always
+    // updated; lastLogonTimestamp is the replicated value, refreshed only when
+    // the stored one is older than the 14-day window (MS-ADTS 3.1.1.5.4), so a
+    // busy account does not replicate on every logon.
+    const quint64 logonTime = ntTimeNow();
+    QMap<QString, QString> logonAttributes;
+    logonAttributes.insert(QStringLiteral("lastLogon"), QString::number(logonTime));
+    const quint64 previousLogonCount =
+        account.attributes.value(QStringLiteral("logonCount")).toULongLong();
+    logonAttributes.insert(QStringLiteral("logonCount"),
+                           QString::number(previousLogonCount + 1));
+    const quint64 replicatedStamp =
+        ntTimeAttribute(account, QStringLiteral("lastLogonTimestamp"));
+    constexpr quint64 kFourteenDays = 14ull * 24 * 60 * 60 * 10000000ull;
+    if (replicatedStamp == 0 || logonTime - replicatedStamp > kFourteenDays)
+        logonAttributes.insert(QStringLiteral("lastLogonTimestamp"),
+                               QString::number(logonTime));
+    if (m_writes.updateAccount) {
+        QString writeError;
+        if (!m_writes.updateAccount(account.id, logonAttributes, &writeError)
+            && !qEnvironmentVariableIsEmpty("MONARCHY_RPC_TRACE")) {
+            qWarning("Netlogon: last-logon write for %s failed: %s", qPrintable(account.id),
+                     qPrintable(writeError));
+        }
+    }
+
     SamAnswer answer;
     answer.account = account.attributes.value(QStringLiteral("sAMAccountName"));
     answer.fullName = account.attributes.value(QStringLiteral("displayName"));
