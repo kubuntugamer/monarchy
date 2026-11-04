@@ -37,10 +37,15 @@ DEV_PORTS=""
 FORCE=0
 INSTALL_DEPS=0
 FIX_DNS53=0
+DNS53_DECLINED=0
+WIZARD=0
 SERVICE=""
 USER_MODE=0
 SERVICE_USER="monarchy-dc"
 GENERATED_PASS=0
+REALM_GIVEN=0
+DOMAIN_GIVEN=0
+DC_IP_GIVEN=0
 
 log()  { printf '==> %s\n' "$*"; }
 warn() { printf 'install-monarchy: %s\n' "$*" >&2; }
@@ -70,6 +75,9 @@ Install mode
   --no-service        Install binaries only; do not touch systemd
   --user              Rootless install: ~/.local, development ports,
                       no systemd (default for a non-root run)
+  --wizard, --dcpromo Interactively promote this machine to a new forest:
+                      asks for the domain, NetBIOS name, DC address and
+                      Administrator password, then shows a summary
 
 Domain
   --realm REALM       Kerberos realm (default: MONARCHY.EXAMPLE.COM)
@@ -103,17 +111,18 @@ while [[ $# -gt 0 ]]; do
         --skip-tests)   RUN_TESTS=0; shift ;;
         --service)      SERVICE=1; shift ;;
         --no-service)   SERVICE=0; shift ;;
+        --wizard|--dcpromo) WIZARD=1; shift ;;
         --user)         SERVICE=0; USER_MODE=1; PREFIX="${PREFIX:-$HOME/.local}"; shift ;;
-        --realm)        REALM="${2:?--realm needs a value}"; shift 2 ;;
-        --realm=*)      REALM="${1#*=}"; shift ;;
-        --domain)       DOMAIN="${2:?--domain needs a value}"; shift 2 ;;
-        --domain=*)     DOMAIN="${1#*=}"; shift ;;
+        --realm)        REALM="${2:?--realm needs a value}"; REALM_GIVEN=1; shift 2 ;;
+        --realm=*)      REALM="${1#*=}"; REALM_GIVEN=1; shift ;;
+        --domain)       DOMAIN="${2:?--domain needs a value}"; DOMAIN_GIVEN=1; shift 2 ;;
+        --domain=*)     DOMAIN="${1#*=}"; DOMAIN_GIVEN=1; shift ;;
         --adminpass)    ADMINPASS="${2:?--adminpass needs a value}"; shift 2 ;;
         --adminpass=*)  ADMINPASS="${1#*=}"; shift ;;
         --dcdir)        DCDIR="${2:?--dcdir needs a directory}"; shift 2 ;;
         --dcdir=*)      DCDIR="${1#*=}"; shift ;;
-        --dc-ip)        DC_IP="${2:?--dc-ip needs an address}"; shift 2 ;;
-        --dc-ip=*)      DC_IP="${1#*=}"; shift ;;
+        --dc-ip)        DC_IP="${2:?--dc-ip needs an address}"; DC_IP_GIVEN=1; shift 2 ;;
+        --dc-ip=*)      DC_IP="${1#*=}"; DC_IP_GIVEN=1; shift ;;
         --dev-ports)    DEV_PORTS=1; shift ;;
         --native-ports) DEV_PORTS=0; shift ;;
         --fix-dns53)    FIX_DNS53=1; shift ;;
@@ -403,6 +412,10 @@ check_dns_port_conflict() {
         warn "port 53 is held by ${holders//$'\n'/, }, not systemd-resolved; leaving it alone"
         return 0
     fi
+    if [[ $DNS53_DECLINED -eq 1 ]]; then
+        warn "leaving systemd-resolved untouched; Monarchy's DNS endpoint will not bind"
+        return 0
+    fi
 
     if [[ $FIX_DNS53 -eq 0 ]]; then
         if [[ -t 0 ]]; then
@@ -485,7 +498,200 @@ start_service() {
     fi
 }
 
+# --- promotion wizard -------------------------------------------------------
+
+# Prompts go to stderr so callers can capture just the answer. A blank answer
+# accepts the shown default.
+wizard_ask() {
+    local label="$1" default="${2-}" answer=""
+    if [[ -n "$default" ]]; then
+        printf '%s [%s]: ' "$label" "$default" >&2
+    else
+        printf '%s: ' "$label" >&2
+    fi
+    IFS= read -r answer || die "input ended during promotion setup"
+    [[ -z "$answer" ]] && answer="$default"
+    printf '%s' "$answer"
+}
+
+wizard_valid_fqdn() {
+    local name="$1" label
+    local -a labels
+    [[ "$name" == *.* && "$name" != .* && "$name" != *. ]] || return 1
+    (( ${#name} <= 253 )) || return 1
+    IFS=. read -r -a labels <<<"$name"
+    (( ${#labels[@]} >= 2 )) || return 1
+    for label in "${labels[@]}"; do
+        (( ${#label} >= 1 && ${#label} <= 63 )) || return 1
+        [[ "$label" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] || return 1
+    done
+    return 0
+}
+
+wizard_valid_ipv4() {
+    local ip="$1" octet
+    local -a octets
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    IFS=. read -r -a octets <<<"$ip"
+    for octet in "${octets[@]}"; do
+        (( 10#$octet <= 255 )) || return 1
+    done
+    return 0
+}
+
+detect_primary_ipv4() {
+    local ip=""
+    if command -v ip >/dev/null 2>&1; then
+        ip="$(ip -4 route get 1.1.1.1 2>/dev/null \
+            | awk '{for (i = 1; i <= NF; i++) if ($i == "src") { print $(i + 1); exit }}') "
+        ip="${ip// /}"
+    fi
+    if [[ -z "$ip" ]] && command -v hostname >/dev/null 2>&1; then
+        ip="$(hostname -I 2>/dev/null | tr ' ' '\n' \
+            | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' \
+            | grep -v '^127\.' | head -n1 || true)"
+    fi
+    printf '%s' "$ip"
+}
+
+wizard_password() {
+    [[ -n "$ADMINPASS" ]] && return 0
+    local first="" second=""
+    while :; do
+        printf 'Administrator password (blank to generate): ' >&2
+        IFS= read -r -s first || die "input ended during promotion setup"
+        printf '\n' >&2
+        if [[ -z "$first" ]]; then
+            ADMINPASS=""
+            GENERATED_PASS=1
+            return 0
+        fi
+        printf 'Confirm Administrator password: ' >&2
+        IFS= read -r -s second || die "input ended during promotion setup"
+        printf '\n' >&2
+        if [[ "$first" == "$second" ]]; then
+            ADMINPASS="$first"
+            GENERATED_PASS=0
+            return 0
+        fi
+        warn "passwords do not match; try again"
+    done
+}
+
+run_promotion_wizard() {
+    cat >&2 <<'EOF'
+
+Monarchy Domain Controller Promotion Wizard
+===========================================
+
+This creates a NEW forest on this machine. It does not join an existing
+domain, add a replica domain controller, or offer RODC/DSRM options.
+
+EOF
+
+    if [[ -f "$DCDIR/dc.conf" && $FORCE -eq 0 ]]; then
+        warn "a domain store already exists at $DCDIR"
+        local replace=""
+        replace="$(wizard_ask "Replace it? This deletes its directory, zone and keys (y/N)" "n")"
+        [[ "$replace" =~ ^[Yy] ]] || die "cancelled"
+        FORCE=1
+    fi
+
+    local fqdn="" netbios="" ip="" answer="" password_note=""
+    local fqdn_default=""
+    [[ $REALM_GIVEN -eq 1 ]] && fqdn_default="$REALM"
+    while :; do
+        fqdn="$(wizard_ask "Domain name (FQDN)" "$fqdn_default")"
+        wizard_valid_fqdn "$fqdn" && break
+        warn "'$fqdn' is not a valid DNS domain name (example: domainname.lan)"
+        fqdn_default=""
+    done
+    REALM="${fqdn^^}"
+
+    local netbios_default="${REALM%%.*}"
+    [[ $DOMAIN_GIVEN -eq 1 ]] && netbios_default="$DOMAIN"
+    if (( ${#netbios_default} > 15 )); then
+        netbios_default=""
+    fi
+    while :; do
+        netbios="$(wizard_ask "NetBIOS domain name" "$netbios_default")"
+        if [[ "$netbios" =~ ^[A-Za-z0-9-]{1,15}$ ]]; then
+            DOMAIN="${netbios^^}"
+            break
+        fi
+        warn "NetBIOS name must be 1-15 letters, digits or hyphens"
+        netbios_default=""
+    done
+
+    local ip_default="$DC_IP"
+    [[ -z "$ip_default" ]] && ip_default="$(detect_primary_ipv4)"
+    while :; do
+        ip="$(wizard_ask "Domain controller IPv4 address" "$ip_default")"
+        wizard_valid_ipv4 "$ip" && break
+        warn "'$ip' is not a valid IPv4 address"
+        ip_default=""
+    done
+    DC_IP="$ip"
+
+    wizard_password
+    if [[ -n "$ADMINPASS" ]]; then
+        password_note="supplied"
+    else
+        password_note="generated after confirmation"
+    fi
+
+    if [[ $FIX_DNS53 -eq 0 ]]; then
+        answer="$(wizard_ask "Use this DC as this machine's DNS resolver? (y/n)" "y")"
+        if [[ "$answer" =~ ^[Nn] ]]; then
+            FIX_DNS53=0
+            DNS53_DECLINED=1
+        else
+            FIX_DNS53=1
+        fi
+    fi
+    if [[ $SERVICE -eq 0 ]]; then
+        FIX_DNS53=0
+        DNS53_DECLINED=1
+    fi
+
+    local dc_name="${REALM%%.*}DC1"
+    local dns_domain="${REALM,,}"
+    local service_note="monarchy-dcd at boot"
+    [[ $SERVICE -eq 1 ]] || service_note="not installed (--no-service)"
+    local resolver_note="unchanged"
+    [[ $FIX_DNS53 -eq 1 ]] && resolver_note="DC (disable the systemd-resolved stub if needed)"
+    local store_note="new"
+    [[ $FORCE -eq 1 ]] && store_note="will be replaced"
+
+    cat >&2 <<EOF
+
+Promotion summary
+-----------------
+  Domain (FQDN):    $dns_domain
+  NetBIOS name:     $DOMAIN
+  Kerberos realm:   $REALM
+  DC DNS name:      ${dc_name,,}.$dns_domain
+  DC IPv4 address:  $DC_IP
+  Administrator:    $password_note
+  Domain store:     $DCDIR
+  Install prefix:   $PREFIX
+  Service:          $service_note
+  Host resolver:    $resolver_note
+  Existing store:   $store_note
+
+EOF
+    answer="$(wizard_ask "Proceed with promotion? (y/N)" "n")"
+    [[ "$answer" =~ ^[Yy] ]] || die "promotion cancelled"
+}
+
 # --- main -------------------------------------------------------------------
+
+if [[ $WIZARD -eq 1 ]]; then
+    [[ $EUID -eq 0 ]] || die "the promotion wizard installs a system service; rerun with sudo"
+    [[ $USER_MODE -eq 0 ]] || die "the promotion wizard cannot be combined with --user"
+    [[ $PROVISION -eq 1 ]] || die "the promotion wizard needs provisioning; remove --no-provision"
+    run_promotion_wizard
+fi
 
 if [[ $INSTALL_DEPS -eq 1 ]]; then
     install_dependencies

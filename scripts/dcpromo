@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Monarchy contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Shortcut for the Monarchy promotion wizard:
+#
+#   sudo scripts/dcpromo
+#
+# It is the same code path as `scripts/install-monarchy.sh --wizard`.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec "$ROOT/install-monarchy.sh" --wizard "$@"

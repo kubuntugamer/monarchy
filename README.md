@@ -113,8 +113,20 @@ daemon and provisioner, provisions the domain, installs the systemd unit and
 starts the service:
 
 ```sh
-sudo scripts/install-monarchy.sh --realm CORP.EXAMPLE.COM
+sudo scripts/install-monarchy.sh --realm CORP.EXAMPLE.COM --dc-ip 192.168.1.50
 ```
+
+For a `dcpromo`-style promotion, run the wizard instead:
+
+```sh
+sudo scripts/dcpromo
+# or: sudo scripts/install-monarchy.sh --wizard
+```
+
+It asks for the domain FQDN, NetBIOS name, domain controller IPv4 address,
+Administrator password and resolver choice, then prints a promotion summary
+before touching the machine. This build creates a **new forest only**; the
+wizard states that it cannot join an existing domain or add a replica DC.
 
 Without `--adminpass` the script generates an Administrator password and
 prints it once at the end; without `--realm` it provisions
@@ -132,9 +144,9 @@ scripts/install-monarchy.sh
 Other options: `--with-ldap` (system OpenLDAP client backend),
 `--install-deps` (installs build packages for Debian/Ubuntu, Fedora, Arch or
 openSUSE), `--fix-dns53` (disable systemd-resolved's port 53 stub listener and
-make the DC the host's caching/forwarding resolver), `--skip-tests`,
-`--no-service`, `--no-provision`, `--prefix`, `--build-dir`, `--jobs`. See
-`scripts/install-monarchy.sh --help`.
+make the DC the host's caching/forwarding resolver), `--wizard`/`--dcpromo`,
+`--skip-tests`, `--no-service`, `--no-provision`, `--prefix`, `--build-dir`,
+`--jobs`. See `scripts/install-monarchy.sh --help`.
 
 ## Uninstall
 
