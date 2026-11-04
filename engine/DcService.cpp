@@ -18,6 +18,7 @@
 
 #include <QDir>
 #include <QFileInfo>
+#include <QRegularExpression>
 #include <QSettings>
 #include <QStandardPaths>
 
@@ -501,6 +502,15 @@ bool DcService::start(const QString &dcDir)
     // and an unprovisioned console synthesises the same AD service records for
     // itself so the domain resolves consistently either way.
     m_dnsServer = new DnsServer(this);
+    // Out-of-zone names are resolved through the forwarders in dc.conf, or the
+    // host's own nameservers when none are listed. This is what lets the DC be
+    // the machine's resolver: it answers its zone authoritatively and caches
+    // everything else.
+    const QStringList forwarders =
+        dcConfig.value(QStringLiteral("forwarders")).toString()
+            .split(QRegularExpression(QStringLiteral("[,;\\s]+")), Qt::SkipEmptyParts);
+    m_dnsServer->setForwarders(forwarders);
+    m_dnsServer->setForwardingEnabled(dcConfig.value(QStringLiteral("forwarding"), true).toBool());
     if (!m_dnsServer->loadZone(m_zonePath)) {
         m_dnsServer->loadAdZone(dnsDomain, dcHost, dcIp, quint16(ldapPort), 3268, siteName);
     }

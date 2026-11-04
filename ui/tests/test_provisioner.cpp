@@ -67,7 +67,9 @@ void ProvisionerTest::buildsDomainFromScratch()
     QTemporaryDir dir;
     QVERIFY(dir.isValid());
 
-    const ProvisionResult result = provisionDomain(testConfig(dir.path()));
+    ProvisionConfig config = testConfig(dir.path());
+    config.forwarders = {QStringLiteral("192.0.2.53"), QStringLiteral("192.0.2.54:5353")};
+    const ProvisionResult result = provisionDomain(config);
     QVERIFY2(result.ok, qPrintable(result.error));
     QCOMPARE(result.baseDn, QStringLiteral("DC=test,DC=example,DC=org"));
     QCOMPARE(result.dnsDomain, QStringLiteral("test.example.org"));
@@ -87,6 +89,8 @@ void ProvisionerTest::buildsDomainFromScratch()
     // AD's native bindings by default (dynamic-RPC ports for SAMR/LSAD).
     QCOMPARE(conf.value(QStringLiteral("samrPort")).toInt(), 49152);
     QCOMPARE(conf.value(QStringLiteral("lsadPort")).toInt(), 49153);
+    QCOMPARE(conf.value(QStringLiteral("forwarders")).toString(),
+             QStringLiteral("192.0.2.53, 192.0.2.54:5353"));
 
     LdapServer store;
     QVERIFY(store.loadFromFile(result.storePath));

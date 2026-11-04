@@ -4,7 +4,10 @@
 #include <QtTest>
 
 #include <QElapsedTimer>
+#include <QHash>
 #include <QHostAddress>
+#include <QTcpServer>
+#include <QTcpSocket>
 #include <QTemporaryDir>
 #include <QUdpSocket>
 
@@ -187,6 +190,36 @@ QByteArray exchange(quint16 port, const QByteArray &request, int timeoutMs = 300
     return reply;
 }
 
+QByteArray exchangeTcp(quint16 port, const QByteArray &request, int timeoutMs = 3000)
+{
+    QTcpSocket socket;
+    socket.connectToHost(QHostAddress::LocalHost, port);
+    QElapsedTimer timer;
+    timer.start();
+    while (timer.elapsed() < timeoutMs
+           && socket.state() != QAbstractSocket::ConnectedState)
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 10);
+    if (socket.state() != QAbstractSocket::ConnectedState)
+        return {};
+
+    QByteArray frame;
+    put16(frame, quint16(request.size()));
+    frame += request;
+    socket.write(frame);
+
+    QByteArray buffer;
+    while (timer.elapsed() < timeoutMs) {
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 10);
+        buffer += socket.readAll();
+        if (buffer.size() >= 2) {
+            const int length = (int(quint8(buffer[0])) << 8) | int(quint8(buffer[1]));
+            if (buffer.size() >= 2 + length)
+                return buffer.mid(2, length);
+        }
+    }
+    return {};
+}
+
 struct UpdateRecord {
     QString name;
     quint16 type = 1;
@@ -249,6 +282,9 @@ private slots:
     void publishesAdServiceRecords();
     void answersQueriesOverUdp();
     void refusesOutOfZoneQueries();
+    void answersQueriesOverTcp();
+    void forwardsAndCachesOutOfZoneQueries();
+    void forwardsTcpQueriesOverTcp();
     void appliesDynamicUpdates();
     void enforcesUpdatePolicy();
     void persistsZone();
@@ -377,6 +413,198 @@ void DnsTest::refusesOutOfZoneQueries()
                        &reply));
     QCOMPARE(reply.rcode, 5); // REFUSED: not authoritative, not a resolver
     QVERIFY(reply.answers.isEmpty());
+}
+
+void DnsTest::answersQueriesOverTcp()
+{
+    DnsServer server;
+    QVERIFY(server.listen(0));
+    server.loadDefaultZone(QStringLiteral("corp.example.com"));
+
+    Reply reply;
+    QVERIFY(parseReply(exchangeTcp(server.serverPort(),
+                                   DnsServer::buildQuery(
+                                       QStringLiteral("_ldap._tcp.corp.example.com"),
+                                       DnsServer::TypeSrv, 0x5301)),
+                       &reply));
+    QCOMPARE(reply.id, 0x5301);
+    QCOMPARE(reply.rcode, 0);
+    QCOMPARE(reply.answers.size(), 1);
+    QCOMPARE(reply.answers.first().type, DnsServer::TypeSrv);
+}
+
+void DnsTest::forwardsTcpQueriesOverTcp()
+{
+    // The upstream only speaks DNS-over-TCP: a TCP client query must reach it
+    // framed, and the framed answer must come back to the client.
+    QTcpServer upstream;
+    QVERIFY(upstream.listen(QHostAddress::LocalHost, 0));
+    int upstreamQueries = 0;
+    QHash<QTcpSocket *, QByteArray> buffers;
+    QObject::connect(&upstream, &QTcpServer::newConnection, &upstream, [&]() {
+        while (QTcpSocket *connection = upstream.nextPendingConnection()) {
+            buffers.insert(connection, {});
+            QObject::connect(connection, &QTcpSocket::readyRead, connection,
+                             [connection, &buffers, &upstreamQueries]() {
+                                 QByteArray &buffer = buffers[connection];
+                                 buffer += connection->readAll();
+                                 while (buffer.size() >= 2) {
+                                     const int length = (int(quint8(buffer[0])) << 8)
+                                                        | int(quint8(buffer[1]));
+                                     if (buffer.size() < 2 + length)
+                                         return;
+                                     const QByteArray query = buffer.mid(2, length);
+                                     buffer.remove(0, 2 + length);
+                                     if (query.size() < 12)
+                                         continue;
+                                     ++upstreamQueries;
+
+                                     QByteArray response;
+                                     put16(response, quint16((quint8(query[0]) << 8)
+                                                             | quint8(query[1])));
+                                     put16(response, 0x8180); // QR, RD, RA, NOERROR
+                                     put16(response, 1);
+                                     put16(response, 1);
+                                     put16(response, 0);
+                                     put16(response, 0);
+                                     response += query.mid(12);
+                                     response.append(char(0xc0));
+                                     response.append(char(0x0c));
+                                     put16(response, DnsServer::TypeA);
+                                     put16(response, 1);
+                                     put32(response, 60);
+                                     put16(response, 4);
+                                     response.append(QByteArray::fromHex("c0000207"));
+
+                                     QByteArray frame;
+                                     put16(frame, quint16(response.size()));
+                                     frame += response;
+                                     connection->write(frame);
+                                 }
+                             });
+            QObject::connect(connection, &QTcpSocket::disconnected, connection,
+                             [connection, &buffers]() {
+                                 buffers.remove(connection);
+                                 connection->deleteLater();
+                             });
+        }
+    });
+
+    DnsServer server;
+    server.setForwarders(
+        {QStringLiteral("127.0.0.1:%1").arg(upstream.serverPort())});
+    server.setForwardingEnabled(true);
+    QVERIFY(server.listen(0));
+    server.loadDefaultZone(QStringLiteral("corp.example.com"));
+
+    Reply first;
+    QVERIFY(parseReply(exchangeTcp(server.serverPort(),
+                                   DnsServer::buildQuery(QStringLiteral("www.example.org"),
+                                                         DnsServer::TypeA, 0x5302)),
+                       &first));
+    QCOMPARE(first.id, 0x5302);
+    QCOMPARE(first.answers.size(), 1);
+    QCOMPARE(first.answers.first().rdata, QByteArray::fromHex("c0000207"));
+    QCOMPARE(upstreamQueries, 1);
+
+    Reply cached;
+    QVERIFY(parseReply(exchangeTcp(server.serverPort(),
+                                   DnsServer::buildQuery(QStringLiteral("www.example.org"),
+                                                         DnsServer::TypeA, 0x5303)),
+                       &cached));
+    QCOMPARE(cached.id, 0x5303);
+    QCOMPARE(cached.answers.size(), 1);
+    QCOMPARE(upstreamQueries, 1);
+}
+
+void DnsTest::forwardsAndCachesOutOfZoneQueries()
+{
+    // A tiny upstream resolver: it answers every A query with 192.0.2.7 and
+    // counts how often it was actually asked.
+    QUdpSocket upstream;
+    QVERIFY(upstream.bind(QHostAddress::LocalHost, 0));
+    int upstreamQueries = 0;
+    QObject::connect(&upstream, &QUdpSocket::readyRead, &upstream, [&upstream, &upstreamQueries]() {
+        while (upstream.hasPendingDatagrams()) {
+            QByteArray query;
+            query.resize(int(upstream.pendingDatagramSize()));
+            QHostAddress peer;
+            quint16 peerPort = 0;
+            const qint64 read = upstream.readDatagram(query.data(), query.size(), &peer, &peerPort);
+            if (read < 12)
+                continue;
+            query.truncate(int(read));
+            ++upstreamQueries;
+
+            QByteArray response;
+            put16(response, quint16((quint8(query[0]) << 8) | quint8(query[1])));
+            put16(response, 0x8180); // QR, RD, RA, NOERROR
+            put16(response, 1);
+            put16(response, 1);
+            put16(response, 0);
+            put16(response, 0);
+            response += query.mid(12); // question
+            response.append(char(0xc0));
+            response.append(char(0x0c)); // pointer to the question name
+            put16(response, DnsServer::TypeA);
+            put16(response, 1);
+            put32(response, 60);
+            put16(response, 4);
+            response.append(QByteArray::fromHex("c0000207"));
+            upstream.writeDatagram(response, peer, peerPort);
+        }
+    });
+
+    DnsServer server;
+    server.setForwarders({QStringLiteral("127.0.0.1:%1").arg(upstream.localPort())});
+    server.setForwardingEnabled(true);
+    QVERIFY(server.listen(0));
+    server.loadDefaultZone(QStringLiteral("corp.example.com"));
+
+    // The domain stays authoritative: no upstream traffic for its own names.
+    Reply inZone;
+    QVERIFY(parseReply(exchange(server.serverPort(),
+                                DnsServer::buildQuery(
+                                    QStringLiteral("_ldap._tcp.corp.example.com"),
+                                    DnsServer::TypeSrv, 0x5200)),
+                       &inZone));
+    QCOMPARE(inZone.rcode, 0);
+    QCOMPARE(upstreamQueries, 0);
+
+    Reply first;
+    QVERIFY(parseReply(exchange(server.serverPort(),
+                                DnsServer::buildQuery(QStringLiteral("www.example.org"),
+                                                      DnsServer::TypeA, 0x5201)),
+                       &first));
+    QCOMPARE(first.rcode, 0);
+    QCOMPARE(first.id, 0x5201);
+    QCOMPARE(first.answers.size(), 1);
+    QCOMPARE(first.answers.first().rdata, QByteArray::fromHex("c0000207"));
+    QCOMPARE(upstreamQueries, 1);
+
+    // A second client gets the cached answer: a different transaction ID, no
+    // second upstream query, and the TTL is not older than it was received.
+    Reply second;
+    QVERIFY(parseReply(exchange(server.serverPort(),
+                                DnsServer::buildQuery(QStringLiteral("www.example.org"),
+                                                      DnsServer::TypeA, 0x5202)),
+                       &second));
+    QCOMPARE(second.id, 0x5202);
+    QCOMPARE(second.answers.size(), 1);
+    QCOMPARE(second.answers.first().rdata, QByteArray::fromHex("c0000207"));
+    QVERIFY(second.answers.first().ttl <= 60);
+    QCOMPARE(upstreamQueries, 1);
+    QCOMPARE(server.cachedResponseCount(), 1);
+
+    // Turning recursion off restores the authoritative-only policy.
+    server.setForwardingEnabled(false);
+    Reply refused;
+    QVERIFY(parseReply(exchange(server.serverPort(),
+                                DnsServer::buildQuery(QStringLiteral("www.example.org"),
+                                                      DnsServer::TypeA, 0x5203)),
+                       &refused));
+    QCOMPARE(refused.rcode, 5); // REFUSED
+    QCOMPARE(upstreamQueries, 1);
 }
 
 void DnsTest::appliesDynamicUpdates()

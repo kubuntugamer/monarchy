@@ -9,6 +9,10 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QNetworkInterface>
+#include <QRegularExpression>
+#include <QTcpSocket>
+#include <QTimer>
 #include <QtEndian>
 #include <algorithm>
 
@@ -186,6 +190,99 @@ QString targetOfSrv(const QByteArray &rdata) {
     return decodeName(rdata, pos);
 }
 
+// Accepts "192.0.2.1", "192.0.2.1:5353", "2001:db8::1" or
+// "[2001:db8::1]:5353". Names are deliberately not resolved here: using the
+// system resolver to look up a forwarder would recurse through this server.
+bool parseForwarder(const QString &spec, QHostAddress *address, quint16 *port)
+{
+    QString host = spec.trimmed();
+    quint16 value = 53;
+    if (host.isEmpty())
+        return false;
+
+    if (host.startsWith(QLatin1Char('['))) {
+        const int close = host.indexOf(QLatin1Char(']'));
+        if (close < 0)
+            return false;
+        const QString rest = host.mid(close + 1);
+        host = host.mid(1, close - 1);
+        if (!rest.isEmpty()) {
+            if (!rest.startsWith(QLatin1Char(':')))
+                return false;
+            bool ok = false;
+            const uint parsed = rest.mid(1).toUInt(&ok);
+            if (!ok || parsed == 0 || parsed > 65535)
+                return false;
+            value = quint16(parsed);
+        }
+    } else if (host.count(QLatin1Char(':')) == 1) {
+        const int colon = host.indexOf(QLatin1Char(':'));
+        bool ok = false;
+        const uint parsed = host.mid(colon + 1).toUInt(&ok);
+        if (ok) {
+            if (parsed == 0 || parsed > 65535)
+                return false;
+            value = quint16(parsed);
+            host = host.left(colon);
+        }
+    }
+
+    const QHostAddress parsedAddress(host);
+    if (parsedAddress.isNull())
+        return false;
+    *address = parsedAddress;
+    *port = value;
+    return true;
+}
+
+QString cacheKeyFor(const QString &name, quint16 type, quint16 qclass)
+{
+    return name.toLower() + QLatin1Char('|') + QString::number(type) + QLatin1Char('|')
+           + QString::number(qclass);
+}
+
+// Records the offset of every TTL field in the answer, authority and
+// additional sections (so a cached packet can be aged) and returns the
+// smallest TTL. OPT pseudo-records are skipped: their TTL field is flags.
+bool collectTtls(const QByteArray &packet, QList<int> *offsets, quint32 *minTtl)
+{
+    int pos = 0;
+    quint16 ignored = 0, qdcount = 0, ancount = 0, nscount = 0, arcount = 0;
+    if (!take16(packet, pos, &ignored) || !take16(packet, pos, &ignored)
+        || !take16(packet, pos, &qdcount) || !take16(packet, pos, &ancount)
+        || !take16(packet, pos, &nscount) || !take16(packet, pos, &arcount))
+        return false;
+
+    for (int i = 0; i < qdcount; ++i) {
+        decodeName(packet, pos);
+        quint16 ignored = 0;
+        if (!take16(packet, pos, &ignored) || !take16(packet, pos, &ignored))
+            return false;
+    }
+
+    const int total = int(ancount) + int(nscount) + int(arcount);
+    for (int i = 0; i < total; ++i) {
+        decodeName(packet, pos);
+        quint16 type = 0, ignoredClass = 0, rdlength = 0;
+        quint32 ttl = 0;
+        if (!take16(packet, pos, &type) || !take16(packet, pos, &ignoredClass))
+            return false;
+        Q_UNUSED(ignoredClass)
+        const int ttlOffset = pos;
+        if (!take32(packet, pos, &ttl) || !take16(packet, pos, &rdlength))
+            return false;
+        if (pos < 0 || pos + rdlength > packet.size())
+            return false;
+        pos += rdlength;
+        if (type == 41) // OPT: TTL carries extended rcode/version/flags
+            continue;
+        offsets->append(ttlOffset);
+        if (ttl < *minTtl)
+            *minTtl = ttl;
+    }
+    return true;
+}
+
 } // namespace
 
 struct DnsServer::Message {
@@ -277,6 +374,14 @@ bool parseMessage(const QByteArray &packet, DnsServer::Message *message) {
 DnsServer::DnsServer(QObject *parent) : QObject(parent) {
     m_socket = new QUdpSocket(this);
     connect(m_socket, &QUdpSocket::readyRead, this, &DnsServer::onReadyRead);
+
+    m_upstreamSocket = new QUdpSocket(this);
+    if (!m_upstreamSocket->bind(QHostAddress::Any, 0))
+        m_upstreamSocket->bind(QHostAddress::AnyIPv4, 0);
+    connect(m_upstreamSocket, &QUdpSocket::readyRead, this, &DnsServer::onUpstreamReadyRead);
+
+    m_tcpServer = new QTcpServer(this);
+    connect(m_tcpServer, &QTcpServer::newConnection, this, &DnsServer::onNewTcpConnection);
 }
 
 DnsServer::~DnsServer() {
@@ -284,10 +389,24 @@ DnsServer::~DnsServer() {
 }
 
 bool DnsServer::listen(quint16 port) {
-    return m_socket->bind(QHostAddress::Any, port);
+    if (!m_socket->bind(QHostAddress::Any, port))
+        return false;
+    // TCP is part of DNS, not a fallback: bind the same port number.
+    if (!m_tcpServer->isListening()
+        && !m_tcpServer->listen(QHostAddress::Any, m_socket->localPort())) {
+        m_socket->close();
+        return false;
+    }
+    return true;
 }
 
 void DnsServer::close() {
+    const QSet<QTcpSocket *> clients = m_tcpClients;
+    m_tcpClients.clear();
+    m_tcpClientBuffers.clear();
+    for (QTcpSocket *client : clients)
+        client->abort();
+    m_tcpServer->close();
     m_socket->close();
 }
 
@@ -313,6 +432,40 @@ void DnsServer::setDynamicUpdatesEnabled(bool enabled) {
 
 bool DnsServer::dynamicUpdatesEnabled() const {
     return m_updatesEnabled;
+}
+
+void DnsServer::setForwardingEnabled(bool enabled)
+{
+    m_forwarding = enabled;
+}
+
+bool DnsServer::forwardingEnabled() const
+{
+    return m_forwarding;
+}
+
+void DnsServer::setForwarders(const QStringList &forwarders)
+{
+    m_forwarders.clear();
+    for (const QString &forwarder : forwarders) {
+        if (!forwarder.trimmed().isEmpty())
+            m_forwarders.append(forwarder.trimmed());
+    }
+}
+
+QStringList DnsServer::forwarders() const
+{
+    return m_forwarders;
+}
+
+void DnsServer::clearCache()
+{
+    m_cache.clear();
+}
+
+int DnsServer::cachedResponseCount() const
+{
+    return m_cache.size();
 }
 
 QList<DnsServer::Record> &DnsServer::recordList(const QString &name) {
@@ -490,13 +643,14 @@ void DnsServer::onReadyRead() {
         if (read <= 0)
             continue;
         buffer.truncate(int(read));
-        const QByteArray response = handlePacket(buffer);
+        const QByteArray response = handlePacket(buffer, peer, port);
         if (!response.isEmpty())
             m_socket->writeDatagram(response, peer, port);
     }
 }
 
-QByteArray DnsServer::handlePacket(const QByteArray &packet) {
+QByteArray DnsServer::handlePacket(const QByteArray &packet, const QHostAddress &from,
+                                   quint16 fromPort, QTcpSocket *tcpClient) {
     Message message;
     if (!parseMessage(packet, &message))
         return buildResponse(packet, {}, FormErr);
@@ -509,11 +663,417 @@ QByteArray DnsServer::handlePacket(const QByteArray &packet) {
     if (opcode != 0)
         return buildResponse(packet, {}, NotImp);
 
+    // Anything outside our zone that asks for recursion goes upstream; the
+    // reply may arrive later, so an empty return means "wait".
+    if (m_forwarding && (message.flags & 0x8000) == 0 && (message.flags & 0x0100) != 0
+        && message.questions.size() == 1
+        && message.questions.first().qclass == ClassIn
+        && !inZone(message.questions.first().name)) {
+        return forwardQuery(message, packet, from, fromPort, tcpClient);
+    }
+
     QList<Record> answers;
     const int rcode = handleQuery(message, answers);
     if (rcode != NoError)
         answers.clear();
     return buildResponse(packet, answers, rcode);
+}
+
+QByteArray DnsServer::forwardQuery(const Message &message, const QByteArray &packet,
+                                   const QHostAddress &from, quint16 fromPort,
+                                   QTcpSocket *tcpClient)
+{
+    const Message::Question question = message.questions.first();
+    bool dnssecOk = false;
+    for (const Record &record : message.additional) {
+        if (record.type == 41) // OPT: the DO bit is the top TTL flag
+            dnssecOk = (record.ttl & 0x8000) != 0;
+    }
+    const QString key = cacheKeyFor(question.name, question.type, question.qclass)
+                        + (dnssecOk ? QStringLiteral("|do") : QString());
+
+    auto cached = m_cache.find(key);
+    if (cached != m_cache.end()) {
+        const qint64 age = cached->stored.secsTo(QDateTime::currentDateTimeUtc());
+        if (age >= 0 && age < qint64(cached->lifetime))
+            return cachedResponse(cached.value(), message.id);
+        m_cache.erase(cached);
+    }
+
+    if (m_pending.size() >= 1024
+        || m_upstreamSocket->state() != QAbstractSocket::BoundState)
+        return buildResponse(packet, {}, ServFail);
+
+    const QStringList servers = effectiveForwarders();
+    QHostAddress upstream;
+    quint16 upstreamPort = 53;
+    for (int i = 0; i < servers.size() && upstream.isNull(); ++i) {
+        const QString spec = servers.at(int(m_forwarderIndex++) % servers.size());
+        parseForwarder(spec, &upstream, &upstreamPort);
+    }
+    if (upstream.isNull())
+        return buildResponse(packet, {}, ServFail);
+
+    quint16 upstreamId = m_nextUpstreamId++;
+    int guard = 0;
+    while (m_pending.contains(upstreamId) && ++guard < 65536)
+        upstreamId = m_nextUpstreamId++;
+
+    PendingQuery pending;
+    pending.clientAddress = from;
+    pending.clientPort = fromPort;
+    pending.tcpClient = tcpClient;
+    pending.upstreamAddress = upstream;
+    pending.upstreamPort = upstreamPort;
+    pending.query = packet;
+    pending.cacheKey = key;
+    pending.sent = QDateTime::currentDateTimeUtc();
+    if (tcpClient)
+        pending.upstreamTcp = new QTcpSocket(this);
+    m_pending.insert(upstreamId, pending);
+
+    QByteArray upstreamQuery = packet;
+    if (upstreamQuery.size() < 2 || upstreamQuery.size() > 65535) {
+        m_pending.remove(upstreamId);
+        return buildResponse(packet, {}, FormErr);
+    }
+    upstreamQuery[0] = char((upstreamId >> 8) & 0xff);
+    upstreamQuery[1] = char(upstreamId & 0xff);
+
+    if (tcpClient) {
+        QTcpSocket *upstreamSocket = pending.upstreamTcp;
+        m_upstreamTcpIds.insert(upstreamSocket, upstreamId);
+        QObject::connect(upstreamSocket, &QTcpSocket::connected, this,
+                         [upstreamSocket, upstreamQuery]() {
+                             QByteArray framed;
+                             framed.append(char((upstreamQuery.size() >> 8) & 0xff));
+                             framed.append(char(upstreamQuery.size() & 0xff));
+                             framed.append(upstreamQuery);
+                             upstreamSocket->write(framed);
+                         });
+        QObject::connect(upstreamSocket, &QTcpSocket::readyRead, this,
+                         &DnsServer::onUpstreamTcpReadyRead);
+        QObject::connect(upstreamSocket, &QTcpSocket::disconnected, this,
+                         &DnsServer::onUpstreamTcpDisconnected);
+        QObject::connect(upstreamSocket, &QAbstractSocket::errorOccurred, this,
+                         [this, upstreamId](QAbstractSocket::SocketError) {
+                             failPending(upstreamId);
+                         });
+        upstreamSocket->connectToHost(upstream, upstreamPort);
+    } else if (m_upstreamSocket->writeDatagram(upstreamQuery, upstream, upstreamPort) < 0) {
+        m_pending.remove(upstreamId);
+        return buildResponse(packet, {}, ServFail);
+    }
+
+    QTimer::singleShot(5000, this, [this, upstreamId]() { timeoutPending(upstreamId); });
+    return {};
+}
+
+void DnsServer::onUpstreamReadyRead()
+{
+    while (m_upstreamSocket->hasPendingDatagrams()) {
+        QHostAddress peer;
+        quint16 peerPort = 0;
+        QByteArray buffer;
+        buffer.resize(int(m_upstreamSocket->pendingDatagramSize()));
+        const qint64 read =
+            m_upstreamSocket->readDatagram(buffer.data(), buffer.size(), &peer, &peerPort);
+        if (read <= 0)
+            continue;
+        buffer.truncate(int(read));
+        if (buffer.size() < 12 || (quint8(buffer[2]) & 0x80) == 0)
+            continue;
+
+        const quint16 id = quint16((quint8(buffer[0]) << 8) | quint8(buffer[1]));
+        auto pendingIt = m_pending.find(id);
+        if (pendingIt == m_pending.end())
+            continue;
+        // Only the resolver this query was sent to may answer it. A
+        // dual-stack socket can report an IPv4 peer as ::ffff:a.b.c.d.
+        if (pendingIt->upstreamPort != peerPort
+            || !pendingIt->upstreamAddress.isEqual(peer, QHostAddress::ConvertV4MappedToIPv4))
+            continue;
+        deliverPending(id, buffer);
+    }
+}
+
+void DnsServer::onNewTcpConnection()
+{
+    while (m_tcpServer->hasPendingConnections()) {
+        QTcpSocket *socket = m_tcpServer->nextPendingConnection();
+        m_tcpClients.insert(socket);
+        m_tcpClientBuffers.insert(socket, {});
+        QObject::connect(socket, &QTcpSocket::readyRead, this, &DnsServer::onTcpClientReadyRead);
+        QObject::connect(socket, &QTcpSocket::disconnected, this, [this, socket]() {
+            m_tcpClients.remove(socket);
+            m_tcpClientBuffers.remove(socket);
+            socket->deleteLater();
+        });
+    }
+}
+
+void DnsServer::onTcpClientReadyRead()
+{
+    auto *socket = qobject_cast<QTcpSocket *>(sender());
+    if (!socket)
+        return;
+    QByteArray &buffer = m_tcpClientBuffers[socket];
+    buffer += socket->readAll();
+    while (buffer.size() >= 2) {
+        const int length = (int(quint8(buffer[0])) << 8) | int(quint8(buffer[1]));
+        if (length == 0) {
+            buffer.remove(0, 2);
+            continue;
+        }
+        if (buffer.size() < 2 + length)
+            return;
+        const QByteArray query = buffer.mid(2, length);
+        buffer.remove(0, 2 + length);
+        const QByteArray response =
+            handlePacket(query, socket->peerAddress(), socket->peerPort(), socket);
+        if (!response.isEmpty())
+            sendTcpResponse(socket, response);
+    }
+}
+
+void DnsServer::sendTcpResponse(QTcpSocket *socket, const QByteArray &response)
+{
+    if (!socket || socket->state() != QAbstractSocket::ConnectedState || response.size() > 65535)
+        return;
+    QByteArray framed;
+    framed.append(char((response.size() >> 8) & 0xff));
+    framed.append(char(response.size() & 0xff));
+    framed.append(response);
+    socket->write(framed);
+}
+
+void DnsServer::onUpstreamTcpReadyRead()
+{
+    auto *socket = qobject_cast<QTcpSocket *>(sender());
+    if (!socket)
+        return;
+    const auto idIt = m_upstreamTcpIds.constFind(socket);
+    if (idIt == m_upstreamTcpIds.constEnd()) {
+        socket->readAll();
+        return;
+    }
+    const quint16 id = idIt.value();
+    auto pendingIt = m_pending.find(id);
+    if (pendingIt == m_pending.end()) {
+        socket->readAll();
+        return;
+    }
+
+    pendingIt->upstreamTcpBuffer += socket->readAll();
+    QByteArray &buffer = pendingIt->upstreamTcpBuffer;
+    while (buffer.size() >= 2) {
+        const int length = (int(quint8(buffer[0])) << 8) | int(quint8(buffer[1]));
+        if (length == 0) {
+            buffer.remove(0, 2);
+            continue;
+        }
+        if (buffer.size() < 2 + length)
+            return;
+        const QByteArray response = buffer.mid(2, length);
+        buffer.remove(0, 2 + length);
+        if (response.size() >= 12 && (quint8(response[2]) & 0x80) != 0) {
+            deliverPending(id, response);
+            return;
+        }
+    }
+}
+
+void DnsServer::onUpstreamTcpDisconnected()
+{
+    auto *socket = qobject_cast<QTcpSocket *>(sender());
+    if (!socket)
+        return;
+    const auto idIt = m_upstreamTcpIds.constFind(socket);
+    if (idIt == m_upstreamTcpIds.constEnd())
+        return;
+    const quint16 id = idIt.value();
+    m_upstreamTcpIds.remove(socket);
+    failPending(id);
+    socket->deleteLater();
+}
+
+void DnsServer::deliverPending(quint16 upstreamId, const QByteArray &response)
+{
+    auto it = m_pending.find(upstreamId);
+    if (it == m_pending.end())
+        return;
+    const PendingQuery pending = it.value();
+    m_pending.erase(it);
+
+    if (pending.upstreamTcp) {
+        m_upstreamTcpIds.remove(pending.upstreamTcp);
+        pending.upstreamTcp->disconnect(this);
+        pending.upstreamTcp->abort();
+        pending.upstreamTcp->deleteLater();
+    }
+
+    QByteArray packet = response;
+    if (packet.size() < 12) {
+        packet = buildResponse(pending.query, {}, ServFail);
+    } else {
+        const quint16 clientId =
+            pending.query.size() >= 2
+                ? quint16((quint8(pending.query[0]) << 8) | quint8(pending.query[1]))
+                : quint16((quint8(packet[0]) << 8) | quint8(packet[1]));
+        packet[0] = char((clientId >> 8) & 0xff);
+        packet[1] = char(clientId & 0xff);
+        const quint16 flags = quint16((quint8(packet[2]) << 8) | quint8(packet[3]));
+        const quint16 normalized = quint16((flags & ~0x0400) | 0x0080);
+        packet[2] = char((normalized >> 8) & 0xff);
+        packet[3] = char(normalized & 0xff);
+        cacheResponse(pending.cacheKey, packet);
+    }
+
+    if (pending.tcpClient) {
+        sendTcpResponse(pending.tcpClient, packet);
+    } else if (!packet.isEmpty()) {
+        m_socket->writeDatagram(packet, pending.clientAddress, pending.clientPort);
+    }
+}
+
+void DnsServer::failPending(quint16 upstreamId)
+{
+    deliverPending(upstreamId, {});
+}
+
+void DnsServer::timeoutPending(quint16 upstreamId)
+{
+    failPending(upstreamId);
+}
+
+void DnsServer::cacheResponse(const QString &key, const QByteArray &packet)
+{
+    if (key.isEmpty() || packet.size() < 12 || packet.size() > 4096)
+        return;
+
+    const quint16 flags = quint16((quint8(packet[2]) << 8) | quint8(packet[3]));
+    if ((flags & 0x0200) != 0) // truncated: a TCP retry may be needed
+        return;
+    const int rcode = flags & 0x0f;
+    if (rcode != NoError && rcode != NxDomain)
+        return;
+
+    QList<int> ttlOffsets;
+    quint32 minTtl = 0xffffffffu;
+    if (!collectTtls(packet, &ttlOffsets, &minTtl))
+        return;
+    if (ttlOffsets.isEmpty()) {
+        // A negative answer without a usable SOA still should not be asked
+        // again on every single lookup.
+        if (rcode != NxDomain)
+            return;
+        minTtl = 30;
+    }
+    if (minTtl == 0 || minTtl == 0xffffffffu)
+        return;
+    if (minTtl > 86400)
+        minTtl = 86400;
+
+    if (m_cache.size() >= 4096) {
+        const QDateTime now = QDateTime::currentDateTimeUtc();
+        for (auto it = m_cache.begin(); it != m_cache.end();) {
+            if (it->stored.secsTo(now) >= qint64(it->lifetime))
+                it = m_cache.erase(it);
+            else
+                ++it;
+        }
+        if (m_cache.size() >= 4096)
+            return;
+    }
+
+    CacheEntry entry;
+    entry.packet = packet;
+    entry.packet[0] = 0;
+    entry.packet[1] = 0;
+    entry.stored = QDateTime::currentDateTimeUtc();
+    entry.lifetime = minTtl;
+    entry.ttlOffsets = ttlOffsets;
+    m_cache.insert(key, entry);
+}
+
+QByteArray DnsServer::cachedResponse(const CacheEntry &entry, quint16 id) const
+{
+    QByteArray packet = entry.packet;
+    if (packet.size() < 12)
+        return {};
+
+    packet[0] = char((id >> 8) & 0xff);
+    packet[1] = char(id & 0xff);
+    const quint16 flags = quint16((quint8(packet[2]) << 8) | quint8(packet[3]));
+    const quint16 normalized = quint16((flags & ~0x0400) | 0x0080);
+    packet[2] = char((normalized >> 8) & 0xff);
+    packet[3] = char(normalized & 0xff);
+
+    const qint64 age =
+        qMax<qint64>(0, entry.stored.secsTo(QDateTime::currentDateTimeUtc()));
+    for (int offset : entry.ttlOffsets) {
+        if (offset < 0 || offset + 4 > packet.size())
+            continue;
+        const quint32 ttl = (quint32(quint8(packet[offset])) << 24)
+                            | (quint32(quint8(packet[offset + 1])) << 16)
+                            | (quint32(quint8(packet[offset + 2])) << 8)
+                            | quint32(quint8(packet[offset + 3]));
+        const quint32 remaining =
+            ttl > quint32(age) ? ttl - quint32(age) : 0;
+        packet[offset] = char((remaining >> 24) & 0xff);
+        packet[offset + 1] = char((remaining >> 16) & 0xff);
+        packet[offset + 2] = char((remaining >> 8) & 0xff);
+        packet[offset + 3] = char(remaining & 0xff);
+    }
+    return packet;
+}
+
+QStringList DnsServer::effectiveForwarders() const
+{
+    if (!m_forwarders.isEmpty())
+        return m_forwarders;
+
+    const auto readNameservers = [](const QString &path) {
+        QStringList servers;
+        QFile file(path);
+        if (!file.open(QIODevice::ReadOnly | QIODevice::Text))
+            return servers;
+        static const QRegularExpression whitespace(QStringLiteral("\\s+"));
+        while (!file.atEnd()) {
+            const QString line = QString::fromUtf8(file.readLine()).trimmed();
+            if (!line.startsWith(QLatin1String("nameserver")))
+                continue;
+            const QStringList parts = line.split(whitespace, Qt::SkipEmptyParts);
+            if (parts.size() >= 2)
+                servers.append(parts.at(1));
+        }
+        return servers;
+    };
+
+    QStringList localAddresses;
+    for (const QHostAddress &address : QNetworkInterface::allAddresses())
+        localAddresses.append(address.toString());
+
+    const auto usable = [&localAddresses](const QStringList &servers) {
+        QStringList result;
+        for (const QString &spec : servers) {
+            QHostAddress address;
+            quint16 port = 53;
+            if (!parseForwarder(spec, &address, &port))
+                continue;
+            // Skip ourselves and a local stub: forwarding there would either
+            // loop or depend on the resolver this server replaces.
+            if (address.isLoopback() || localAddresses.contains(address.toString()))
+                continue;
+            result.append(spec);
+        }
+        return result;
+    };
+
+    QStringList servers = usable(readNameservers(QStringLiteral("/etc/resolv.conf")));
+    if (servers.isEmpty())
+        servers = usable(readNameservers(QStringLiteral("/run/systemd/resolve/resolv.conf")));
+    return servers;
 }
 
 int DnsServer::handleQuery(const Message &message, QList<Record> &answers) {
@@ -675,9 +1235,11 @@ QByteArray DnsServer::buildResponse(const QByteArray &query, const QList<Record>
     wr16(response, id);
     const quint16 opcode = quint16(queryFlags & 0x7800);
     const quint16 rd = quint16(queryFlags & 0x0100);
-    // AA only means something on a successful authoritative answer.
+    // AA only means something on a successful authoritative answer; RA says
+    // this server can recurse for names outside the zone.
     const quint16 aa = rcode == NoError ? quint16(0x0400) : quint16(0);
-    wr16(response, quint16(0x8000 | opcode | rd | aa | quint16(rcode & 0x0f)));
+    const quint16 ra = m_forwarding ? quint16(0x0080) : quint16(0);
+    wr16(response, quint16(0x8000 | opcode | rd | ra | aa | quint16(rcode & 0x0f)));
     wr16(response, qdcount);
     wr16(response, quint16(answers.size()));
     wr16(response, 0);

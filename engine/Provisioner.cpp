@@ -319,6 +319,15 @@ ProvisionResult provisionDomain(const ProvisionConfig &config)
         return result;
     }
 
+    // `--dev-ports` selects the unprivileged binding set. A caller that set a
+    // port explicitly keeps it; epm (135) and SMB (445) have no unprivileged
+    // equivalent and stay native.
+    const quint16 ldapPort = config.devPorts && config.ldapPort == 389 ? 1389 : config.ldapPort;
+    const quint16 dnsPort = config.devPorts && config.dnsPort == 53 ? 1053 : config.dnsPort;
+    const quint16 kdcPort = config.devPorts && config.kdcPort == 88 ? 8888 : config.kdcPort;
+    const quint16 samrPort = config.devPorts && config.samrPort == 49152 ? 1035 : config.samrPort;
+    const quint16 lsadPort = config.devPorts && config.lsadPort == 49153 ? 1036 : config.lsadPort;
+
     QString target = config.targetDir;
     if (target.isEmpty()) {
         result.error = QStringLiteral("target directory must not be empty");
@@ -678,7 +687,7 @@ ProvisionResult provisionDomain(const ProvisionConfig &config)
     // service records and the records a client resolves can never disagree.
     {
         DnsServer dns;
-        dns.loadAdZone(b.dnsDomain, result.dcHost, dcIp, 1389, 3268,
+        dns.loadAdZone(b.dnsDomain, result.dcHost, dcIp, ldapPort, 3268,
                        QStringLiteral("Default-First-Site-Name"));
         QString zoneError;
         if (!dns.saveZone(result.zonePath, &zoneError)) {
@@ -714,7 +723,7 @@ ProvisionResult provisionDomain(const ProvisionConfig &config)
                            "    .%4 = %1\n"
                            "    %4 = %1\n")
                 .arg(realm, dcIp)
-                .arg(config.kdcPort)
+                .arg(kdcPort)
                 .arg(result.dnsDomain);
         if (!writeFile(result.krb5ConfPath, contents.toUtf8(), &error)) {
             result.error = error;
@@ -732,17 +741,19 @@ ProvisionResult provisionDomain(const ProvisionConfig &config)
     conf.setValue(QStringLiteral("dnsDomain"), b.dnsDomain);
     conf.setValue(QStringLiteral("netbiosDomain"), b.netbios);
     conf.setValue(QStringLiteral("baseDn"), b.baseDn);
-    conf.setValue(QStringLiteral("ldapPort"), config.ldapPort);
-    conf.setValue(QStringLiteral("dnsPort"), config.dnsPort);
+    conf.setValue(QStringLiteral("ldapPort"), ldapPort);
+    conf.setValue(QStringLiteral("dnsPort"), dnsPort);
+    if (!config.forwarders.isEmpty())
+        conf.setValue(QStringLiteral("forwarders"), config.forwarders.join(QStringLiteral(", ")));
     // The DC serves SAMR, LSAD, the endpoint mapper and SMB2 the way a Windows
     // DC does: dynamic-RPC ports for the two SAM/LSA interfaces, well-known
     // 135/445 for the mapper and the pipe host. Under `--dev-ports` the
     // unprivileged pair keeps a rootless console or test run bindable.
-    conf.setValue(QStringLiteral("samrPort"), config.samrPort);
-    conf.setValue(QStringLiteral("lsadPort"), config.lsadPort);
+    conf.setValue(QStringLiteral("samrPort"), samrPort);
+    conf.setValue(QStringLiteral("lsadPort"), lsadPort);
     conf.setValue(QStringLiteral("epmPort"), config.epmPort);
     conf.setValue(QStringLiteral("smbPort"), config.smbPort);
-    conf.setValue(QStringLiteral("kdcPort"), config.kdcPort);
+    conf.setValue(QStringLiteral("kdcPort"), kdcPort);
     conf.setValue(QStringLiteral("krb5ConfPath"), result.krb5ConfPath);
     conf.setValue(QStringLiteral("dcName"), b.dcName);
     conf.setValue(QStringLiteral("dcHost"), result.dcHost);

@@ -5,6 +5,7 @@
 #define PROVISIONER_H
 
 #include <QString>
+#include <QStringList>
 
 // Creates an AD-shaped domain tree from scratch. No Samba, no external
 // directory server: the seed directory is produced by Monarchy itself and is
@@ -31,6 +32,9 @@ struct ProvisionConfig {
     quint16 epmPort = 135;
     quint16 smbPort = 445;
     bool devPorts = false;
+    // Upstream resolvers for out-of-zone DNS (address or address:port). Empty
+    // leaves detection to the host's resolv.conf at runtime.
+    QStringList forwarders;
     bool force = false;
 };
 

@@ -47,6 +47,10 @@ int main(int argc, char *argv[])
                                 QStringLiteral("Provision the unprivileged port set "
                                                "(1389/1053/8888/1035/1036) a rootless "
                                                "console run can bind."));
+    QCommandLineOption forwarderOption(QStringLiteral("forwarder"),
+                                QStringLiteral("Upstream resolver for out-of-zone DNS "
+                                               "(repeatable; address or address:port)."),
+                                QStringLiteral("address"));
     QCommandLineOption forceOption(QStringLiteral("force"),
                                    QStringLiteral("Overwrite an existing domain store."));
 
@@ -57,6 +61,7 @@ int main(int argc, char *argv[])
     parser.addOption(ipOption);
     parser.addOption(kdcPortOption);
     parser.addOption(devPortsOption);
+    parser.addOption(forwarderOption);
     parser.addOption(forceOption);
     parser.addPositionalArgument(QStringLiteral("targetdir"),
                                  QStringLiteral("Target directory (same as --targetdir)."),
@@ -79,6 +84,7 @@ int main(int argc, char *argv[])
     config.devPorts = parser.isSet(devPortsOption);
     if (config.devPorts && !parser.isSet(kdcPortOption))
         config.kdcPort = 8888; // rootless development binding
+    config.forwarders = parser.values(forwarderOption);
     config.force = parser.isSet(forceOption);
 
     QTextStream out(stdout);
