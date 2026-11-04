@@ -112,12 +112,18 @@ failure) |
   would open (`NetrServerAuthenticate3` against the trust account, then
   `NetrSetTrustedDomainAuthInfo`) is not served; a partner can authenticate its
   trust channel and read the trust account's RID.
-- **SMB2 beyond the pipe transport**: dialects 2.0.2 and 2.1 only (no SMB 3.x,
-  so no preauth integrity, no encryption, no multi-channel); only the `IPC$`
-  share exists, so a directory browse is empty; SMB1 is not answered, which
-  means a client that insists on an SMB1 negotiation rather than falling back
-  to SMB2 cannot connect; and `smbPort` defaults to 445, which needs
-  `CAP_NET_BIND_SERVICE` or root like the endpoint mapper.
+- **SMB beyond the pipe transport**: SMB2 dialects 2.0.2 and 2.1 only (no SMB
+  3.x, so no preauth integrity, no encryption, no multi-channel). SMB1 is
+  answered for NT LM 0.12 (`engine/Smb1.{h,cpp}`): negotiate, extended session
+  setup with NTLMSSP in SPNEGO, tree connect to `IPC$`, NT create on a pipe,
+  and write/read/transact over it, which is the transport a Windows 2000
+  workstation needs for a domain join. SMB1 signing is not implemented (the
+  server answers `SecurityMode` without the signature bits), so a client whose
+  policy makes signing mandatory, such as Samba's default client, is refused.
+  Only the `IPC$` share exists on either dialect, so a directory browse is
+  empty and there are no `SYSVOL`/`NETLOGON` file shares yet; and `smbPort`
+  defaults to 445, which needs `CAP_NET_BIND_SERVICE` or root like the endpoint
+  mapper.
 - **The endpoint mapper's limits**: it binds `epmPort` (135 by default), and
   binding 135 needs `CAP_NET_BIND_SERVICE` or root: an unprivileged console
   reports that on the status bar and the endpoints stay reachable by explicit

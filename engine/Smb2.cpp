@@ -13,6 +13,7 @@
 
 #include "Gss.h"
 #include "Ntlm.h"
+#include "Smb1.h"
 
 
 namespace {
@@ -145,6 +146,9 @@ struct Smb2Server::Connection {
     };
     QHash<quint64, Pipe> handles;
     QHash<quint32, QString> trees;
+    // Windows 2000 and other SMB1-only clients keep their own session state on
+    // the same connection; created on the first SMB1 message.
+    Smb1::Session *smb1 = nullptr;
 
     quint64 nextSession = 0x00010000;
     quint64 nextTree = 0x00020000;
@@ -191,6 +195,7 @@ void Smb2Server::close()
     for (Connection *connection : m_connections) {
         for (auto &pipe : connection->handles)
             delete pipe.channel;
+        delete connection->smb1;
         delete connection;
     }
     m_connections.clear();
@@ -266,6 +271,7 @@ void Smb2Server::onDisconnected()
             Connection *connection = m_connections[i];
             for (auto &pipe : connection->handles)
                 delete pipe.channel;
+            delete connection->smb1;
             delete connection;
             m_connections.removeAt(i);
             break;
@@ -312,6 +318,11 @@ QByteArray Smb2Server::wildcardAnswer(Connection *connection, const QByteArray &
         || quint8(message.at(4)) != 0x72   // SMB_COM_NEGOTIATE
         || message.indexOf("SMB 2.???") < 0)
         return QByteArray();
+    // A client that also offers the SMB1 NT dialect gets SMB1: answering the
+    // SMB2 wildcard would strand an NT1-only session. Samba's client offers
+    // both, and with client max protocol=NT1 expects the SMB1 answer.
+    if (message.contains("NT LM 0.12") || message.contains("NT LANMAN"))
+        return QByteArray();
 
     // A minimal (fake-client) SMB2 negotiate *body*, parsed by the very same
     // negotiate() the pure-SMB2 path uses, wrapped in an SMB2 header so it
@@ -329,8 +340,21 @@ QByteArray Smb2Server::wildcardAnswer(Connection *connection, const QByteArray &
     return handleMessage(connection, smb2Packet);
 }
 
+QByteArray Smb2Server::handleSmb1(Connection *connection, const QByteArray &message)
+{
+    if (!connection->smb1) {
+        connection->smb1 = new Smb1::Session(m_pipes, m_authenticator, m_domain, m_serverName,
+                                             m_dnsDomain);
+        connection->smb1->setNotifier(
+            [this](const QString &operation) { emit requestReceived(operation); });
+    }
+    return connection->smb1->feed(message);
+}
+
 QByteArray Smb2Server::handleMessage(Connection *connection, const QByteArray &message)
 {
+    if (Smb1::Session::isSmb1(message))
+        return handleSmb1(connection, message);
     if (message.size() < int(Smb2::kHeaderSize) || message.left(4) != QByteArray("\376SMB", 4))
         return QByteArray();
 

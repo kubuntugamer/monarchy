@@ -104,6 +104,9 @@ private:
     struct Connection;
 
     QByteArray handleMessage(Connection *connection, const QByteArray &message);
+    // SMB1 (MS-CIFS) for clients that never negotiate SMB2, such as Windows
+    // 2000: it reuses this server's pipe map and authenticator.
+    QByteArray handleSmb1(Connection *connection, const QByteArray &message);
     // The SMB2 negotiate response a classic SMB1 wildcard client must be
     // answered with ([MS-SMB2] 3.3.5.3.1, SMB1 disabled); empty when the
     // message is not that packet, in which case handleMessage takes it.
