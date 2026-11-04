@@ -106,6 +106,45 @@ exactly as it would to a remote domain controller. Ordinary Kerberos clients
   objects are created under the connected naming context and only appear in
   the results pane once the directory accepts them.
 
+## Install
+
+One command builds everything, runs the test suite, installs the console,
+daemon and provisioner, provisions the domain, installs the systemd unit and
+starts the service:
+
+```sh
+sudo scripts/install-monarchy.sh --realm CORP.EXAMPLE.COM
+```
+
+Without `--adminpass` the script generates an Administrator password and
+prints it once at the end; without `--realm` it provisions
+`MONARCHY.EXAMPLE.COM`. Re-running refreshes the binaries and unit and leaves
+an existing domain alone — `--force` replaces it.
+
+Run the same script as a normal user for a self-contained install under
+`~/.local` with development ports and no systemd changes:
+
+```sh
+scripts/install-monarchy.sh
+~/.local/bin/monarchy-ui
+```
+
+Other options: `--with-ldap` (system OpenLDAP client backend),
+`--install-deps` (installs build packages for Debian/Ubuntu, Fedora, Arch or
+openSUSE), `--fix-dns53` (disable systemd-resolved's port 53 stub listener and
+make the DC the host's caching/forwarding resolver), `--skip-tests`,
+`--no-service`, `--no-provision`, `--prefix`, `--build-dir`, `--jobs`. See
+`scripts/install-monarchy.sh --help`.
+
+## Uninstall
+
+`sudo scripts/uninstall-monarchy.sh` stops and removes the `monarchy-dcd`
+unit, the installed binaries, the service account and the domain store, and
+restores the systemd-resolved stub listener and `/etc/resolv.conf` if the
+installer changed them. It asks before deleting anything; `--keep-domain`,
+`--keep-user` and `--keep-resolver` preserve individual pieces, and `--yes`
+runs it unattended. A rootless install uses `--user`.
+
 ## Build
 
 Requirements: CMake 3.16+, a C++17 compiler, and Qt 6.5+ (`Widgets`, `Core`,
@@ -164,12 +203,12 @@ EOF
 
 ### Running as boot-started system services
 
-The same daemon turns into the machine's directory services: `scripts/
-install-dc-services.sh` installs `monarchy-dcd` and the provisioner under
-`/usr/local/bin`, creates a `monarchy-dc` service account, and enables the
-`packaging/monarchy-dcd.service` unit so the LDAP, KDC, DNS, SAMR, LSAD,
-Netlogon, DRSUAPI, EPM and SMB2 endpoints all start at boot under `/var/lib/`
-monarchy/Monarchy` — the way a Windows DC starts them:
+The same daemon turns into the machine's directory services: one process hosts
+LDAP, KDC, DNS, SAMR, LSAD, Netlogon, DRSUAPI, EPM and SMB2 under a dedicated
+`monarchy-dc` service account, the way `lsass.exe` hosts them on a Windows DC.
+`sudo scripts/install-monarchy.sh` builds, installs, provisions and enables it
+in one step; on an already-built tree, `scripts/install-dc-services.sh` installs
+just the binaries and unit:
 
 ```sh
 sudo scripts/install-dc-services.sh
@@ -178,10 +217,33 @@ sudo -u monarchy-dc /usr/local/bin/monarchy-provision \
 sudo systemctl restart monarchy-dcd
 ```
 
+The `packaging/monarchy-dcd.service` unit is enabled at boot and starts after
+`network-online.target` and `time-sync.target`, so the domain is reachable and
+the clock is correct before Kerberos tickets are issued. It restarts after a
+crash, stops with SIGTERM so the directory and zone are flushed, and logs to the
+journal (`journalctl -u monarchy-dcd`). A machine with no provisioned domain
+fails once at boot instead of restarting in a loop. After changing `dc.conf`,
+run `sudo systemctl restart monarchy-dcd`; no reboot is needed.
+
 The unit carries `AmbientCapabilities=CAP_NET_BIND_SERVICE`, and provisioning
 itself defaults to the real-DC ports (DNS 53, LDAP 389, Kerberos 88, SMB 445,
 epm 135), so the service binds them right away the same way `lsass.exe` does.
 Provision with `--dev-ports` only for a rootless machine.
+
+On a host running `systemd-resolved`, its stub listener occupies port 53.
+`scripts/install-monarchy.sh` detects that and offers to disable the stub
+listener (or accepts `--fix-dns53` for unattended runs); it then makes the DC
+the host's resolver in `/etc/resolv.conf`, keeping the previous upstreams as
+fallback.
+
+The DNS endpoint is authoritative for the domain and a caching/forwarding
+resolver for everything else: out-of-zone queries go to `forwarders=` in
+`dc.conf` (comma- or space-separated addresses, optional `:port`), or to the
+host's nameservers when unset, and answers are cached for their TTL. Pass
+`--forwarder ADDRESS` (repeatable) to `monarchy-provision` to record the list,
+or edit `dc.conf` directly. Set `forwarding=false` in `dc.conf` to answer
+out-of-zone queries with REFUSED instead, which is the standalone engine's
+default.
 
 The application starts its local directory on **LDAP 1389**, the KDC on
 **8888** and **DNS 1053**, serves the DCE/RPC endpoints on `samrPort` 1035,
