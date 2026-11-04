@@ -61,6 +61,7 @@ private slots:
     void servesProvisionedDomainOverLdap();
     void rejectsWrongCredentials();
     void usesConfiguredControllerHost();
+    void publishesItsIdentityAndGlobalCatalog();
 };
 
 void ProvisionerTest::buildsDomainFromScratch()
@@ -90,6 +91,7 @@ void ProvisionerTest::buildsDomainFromScratch()
     // AD's native bindings by default (dynamic-RPC ports for SAMR/LSAD).
     QCOMPARE(conf.value(QStringLiteral("samrPort")).toInt(), 49152);
     QCOMPARE(conf.value(QStringLiteral("lsadPort")).toInt(), 49153);
+    QCOMPARE(conf.value(QStringLiteral("gcPort")).toInt(), 3268);
     QCOMPARE(conf.value(QStringLiteral("forwarders")).toString(),
              QStringLiteral("192.0.2.53, 192.0.2.54:5353"));
 
@@ -179,6 +181,38 @@ void ProvisionerTest::buildsDomainFromScratch()
     QVERIFY(domainPolicy->attributes.value(QStringLiteral("gPCFileSysPath"))
                 .endsWith(QStringLiteral("Policies\\") + domainPolicyGuid));
     QVERIFY(findByDn(objects, QStringLiteral("CN=%1,%2").arg(dcPolicyGuid, policiesDn)));
+    QCOMPARE(domainPolicy->attributes.value(QStringLiteral("gPCFileSysPath")),
+             QStringLiteral("\\\\test.example.org\\sysvol\\test.example.org\\Policies\\%1")
+                 .arg(domainPolicyGuid));
+
+    // The DSA's own object exists in the configuration NC, so the FSMO owners
+    // named on the domain, the schema and the partitions container resolve.
+    const QString ntdsDn = QStringLiteral("CN=NTDS Settings,CN=TESTDC1,CN=Servers,"
+                                          "CN=Default-First-Site-Name,CN=Sites,"
+                                          "CN=Configuration,%1")
+                               .arg(result.baseDn);
+    const DirectoryObject *ntds = findByDn(objects, ntdsDn);
+    QVERIFY(ntds);
+    QCOMPARE(ntds->type, QStringLiteral("NTDS Settings"));
+    QCOMPARE(ntds->attributes.value(QStringLiteral("objectClass")),
+             QStringLiteral("top;nTDSDSA"));
+    QCOMPARE(ntds->attributes.value(QStringLiteral("options")), QStringLiteral("1")); // IS_GC
+    // A GUID string without the braces, which is how AD stores invocationId.
+    QCOMPARE(ntds->attributes.value(QStringLiteral("invocationId")).size(), 36);
+    QVERIFY(!ntds->attributes.value(QStringLiteral("invocationId"))
+                 .contains(QLatin1Char('{')));
+    QVERIFY(ntds->attributes.value(QStringLiteral("hasMasterNCs")).contains(result.baseDn));
+    QCOMPARE(domain->attributes.value(QStringLiteral("fSMORoleOwner")), ntdsDn);
+    const DirectoryObject *schema =
+        findByDn(objects, QStringLiteral("CN=Schema,CN=Configuration,%1").arg(result.baseDn));
+    QVERIFY(schema);
+    QCOMPARE(schema->attributes.value(QStringLiteral("fSMORoleOwner")), ntdsDn);
+    const DirectoryObject *partitions =
+        findByDn(objects, QStringLiteral("CN=Partitions,CN=Configuration,%1").arg(result.baseDn));
+    QVERIFY(partitions);
+    QCOMPARE(partitions->attributes.value(QStringLiteral("objectClass")),
+             QStringLiteral("top;crossRefContainer"));
+    QCOMPARE(partitions->attributes.value(QStringLiteral("fSMORoleOwner")), ntdsDn);
 
     for (const QString &guid : {domainPolicyGuid, dcPolicyGuid}) {
         const QString policyDir = result.sysvolPath + QStringLiteral("/Policies/") + guid;
@@ -389,6 +423,137 @@ void ProvisionerTest::usesConfiguredControllerHost()
              QStringLiteral("laptop.test.example.org"));
     QVERIFY(dc->attributes.value(QStringLiteral("servicePrincipalName"))
                 .contains(QStringLiteral("ldap/laptop.test.example.org")));
+}
+
+void ProvisionerTest::publishesItsIdentityAndGlobalCatalog()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const ProvisionResult result = provisionDomain(testConfig(dir.path()));
+    QVERIFY2(result.ok, qPrintable(result.error));
+
+    LdapServer server;
+    QVERIFY(server.loadFromFile(result.storePath));
+    QVERIFY(server.loadSecretsFromFile(result.secretsPath));
+
+    // Exactly what DcService supplies from dc.conf.
+    LdapServer::Identity identity;
+    identity.realm = QStringLiteral("TEST.EXAMPLE.ORG");
+    identity.netbios = QStringLiteral("TEST");
+    identity.dnsDomain = result.dnsDomain;
+    identity.dcHost = result.dcHost;
+    identity.siteName = QStringLiteral("Default-First-Site-Name");
+    server.setIdentity(identity);
+
+    const auto rootAttribute = [&server](const QString &name) {
+        for (const DirectoryObject &object : server.objects()) {
+            if (object.id.isEmpty()) return object.attributes.value(name);
+        }
+        return QString();
+    };
+
+    // The DSA describes itself from the config, not from a guess: the server
+    // DN is the one the provisioned configuration NC holds the NTDS Settings
+    // object in, so serverName and dsServiceName name a real object.
+    const QString serverDn = QStringLiteral("CN=TESTDC1,CN=Servers,"
+                                            "CN=Default-First-Site-Name,CN=Sites,"
+                                            "CN=Configuration,%1")
+                                 .arg(result.baseDn);
+    QCOMPARE(rootAttribute(QStringLiteral("dnsHostName")), result.dcHost);
+    QCOMPARE(rootAttribute(QStringLiteral("serverName")), serverDn);
+    QCOMPARE(rootAttribute(QStringLiteral("dsServiceName")),
+             QStringLiteral("CN=NTDS Settings,%1").arg(serverDn));
+    QCOMPARE(rootAttribute(QStringLiteral("ldapServiceName")),
+             QStringLiteral("test\\testdc1$@TEST.EXAMPLE.ORG"));
+    QCOMPARE(rootAttribute(QStringLiteral("isSynchronized")), QStringLiteral("TRUE"));
+    QCOMPARE(rootAttribute(QStringLiteral("domainControllerFunctionality")), QStringLiteral("0"));
+    QCOMPARE(rootAttribute(QStringLiteral("domainFunctionality")), QStringLiteral("0"));
+    QCOMPARE(rootAttribute(QStringLiteral("forestFunctionality")), QStringLiteral("0"));
+    QVERIFY(rootAttribute(QStringLiteral("supportedControl"))
+                .contains(QStringLiteral("1.2.840.113556.1.4.319")));
+    // No catalog listener is up yet, so the DSA says so rather than claiming
+    // a capability it does not have.
+    QCOMPARE(rootAttribute(QStringLiteral("isGlobalCatalogReady")), QStringLiteral("FALSE"));
+
+    // The catalog is the same store on a second port: the search below must
+    // return the same entries over 3268 (here an ephemeral port) as over the
+    // directory's own listener.
+    QVERIFY(server.listen(0));
+    const quint16 ldapPort = server.serverPort();
+    QVERIFY(server.listenGc(0));
+    QVERIFY(server.gcListening());
+    const quint16 gcPort = server.gcServerPort();
+    QVERIFY(gcPort != 0);
+    QVERIFY(gcPort != ldapPort);
+    QCOMPARE(rootAttribute(QStringLiteral("isGlobalCatalogReady")), QStringLiteral("TRUE"));
+
+    struct CatalogProbe {
+        QList<LdapClient::Entry> viaLdap;
+        QList<LdapClient::Entry> viaGc;
+        QList<LdapClient::Entry> gcRootDse;
+        QString error;
+    } probe;
+    const QString baseDn = result.baseDn;
+    QFuture<void> future = QtConcurrent::run([ldapPort, gcPort, baseDn, &probe] {
+        QString error;
+        const QString administratorDn = QStringLiteral("CN=Administrator,CN=Users,%1").arg(baseDn);
+        LdapClient directory;
+        if (!directory.open(QStringLiteral("127.0.0.1"), ldapPort, &error)) {
+            probe.error = error;
+            return;
+        }
+        if (!directory.bind(administratorDn, QStringLiteral("Secret123!"), &error)) {
+            probe.error = error;
+            directory.close();
+            return;
+        }
+        probe.viaLdap = directory.search(baseDn, 2, QStringLiteral("(objectClass=user)"),
+                                         {QStringLiteral("sAMAccountName")}, &error);
+        directory.close();
+        if (!error.isEmpty()) {
+            probe.error = error;
+            return;
+        }
+
+        LdapClient catalog;
+        if (!catalog.open(QStringLiteral("127.0.0.1"), gcPort, &error)) {
+            probe.error = error;
+            return;
+        }
+        if (!catalog.bind(administratorDn, QStringLiteral("Secret123!"), &error)) {
+            probe.error = error;
+            catalog.close();
+            return;
+        }
+        probe.viaGc = catalog.search(baseDn, 2, QStringLiteral("(objectClass=user)"),
+                                     {QStringLiteral("sAMAccountName")}, &error);
+        probe.gcRootDse = catalog.search(QString(), 0, QStringLiteral("(objectClass=*)"),
+                                         {QStringLiteral("dnsHostName"),
+                                          QStringLiteral("isGlobalCatalogReady")},
+                                         &error);
+        probe.error = error;
+        catalog.close();
+    });
+    QTRY_VERIFY_WITH_TIMEOUT(future.isFinished(), 15000);
+
+    QVERIFY2(probe.error.isEmpty(), qPrintable(probe.error));
+    QStringList ldapDns;
+    for (const LdapClient::Entry &entry : probe.viaLdap)
+        ldapDns.append(entry.dn.toLower());
+    QStringList gcDns;
+    for (const LdapClient::Entry &entry : probe.viaGc)
+        gcDns.append(entry.dn.toLower());
+    ldapDns.sort();
+    gcDns.sort();
+    QVERIFY(gcDns.size() >= 3);
+    QCOMPARE(gcDns, ldapDns);
+    QVERIFY(gcDns.contains(QStringLiteral("cn=administrator,cn=users,%1").arg(baseDn.toLower())));
+
+    QCOMPARE(probe.gcRootDse.size(), 1);
+    QCOMPARE(probe.gcRootDse.first().attrs.value(QStringLiteral("dnsHostName")).value(0),
+             result.dcHost);
+    QCOMPARE(probe.gcRootDse.first().attrs.value(QStringLiteral("isGlobalCatalogReady")).value(0),
+             QStringLiteral("TRUE"));
 }
 
 QTEST_GUILESS_MAIN(ProvisionerTest)

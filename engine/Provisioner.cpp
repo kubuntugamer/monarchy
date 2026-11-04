@@ -375,6 +375,9 @@ ProvisionResult provisionDomain(const ProvisionConfig &config)
     const quint16 kdcPort = config.devPorts && config.kdcPort == 88 ? 8888 : config.kdcPort;
     const quint16 samrPort = config.devPorts && config.samrPort == 49152 ? 1035 : config.samrPort;
     const quint16 lsadPort = config.devPorts && config.lsadPort == 49153 ? 1036 : config.lsadPort;
+    // The Global Catalog has no unprivileged equivalent: 3268 is already above
+    // 1024, so it is the same number in a dev run as on a real DC.
+    const quint16 gcPort = 3268;
 
     QString target = config.targetDir;
     if (target.isEmpty()) {
@@ -600,6 +603,27 @@ ProvisionResult provisionDomain(const ProvisionConfig &config)
     server.attributes.insert(QStringLiteral("dNSHostName"),
                              b.dcName.toLower() + QLatin1Char('.') + b.dnsDomain);
 
+    // The NTDS Settings object: the directory agent's own vertex in the
+    // configuration NC. The domain object already named it in
+    // fSMORoleOwner, so without it that value pointed at nothing.
+    const QString ntdsSettingsDn = QStringLiteral("CN=NTDS Settings,%1").arg(serverDn);
+    {
+        DirectoryObject &ntds = b.add(ntdsSettingsDn, QStringLiteral("NTDS Settings"),
+                                      QStringLiteral("NTDS Settings"), ObjectKind::Container,
+                                      serverDn);
+        b.objectClass(ntds, {QStringLiteral("top"), QStringLiteral("nTDSDSA")});
+        ntds.attributes.insert(QStringLiteral("cn"), QStringLiteral("NTDS Settings"));
+        // options bit 0 (IS_GC): this DSA serves the Global Catalog. The GC
+        // listener is the same store on 3268, so the flag is true.
+        ntds.attributes.insert(QStringLiteral("options"), QStringLiteral("1"));
+        ntds.attributes.insert(QStringLiteral("invocationId"),
+                               QUuid::createUuid().toString().remove(QLatin1Char('{')).remove(
+                                   QLatin1Char('}')));
+        ntds.attributes.insert(QStringLiteral("hasMasterNCs"),
+                               QStringLiteral("%1; CN=Configuration,%1; CN=Schema,CN=Configuration,%1")
+                                   .arg(b.baseDn));
+    }
+
     // --- Schema NC -------------------------------------------------------
     const QString schemaDn = QStringLiteral("CN=Schema,%1").arg(configDn);
     DirectoryObject &schema = b.add(schemaDn, QStringLiteral("Schema"),
@@ -607,6 +631,20 @@ ProvisionResult provisionDomain(const ProvisionConfig &config)
                                     QStringLiteral("Console Root"));
     b.objectClass(schema, {QStringLiteral("top"), QStringLiteral("dMD")});
     schema.attributes.insert(QStringLiteral("cn"), QStringLiteral("Schema"));
+    // Schema Master, held by this DSA.
+    schema.attributes.insert(QStringLiteral("fSMORoleOwner"), ntdsSettingsDn);
+
+    // CN=Partitions carries the Domain Naming Master role, the third FSMO
+    // owner in a Windows 2000 forest's configuration NC.
+    {
+        const QString partitionsDn = QStringLiteral("CN=Partitions,%1").arg(configDn);
+        DirectoryObject &partitions = b.add(partitionsDn, QStringLiteral("Partitions"),
+                                            QStringLiteral("Container"), ObjectKind::Container,
+                                            QStringLiteral("Console Root"));
+        b.objectClass(partitions, {QStringLiteral("top"), QStringLiteral("crossRefContainer")});
+        partitions.attributes.insert(QStringLiteral("cn"), QStringLiteral("Partitions"));
+        partitions.attributes.insert(QStringLiteral("fSMORoleOwner"), ntdsSettingsDn);
+    }
 
     // --- Group Policy -----------------------------------------------------
     // The two policies every domain is created with, linked from the domain
@@ -628,8 +666,8 @@ ProvisionResult provisionDomain(const ProvisionConfig &config)
             gpo.attributes.insert(QStringLiteral("cn"), guid);
             gpo.attributes.insert(QStringLiteral("displayName"), displayName);
             gpo.attributes.insert(QStringLiteral("gPCFileSysPath"),
-                                  QStringLiteral("\\\\%1\\sysvol\\%1\\Policies\\%2")
-                                      .arg(result.dcHost, guid));
+                                  QStringLiteral("\\\\%1\\sysvol\\%2\\Policies\\%3")
+                                      .arg(result.dnsDomain, result.dnsDomain, guid));
             gpo.attributes.insert(QStringLiteral("versionNumber"), QStringLiteral("0"));
             gpo.attributes.insert(QStringLiteral("flags"), QStringLiteral("0"));
             gpo.attributes.insert(QStringLiteral("gPCFunctionalityVersion"), QStringLiteral("2"));
@@ -735,7 +773,7 @@ ProvisionResult provisionDomain(const ProvisionConfig &config)
     // service records and the records a client resolves can never disagree.
     {
         DnsServer dns;
-        dns.loadAdZone(b.dnsDomain, result.dcHost, dcIp, ldapPort, 3268,
+        dns.loadAdZone(b.dnsDomain, result.dcHost, dcIp, ldapPort, gcPort,
                        QStringLiteral("Default-First-Site-Name"));
         QString zoneError;
         if (!dns.saveZone(result.zonePath, &zoneError)) {
@@ -790,6 +828,7 @@ ProvisionResult provisionDomain(const ProvisionConfig &config)
     conf.setValue(QStringLiteral("netbiosDomain"), b.netbios);
     conf.setValue(QStringLiteral("baseDn"), b.baseDn);
     conf.setValue(QStringLiteral("ldapPort"), ldapPort);
+    conf.setValue(QStringLiteral("gcPort"), gcPort);
     conf.setValue(QStringLiteral("dnsPort"), dnsPort);
     if (!config.forwarders.isEmpty())
         conf.setValue(QStringLiteral("forwarders"), config.forwarders.join(QStringLiteral(", ")));

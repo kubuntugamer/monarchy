@@ -18,7 +18,14 @@ exactly as it would to a remote domain controller. Ordinary Kerberos clients
   third-party artwork).
 - **Directory engine (`engine/`)** — an in-process LDAP v3 server (RFC 4511
   subset) with bind, search (base/one-level/subtree), add, modify, compare,
-  delete, modify-DN, WhoAmI, root DSE, and persisted JSON storage. Filters
+  delete, modify-DN, WhoAmI, root DSE, and persisted JSON storage. The root
+  DSE describes the DSA it reached — `dnsHostName`, `serverName`,
+  `dsServiceName` and `ldapServiceName` naming the provisioned
+  `CN=NTDS Settings` object, `isSynchronized`, the Windows 2000 behavior
+  levels, and the controls this server actually answers. The same store is
+  also served as the **Global Catalog** on **3268** (`gcPort`), so a client
+  searching the catalog sees a write made on 389 with no replication step.
+  Filters
   support AND/OR/NOT nesting, equality, substrings and presence (RFC 4515 on
   the client side too). Request controls are parsed, with **paged results**
   (RFC 2696) supported and an unknown critical control refused rather than
@@ -264,7 +271,8 @@ or edit `dc.conf` directly. Set `forwarding=false` in `dc.conf` to answer
 out-of-zone queries with REFUSED instead, which is the standalone engine's
 default.
 
-The daemon serves the provisioned domain on **LDAP 389**, the KDC on
+The daemon serves the provisioned domain on **LDAP 389**, the Global Catalog
+on **3268**, the KDC on
 **88** and **DNS 53**, the DCE/RPC endpoints on `samrPort` 49152,
 `lsadPort` 49153 and `drsPort` 1038 (loopback), the endpoint mapper on
 `epmPort` and SMB2 on `smbPort`. The console is a pure client: it reads the

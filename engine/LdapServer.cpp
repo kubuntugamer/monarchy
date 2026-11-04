@@ -354,6 +354,38 @@ bool LdapServer::listen(quint16 port) {
     return m_server->listen(QHostAddress::Any, port);
 }
 
+void LdapServer::setIdentity(const Identity &identity) {
+    m_identity = identity;
+    if (!m_objects.isEmpty()) ensureRootDse();
+}
+
+bool LdapServer::listenGc(quint16 port) {
+    if (!m_server || !m_server->isListening()) return false;
+    if (m_gcServer && m_gcServer->isListening() && m_gcServer->serverPort() == port) return true;
+    closeGc();
+    // The catalog is the same store on another port, not a copy: a client that
+    // searches 3268 sees what 389 sees, including writes made a moment ago.
+    m_gcServer = new LdapListener(this, this);
+    if (!m_gcServer->listen(QHostAddress::Any, port)) {
+        delete m_gcServer;
+        m_gcServer = nullptr;
+        return false;
+    }
+    ensureRootDse();
+    return true;
+}
+
+void LdapServer::closeGc() {
+    if (!m_gcServer) return;
+    m_gcServer->close();
+    delete m_gcServer;
+    m_gcServer = nullptr;
+    ensureRootDse();
+}
+
+bool LdapServer::gcListening() const { return m_gcServer && m_gcServer->isListening(); }
+quint16 LdapServer::gcServerPort() const { return m_gcServer ? m_gcServer->serverPort() : 0; }
+
 void LdapServer::close() {
     for (auto *c : m_clients) {
         if (c->socket) c->socket->deleteLater();
@@ -361,6 +393,11 @@ void LdapServer::close() {
     }
     m_clients.clear();
     if (m_server) m_server->close();
+    if (m_gcServer) {
+        m_gcServer->close();
+        delete m_gcServer;
+        m_gcServer = nullptr;
+    }
 }
 
 bool LdapServer::isListening() const { return m_server && m_server->isListening(); }
@@ -637,6 +674,50 @@ void LdapServer::ensureRootDse() {
     root.attributes.insert(QStringLiteral("vendorVersion"), QStringLiteral("0.1"));
     root.attributes.insert(QStringLiteral("highestCommittedUSN"), QString::number(m_usn));
     root.attributes.insert(QStringLiteral("currentTime"), QDateTime::currentDateTimeUtc().toString(Qt::ISODate));
+
+    // The DSA's own identity. A Windows client asks these questions before it
+    // treats the server as a domain controller: which directory agent is this,
+    // which NC does it hold, is it in sync, and what behavior level does it
+    // promise. Each value below is published from what this process actually
+    // does, so nothing here asserts a capability the server lacks.
+    if (!m_identity.dcHost.isEmpty()) {
+        const QString shortHost = m_identity.dcHost.section(QLatin1Char('.'), 0, 0).toUpper();
+        const QString site = m_identity.siteName.isEmpty()
+                                 ? QStringLiteral("Default-First-Site-Name")
+                                 : m_identity.siteName;
+        const QString serverDn = QStringLiteral("CN=%1,CN=Servers,CN=%2,CN=Sites,%3")
+                                     .arg(shortHost, site, configDn);
+        root.attributes.insert(QStringLiteral("dnsHostName"), m_identity.dcHost);
+        root.attributes.insert(QStringLiteral("serverName"), serverDn);
+        root.attributes.insert(QStringLiteral("dsServiceName"),
+                               QStringLiteral("CN=NTDS Settings,%1").arg(serverDn));
+        if (!m_identity.netbios.isEmpty() && !m_identity.realm.isEmpty()) {
+            root.attributes.insert(
+                QStringLiteral("ldapServiceName"),
+                QStringLiteral("%1\\%2$@%3")
+                    .arg(m_identity.netbios.toLower(),
+                         shortHost.toLower().section(QLatin1Char('$'), 0, 0),
+                         m_identity.realm));
+        }
+        root.attributes.insert(QStringLiteral("isSynchronized"), QStringLiteral("TRUE"));
+        root.attributes.insert(QStringLiteral("isGlobalCatalogReady"),
+                               gcListening() ? QStringLiteral("TRUE") : QStringLiteral("FALSE"));
+        // Windows 2000 behavior level. Every DC in a Windows 2000 forest reports
+        // 0 here, and 0 is what this server implements: no read-only DCs, no
+        // DFSR, no Recycle Bin, no post-2000 schema behavior.
+        root.attributes.insert(QStringLiteral("domainControllerFunctionality"), QStringLiteral("0"));
+        root.attributes.insert(QStringLiteral("domainFunctionality"), QStringLiteral("0"));
+        root.attributes.insert(QStringLiteral("forestFunctionality"), QStringLiteral("0"));
+        root.attributes.insert(QStringLiteral("supportedCapabilities"),
+                               QStringLiteral("1.2.840.113556.1.4.800"));
+        // Only the control this server answers: paged results. Listing the
+        // others a Windows 2000 DC lists would advertise handlers that are not
+        // here, which is exactly the kind of claim this project refuses.
+        root.attributes.insert(QStringLiteral("supportedControl"),
+                               QStringLiteral("1.2.840.113556.1.4.319"));
+        root.attributes.insert(QStringLiteral("supportedSASLMechanisms"),
+                               QStringLiteral("GSSAPI; GSS-SPNEGO"));
+    }
     m_objects.prepend(root);
 
     // Schema container (minimal) — only when the store does not have one.

@@ -107,6 +107,17 @@ bool DcService::start(const QString &dcDir)
     m_kdc->setRealm(krbRealm);
     m_kdc->setObjectProvider([this]() { return m_ldapServer->objects(); });
     m_ldapServer->setKdc(m_kdc);
+
+    // The DSA's published identity, taken from the same config that named the
+    // realm: the root DSE answers with this instead of leaving a client to
+    // guess which directory agent it reached.
+    LdapServer::Identity identity;
+    identity.realm = krbRealm.realm;
+    identity.netbios = krbRealm.netbios;
+    identity.dnsDomain = dnsDomain;
+    identity.dcHost = dcHost;
+    identity.siteName = siteName;
+    m_ldapServer->setIdentity(identity);
     const int kdcPort = dcConfig.value(QStringLiteral("kdcPort"), 8888).toInt();
     if (!m_kdc->listen(quint16(kdcPort))) {
         emit statusMessage(tr("Kerberos KDC failed to listen on port %1.").arg(kdcPort));
@@ -125,6 +136,18 @@ bool DcService::start(const QString &dcDir)
     if (!m_ldapServer->isListening()) {
         // The directory is the one thing a DC cannot do without.
         return false;
+    }
+
+    // Global Catalog: the same store on 3268, which is what the `_gc._tcp`
+    // locator record has always pointed at. The root DSE reports
+    // isGlobalCatalogReady from whether this listener actually came up, so a
+    // port that is taken is visible to the client instead of assumed away.
+    const int gcPort = dcConfig.value(QStringLiteral("gcPort"), 3268).toInt();
+    if (!m_ldapServer->listenGc(quint16(gcPort))) {
+        emit statusMessage(tr("Global Catalog failed to listen on port %1.").arg(gcPort));
+    } else {
+        emit statusMessage(
+            tr("Global Catalog served on port %1.").arg(m_ldapServer->gcServerPort()));
     }
 
     // Remote management: the SAMR interface over DCE/RPC, backed by the same
@@ -506,7 +529,8 @@ bool DcService::start(const QString &dcDir)
     m_dnsServer->setForwarders(forwarders);
     m_dnsServer->setForwardingEnabled(dcConfig.value(QStringLiteral("forwarding"), true).toBool());
     if (!m_dnsServer->loadZone(m_zonePath)) {
-        m_dnsServer->loadAdZone(dnsDomain, dcHost, dcIp, quint16(ldapPort), 3268, siteName);
+        m_dnsServer->loadAdZone(dnsDomain, dcHost, dcIp, quint16(ldapPort), quint16(gcPort),
+                                siteName);
     }
     if (!m_dnsServer->listen(quint16(dcConfig.value(QStringLiteral("dnsPort"), 1053).toInt()))) {
         emit statusMessage(tr("DNS server failed to bind its port."));

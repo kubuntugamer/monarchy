@@ -34,6 +34,27 @@ public:
 
     bool listen(quint16 port = 1389);
 
+    // What a Windows client learns about the DSA itself from the root DSE. Set
+    // from dc.conf; while it is unset the root DSE publishes only the naming
+    // contexts, so a bare store does not claim to be a domain controller.
+    struct Identity {
+        QString realm;
+        QString netbios;
+        QString dnsDomain;
+        QString dcHost;
+        QString siteName;
+    };
+    void setIdentity(const Identity &identity);
+    Identity identity() const { return m_identity; }
+
+    // The Global Catalog: the same store, offered on the port a client uses
+    // when it wants a forest-wide view. It is the same LdapServer and the same
+    // objects, so a write is visible on both ports with no replication step.
+    bool listenGc(quint16 port = 3268);
+    void closeGc();
+    bool gcListening() const;
+    quint16 gcServerPort() const;
+
     // TLS for StartTLS (RFC 4511 §4.14.1). The listener accepts plaintext and
     // upgrades a connection in place when the client sends the StartTLS extended
     // request. With no credentials loaded the request is refused with
@@ -262,6 +283,8 @@ private:
     void ensureRootDse();
 
     QTcpServer *m_server = nullptr;
+    QTcpServer *m_gcServer = nullptr;
+    Identity m_identity;
     Kdc *m_kdc = nullptr;
     QSslCertificate m_tlsCertificate;
     QSslKey m_tlsKey;
