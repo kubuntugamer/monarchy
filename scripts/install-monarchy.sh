@@ -83,7 +83,7 @@ Install mode
 
 Domain
   --realm REALM       Kerberos realm (default: MONARCHY.EXAMPLE.COM)
-  --domain NAME       NetBIOS domain name (wizard default: the hostname;
+  --domain NAME       NetBIOS name (wizard default: the hostname;
                       otherwise the first realm label)
   --adminpass PASS    Administrator password (prompted for when omitted;
                       required for unattended runs)
@@ -627,7 +627,7 @@ EOF
         netbios_default="${netbios_default:0:15}"
     fi
     while :; do
-        netbios="$(wizard_ask "NetBIOS domain name" "$netbios_default")"
+        netbios="$(wizard_ask "NetBIOS name" "$netbios_default")"
         if [[ "$netbios" =~ ^[A-Za-z0-9-]{1,15}$ ]]; then
             DOMAIN="${netbios^^}"
             break
