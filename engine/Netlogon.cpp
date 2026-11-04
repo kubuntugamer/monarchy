@@ -926,8 +926,13 @@ QByteArray NetlogonServer::serverPasswordSet2(const QByteArray &stub)
         return statusOnly(kStatusWrongPassword);
     const QByteArray plain = Krb5::rc4(channel->sessionKey, cipherText);
     QByteArray passwordBytes = plain.mid(512 - int(length), int(length));
-    while (passwordBytes.size() >= 2 && passwordBytes.endsWith('\0'))
-        passwordBytes.chop(1);
+    // Trim the UTF-16 terminator a code unit at a time. Chopping single bytes
+    // would also eat the zero high byte of a final ASCII character, so
+    // "Pass12" would arrive at the hash as "Pass1".
+    while (passwordBytes.size() >= 2 && passwordBytes.at(passwordBytes.size() - 1) == '\0'
+           && passwordBytes.at(passwordBytes.size() - 2) == '\0') {
+        passwordBytes.chop(2);
+    }
     if (passwordBytes.size() < 2)
         return statusOnly(kStatusWrongPassword);
     const QString password = QString::fromUtf16(
@@ -945,8 +950,11 @@ QByteArray NetlogonServer::serverPasswordSet2(const QByteArray &stub)
         return statusOnly(kStatusAccessDenied);
     }
 
+    // The return authenticator echoes the request's timestamp, as the logon
+    // arm does; a client steps its chain on that value, so a zero here would
+    // desynchronise every later call on the channel.
     QByteArray out = reply;
-    putLe32(out, 0); // return_authenticator.timestamp
+    putLe32(out, timestamp);
     putLe32(out, kStatusSuccess);
     emit requestReceived(QStringLiteral("ServerPasswordSet2(%1)").arg(accountName));
     return out;

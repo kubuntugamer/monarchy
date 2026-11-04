@@ -9,6 +9,7 @@
 #include "Des.h"
 #include "Netlogon.h"
 #include "Ndr.h"
+#include "Krb5.h"
 #include "Ntlm.h"
 
 namespace {
@@ -215,6 +216,98 @@ void appendNetworkLogon(QByteArray &out, quint16 validationLevel, const QByteArr
 
 }
 
+QByteArray uniqueString(const QString &text, quint32 referent)
+{
+    QByteArray out;
+    appendLe32(out, referent);
+    appendStringArray(out, text);
+    return out;
+}
+
+QByteArray passwordSetRequest(const QString &account, const QString &computer,
+                              const QByteArray &credential, quint32 timestamp,
+                              const QByteArray &cipherText, quint32 length)
+{
+    QByteArray stub;
+    appendLe32(stub, 0); // NULL server_name
+    appendStringArray(stub, account, false);
+    appendLe16(stub, 2); // SEC_CHAN_WKSTA
+    while (stub.size() % 4 != 0) stub.append('\0');
+    appendStringArray(stub, computer);
+    stub.append(credential);
+    appendLe32(stub, timestamp);
+    stub.append(cipherText);
+    appendLe32(stub, length);
+    return stub;
+}
+
+QByteArray getDcNameRequest(const QString &domain)
+{
+    QByteArray stub;
+    appendStringArray(stub, QString()); // DomainControllerName: not yet known
+    stub.append(uniqueString(domain, 0x00022000u));
+    return stub;
+}
+
+DirectoryObject machineAccount(const QByteArray &ntHash)
+{
+    DirectoryObject machine;
+    machine.id = QStringLiteral("CN=DC1,OU=Domain Controllers,DC=corp,DC=example,DC=com");
+    machine.name = QStringLiteral("DC1");
+    machine.kind = ObjectKind::Computer;
+    machine.attributes.insert(QStringLiteral("sAMAccountName"), QStringLiteral("DC1$"));
+    machine.attributes.insert(QStringLiteral("objectSid"), QStringLiteral("S-1-5-21-1-2-3-1000"));
+    machine.attributes.insert(QStringLiteral("ntHash"), QString::fromLatin1(ntHash.toHex()));
+    return machine;
+}
+
+struct ChannelFixture {
+    bool ok = false;
+    QByteArray sessionKey;
+    QByteArray seed;
+    quint32 flags = 0;
+};
+
+// The client half of MS-NRPC 3.1.4.4.1-3.1.4.4.3, computed independently of
+// the server: challenge, session key from the machine hash, and the first
+// credential over the client challenge.
+ChannelFixture openChannel(NetlogonServer &server, const QByteArray &machineHash,
+                           quint32 flags = Netlogon::kNegStrongKeys | Netlogon::kNegSupportsAes)
+{
+    ChannelFixture out;
+    out.flags = flags;
+    const QByteArray clientChallenge = QByteArray::fromHex("1112131415161718");
+    const QByteArray challengeReply = server.handleCall(
+        Netlogon::OpServerReqChallenge,
+        challengeRequest(QStringLiteral("DC1"), clientChallenge));
+    if (challengeReply.size() != 12 || readLe32(challengeReply, 8) != 0)
+        return out;
+    const QByteArray serverChallenge = challengeReply.left(8);
+    out.sessionKey = expectedSessionKey(machineHash, clientChallenge, serverChallenge, flags);
+    const QByteArray authReply = server.handleCall(
+        Netlogon::OpServerAuthenticate3,
+        authenticateRequest(QStringLiteral("DC1$"), QStringLiteral("DC1"),
+                            expectedCredential(clientChallenge, out.sessionKey, flags), flags));
+    if (authReply.size() != 20 || readLe32(authReply, 16) != 0)
+        return out;
+    out.seed = authReply.left(8);
+    out.ok = true;
+    return out;
+}
+
+QByteArray dsrGetDcNameEx2Request(const QString &domain)
+{
+    QByteArray stub;
+    appendLe32(stub, 0); // NULL ServerName
+    appendLe32(stub, 0); // NULL AccountName
+    appendLe32(stub, 0x1cu); // DomainControllerFlags
+    stub.append(uniqueString(domain, 0x00023000u));
+    appendLe32(stub, 0); // NULL DomainGuid
+    appendLe32(stub, 0); // NULL SiteName
+    appendLe32(stub, 0); // Flags
+    return stub;
+}
+
 } // namespace
 
 class NetlogonTest : public QObject
@@ -226,6 +319,9 @@ private slots:
     void secureChannelNegotiatesCrypto();
     void legacySamLogonAuthenticatesSecureChannel_data();
     void legacySamLogonAuthenticatesSecureChannel();
+    void passwordSet2WritesTheMachineHash();
+    void rejectsAChannelCredentialFromTheWrongPassword();
+    void dcLocatorNamesThisDc();
 };
 
 void NetlogonTest::secureChannelNegotiatesCrypto_data()
@@ -415,6 +511,135 @@ void NetlogonTest::secureChannelNegotiatesCrypto()
         QCOMPARE(readLe32(flagsReply, 12), quint32(0));
     }
 
+}
+
+void NetlogonTest::passwordSet2WritesTheMachineHash()
+{
+    NetlogonServer server;
+    Netlogon::Config config;
+    config.netbios = QStringLiteral("CORP");
+    config.realm = QStringLiteral("CORP.EXAMPLE.COM");
+    config.dnsDomain = QStringLiteral("corp.example.com");
+    config.dcName = QStringLiteral("DC1");
+    config.domainSid = QStringLiteral("S-1-5-21-1-2-3");
+    server.setConfig(config);
+
+    const QByteArray oldHash = Ntlm::ntowfV1(QStringLiteral("Mach!neP@ss1"));
+    const DirectoryObject machine = machineAccount(oldHash);
+    server.setObjectProvider([machine]() { return QList<DirectoryObject>{machine}; });
+
+    QString writtenDn;
+    QByteArray writtenHash;
+    Netlogon::WriteBackend writes;
+    writes.setNtHash = [&writtenDn, &writtenHash](const QString &dn, const QByteArray &hash,
+                                                  QString *) {
+        writtenDn = dn;
+        writtenHash = hash;
+        return true;
+    };
+    server.setWriteBackend(writes);
+
+    const ChannelFixture channel = openChannel(server, oldHash);
+    QVERIFY(channel.ok);
+
+    // MS-NRPC 3.1.4.4.5: the 512-byte buffer is the new password, UTF-16LE and
+    // right-justified, RC4-ciphered under the channel's session key.
+    const QByteArray password = Ndr::utf16le(QStringLiteral("N3w!Machine#42")) + QByteArray(2, '\0');
+    QByteArray plain(512, '\0');
+    plain.replace(512 - password.size(), password.size(), password);
+    const quint32 timestamp = 77;
+    const QByteArray reply = server.handleCall(
+        Netlogon::OpServerPasswordSet2,
+        passwordSetRequest(QStringLiteral("DC1$"), QStringLiteral("DC1"),
+                           nextCredential(channel.seed, timestamp, channel.sessionKey, channel.flags,
+                                          false),
+                           timestamp, Krb5::rc4(channel.sessionKey, plain),
+                           quint32(password.size())));
+    QCOMPARE(reply.size(), 16);
+    QCOMPARE(readLe32(reply, 8), timestamp);
+    QCOMPARE(readLe32(reply, 12), quint32(0));
+    QCOMPARE(writtenDn, machine.id);
+    // Only the hash of the new password reaches the directory.
+    QCOMPARE(writtenHash, Ntlm::ntowfV1(QStringLiteral("N3w!Machine#42")));
+}
+
+void NetlogonTest::rejectsAChannelCredentialFromTheWrongPassword()
+{
+    NetlogonServer server;
+    Netlogon::Config config;
+    config.netbios = QStringLiteral("CORP");
+    config.realm = QStringLiteral("CORP.EXAMPLE.COM");
+    config.domainSid = QStringLiteral("S-1-5-21-1-2-3");
+    server.setConfig(config);
+
+    const QByteArray ntHash = Ntlm::ntowfV1(QStringLiteral("Mach!neP@ss1"));
+    const DirectoryObject machine = machineAccount(ntHash);
+    server.setObjectProvider([machine]() { return QList<DirectoryObject>{machine}; });
+
+    const quint32 flags = Netlogon::kNegStrongKeys | Netlogon::kNegSupportsAes;
+    const QByteArray clientChallenge = QByteArray::fromHex("1112131415161718");
+    const QByteArray challengeReply = server.handleCall(
+        Netlogon::OpServerReqChallenge,
+        challengeRequest(QStringLiteral("DC1"), clientChallenge));
+    QCOMPARE(challengeReply.size(), 12);
+    const QByteArray serverChallenge = challengeReply.left(8);
+
+    // A client that does not know the machine password derives a different
+    // key, so its credential cannot match the one the server computes.
+    const QByteArray wrongKey = expectedSessionKey(
+        Ntlm::ntowfV1(QStringLiteral("not-the-machine-password")), clientChallenge,
+        serverChallenge, flags);
+    const QByteArray reply = server.handleCall(
+        Netlogon::OpServerAuthenticate3,
+        authenticateRequest(QStringLiteral("DC1$"), QStringLiteral("DC1"),
+                            expectedCredential(clientChallenge, wrongKey, flags), flags));
+    QCOMPARE(reply.size(), 4);
+    QCOMPARE(readLe32(reply, 0), quint32(0xc0000022u)); // STATUS_ACCESS_DENIED
+
+    // An account the directory does not hold is refused by name.
+    const QByteArray unknown = server.handleCall(
+        Netlogon::OpServerAuthenticate3,
+        authenticateRequest(QStringLiteral("GHOST$"), QStringLiteral("GHOST"),
+                            QByteArray(8, '\0'), flags));
+    QCOMPARE(unknown.size(), 4);
+    QCOMPARE(readLe32(unknown, 0), quint32(0xc0000064u)); // STATUS_NO_SUCH_USER
+}
+
+void NetlogonTest::dcLocatorNamesThisDc()
+{
+    NetlogonServer server;
+    Netlogon::Config config;
+    config.netbios = QStringLiteral("CORP");
+    config.realm = QStringLiteral("CORP.EXAMPLE.COM");
+    config.dnsDomain = QStringLiteral("corp.example.com");
+    config.dcName = QStringLiteral("DC1");
+    config.dcHost = QStringLiteral("dc1.corp.example.com");
+    config.dcIp = QStringLiteral("10.0.0.10");
+    config.siteName = QStringLiteral("Default-First-Site-Name");
+    config.domainSid = QStringLiteral("S-1-5-21-1-2-3");
+    server.setConfig(config);
+
+    const QByteArray dcNameReply =
+        server.handleCall(Netlogon::OpGetDcName, getDcNameRequest(QStringLiteral("CORP")));
+    QVERIFY(dcNameReply.contains(Ndr::utf16le(QStringLiteral("\\\\DC1"))));
+    QCOMPARE(readLe32(dcNameReply, dcNameReply.size() - 4), quint32(0));
+
+    const QByteArray dcNameRefused =
+        server.handleCall(Netlogon::OpGetDcName, getDcNameRequest(QStringLiteral("OTHER")));
+    QCOMPARE(dcNameRefused.size(), 4);
+    QCOMPARE(readLe32(dcNameRefused, 0), quint32(0xc0000064u)); // STATUS_NO_SUCH_USER
+
+    // The Ex2 arm carries the site, the address and the NBT_SERVER bits a
+    // client needs to pick this DC. It answers for the DNS domain as well as
+    // the NetBIOS name.
+    const QByteArray ex2Reply = server.handleCall(
+        Netlogon::OpDsRGetDcNameEx2, dsrGetDcNameEx2Request(QStringLiteral("corp.example.com")));
+    QVERIFY(ex2Reply.size() > 64);
+    QVERIFY(ex2Reply.contains(Ndr::utf16le(config.dcHost)));
+    QVERIFY(ex2Reply.contains(Ndr::utf16le(config.dcIp)));
+    QVERIFY(ex2Reply.contains(Ndr::utf16le(config.dnsDomain)));
+    QVERIFY(ex2Reply.contains(Ndr::utf16le(config.siteName)));
+    QCOMPARE(readLe32(ex2Reply, ex2Reply.size() - 4), quint32(0));
 }
 
 #include "test_netlogon.moc"

@@ -98,11 +98,14 @@ exactly as it would to a remote domain controller. Ordinary Kerberos clients
   (accounts, groups, membership, the full information classes including the
   aggregate class-21 write and password sets), **LSAD** (policy information,
   privileges, account rights, secrets), **DRSR** (`DsBind`/`DsGetNCChanges`,
-  `DsCrackNames`, DC info — a DCSync-shaped client can walk it), the
+  `DsCrackNames`, DC info — a DCSync-shaped client can walk it), **Netlogon**
+  (secure channel, machine-password write, SamLogon validation and the DC
+  locator), the
   **endpoint mapper**, and **SMB2** with `IPC$` named pipes into those same
   endpoints.
 - **Wiring** — the console hosts the engine on ports 1389 (LDAP), 8888 (KDC)
-  and 1053 (DNS), the DCE/RPC endpoints on `samrPort` 1035, `lsadPort` 1036
+  and 1053 (DNS), the DCE/RPC endpoints on `samrPort` 1035, `lsadPort` 1036,
+  `netlogonPort` 1037
   and `drsPort` 1038 (loopback only), plus the endpoint mapper and SMB2 on
   `epmPort`/`smbPort`, then connects to it over LDAP. Create, edit, delete, refresh, and
   password resets round-trip through the directory and survive a restart. The
@@ -274,7 +277,7 @@ default.
 The daemon serves the provisioned domain on **LDAP 389**, the Global Catalog
 on **3268**, the KDC on
 **88** and **DNS 53**, the DCE/RPC endpoints on `samrPort` 49152,
-`lsadPort` 49153 and `drsPort` 1038 (loopback), the endpoint mapper on
+`lsadPort` 49153, `netlogonPort` 1037 and `drsPort` 1038 (loopback), the endpoint mapper on
 `epmPort` and SMB2 on `smbPort`. The console is a pure client: it reads the
 provisioned domain's `dc.conf` (or `MONARCHY_DCDIR`) for the port, asks the
 server's root DSE for the naming context when none is configured, and connects
@@ -362,10 +365,13 @@ directory is provisioned or connected.
   SIDs, group links, policy files, secrets and root DSE, then binds and searches
   the provisioned store over real LDAP (including rejection of a wrong
   password and of an unknown account).
-- `monarchy-netlogon-tests` — the Netlogon secure-channel crypto: the
-  server-authenticate exchange against independent vectors and the legacy
-  `NetrLogonSamLogon` validation path. (The Netlogon endpoint slice itself is
-  not part of the 0.1.0 claim — see `STATUS.md`.)
+- `monarchy-netlogon-tests` — the Netlogon (MS-NRPC) endpoint: the
+  secure-channel handshake at every crypto level the server negotiates
+  (legacy DES, strong-key MD4, AES), the original and flags-carrying
+  authenticate opnums, an independently computed client walking the
+  credential chain into `NetrLogonSamLogon`, `NetrServerPasswordSet2` writing
+  only the new machine hash, a forged credential and unknown account refused,
+  and the DC locator's `NetrGetDCName`/`NetrDSRGetDcNameEx2` answers.
 - `monarchy-drs-tests` — the DRSR bind extensions, a whole V6
   `DsGetNCChanges` reply walked field by field (every object, its attribute
   list and its values), level-2 DC info, FQDN→canonical name cracking, and
@@ -479,8 +485,8 @@ fault, NDR32 negotiation) and `engine/Ndr.cpp` the NDR primitives, with
 `engine/Samr.cpp` serving SAMR, `engine/Lsad.cpp` LSAD and `engine/Drs.cpp`
 DRSR. The DC process serves those endpoints itself, from
 the same store the LDAP engine holds: `monarchy-ui` listens on `127.0.0.1`, on the
-ports in `dc.conf` (`samrPort` 1035, `lsadPort` 1036 and `drsPort` 1038 by
-default), so the accounts and RIDs returned
+ports in `dc.conf` (`samrPort` 1035, `lsadPort` 1036, `netlogonPort` 1037 and
+`drsPort` 1038 by default), so the accounts and RIDs returned
 over SAMR are the provisioned domain's own (a provisioned domain yields
 RIDs 500/501/502/1000 over both protocols). Binds authenticate with NTLMSSP,
 either directly (`auth_type` 10) or wrapped in GSS-SPNEGO (`auth_type` 9), which
@@ -619,20 +625,21 @@ Protocol references used for this
 `samr`/`lsad`/`epm` clients, with
 provenance and licences) are held in `reference/specs/`. Everything else — the
 bad-password and logon counters, the domain information *set* calls, and aliases
-— is absent and is not claimed to work; Netlogon (secure channel, DC locator,
-domain join) and `DsReplicaAdd` with the multi-DC half of replication are not
-implemented, nor is SMB 3.x, so there is no SMB encryption or preauth integrity, and `IPC$`
-is the only share — `\pipe\samr`, `\pipe\lsarpc` and `\pipe\epmapper` are
-reachable over SMB2 (see below), but a directory browse is empty;
-and LSAD's trusted-domain calls are refused until Netlogon exists to carry their
-secure channel. A logon week written over SAMR is
+— is absent and is not claimed to work; `DsReplicaAdd` with the multi-DC half
+of replication is not implemented, nor is SMB 3.x, so there is no SMB
+encryption or preauth integrity, and `IPC$` is the only share — `\pipe\samr`,
+`\pipe\lsarpc`, `\pipe\netlogon` and `\pipe\epmapper` are reachable over SMB2
+(see below), but a directory browse is empty. Netlogon now serves the
+secure-channel calls, but no real member has been driven through a domain join
+against it here, and LSAD's trusted-domain calls are still refused because
+creation has not been wired to the new channel. A logon week written over SAMR is
 stored and read back, but nothing consults it at logon yet, so it restricts
 nobody.
 `monarchy-rpc-probe` is the development endpoint used to drive that interop by
 hand, and `STATUS.md` is the 0.1.0 release contract.
 
 Not yet implemented: PKINIT and S4U, the rest of SAMR, LSAD trusted domains,
-Netlogon, `DsReplicaAdd` and multi-DC replication (two Monarchy DCs, or
+`DsReplicaAdd` and multi-DC replication (two Monarchy DCs, or
 Samba/Windows peers),
 NTLM over raw SMB/DCE, GPO editing and client-side extension processing, the
 DNSP RPC interface and

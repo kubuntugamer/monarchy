@@ -840,6 +840,7 @@ ProvisionResult provisionDomain(const ProvisionConfig &config)
     conf.setValue(QStringLiteral("lsadPort"), lsadPort);
     conf.setValue(QStringLiteral("epmPort"), config.epmPort);
     conf.setValue(QStringLiteral("smbPort"), config.smbPort);
+    conf.setValue(QStringLiteral("netlogonPort"), 1037);
     conf.setValue(QStringLiteral("kdcPort"), kdcPort);
     conf.setValue(QStringLiteral("krb5ConfPath"), result.krb5ConfPath);
     conf.setValue(QStringLiteral("dcName"), b.dcName);
