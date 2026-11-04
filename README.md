@@ -374,8 +374,9 @@ directory is provisioned or connected.
   writing only the new machine hash, a forged credential and unknown account
   refused, a partner DC's trust channel authenticating with the stored trust
   secret (an outbound-only trust is not an account), `NetrLogonGetTrustRid`
-  naming the disabled trust account LSAD creates, and the DC locator's
-  `NetrGetDCName`/`NetrDSRGetDcNameEx2` answers.
+  naming the disabled trust account LSAD creates, and the locator calls —
+  `NetrGetDCName`, `NetrDSRGetDcNameEx2`, the older `NetrGetAnyDCName` and
+  `NetrDSRGetSiteName`.
 - `monarchy-drs-tests` — the DRSR bind extensions, a whole V6
   `DsGetNCChanges` reply walked field by field (every object, its attribute
   list and its values), level-2 DC info, FQDN→canonical name cracking, and

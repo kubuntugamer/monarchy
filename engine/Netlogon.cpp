@@ -1225,6 +1225,56 @@ QByteArray NetlogonServer::samLogon(const QByteArray &stub, bool withAuthenticat
     return out;
 }
 
+// NetrGetAnyDCName: the Windows 2000-era locator a workstation calls when it
+// knows only the domain. Any DC in a served domain is a correct answer, so it
+// is this one; a domain this DC does not serve is ERROR_NO_SUCH_DOMAIN.
+QByteArray NetlogonServer::getAnyDcName(const QByteArray &stub)
+{
+    constexpr quint32 kErrorNoSuchDomain = 1355;
+    Ndr::Reader reader(stub);
+    QString logonServer;
+    QString domain;
+    if (!readUniqueString(reader, &logonServer) || !readUniqueString(reader, &domain))
+        return statusOnly(kStatusInvalidParameter);
+    Q_UNUSED(logonServer)
+    const bool served = domain.compare(m_config.netbios, Qt::CaseInsensitive) == 0
+                        || domain.compare(m_config.realm, Qt::CaseInsensitive) == 0
+                        || domain.compare(m_config.dnsDomain, Qt::CaseInsensitive) == 0;
+    QByteArray out;
+    if (!served) {
+        putLe32(out, 0); // NULL dcname
+        putLe32(out, kErrorNoSuchDomain);
+        emit requestReceived(QStringLiteral("GetAnyDCName(%1): no such domain").arg(domain));
+        return out;
+    }
+    const QString name = QStringLiteral("\\\\%1").arg(m_config.dcName);
+    putLe32(out, 0x00020001u);
+    out.append(stringArray(name));
+    putLe32(out, kStatusSuccess);
+    emit requestReceived(QStringLiteral("GetAnyDCName(%1) = %2").arg(domain, name));
+    return out;
+}
+
+// NetrDsRGetSiteName: the site a computer belongs to. One site is defined, so
+// every computer is in it.
+QByteArray NetlogonServer::dsrGetSiteName(const QByteArray &stub)
+{
+    Ndr::Reader reader(stub);
+    QString computer;
+    if (!readUniqueString(reader, &computer))
+        return statusOnly(kStatusInvalidParameter);
+    Q_UNUSED(computer)
+    QString site = m_config.siteName;
+    if (site.isEmpty())
+        site = QStringLiteral("Default-First-Site-Name");
+    QByteArray out;
+    putLe32(out, 0x00020001u);
+    out.append(stringArray(site));
+    putLe32(out, kStatusSuccess);
+    emit requestReceived(QStringLiteral("DsRGetSiteName = %1").arg(site));
+    return out;
+}
+
 // NetrLogonGetTrustRid (MS-NRPC 3.5.4.4.6): the RID of the account the trust
 // keeps in this domain, which is the `FABRIKAM$` account LSAD created beside
 // the trustedDomain object. A caller that names a domain this DC has no trust
@@ -1367,6 +1417,10 @@ QByteArray NetlogonServer::handleCall(quint16 opnum, const QByteArray &stub,
         return serverPasswordSet2(stub);
     case Netlogon::OpLogonSamLogonEx:
         return samLogon(stub, false, true);
+    case Netlogon::OpGetAnyDCName:
+        return getAnyDcName(stub);
+    case Netlogon::OpDsRGetSiteName:
+        return dsrGetSiteName(stub);
     case Netlogon::OpLogonGetTrustRid:
         return logonGetTrustRid(stub);
     case Netlogon::OpGetDcName:

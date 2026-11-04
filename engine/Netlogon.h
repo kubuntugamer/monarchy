@@ -67,7 +67,9 @@ enum Opnum : quint16 {
     OpServerAuthenticate2 = 15,
     OpServerAuthenticate3 = 26,
     OpServerPasswordSet2 = 30,
+    OpGetAnyDCName = 13,
     OpLogonGetTrustRid = 23,
+    OpDsRGetSiteName = 28,
     OpDsRGetDcNameEx2 = 34,
     OpLogonSamLogonEx = 39,
     OpLogonSamLogonWithFlags = 45
@@ -146,6 +148,8 @@ private:
     QByteArray serverReqChallenge(const QByteArray &stub);
     QByteArray serverAuthenticate(const QByteArray &stub, quint16 opnum);
     QByteArray serverPasswordSet2(const QByteArray &stub);
+    QByteArray getAnyDcName(const QByteArray &stub);
+    QByteArray dsrGetSiteName(const QByteArray &stub);
     QByteArray logonGetTrustRid(const QByteArray &stub);
     QByteArray getDcName(const QByteArray &stub);
     QByteArray dsrGetDcNameEx2(const QByteArray &stub);

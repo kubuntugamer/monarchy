@@ -324,6 +324,7 @@ private slots:
     void dcLocatorNamesThisDc();
     void trustChannelUsesTheTrustSecret();
     void reportsTheTrustAccountRid();
+    void answersTheLegacyLocatorCalls();
 };
 
 void NetlogonTest::secureChannelNegotiatesCrypto_data()
@@ -743,6 +744,47 @@ void NetlogonTest::reportsTheTrustAccountRid()
     const QByteArray unknown =
         server.handleCall(Netlogon::OpLogonGetTrustRid, request(QStringLiteral("CONTOSO")));
     QCOMPARE(readLe32(unknown, unknown.size() - 4), quint32(1355)); // ERROR_NO_SUCH_DOMAIN
+}
+
+// The pre-DsRGetDcName locator a Windows 2000 client uses: any DC in a served
+// domain, and the site a computer sits in.
+void NetlogonTest::answersTheLegacyLocatorCalls()
+{
+    NetlogonServer server;
+    Netlogon::Config config;
+    config.netbios = QStringLiteral("CORP");
+    config.realm = QStringLiteral("CORP.EXAMPLE.COM");
+    config.dnsDomain = QStringLiteral("corp.example.com");
+    config.dcName = QStringLiteral("DC1");
+    config.siteName = QStringLiteral("Default-First-Site-Name");
+    config.domainSid = QStringLiteral("S-1-5-21-1-2-3");
+    server.setConfig(config);
+
+    const auto anyDcRequest = [](const QString &domain) {
+        QByteArray stub;
+        appendLe32(stub, 0);          // logon_server: NULL
+        appendLe32(stub, 0x00020001); // domainname present
+        appendStringArray(stub, domain);
+        return stub;
+    };
+    const QByteArray reply =
+        server.handleCall(Netlogon::OpGetAnyDCName, anyDcRequest(QStringLiteral("CORP")));
+    QCOMPARE(readLe32(reply, reply.size() - 4), quint32(0));
+    QVERIFY(readLe32(reply, 0) != 0); // the dcname pointer
+    QVERIFY(reply.contains(Ndr::utf16le(QStringLiteral("\\\\DC1"))));
+
+    const QByteArray unknown =
+        server.handleCall(Netlogon::OpGetAnyDCName, anyDcRequest(QStringLiteral("CONTOSO")));
+    QCOMPARE(readLe32(unknown, 0), quint32(0)); // NULL dcname
+    QCOMPARE(readLe32(unknown, unknown.size() - 4), quint32(1355)); // NO_SUCH_DOMAIN
+
+    // DsRGetSiteName with a NULL computer name still answers this DC's site.
+    QByteArray siteRequest;
+    appendLe32(siteRequest, 0);
+    const QByteArray site =
+        server.handleCall(Netlogon::OpDsRGetSiteName, siteRequest);
+    QCOMPARE(readLe32(site, site.size() - 4), quint32(0));
+    QVERIFY(site.contains(Ndr::utf16le(QStringLiteral("Default-First-Site-Name"))));
 }
 
 void NetlogonTest::dcLocatorNamesThisDc()
