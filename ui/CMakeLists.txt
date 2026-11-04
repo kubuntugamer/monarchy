@@ -378,4 +378,4 @@ if(BUILD_TESTING)
     )
 endif()
 
-install(TARGETS monarchy-ui monarchy-provision DESTINATION bin)
+install(TARGETS monarchy-ui monarchy-dcd monarchy-provision DESTINATION bin)

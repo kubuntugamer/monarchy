@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-FileCopyrightText: 2026 Monarchy contributors
 # SPDX-License-Identifier: GPL-3.0-or-later
-# Install Monarchy's domain controller as boot-started system services.
+# Install an already-built Monarchy as a boot-started system service.
 #
 #   scripts/install-dc-services.sh [dcdir]
 #
@@ -9,17 +9,20 @@
 # StateDirectory= creates and owns for the service. Everything lives under
 # that directory: the provisioned store, dc.conf, DNS zone, sysvol, keys.
 #
-# After installing, provision the domain once:
+# The unit is enabled at boot. If the domain is not provisioned yet the script
+# leaves it stopped rather than starting a service that has nothing to serve:
 #   sudo -u monarchy-dc /usr/local/bin/monarchy-provision \
 #        /var/lib/monarchy/Monarchy --realm MONARCHY.EXAMPLE.COM --adminpass '…'
-# and restart the unit (`systemctl restart monarchy-dcd`). The daemon then
-# serves whatever dc.conf lists at boot, exactly like a Windows DC's
-# services start.
+#   sudo systemctl restart monarchy-dcd
+#
+# For a full build-install-provision-start run, use scripts/install-monarchy.sh
+# instead.
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DCDIR="${1:-/var/lib/monarchy/Monarchy}"
+DCDIR="$(realpath -m "${1:-/var/lib/monarchy/Monarchy}")"
+PREFIX="/usr/local"
 SERVICE_USER="monarchy-dc"
 SERVICE_GROUP="$SERVICE_USER"
 
@@ -41,30 +44,59 @@ DCD_BIN="$(find_bin monarchy-dcd)"
 PROVISION_BIN="$(find_bin monarchy-provision)"
 
 # The service runs unprivileged except for binding the privileged ports.
+getent group "$SERVICE_GROUP" >/dev/null \
+    || groupadd --system "$SERVICE_GROUP"
 getent passwd "$SERVICE_USER" >/dev/null \
-    || useradd --system --home-dir /var/lib/monarchy --shell /usr/sbin/nologin \
-               "$SERVICE_USER"
+    || useradd --system --gid "$SERVICE_GROUP" --home-dir /var/lib/monarchy \
+               --shell /usr/sbin/nologin "$SERVICE_USER"
 
-install -m 0755 "$DCD_BIN" /usr/local/bin/monarchy-dcd
-install -m 0755 "$PROVISION_BIN" /usr/local/bin/monarchy-provision
-install -m 0644 "$ROOT/packaging/monarchy-dcd.service" /etc/systemd/system/monarchy-dcd.service
+install -m 0755 "$DCD_BIN" "$PREFIX/bin/monarchy-dcd"
+install -m 0755 "$PROVISION_BIN" "$PREFIX/bin/monarchy-provision"
 
 # The store's home: systemd's StateDirectory= already creates
 # /var/lib/monarchy at start, but provisioning happens before the first
-# start, so create it here with the service's ownership.
-install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$(dirname "$DCDIR")"
-install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$DCDIR"
+# start, so create it here with the service's ownership. Own only the store
+# itself, never an arbitrary parent such as /srv.
+mkdir -p "$DCDIR"
+chown "$SERVICE_USER:$SERVICE_GROUP" "$DCDIR"
+chmod 0750 "$DCDIR"
+
+# The unit assumes the default paths; rewrite them when dcdir differs.
+# A store under /home also needs ProtectHome lifted.
+protect_home=true
+[[ "$DCDIR" == /home/* ]] && protect_home=false
+sed -e "s|--dcdir /var/lib/monarchy/Monarchy|--dcdir $DCDIR|" \
+    -e "s|-/var/lib/monarchy/Monarchy|-$DCDIR|" \
+    -e "s|ProtectHome=true|ProtectHome=$protect_home|" \
+    "$ROOT/packaging/monarchy-dcd.service" \
+    > /etc/systemd/system/monarchy-dcd.service
+chmod 0644 /etc/systemd/system/monarchy-dcd.service
 
 systemctl daemon-reload
-systemctl enable --now monarchy-dcd.service
+systemctl enable monarchy-dcd.service
+
+if [[ -f "$DCDIR/dc.conf" ]]; then
+    systemctl restart monarchy-dcd.service
+    STATE="running"
+    if command -v ss >/dev/null 2>&1; then
+        dns53="$(ss -lunpH 'sport = :53' 2>/dev/null || true)"
+        if [[ -n "$dns53" ]] && ! grep -q 'monarchy-dcd' <<<"$dns53"; then
+            printf 'install-dc-services: port 53 is held by another resolver; if it is\n' >&2
+            printf '  systemd-resolved, run scripts/install-monarchy.sh --fix-dns53\n' >&2
+        fi
+    fi
+else
+    STATE="waiting for a provisioned domain"
+fi
 
 cat <<EOF
 
 Monarchy's domain controller is installed and enabled at boot.
 
   Unit:      systemctl status monarchy-dcd
-  State:     $DCDIR
-  Provision: sudo -u $SERVICE_USER /usr/local/bin/monarchy-provision \\
+  State:     $STATE
+  Store:     $DCDIR
+  Provision: sudo -u $SERVICE_USER $PREFIX/bin/monarchy-provision \\
                  $DCDIR --realm MONARCHY.EXAMPLE.COM --adminpass '…' [--force]
   Provisioning defaults to the native DC ports (53/389/88/135/445). Only for a
   rootless dev machine add --dev-ports. After re-provisioning (dc.conf changes):

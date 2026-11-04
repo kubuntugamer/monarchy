@@ -27,12 +27,57 @@
 #include "DcService.h"
 
 #include <QCoreApplication>
+#include <QFileInfo>
+#include <QSocketNotifier>
 #include <QStandardPaths>
 
+#include <csignal>
 #include <cstdio>
+#include <sys/socket.h>
+#include <unistd.h>
+
+namespace {
+
+// Exit status for a missing domain, matching sysexits.h's EX_CONFIG. The unit
+// lists it in RestartPreventExitStatus=, so an unprovisioned machine fails once
+// and visibly at boot instead of restarting forever.
+constexpr int kExitConfig = 78;
+
+int g_signalPipe[2] = {-1, -1};
+
+void onTerminationSignal(int signalNumber)
+{
+    const unsigned char byte = static_cast<unsigned char>(signalNumber);
+    // write(2) is async-signal-safe; the QSocketNotifier drains the other end.
+    const ssize_t written = ::write(g_signalPipe[1], &byte, 1);
+    (void)written;
+}
+
+// SIGTERM is what `systemctl stop` and `systemctl restart` send. Turning it
+// into QCoreApplication::quit() runs DcService::stop(), which flushes the
+// directory and DNS zone, instead of letting the process die mid-write.
+bool installTerminationHandlers()
+{
+    if (::socketpair(AF_UNIX, SOCK_STREAM, 0, g_signalPipe) != 0)
+        return false;
+    struct sigaction action {};
+    action.sa_handler = onTerminationSignal;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = SA_RESTART;
+    ::sigaction(SIGTERM, &action, nullptr);
+    ::sigaction(SIGINT, &action, nullptr);
+    return true;
+}
+
+} // namespace
 
 int main(int argc, char *argv[])
 {
+    // systemd captures stdout through a pipe, where stdio would otherwise
+    // buffer status lines until exit and leave `journalctl -u monarchy-dcd`
+    // empty while the service is running.
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);
+
     QCoreApplication app(argc, argv);
     // Same identity the provisioner and the console use, so the default
     // application-data directory (and therefore dc.conf) resolves alike.
@@ -58,8 +103,34 @@ int main(int argc, char *argv[])
         }
     }
 
-    // A daemon does not serve a demo store: without a provisioned domain it
-    // stops and reports, instead of answering LDAP with sample objects.
+    // A daemon does not serve a demo store. Check the configuration before
+    // constructing anything so an unprovisioned boot reports one clear error
+    // (and a non-restarting status) rather than a crash loop.
+    const QString resolvedDcDir =
+        dcDir.isEmpty() ? QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) : dcDir;
+    if (!QFileInfo::exists(resolvedDcDir + QStringLiteral("/dc.conf"))) {
+        std::fprintf(stderr,
+                     "monarchy-dcd: no provisioned domain under %s (dc.conf is missing).\n"
+                     "Create one with monarchy-provision, then start the service again.\n",
+                     qPrintable(resolvedDcDir));
+        return kExitConfig;
+    }
+
+    if (!installTerminationHandlers()) {
+        std::fprintf(stderr, "monarchy-dcd: could not install termination handlers.\n");
+        return 1;
+    }
+    auto *termination = new QSocketNotifier(g_signalPipe[0], QSocketNotifier::Read, &app);
+    QObject::connect(termination, &QSocketNotifier::activated, &app,
+                     [&app, termination]() {
+                         unsigned char signalNumber = 0;
+                         if (::read(g_signalPipe[0], &signalNumber, 1) <= 0)
+                             return;
+                         termination->setEnabled(false);
+                         std::printf("Received signal %d; stopping.\n", int(signalNumber));
+                         app.quit();
+                     });
+
     DcService service(false);
     QObject::connect(&service, &DcService::statusMessage,
                      [](const QString &message) { std::printf("%s\n", qPrintable(message)); });

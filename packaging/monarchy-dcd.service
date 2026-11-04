@@ -7,31 +7,65 @@
 # the AmbientCapabilities grant below makes those binds legal for the
 # service user. A domain provisioned with `--dev-ports` works the same way
 # on the unprivileged set.
+#
+# Installers rewrite the two absolute paths below when --prefix or --dcdir
+# differ from the defaults.
 
 [Unit]
 Description=Monarchy domain controller
-Documentation=file:///usr/share/doc/monarchy/README.md
-After=network-online.target
+Documentation=https://github.com/kubuntugamer/monarchy
+# A DC has to be reachable once the network is up and its clock has to be
+# right before it issues Kerberos tickets.
+After=network-online.target time-sync.target
 Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
-Type=simple
+Type=exec
 ExecStart=/usr/local/bin/monarchy-dcd --dcdir /var/lib/monarchy/Monarchy
 # A system account, not root: the only privilege it needs is binding the
 # privileged service ports, which AmbientCapabilities grants to the process.
 User=monarchy-dc
 Group=monarchy-dc
 StateDirectory=monarchy
+StateDirectoryMode=0750
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
+
+# Restart a crashed DC, but leave a machine with no provisioned domain in a
+# failed state: the daemon exits EX_CONFIG (78) when dc.conf is missing.
 Restart=on-failure
 RestartSec=2
+RestartPreventExitStatus=78
+# SIGTERM makes the daemon flush its store and DNS zone before exiting.
+KillSignal=SIGTERM
+TimeoutStopSec=30
 
 # A domain controller is written to be long-running; log to the journal the
 # way every other service does.
 StandardOutput=journal
 StandardError=journal
+SyslogIdentifier=monarchy-dcd
+UMask=0027
+
+# The service reads its configuration and writes only its state directory;
+# everything else on the host stays out of reach.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+ReadWritePaths=-/var/lib/monarchy/Monarchy
 
 [Install]
 WantedBy=multi-user.target
