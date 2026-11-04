@@ -343,9 +343,9 @@ private slots:
         QCOMPARE(readLe32(reply, 8), quint32(52));         // rgb conformant count
         // dwFlags: GETCHGREQ V5/V8/V10, GETCHGREPLY V6 — the shapes served.
         QCOMPARE(readLe32(reply, 12), quint32(0x25100000));
-        // The handle: 16-byte key plus the 4-byte pad, all non-zero key bytes.
-        for (int i = 64; i < 80; ++i)
-            QVERIFY2(reply.at(i) != '\0', "handle key must be non-zero");
+        // The handle: 16-byte key plus the 4-byte pad. Any byte of a GUID may
+        // legitimately be zero; what the client needs is a non-null handle.
+        QVERIFY(reply.mid(64, 16) != QByteArray(16, '\0'));
         QCOMPARE(readLe32(reply, 84), quint32(0)); // ErrorCode
     }
 
