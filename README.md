@@ -372,7 +372,9 @@ directory is provisioned or connected.
   credential chain into `NetrLogonSamLogon` (whose success stamps `lastLogon`,
   `logonCount` and the 14-day `lastLogonTimestamp`), `NetrServerPasswordSet2`
   writing only the new machine hash, a forged credential and unknown account
-  refused, and the DC locator's `NetrGetDCName`/`NetrDSRGetDcNameEx2` answers.
+  refused, a partner DC's trust channel authenticating with the stored trust
+  secret (an outbound-only trust is not an account), and the DC locator's
+  `NetrGetDCName`/`NetrDSRGetDcNameEx2` answers.
 - `monarchy-drs-tests` — the DRSR bind extensions, a whole V6
   `DsGetNCChanges` reply walked field by field (every object, its attribute
   list and its values), level-2 DC info, FQDN→canonical name cracking, and

@@ -719,6 +719,67 @@ DirectoryObject NetlogonServer::findAccount(const QString &name) const
     return {};
 }
 
+// A trust channel authenticates against the trustedDomain object the LSAD
+// calls store: the trusted domain's own account name (`FABRIKAM$`) and the
+// secret in trustAuthIncoming. Windows keeps a disabled account for the same
+// purpose; reading the trust directly means the two protocols cannot disagree
+// about which secret is current.
+DirectoryObject NetlogonServer::findTrustPrincipal(const QString &name) const
+{
+    QString account = name;
+    const int backslash = account.indexOf(QLatin1Char('\\'));
+    if (backslash >= 0)
+        account = account.mid(backslash + 1);
+    const int at = account.indexOf(QLatin1Char('@'));
+    if (at > 0)
+        account = account.left(at);
+    if (account.endsWith(QLatin1Char('$')))
+        account.chop(1);
+    if (account.isEmpty())
+        return {};
+    for (const DirectoryObject &object : directory()) {
+        if (!object.attributes.value(QStringLiteral("objectClass"))
+                 .contains(QLatin1String("trustedDomain"), Qt::CaseInsensitive))
+            continue;
+        const QString flat = object.attributes.value(QStringLiteral("flatName"));
+        const QString partner = object.attributes.value(QStringLiteral("trustPartner"));
+        const QString partnerFlat = partner.section(QLatin1Char('.'), 0, 0);
+        if (flat.compare(account, Qt::CaseInsensitive) != 0
+            && partnerFlat.compare(account, Qt::CaseInsensitive) != 0)
+            continue;
+        // Only an inbound trust accepts a channel from that domain, and only a
+        // secret this DC holds can prove it.
+        if ((object.attributes.value(QStringLiteral("trustDirection")).toUInt() & 1u) == 0)
+            continue;
+        const QString auth = object.attributes.value(QStringLiteral("trustAuthIncoming"));
+        const int colon = auth.indexOf(QLatin1Char(':'));
+        if (colon < 0)
+            continue;
+        const quint32 authType = auth.left(colon).toUInt();
+        const QByteArray data = QByteArray::fromHex(auth.mid(colon + 1).toLatin1());
+        QByteArray ntHash;
+        if (authType == 2) // TRUST_AUTH_TYPE_CLEAR
+            ntHash = Ntlm::ntowfV1(QString::fromUtf8(data));
+        else if (authType == 1 && data.size() == 16) // TRUST_AUTH_TYPE_NT4OWF
+            ntHash = data;
+        else
+            continue;
+        DirectoryObject principal;
+        principal.id = object.id;
+        principal.name = flat;
+        principal.kind = ObjectKind::Unknown;
+        principal.attributes.insert(QStringLiteral("sAMAccountName"),
+                                    flat + QLatin1Char('$'));
+        principal.attributes.insert(QStringLiteral("objectSid"),
+                                    object.attributes.value(QStringLiteral("securityIdentifier")));
+        principal.attributes.insert(QStringLiteral("ntHash"),
+                                    QString::fromLatin1(ntHash.toHex()));
+        principal.attributes.insert(QStringLiteral("userAccountControl"), QStringLiteral("0"));
+        return principal;
+    }
+    return {};
+}
+
 bool NetlogonServer::machineCredential(const DirectoryObject &object, QByteArray *ntHash) const
 {
     const QByteArray hash = QByteArray::fromHex(
@@ -827,7 +888,9 @@ QByteArray NetlogonServer::serverAuthenticate(const QByteArray &stub, quint16 op
         return statusOnly(kStatusNotSupported);
     }
 
-    const DirectoryObject account = findAccount(accountName);
+    DirectoryObject account = findAccount(accountName);
+    if (account.id.isEmpty())
+        account = findTrustPrincipal(accountName);
     if (account.id.isEmpty())
         return statusOnly(kStatusNoSuchUser);
     QByteArray ntHash;

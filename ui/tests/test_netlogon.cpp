@@ -322,6 +322,7 @@ private slots:
     void passwordSet2WritesTheMachineHash();
     void rejectsAChannelCredentialFromTheWrongPassword();
     void dcLocatorNamesThisDc();
+    void trustChannelUsesTheTrustSecret();
 };
 
 void NetlogonTest::secureChannelNegotiatesCrypto_data()
@@ -623,6 +624,72 @@ void NetlogonTest::rejectsAChannelCredentialFromTheWrongPassword()
                             QByteArray(8, '\0'), flags));
     QCOMPARE(unknown.size(), 4);
     QCOMPARE(readLe32(unknown, 0), quint32(0xc0000064u)); // STATUS_NO_SUCH_USER
+}
+
+// A partner DC opens the trust channel with the trusted domain's account name
+// and the trust secret, not a machine password. The secret the LSAD calls store
+// is the one used, so creating a trust over lsarpc is what enables its channel.
+void NetlogonTest::trustChannelUsesTheTrustSecret()
+{
+    NetlogonServer server;
+    Netlogon::Config config;
+    config.netbios = QStringLiteral("CORP");
+    config.realm = QStringLiteral("CORP.EXAMPLE.COM");
+    config.domainSid = QStringLiteral("S-1-5-21-1-2-3");
+    server.setConfig(config);
+
+    DirectoryObject trust;
+    trust.id = QStringLiteral("CN=FABRIKAM,CN=System,DC=corp,DC=example,DC=com");
+    trust.name = QStringLiteral("FABRIKAM");
+    trust.attributes.insert(QStringLiteral("objectClass"),
+                            QStringLiteral("top;leaf;trustedDomain"));
+    trust.attributes.insert(QStringLiteral("flatName"), QStringLiteral("FABRIKAM"));
+    trust.attributes.insert(QStringLiteral("trustPartner"), QStringLiteral("fabrikam.local"));
+    trust.attributes.insert(QStringLiteral("securityIdentifier"),
+                            QStringLiteral("S-1-5-21-9-8-7"));
+    trust.attributes.insert(QStringLiteral("trustDirection"), QStringLiteral("3"));
+    const QString secret = QStringLiteral("Trust!Secret9");
+    trust.attributes.insert(QStringLiteral("trustAuthIncoming"),
+                            QStringLiteral("2:")
+                                + QString::fromLatin1(secret.toUtf8().toHex()));
+    server.setObjectProvider([trust]() { return QList<DirectoryObject>{trust}; });
+
+    const QByteArray ntHash = Ntlm::ntowfV1(secret);
+    const QByteArray clientChallenge = QByteArray::fromHex("1020304050607080");
+    const QByteArray challengeReply = server.handleCall(
+        Netlogon::OpServerReqChallenge,
+        challengeRequest(QStringLiteral("PARTNERDC"), clientChallenge));
+    QCOMPARE(readLe32(challengeReply, 8), quint32(0));
+    const QByteArray serverChallenge = challengeReply.left(8);
+
+    const quint32 flags = Netlogon::kNegStrongKeys | Netlogon::kNegSupportsAes;
+    const QByteArray sessionKey =
+        expectedSessionKey(ntHash, clientChallenge, serverChallenge, flags);
+    const QByteArray reply = server.handleCall(
+        Netlogon::OpServerAuthenticate3,
+        authenticateRequest(QStringLiteral("FABRIKAM$"), QStringLiteral("PARTNERDC"),
+                            expectedCredential(clientChallenge, sessionKey, flags), flags));
+    QCOMPARE(readLe32(reply, reply.size() - 4), quint32(0));
+    QCOMPARE(readLe32(reply, 8), flags);
+    QCOMPARE(readLe32(reply, 12), quint32(7)); // the trust's SID, not a machine RID
+    QCOMPARE(reply.left(8), expectedCredential(serverChallenge, sessionKey, flags));
+
+    // A channel for a domain this DC has no inbound trust with has no secret to
+    // check against, so it is not an account at all.
+    trust.attributes.insert(QStringLiteral("trustDirection"), QStringLiteral("2")); // outbound only
+    NetlogonServer outbound;
+    outbound.setConfig(config);
+    outbound.setObjectProvider([trust]() { return QList<DirectoryObject>{trust}; });
+    const QByteArray outboundChallenge = outbound.handleCall(
+        Netlogon::OpServerReqChallenge,
+        challengeRequest(QStringLiteral("PARTNERDC"), clientChallenge));
+    const QByteArray outboundKey = expectedSessionKey(
+        ntHash, clientChallenge, outboundChallenge.left(8), flags);
+    const QByteArray refused = outbound.handleCall(
+        Netlogon::OpServerAuthenticate3,
+        authenticateRequest(QStringLiteral("FABRIKAM$"), QStringLiteral("PARTNERDC"),
+                            expectedCredential(clientChallenge, outboundKey, flags), flags));
+    QCOMPARE(readLe32(refused, refused.size() - 4), quint32(0xc0000064u)); // NO_SUCH_USER
 }
 
 void NetlogonTest::dcLocatorNamesThisDc()

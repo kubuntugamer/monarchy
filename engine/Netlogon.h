@@ -134,6 +134,9 @@ private:
     };
 
     DirectoryObject findAccount(const QString &name) const;
+    // The principal a partner DC authenticates as for an inbound trust. Its
+    // credential is the trust secret, not a machine password.
+    DirectoryObject findTrustPrincipal(const QString &name) const;
     QList<DirectoryObject> directory() const;
     // Gates the machine account the channel is opened for.
     bool machineCredential(const DirectoryObject &object, QByteArray *ntHash) const;
