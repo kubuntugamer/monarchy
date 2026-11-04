@@ -118,8 +118,9 @@ sudo scripts/install-monarchy.sh
 
 It asks for the domain FQDN, NetBIOS name, domain controller IPv4 address,
 Administrator password and resolver choice, then prints a promotion summary
-before touching the machine. The password is required and confirmed; it is
-never generated automatically. This build creates a **new forest only**; the
+before touching the machine. The NetBIOS name defaults to this machine's short
+hostname (uppercased and limited to 15 characters); you can edit it. The
+password is required and confirmed; it is never generated automatically. This build creates a **new forest only**; the
 wizard states that it cannot join an existing domain or add a replica DC.
 `sudo scripts/dcpromo` and `--wizard` open the same wizard directly.
 

@@ -83,7 +83,8 @@ Install mode
 
 Domain
   --realm REALM       Kerberos realm (default: MONARCHY.EXAMPLE.COM)
-  --domain NAME       NetBIOS domain name (default: first realm label)
+  --domain NAME       NetBIOS domain name (wizard default: the hostname;
+                      otherwise the first realm label)
   --adminpass PASS    Administrator password (prompted for when omitted;
                       required for unattended runs)
   --dcdir DIR         Domain store directory (default: /var/lib/monarchy/
@@ -536,6 +537,20 @@ wizard_valid_ipv4() {
     return 0
 }
 
+detect_netbios_name() {
+    local name=""
+    if command -v hostname >/dev/null 2>&1; then
+        name="$(hostname -s 2>/dev/null || hostname 2>/dev/null || true)"
+    fi
+    name="${name%%.*}"
+    name="$(printf '%s' "$name" \
+        | sed -e 's/[^A-Za-z0-9-]/-/g' -e 's/^-*//' -e 's/-*$//' \
+        | cut -c1-15)"
+    name="${name^^}"
+    name="${name%-}"
+    printf '%s' "$name"
+}
+
 detect_primary_ipv4() {
     local ip=""
     if command -v ip >/dev/null 2>&1; then
@@ -603,10 +618,13 @@ EOF
     done
     REALM="${fqdn^^}"
 
-    local netbios_default="${REALM%%.*}"
-    [[ $DOMAIN_GIVEN -eq 1 ]] && netbios_default="$DOMAIN"
-    if (( ${#netbios_default} > 15 )); then
-        netbios_default=""
+    local netbios_default=""
+    if [[ $DOMAIN_GIVEN -eq 1 ]]; then
+        netbios_default="$DOMAIN"
+    else
+        netbios_default="$(detect_netbios_name)"
+        [[ -n "$netbios_default" ]] || netbios_default="${REALM%%.*}"
+        netbios_default="${netbios_default:0:15}"
     fi
     while :; do
         netbios="$(wizard_ask "NetBIOS domain name" "$netbios_default")"
