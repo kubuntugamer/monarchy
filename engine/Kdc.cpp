@@ -342,23 +342,33 @@ QList<DirectoryObject> Kdc::directory() const
 
 bool Kdc::listen(quint16 port)
 {
-    close();
-    m_tcp = new QTcpServer(this);
-    if (!m_tcp->listen(QHostAddress::Any, port)) {
+    // Kerberos is served on one number over both TCP and UDP. UDP and TCP have
+    // separate port spaces, so when the caller asks for port 0 the number the
+    // kernel hands the TCP socket can already belong to an unrelated UDP socket
+    // and the pair cannot be completed. An ephemeral request therefore means
+    // "any port that carries both", so draw again rather than failing; a port
+    // asked for by number is bound once.
+    const int attempts = port == 0 ? 16 : 1;
+    for (int attempt = 0; attempt < attempts; ++attempt) {
         close();
-        return false;
-    }
-    m_port = m_tcp->serverPort();
+        m_tcp = new QTcpServer(this);
+        if (!m_tcp->listen(QHostAddress::Any, port)) {
+            close();
+            return false;
+        }
+        m_port = m_tcp->serverPort();
 
-    m_udp = new QUdpSocket(this);
-    if (!m_udp->bind(QHostAddress::Any, m_port)) {
-        close();
-        return false;
-    }
+        m_udp = new QUdpSocket(this);
+        if (!m_udp->bind(QHostAddress::Any, m_port)) {
+            close();
+            continue;
+        }
 
-    connect(m_tcp, &QTcpServer::newConnection, this, &Kdc::onTcpConnection);
-    connect(m_udp, &QUdpSocket::readyRead, this, &Kdc::onUdpDatagram);
-    return true;
+        connect(m_tcp, &QTcpServer::newConnection, this, &Kdc::onTcpConnection);
+        connect(m_udp, &QUdpSocket::readyRead, this, &Kdc::onUdpDatagram);
+        return true;
+    }
+    return false;
 }
 
 void Kdc::close()
