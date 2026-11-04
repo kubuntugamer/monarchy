@@ -42,7 +42,6 @@ WIZARD=0
 SERVICE=""
 USER_MODE=0
 SERVICE_USER="monarchy-dc"
-GENERATED_PASS=0
 REALM_GIVEN=0
 DOMAIN_GIVEN=0
 DC_IP_GIVEN=0
@@ -82,8 +81,8 @@ Install mode
 Domain
   --realm REALM       Kerberos realm (default: MONARCHY.EXAMPLE.COM)
   --domain NAME       NetBIOS domain name (default: first realm label)
-  --adminpass PASS    Administrator password (default: generated and
-                      printed at the end)
+  --adminpass PASS    Administrator password (prompted for when omitted;
+                      required for unattended runs)
   --dcdir DIR         Domain store directory (default: /var/lib/monarchy/
                       Monarchy as root, the user data directory otherwise)
   --dc-ip ADDRESS     Address published in the domain DNS zone
@@ -436,16 +435,6 @@ check_dns_port_conflict() {
     configure_resolved_stub_listener || true
 }
 
-generate_password() {
-    local raw
-    if command -v openssl >/dev/null 2>&1; then
-        raw="$(openssl rand -base64 32 | tr -dc 'A-Za-z0-9')"
-    else
-        raw="$(head -c 32 /dev/urandom | base64 | tr -dc 'A-Za-z0-9')"
-    fi
-    printf 'Aa1!%s' "${raw:0:20}"
-}
-
 provision_domain() {
     [[ $PROVISION -eq 1 ]] || { log "Skipping domain provisioning"; return 0; }
 
@@ -455,8 +444,7 @@ provision_domain() {
     fi
 
     if [[ -z "$ADMINPASS" ]]; then
-        ADMINPASS="$(generate_password)"
-        GENERATED_PASS=1
+        die "an Administrator password is required; pass --adminpass or run interactively"
     fi
 
     local provisioner="$PREFIX/bin/monarchy-provision"
@@ -554,24 +542,22 @@ detect_primary_ipv4() {
     printf '%s' "$ip"
 }
 
-wizard_password() {
+prompt_admin_password() {
     [[ -n "$ADMINPASS" ]] && return 0
     local first="" second=""
     while :; do
-        printf 'Administrator password (blank to generate): ' >&2
+        printf 'Administrator password: ' >&2
         IFS= read -r -s first || die "input ended during promotion setup"
         printf '\n' >&2
         if [[ -z "$first" ]]; then
-            ADMINPASS=""
-            GENERATED_PASS=1
-            return 0
+            warn "a password is required; enter one or pass --adminpass"
+            continue
         fi
         printf 'Confirm Administrator password: ' >&2
         IFS= read -r -s second || die "input ended during promotion setup"
         printf '\n' >&2
         if [[ "$first" == "$second" ]]; then
             ADMINPASS="$first"
-            GENERATED_PASS=0
             return 0
         fi
         warn "passwords do not match; try again"
@@ -633,12 +619,8 @@ EOF
     done
     DC_IP="$ip"
 
-    wizard_password
-    if [[ -n "$ADMINPASS" ]]; then
-        password_note="supplied"
-    else
-        password_note="generated after confirmation"
-    fi
+    prompt_admin_password
+    password_note="supplied"
 
     if [[ $FIX_DNS53 -eq 0 ]]; then
         answer="$(wizard_ask "Use this DC as this machine's DNS resolver? (y/n)" "y")"
@@ -691,6 +673,15 @@ if [[ $WIZARD -eq 1 ]]; then
     [[ $USER_MODE -eq 0 ]] || die "the promotion wizard cannot be combined with --user"
     [[ $PROVISION -eq 1 ]] || die "the promotion wizard needs provisioning; remove --no-provision"
     run_promotion_wizard
+elif [[ $PROVISION -eq 1 && -z "$ADMINPASS" \
+        && ( $FORCE -eq 1 || ! -f "$DCDIR/dc.conf" ) ]]; then
+    # No default password: ask for one interactively, and fail fast in
+    # unattended runs before spending time on the build.
+    if [[ -t 0 ]]; then
+        prompt_admin_password
+    else
+        die "an Administrator password is required; pass --adminpass or run interactively"
+    fi
 fi
 
 if [[ $INSTALL_DEPS -eq 1 ]]; then
@@ -728,15 +719,6 @@ else
     cat <<EOF
   Run:     $PREFIX/bin/monarchy-ui
   Daemon:  $PREFIX/bin/monarchy-dcd --dcdir "$DCDIR"
-
-EOF
-fi
-
-if [[ $GENERATED_PASS -eq 1 ]]; then
-    cat <<EOF
-Administrator password (generated once, save it now):
-
-  $ADMINPASS
 
 EOF
 fi

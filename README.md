@@ -125,11 +125,13 @@ sudo scripts/dcpromo
 
 It asks for the domain FQDN, NetBIOS name, domain controller IPv4 address,
 Administrator password and resolver choice, then prints a promotion summary
-before touching the machine. This build creates a **new forest only**; the
-wizard states that it cannot join an existing domain or add a replica DC.
+before touching the machine. The password is required (use `--adminpass` to
+pre-set it); it is never generated automatically. This build creates a **new
+forest only**; the wizard states that it cannot join an existing domain or add
+a replica DC.
 
-Without `--adminpass` the script generates an Administrator password and
-prints it once at the end; without `--realm` it provisions
+Interactive runs prompt for the Administrator password twice; unattended runs
+must pass `--adminpass`. Without `--realm` the script provisions
 `MONARCHY.EXAMPLE.COM`. Re-running refreshes the binaries and unit and leaves
 an existing domain alone — `--force` replaces it.
 
