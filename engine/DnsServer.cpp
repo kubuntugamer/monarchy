@@ -389,15 +389,22 @@ DnsServer::~DnsServer() {
 }
 
 bool DnsServer::listen(quint16 port) {
-    if (!m_socket->bind(QHostAddress::Any, port))
-        return false;
-    // TCP is part of DNS, not a fallback: bind the same port number.
-    if (!m_tcpServer->isListening()
-        && !m_tcpServer->listen(QHostAddress::Any, m_socket->localPort())) {
+    // TCP is part of DNS, not a fallback: it binds the same number as UDP. UDP
+    // and TCP have separate port spaces, so when the caller asks for port 0 the
+    // number the kernel hands the UDP socket can already belong to an unrelated
+    // TCP socket, and the pair cannot be completed. Asking for an ephemeral port
+    // therefore means "any port that carries both", so draw again rather than
+    // failing the listener. A port that was asked for by number is bound once.
+    const int attempts = port == 0 ? 16 : 1;
+    for (int attempt = 0; attempt < attempts; ++attempt) {
+        if (!m_socket->bind(QHostAddress::Any, port))
+            return false;
+        if (m_tcpServer->isListening()
+            || m_tcpServer->listen(QHostAddress::Any, m_socket->localPort()))
+            return true;
         m_socket->close();
-        return false;
     }
-    return true;
+    return false;
 }
 
 void DnsServer::close() {
