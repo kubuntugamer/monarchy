@@ -952,8 +952,16 @@ bool RpcServer::verifyAuthenticate(Client *client, const QByteArray &ntlmsspToke
         client->security.challenge.clear();
         emit requestReceived(QStringLiteral("%1 authentication failed for %2")
                                  .arg(m_interface.name, authenticate.user));
-        if (client->canWrite())
-            client->socket->disconnectFromHost();
+        // The teardown is queued rather than done here. disconnectFromHost()
+        // emits `disconnected` synchronously, onDisconnected() frees this Client
+        // in response, and handlePdu() is still holding it on its stack — it
+        // would answer the rejected bind through freed memory. A pipe has no
+        // socket of its own (the SMB2 session carries it), and its calls are
+        // refused anyway because `active` never became true.
+        if (QTcpSocket *socket = client->socket) {
+            QMetaObject::invokeMethod(
+                socket, [socket]() { socket->disconnectFromHost(); }, Qt::QueuedConnection);
+        }
         return false;
     }
 
