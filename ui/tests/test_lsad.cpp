@@ -578,6 +578,25 @@ void LsadTest::createsQueriesEnumeratesAndDeletesATrust()
     QVERIFY(readLe32At(list, 8) != 0); // array pointer
     QVERIFY(list.contains(utf16Bytes(QStringLiteral("fabrikam.local"))));
 
+    // Level 7 returns the stored secret itself, inside the auth-info buffers,
+    // and level 8 the full info: InfoEx, POSIX offset and that auth info.
+    QByteArray secretQuery = trustHandle;
+    appendLe16(secretQuery, 7);
+    const QByteArray authInfo =
+        server.handleCall(Lsad::OpQueryTrustedDomainInfo, secretQuery);
+    QCOMPARE(lastWord(authInfo), 0u);
+    QCOMPARE(readLe16At(authInfo, 4), quint16(7));
+    QCOMPARE(readLe32At(authInfo, 8), 1u); // incoming_count
+    QVERIFY(authInfo.contains(QByteArray("s3cret")));
+
+    QByteArray fullQuery = trustHandle;
+    appendLe16(fullQuery, 8);
+    const QByteArray full = server.handleCall(Lsad::OpQueryTrustedDomainInfo, fullQuery);
+    QCOMPARE(lastWord(full), 0u);
+    QCOMPARE(readLe16At(full, 4), quint16(8));
+    QVERIFY(full.contains(utf16Bytes(QStringLiteral("fabrikam.local"))));
+    QVERIFY(full.contains(QByteArray("s3cret")));
+
     // A password rollover writes the new clear secret and the keys derived
     // from it, so the partner's next ticket uses the new key.
     const QString oldAes = trust.attributes.value(QStringLiteral("aes128Key"));
@@ -646,13 +665,13 @@ void LsadTest::refusesDuplicateAndUnknownTrusts()
     remove.append(wireSid(QStringLiteral("S-1-5-21-1-1-1")));
     QCOMPARE(lastWord(server.handleCall(Lsad::OpDeleteTrustedDomain, remove)), 0xc0000034u);
 
-    // Level 7 carries the trust secret; it is refused rather than answered with
-    // an empty password a client might install as the trust key.
+    // A level this DC does not encode (the internal auth-info form) is refused
+    // rather than answered with an empty structure.
     const QByteArray opened =
         server.handleCall(Lsad::OpOpenTrustedDomainByName,
                           openTrustByNameStub(policy, QStringLiteral("TAILSPIN")));
     QByteArray query = opened.left(20);
-    appendLe16(query, 7);
+    appendLe16(query, 9);
     const QByteArray refused = server.handleCall(Lsad::OpQueryTrustedDomainInfo, query);
     QCOMPARE(lastWord(refused), 0xc0000003u); // STATUS_INVALID_INFO_CLASS
     QCOMPARE(readLe32At(refused, 0), 0u);

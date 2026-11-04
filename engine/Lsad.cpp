@@ -927,8 +927,58 @@ QByteArray LsadServer::handleCall(quint16 opnum, const QByteArray &stub,
     // for the requested level. Levels 1 (name) and 6 (info ex) are what a
     // client needs to recognise a trust; the secret-bearing levels stay
     // INVALID_INFO_CLASS rather than returning an empty secret.
+    // lsa_TrustDomainInfoAuthInfo out: one current buffer per direction, the
+    // previous slot empty. A buffer is a pointer to { NTTIME, auth type, a
+    // DATA_BUF2 }, whose bytes are a deferred conformant array.
+    struct StoredSecret {
+        bool present = false;
+        quint32 authType = 0;
+        QByteArray data;
+    };
+    const auto readSecret = [](const DirectoryObject &trust, const QString &attribute) {
+        StoredSecret secret;
+        const QString stored = trust.attributes.value(attribute);
+        const int colon = stored.indexOf(QLatin1Char(':'));
+        if (colon < 0)
+            return secret;
+        secret.present = true;
+        secret.authType = stored.left(colon).toUInt();
+        secret.data = QByteArray::fromHex(stored.mid(colon + 1).toLatin1());
+        return secret;
+    };
+    const auto putAuthInfo = [&](QByteArray &out, QByteArray &later,
+                                 const DirectoryObject &trust, quint32 *ref) {
+        const StoredSecret incoming = readSecret(trust, QStringLiteral("trustAuthIncoming"));
+        const StoredSecret outgoing = readSecret(trust, QStringLiteral("trustAuthOutgoing"));
+        const quint32 incomingRef = incoming.present ? ++*ref : 0;
+        const quint32 outgoingRef = outgoing.present ? ++*ref : 0;
+        putLe32(out, incoming.present ? 1u : 0u); // incoming_count
+        putLe32(out, incomingRef);
+        putLe32(out, 0); // incoming_previous
+        putLe32(out, outgoing.present ? 1u : 0u); // outgoing_count
+        putLe32(out, outgoingRef);
+        putLe32(out, 0); // outgoing_previous
+        // The buffers themselves, each with its bytes deferred behind it.
+        const auto appendBuffer = [&](const StoredSecret &secret) {
+            if (!secret.present)
+                return;
+            alignFixed(out, 8); // last_update_time is an NTTIME_hyper
+            putLe64(out, 0);    // no recorded update time for this secret
+            putLe32(out, secret.authType);
+            putLe32(out, quint32(secret.data.size()));
+            putLe32(out, secret.data.isEmpty() ? 0u : ++*ref);
+            if (!secret.data.isEmpty()) {
+                putLe32(later, quint32(secret.data.size())); // array maximum count
+                later.append(secret.data);
+                alignFixed(later, 4);
+            }
+        };
+        appendBuffer(incoming);
+        appendBuffer(outgoing);
+    };
+
     const auto putTrustInformation = [&](const DirectoryObject &trust, quint16 level) {
-        if (level != 1 && level != 6)
+        if (level != 1 && level != 6 && level != 7 && level != 8)
             return false;
         putLe32(fixed, ++nextReferent);
         putLe16(fixed, level);
@@ -941,7 +991,15 @@ QByteArray LsadServer::handleCall(quint16 opnum, const QByteArray &stub,
                 appendVaryingChars(deferred, flat, true);
             return true;
         }
+        if (level == 7) {
+            putAuthInfo(fixed, deferred, trust, &nextReferent);
+            return true;
+        }
         putTrustInfo(fixed, deferred, trust, &nextReferent);
+        if (level == 8) {
+            putLe32(fixed, trust.attributes.value(QStringLiteral("trustPosixOffset")).toUInt());
+            putAuthInfo(fixed, deferred, trust, &nextReferent);
+        }
         return true;
     };
 
