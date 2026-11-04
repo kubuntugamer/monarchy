@@ -320,6 +320,28 @@ bool DcService::start(const QString &dcDir)
             persist();
         return ok;
     };
+    // Trusts live under CN=System as trustedDomain objects, so an LDAP search
+    // finds the same partner and direction the trust calls report, and the
+    // object is written to the same persisted store as everything else.
+    lsadWrites.createTrust = [this, persist](DirectoryObject *object, QString *error) {
+        if (!object || object->id.isEmpty()) {
+            if (error)
+                *error = QStringLiteral("trust object has no distinguished name");
+            return false;
+        }
+        m_ldapServer->addObject(*object);
+        persist();
+        return true;
+    };
+    lsadWrites.removeTrust = [this, persist](const QString &dn, QString *error) {
+        if (!m_ldapServer->removeObject(dn)) {
+            if (error)
+                *error = QStringLiteral("trust not found (%1)").arg(dn);
+            return false;
+        }
+        persist();
+        return true;
+    };
     m_lsadServer->setWriteBackend(lsadWrites);
     const int lsadPort = dcConfig.value(QStringLiteral("lsadPort"), 1036).toInt();
     if (!m_lsadServer->listen(quint16(lsadPort))) {

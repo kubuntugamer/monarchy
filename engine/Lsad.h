@@ -65,14 +65,18 @@ enum Opnum : quint16 {
     OpEnumAccountRights = 36,
     OpAddAccountRights = 37,
     OpRemoveAccountRights = 38,
+    OpDeleteTrustedDomain = 41,
     OpStorePrivateData = 42,
     OpRetrievePrivateData = 43,
     OpOpenPolicy2 = 44,
     OpGetUserName = 45,
     OpQueryInformationPolicy2 = 46,
     OpSetInformationPolicy2 = 47,
+    OpQueryTrustedDomainInfoByName = 48,
+    OpSetTrustedDomainInfoByName = 49,
     OpEnumTrustedDomainsEx = 50,
     OpCreateTrustedDomainEx = 51,
+    OpCloseTrustedDomainEx = 52,
     OpQueryDomainInfoPolicy = 53,
     OpSetDomainInfoPolicy = 54,
     OpOpenTrustedDomainByName = 55,
@@ -115,6 +119,12 @@ enum DomainInfoClass : quint16 {
 // survives a restart the way the rest of the store does.
 struct WriteBackend {
     std::function<bool(const QString &dn, const QStringList &rights, QString *error)> setRights;
+    // A trust is a directory object under CN=System, the way a Windows DC
+    // stores one: LDAP searches see the same partner, direction and SID that
+    // the trust calls report, and it survives a restart with the rest of the
+    // store.
+    std::function<bool(DirectoryObject *object, QString *error)> createTrust;
+    std::function<bool(const QString &dn, QString *error)> removeTrust;
 };
 
 Rpc::Interface interface();
@@ -174,6 +184,10 @@ private:
 
     QList<DirectoryObject> directory() const;
     DirectoryObject findAccount(const QString &sid) const;
+    QList<DirectoryObject> trusts() const;
+    DirectoryObject findTrustByName(const QString &name) const;
+    DirectoryObject findTrustBySid(const QString &sid) const;
+    static QString trustDn(const QString &netbios, const QString &baseDn);
     QStringList rightsFor(const QString &sid) const;
     bool storeRights(const QString &sid, const QStringList &rights, quint32 *status);
     QStringList accountsWithRights() const;

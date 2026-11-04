@@ -10,6 +10,7 @@
 
 #include <algorithm>
 
+#include "Krb5.h"
 #include "Ndr.h"
 
 namespace {
@@ -22,6 +23,7 @@ constexpr quint32 kStatusInvalidHandle = 0xc0000008u;
 constexpr quint32 kStatusInvalidParameter = 0xc000000du;
 constexpr quint32 kStatusInvalidInfoClass = 0xc0000003u;
 constexpr quint32 kStatusObjectNameNotFound = 0xc0000034u;
+constexpr quint32 kStatusObjectNameCollision = 0xc0000035u;
 constexpr quint32 kStatusNoSuchPrivilege = 0xc0000060u;
 constexpr quint32 kStatusNoSuchUser = 0xc0000064u;
 constexpr quint32 kStatusInvalidSid = 0xc0000078u;
@@ -569,6 +571,48 @@ DirectoryObject LsadServer::findAccount(const QString &sid) const
     return {};
 }
 
+// A trusted domain is the trustedDomain object a Windows DC keeps under
+// CN=System; its attributes are the LSA information classes in directory form.
+QString LsadServer::trustDn(const QString &netbios, const QString &baseDn)
+{
+    return QStringLiteral("CN=%1,CN=System,%2").arg(netbios, baseDn);
+}
+
+QList<DirectoryObject> LsadServer::trusts() const
+{
+    QList<DirectoryObject> result;
+    for (const DirectoryObject &object : directory()) {
+        if (object.attributes.value(QStringLiteral("objectClass"))
+                .contains(QLatin1String("trustedDomain"), Qt::CaseInsensitive))
+            result.append(object);
+    }
+    return result;
+}
+
+DirectoryObject LsadServer::findTrustByName(const QString &name) const
+{
+    for (const DirectoryObject &object : trusts()) {
+        const QString flat = object.attributes.value(QStringLiteral("flatName"));
+        const QString partner = object.attributes.value(QStringLiteral("trustPartner"));
+        if (flat.compare(name, Qt::CaseInsensitive) == 0
+            || partner.compare(name, Qt::CaseInsensitive) == 0
+            || object.name.compare(name, Qt::CaseInsensitive) == 0)
+            return object;
+    }
+    return {};
+}
+
+DirectoryObject LsadServer::findTrustBySid(const QString &sid) const
+{
+    for (const DirectoryObject &object : trusts()) {
+        if (object.attributes.value(QStringLiteral("securityIdentifier"))
+                .compare(sid, Qt::CaseInsensitive)
+            == 0)
+            return object;
+    }
+    return {};
+}
+
 QStringList LsadServer::rightsFor(const QString &sid) const
 {
     for (const DirectoryObject &object : directory()) {
@@ -721,6 +765,185 @@ QByteArray LsadServer::handleCall(quint16 opnum, const QByteArray &stub,
                                                         : m_config.domainSid);
     };
 
+    // The fixed half of an in-line lsa_StringLarge: Length, MaximumLength and
+    // the buffer referent. Its characters are a deferred referent, so they are
+    // read after every scalar field of the enclosing structure.
+    const auto readStringHeader = [&reader](QString *text, bool *present) {
+        quint16 length = 0;
+        quint16 maximum = 0;
+        quint32 buffer = 0;
+        if (!reader.u16(&length) || !reader.u16(&maximum) || !reader.u32(&buffer))
+            return false;
+        *present = buffer != 0 && length != 0;
+        text->clear();
+        return true;
+    };
+
+    // lsa_TrustDomainInfoInfoEx in. Pointers inside the parameter list are
+    // deferred to the end of that list, so only the referent, both name
+    // headers, the SID pointer and the three scalars are here; the names and
+    // SID follow after the auth-info pointer and the access mask.
+    struct TrustInfoIn {
+        QString domainName;
+        QString netbiosName;
+        bool hasDomain = false;
+        bool hasNetbios = false;
+        bool hasSid = false;
+        quint32 direction = 0;
+        quint32 type = 0;
+        quint32 attributes = 0;
+    };
+    const auto readTrustInfo = [&](TrustInfoIn *info) {
+        bool present = false;
+        if (!reader.referent(&present) || !present)
+            return false;
+        if (!readStringHeader(&info->domainName, &info->hasDomain)
+            || !readStringHeader(&info->netbiosName, &info->hasNetbios))
+            return false;
+        if (!reader.referent(&info->hasSid))
+            return false;
+        return reader.u32(&info->direction) && reader.u32(&info->type)
+               && reader.u32(&info->attributes);
+    };
+    const auto readTrustInfoBuffers = [&](TrustInfoIn *info, QMap<QString, QString> *attributes) {
+        if (info->hasDomain && !readVaryingChars(reader, &info->domainName))
+            return false;
+        if (info->hasNetbios && !readVaryingChars(reader, &info->netbiosName))
+            return false;
+        QString sid;
+        if (info->hasSid && !readWireSid(reader, &sid))
+            return false;
+        attributes->insert(QStringLiteral("trustPartner"), info->domainName);
+        attributes->insert(QStringLiteral("flatName"), info->netbiosName);
+        attributes->insert(QStringLiteral("securityIdentifier"), sid);
+        attributes->insert(QStringLiteral("trustDirection"), QString::number(info->direction));
+        attributes->insert(QStringLiteral("trustType"), QString::number(info->type));
+        attributes->insert(QStringLiteral("trustAttributes"), QString::number(info->attributes));
+        return !info->netbiosName.isEmpty();
+    };
+
+    // One lsa_TrustDomainInfoBuffer: NTTIME, auth type, then a DATA_BUF2 whose
+    // bytes are a deferred conformant array.
+    const auto readAuthBuffer = [&reader](QByteArray *value) {
+        quint32 authType = 0;
+        reader.align(8); // last_update_time is an NTTIME_hyper
+        if (!reader.skip(8))
+            return false;
+        if (!reader.u32(&authType))
+            return false;
+        quint32 size = 0;
+        if (!reader.u32(&size))
+            return false;
+        bool present = false;
+        if (!reader.referent(&present))
+            return false;
+        QByteArray data;
+        if (present) {
+            quint32 maximum = 0;
+            if (!reader.u32(&maximum))
+                return false;
+            if (!reader.bytes(int(qMin(maximum, size)), &data))
+                return false;
+            reader.align(4);
+        }
+        *value = (QString::number(authType) + QLatin1Char(':') + QString::fromLatin1(data.toHex()))
+                     .toLatin1();
+        return true;
+    };
+
+    // lsa_TrustDomainInfoAuthInfo in, after its referent: both counts and all
+    // four pointers first, then the buffers they point at. Only the current
+    // secrets are kept: an old one is retained for rollover, and a trust
+    // created from scratch has none.
+    const auto readAuthInfo = [&](QMap<QString, QString> *attributes, bool internal) {
+        if (internal) {
+            // lsa_TrustDomainInfoAuthInfoInternal is just a DATA_BUF2 blob.
+            quint32 size = 0;
+            if (!reader.u32(&size))
+                return false;
+            bool hasBlob = false;
+            if (!reader.referent(&hasBlob))
+                return false;
+            QByteArray blob;
+            if (hasBlob) {
+                quint32 maximum = 0;
+                if (!reader.u32(&maximum) || !reader.bytes(int(qMin(maximum, size)), &blob))
+                    return false;
+                reader.align(4);
+            }
+            attributes->insert(QStringLiteral("msDS-AuthInfoInternal"), QString::fromLatin1(blob.toHex()));
+            return true;
+        }
+        quint32 incomingCount = 0;
+        bool hasIncomingCurrent = false;
+        bool hasIncomingPrevious = false;
+        if (!reader.u32(&incomingCount) || !reader.referent(&hasIncomingCurrent)
+            || !reader.referent(&hasIncomingPrevious))
+            return false;
+        quint32 outgoingCount = 0;
+        bool hasOutgoingCurrent = false;
+        bool hasOutgoingPrevious = false;
+        if (!reader.u32(&outgoingCount) || !reader.referent(&hasOutgoingCurrent)
+            || !reader.referent(&hasOutgoingPrevious))
+            return false;
+        QByteArray incoming;
+        QByteArray outgoing;
+        if (hasIncomingCurrent && !readAuthBuffer(&incoming))
+            return false;
+        if (hasIncomingPrevious && !readAuthBuffer(&incoming))
+            return false;
+        if (hasOutgoingCurrent && !readAuthBuffer(&outgoing))
+            return false;
+        if (hasOutgoingPrevious && !readAuthBuffer(&outgoing))
+            return false;
+        attributes->insert(QStringLiteral("trustAuthIncoming"), QString::fromLatin1(incoming));
+        attributes->insert(QStringLiteral("trustAuthOutgoing"), QString::fromLatin1(outgoing));
+        return true;
+    };
+
+    // lsa_TrustDomainInfoInfoEx out: two lsa_StringLarge headers and a SID
+    // pointer in the fixed half, their characters and bytes afterwards.
+    const auto putTrustInfo = [&](QByteArray &out, QByteArray &later,
+                                  const DirectoryObject &trust, quint32 *ref) {
+        const QString partner = trust.attributes.value(QStringLiteral("trustPartner"));
+        const QString flat = trust.attributes.value(QStringLiteral("flatName"));
+        const QString sid = trust.attributes.value(QStringLiteral("securityIdentifier"));
+        putStringHeader(out, partner, ++*ref, true);
+        putStringHeader(out, flat, ++*ref, true);
+        putLe32(out, sid.isEmpty() ? 0u : ++*ref);
+        putLe32(out, trust.attributes.value(QStringLiteral("trustDirection")).toUInt());
+        putLe32(out, trust.attributes.value(QStringLiteral("trustType"), QStringLiteral("2")).toUInt());
+        putLe32(out, trust.attributes.value(QStringLiteral("trustAttributes")).toUInt());
+        if (!partner.isEmpty())
+            appendVaryingChars(later, partner, true);
+        if (!flat.isEmpty())
+            appendVaryingChars(later, flat, true);
+        if (!sid.isEmpty())
+            appendSid(later, sid);
+    };
+
+    // lsa_TrustDomainInfo out: a referent, the union discriminant, and the arm
+    // for the requested level. Levels 1 (name) and 6 (info ex) are what a
+    // client needs to recognise a trust; the secret-bearing levels stay
+    // INVALID_INFO_CLASS rather than returning an empty secret.
+    const auto putTrustInformation = [&](const DirectoryObject &trust, quint16 level) {
+        if (level != 1 && level != 6)
+            return false;
+        putLe32(fixed, ++nextReferent);
+        putLe16(fixed, level);
+        alignFixed(fixed, 4);
+        if (level == 1) {
+            const QString flat = trust.attributes.value(QStringLiteral("flatName"));
+            putStringHeader(fixed, flat, ++nextReferent, true);
+            alignFixed(fixed, 4);
+            if (!flat.isEmpty())
+                appendVaryingChars(deferred, flat, true);
+            return true;
+        }
+        putTrustInfo(fixed, deferred, trust, &nextReferent);
+        return true;
+    };
+
     switch (opnum) {
     case Lsad::OpOpenPolicy:
     case Lsad::OpOpenPolicy2: {
@@ -769,6 +992,16 @@ QByteArray LsadServer::handleCall(quint16 opnum, const QByteArray &stub,
         QByteArray handle;
         if (!reader.bytes(kHandleSize, &handle))
             return {};
+        // Deleting a trust handle deletes the trust, as it does on Windows;
+        // closing one only retires the handle.
+        Handle trust;
+        if (opnum == Lsad::OpDeleteObject
+            && lookupHandle(handle, Handle::TrustedDomain, &trust) && m_writes.removeTrust) {
+            const DirectoryObject object = findTrustByName(trust.name);
+            QString error;
+            if (!object.id.isEmpty())
+                m_writes.removeTrust(object.id, &error);
+        }
         retireHandle(handle);
         fixed.append(QByteArray(kHandleSize, '\0'));
         emit requestReceived(opnum == Lsad::OpClose ? QStringLiteral("Close")
@@ -1104,36 +1337,155 @@ QByteArray LsadServer::handleCall(quint16 opnum, const QByteArray &stub,
         Handle policy;
         if (!readPolicy(&policy))
             return {};
-        quint32 context = 0;
+        quint32 resume = 0;
         quint32 maximumLength = 0;
-        if (!reader.u32(&context) || !reader.u32(&maximumLength))
+        if (!reader.u32(&resume) || !reader.u32(&maximumLength))
             return {};
-        Q_UNUSED(context)
         Q_UNUSED(maximumLength)
-        // A standalone DC has no trusted domains; an empty enumeration that
-        // says so is the answer a Windows DC gives in the same state.
+        QList<DirectoryObject> all = trusts();
+        std::sort(all.begin(), all.end(), [](const DirectoryObject &a, const DirectoryObject &b) {
+            return a.attributes.value(QStringLiteral("flatName"))
+                       .compare(b.attributes.value(QStringLiteral("flatName")),
+                                Qt::CaseInsensitive)
+                   < 0;
+        });
+        const int start = int(qMin<qsizetype>(resume, all.size()));
+        QList<DirectoryObject> page = all.mid(start);
         putLe32(fixed, 0); // resume
-        putLe32(fixed, 0); // entries
-        putLe32(fixed, 0); // NULL array
-        emit requestReceived(QStringLiteral("EnumTrustedDomains (0)"));
-        return result(kStatusNoMoreEntries);
+        putLe32(fixed, quint32(page.size()));
+        putLe32(fixed, page.isEmpty() ? 0u : ++nextReferent);
+        if (opnum == Lsad::OpEnumTrustedDomainsEx) {
+            for (const DirectoryObject &trust : page)
+                putTrustInfo(fixed, deferred, trust, &nextReferent);
+        } else {
+            for (const DirectoryObject &trust : page) {
+                const QString flat = trust.attributes.value(QStringLiteral("flatName"));
+                const QString sid = trust.attributes.value(QStringLiteral("securityIdentifier"));
+                putStringHeader(fixed, flat, ++nextReferent, true);
+                putLe32(fixed, sid.isEmpty() ? 0u : ++nextReferent);
+            }
+            // Deferred buffers follow their elements: the name's characters
+            // and then the SID for the first entry, then the second's.
+            for (const DirectoryObject &trust : page) {
+                const QString flat = trust.attributes.value(QStringLiteral("flatName"));
+                const QString sid = trust.attributes.value(QStringLiteral("securityIdentifier"));
+                if (!flat.isEmpty())
+                    appendVaryingChars(deferred, flat, true);
+                if (!sid.isEmpty())
+                    appendSid(deferred, sid);
+            }
+        }
+        alignFixed(fixed, 4);
+        fixed.append(deferred);
+        emit requestReceived(QStringLiteral("EnumTrustedDomains (%1)").arg(page.size()));
+        return result(page.isEmpty() ? kStatusNoMoreEntries : kStatusSuccess);
     }
-    case Lsad::OpOpenTrustedDomain:
-    case Lsad::OpOpenTrustedDomainByName: {
-        // No trust exists to open.
-        fixed.append(QByteArray(kHandleSize, '\0'));
-        emit requestReceived(QStringLiteral("OpenTrustedDomain: no such trust"));
-        return result(kStatusObjectNameNotFound);
-    }
-    case Lsad::OpQueryTrustedDomainInfo:
-    case Lsad::OpSetInformationTrustedDomain: {
+    case Lsad::OpOpenTrustedDomain: {
+        // Opens by the trusted domain's SID.
         Handle policy;
         if (!readPolicy(&policy))
             return {};
-        putLe32(fixed, 0); // NULL information pointer
-        emit requestReceived(QStringLiteral("trust information for an absent trust"));
-        return result(kStatusObjectNameNotFound);
+        bool hasSid = false;
+        if (!reader.referent(&hasSid))
+            return {};
+        QString sid;
+        if (hasSid && !readWireSid(reader, &sid))
+            return {};
+        quint32 access = 0;
+        if (!reader.u32(&access))
+            return {};
+        const DirectoryObject trust = findTrustBySid(sid);
+        if (trust.id.isEmpty()) {
+            fixed.append(QByteArray(kHandleSize, '\0'));
+            return result(kStatusObjectNameNotFound);
+        }
+        fixed.append(newHandle(Handle::TrustedDomain, QString(),
+                               trust.attributes.value(QStringLiteral("flatName")), access));
+        emit requestReceived(QStringLiteral("OpenTrustedDomain(%1)").arg(sid));
+        return result(kStatusSuccess);
     }
+    case Lsad::OpOpenTrustedDomainByName: {
+        Handle policy;
+        if (!readPolicy(&policy))
+            return {};
+        QString name;
+        if (!readStringInline(reader, &name))
+            return {};
+        quint32 access = 0;
+        if (!reader.u32(&access))
+            return {};
+        const DirectoryObject trust = findTrustByName(name);
+        if (trust.id.isEmpty()) {
+            fixed.append(QByteArray(kHandleSize, '\0'));
+            emit requestReceived(QStringLiteral("OpenTrustedDomainByName(%1): no such trust").arg(name));
+            return result(kStatusObjectNameNotFound);
+        }
+        fixed.append(newHandle(Handle::TrustedDomain, QString(),
+                               trust.attributes.value(QStringLiteral("flatName")), access));
+        emit requestReceived(QStringLiteral("OpenTrustedDomainByName(%1)").arg(name));
+        return result(kStatusSuccess);
+    }
+    case Lsad::OpQueryTrustedDomainInfo: {
+        QByteArray handleBytes;
+        if (!reader.bytes(kHandleSize, &handleBytes))
+            return {};
+        Handle trust;
+        if (!lookupHandle(handleBytes, Handle::TrustedDomain, &trust))
+            return result(kStatusInvalidHandle);
+        quint16 level = 0;
+        if (!reader.u16(&level))
+            return {};
+        reader.align(4);
+        const DirectoryObject object = findTrustByName(trust.name);
+        if (object.id.isEmpty()) {
+            putLe32(fixed, 0); // NULL information pointer
+            return result(kStatusObjectNameNotFound);
+        }
+        if (!putTrustInformation(object, level)) {
+            putLe32(fixed, 0);
+            return result(kStatusInvalidInfoClass);
+        }
+        alignFixed(fixed, 4);
+        fixed.append(deferred);
+        emit requestReceived(QStringLiteral("QueryTrustedDomainInfo(%1, level %2)")
+                                 .arg(trust.name)
+                                 .arg(level));
+        return result(kStatusSuccess);
+    }
+    case Lsad::OpQueryTrustedDomainInfoByName: {
+        Handle policy;
+        if (!readPolicy(&policy))
+            return {};
+        QString name;
+        if (!readStringInline(reader, &name))
+            return {};
+        quint16 level = 0;
+        if (!reader.u16(&level))
+            return {};
+        reader.align(4);
+        const DirectoryObject object = findTrustByName(name);
+        if (object.id.isEmpty()) {
+            putLe32(fixed, 0);
+            emit requestReceived(QStringLiteral("QueryTrustedDomainInfoByName(%1): no such trust").arg(name));
+            return result(kStatusObjectNameNotFound);
+        }
+        if (!putTrustInformation(object, level)) {
+            putLe32(fixed, 0);
+            return result(kStatusInvalidInfoClass);
+        }
+        alignFixed(fixed, 4);
+        fixed.append(deferred);
+        emit requestReceived(QStringLiteral("QueryTrustedDomainInfoByName(%1, level %2)")
+                                 .arg(name)
+                                 .arg(level));
+        return result(kStatusSuccess);
+    }
+    case Lsad::OpSetInformationTrustedDomain:
+    case Lsad::OpSetTrustedDomainInfoByName:
+        // Writing trust secrets is how a trust password rollover happens; a
+        // client that asks for it gets a refusal, not a success that would
+        // leave the agreed secret unchanged.
+        return result(kStatusNotSupported);
     case Lsad::OpQueryForestTrustInfo: {
         Handle policy;
         if (!readPolicy(&policy))
@@ -1143,12 +1495,132 @@ QByteArray LsadServer::handleCall(quint16 opnum, const QByteArray &stub,
     }
     case Lsad::OpCreateTrustedDomain:
     case Lsad::OpCreateTrustedDomainEx:
-    case Lsad::OpCreateTrustedDomainEx2:
-        // A trust is only real once Netlogon carries its secure channel, which
-        // this DC does not serve yet; recording one would make every later
-        // authentication through it fail with no explanation.
-        emit requestReceived(QStringLiteral("CreateTrustedDomain refused: no Netlogon channel"));
-        return result(kStatusNotSupported);
+    case Lsad::OpCreateTrustedDomainEx2: {
+        Handle policy;
+        if (!readPolicy(&policy))
+            return {};
+        QMap<QString, QString> attributes;
+        quint32 access = 0;
+        if (opnum == Lsad::OpCreateTrustedDomain) {
+            // The oldest form carries only lsa_DomainInfo: a name and a SID.
+            bool present = false;
+            if (!reader.referent(&present) || !present)
+                return result(kStatusInvalidParameter);
+            QString name;
+            bool hasName = false;
+            if (!readStringHeader(&name, &hasName))
+                return {};
+            bool hasSid = false;
+            if (!reader.referent(&hasSid))
+                return {};
+            // The access mask is a scalar after the SID pointer; the name's
+            // characters and the SID bytes are deferred behind it.
+            if (!reader.u32(&access))
+                return {};
+            if (hasName && !readVaryingChars(reader, &name))
+                return {};
+            QString sid;
+            if (hasSid && !readWireSid(reader, &sid))
+                return {};
+            attributes.insert(QStringLiteral("flatName"), name);
+            attributes.insert(QStringLiteral("trustPartner"), name);
+            attributes.insert(QStringLiteral("securityIdentifier"), sid);
+            attributes.insert(QStringLiteral("trustDirection"), QStringLiteral("3"));
+            attributes.insert(QStringLiteral("trustType"), QStringLiteral("2"));
+            attributes.insert(QStringLiteral("trustAttributes"), QStringLiteral("0"));
+        } else {
+            TrustInfoIn info;
+            if (!readTrustInfo(&info))
+                return result(kStatusInvalidParameter);
+            bool hasAuth = false;
+            if (!reader.referent(&hasAuth))
+                return {};
+            if (!reader.u32(&access))
+                return {};
+            if (!readTrustInfoBuffers(&info, &attributes))
+                return result(kStatusInvalidParameter);
+            if (hasAuth && !readAuthInfo(&attributes, opnum == Lsad::OpCreateTrustedDomainEx2))
+                return {};
+        }
+        Q_UNUSED(access)
+        const QString flat = attributes.value(QStringLiteral("flatName"));
+        if (flat.isEmpty())
+            return result(kStatusInvalidParameter);
+        if (!findTrustByName(flat).id.isEmpty()) {
+            fixed.append(QByteArray(kHandleSize, '\0'));
+            return result(kStatusObjectNameCollision);
+        }
+        if (!m_writes.createTrust) {
+            fixed.append(QByteArray(kHandleSize, '\0'));
+            return result(kStatusNotSupported);
+        }
+        DirectoryObject trust;
+        trust.id = trustDn(flat, m_config.baseDn);
+        trust.name = flat;
+        trust.type = QStringLiteral("Trusted Domain");
+        trust.kind = ObjectKind::Unknown;
+        trust.container = QStringLiteral("System");
+        attributes.insert(QStringLiteral("cn"), flat);
+        attributes.insert(QStringLiteral("distinguishedName"), trust.id);
+        attributes.insert(QStringLiteral("objectClass"),
+                          QStringLiteral("top;leaf;trustedDomain"));
+        if (!attributes.contains(QStringLiteral("trustPosixOffset")))
+            attributes.insert(QStringLiteral("trustPosixOffset"), QStringLiteral("0"));
+        trust.attributes = attributes;
+        // A clear secret is the trust password, and the same password derives
+        // the inter-realm krbtgt keys both sides use. Windows keeps those on the
+        // trustedDomain object; deriving them here is what makes a trust created
+        // over lsarpc usable by the KDC without a second enrollment step.
+        const QString incoming =
+            attributes.value(QStringLiteral("trustAuthIncoming"));
+        if (incoming.startsWith(QStringLiteral("2:"))) {
+            const QByteArray clear = QByteArray::fromHex(incoming.mid(2).toLatin1());
+            if (!clear.isEmpty())
+                Krb5::storeTrustKeys(trust, QString::fromUtf8(clear), m_config.realm,
+                                     attributes.value(QStringLiteral("trustPartner")));
+        }
+        QString error;
+        if (!m_writes.createTrust(&trust, &error)) {
+            fixed.append(QByteArray(kHandleSize, '\0'));
+            emit requestReceived(QStringLiteral("CreateTrustedDomain refused: %1").arg(error));
+            return result(kStatusObjectNameCollision);
+        }
+        fixed.append(newHandle(Handle::TrustedDomain, QString(), flat, access));
+        emit requestReceived(QStringLiteral("CreateTrustedDomain(%1, direction %2)")
+                                 .arg(flat, attributes.value(QStringLiteral("trustDirection"))));
+        return result(kStatusSuccess);
+    }
+    case Lsad::OpCloseTrustedDomainEx:
+    case Lsad::OpDeleteTrustedDomain: {
+        Handle policy;
+        if (!readPolicy(&policy))
+            return {};
+        if (opnum == Lsad::OpCloseTrustedDomainEx) {
+            QByteArray handleBytes;
+            if (!reader.bytes(kHandleSize, &handleBytes))
+                return {};
+            retireHandle(handleBytes);
+            fixed.append(QByteArray(kHandleSize, '\0'));
+            return result(kStatusSuccess);
+        }
+        bool hasSid = false;
+        if (!reader.referent(&hasSid))
+            return {};
+        QString sid;
+        if (hasSid && !readWireSid(reader, &sid))
+            return {};
+        const DirectoryObject trust = findTrustBySid(sid);
+        if (trust.id.isEmpty())
+            return result(kStatusObjectNameNotFound);
+        if (!m_writes.removeTrust)
+            return result(kStatusNotSupported);
+        QString error;
+        if (!m_writes.removeTrust(trust.id, &error))
+            return result(kStatusObjectNameNotFound);
+        emit requestReceived(QStringLiteral("DeleteTrustedDomain(%1)")
+                                 .arg(trust.attributes.value(QStringLiteral("flatName"))));
+        return result(kStatusSuccess);
+    }
     case Lsad::OpLookupNames:
     case Lsad::OpLookupNames2:
     case Lsad::OpLookupNames3:

@@ -7,6 +7,12 @@
 
 namespace {
 
+void appendLe16(QByteArray &out, quint16 value)
+{
+    out.append(char(value & 0xff));
+    out.append(char((value >> 8) & 0xff));
+}
+
 void appendLe32(QByteArray &out, quint32 value)
 {
     out.append(char(value & 0xff));
@@ -62,7 +68,143 @@ Samr::Config testConfig()
     config.realm = QStringLiteral("CORP.EXAMPLE.COM");
     config.netbios = QStringLiteral("CORP");
     config.domainSid = QStringLiteral("S-1-5-21-1-2-3");
+    config.baseDn = QStringLiteral("DC=corp,DC=example,DC=com");
     return config;
+}
+
+void alignTo(QByteArray &out, int boundary)
+{
+    while (out.size() % boundary != 0)
+        out.append('\0');
+}
+
+void appendUtf16(QByteArray &out, const QString &text)
+{
+    for (const QChar c : text) {
+        out.append(char(c.unicode() & 0xff));
+        out.append(char((c.unicode() >> 8) & 0xff));
+    }
+}
+
+QByteArray utf16Bytes(const QString &text)
+{
+    QByteArray out;
+    appendUtf16(out, text);
+    return out;
+}
+
+// An lsa_StringLarge header: Length, MaximumLength (which counts the
+// terminator) and the buffer referent.
+void appendStringHeader(QByteArray &out, const QString &text, quint32 referent)
+{
+    appendLe16(out, quint16(text.size() * 2));
+    appendLe16(out, quint16(text.size() * 2 + 2));
+    appendLe32(out, referent);
+}
+
+// A deferred varying buffer: maximum count, offset, actual count, characters.
+void appendDeferredChars(QByteArray &out, const QString &text)
+{
+    appendLe32(out, quint32(text.size() + 1));
+    appendLe32(out, 0);
+    appendLe32(out, quint32(text.size()));
+    appendUtf16(out, text);
+    alignTo(out, 4);
+}
+
+// dom_sid2 in the order this endpoint writes it: the sub-authority array's
+// maximum count, then revision, count, identifier authority and elements.
+QByteArray wireSid(const QString &sid)
+{
+    const QStringList parts = sid.split(QLatin1Char('-'));
+    QByteArray out;
+    appendLe32(out, quint32(parts.size() - 3));
+    out.append(char(parts.at(1).toUInt()));
+    out.append(char(parts.size() - 3));
+    const quint64 authority = parts.at(2).toULongLong();
+    for (int i = 5; i >= 0; --i)
+        out.append(char((authority >> (i * 8)) & 0xff));
+    for (int i = 3; i < parts.size(); ++i)
+        appendLe32(out, parts.at(i).toUInt());
+    return out;
+}
+
+// LsarCreateTrustedDomainEx as Samba's pidl client marshals it: the policy
+// handle, the InfoEx referent with its fixed fields, the auth-info referent and
+// the access mask, then every deferred buffer in pointer order.
+QByteArray createTrustStub(const QByteArray &handle, const QString &partner,
+                           const QString &flat, const QString &sid, quint32 direction,
+                           quint32 type, bool internalBlob = false)
+{
+    QByteArray stub = handle;
+    appendLe32(stub, 0x00020010); // InfoEx pointer
+    appendStringHeader(stub, partner, 0x00020011);
+    appendStringHeader(stub, flat, 0x00020012);
+    appendLe32(stub, 0x00020013); // SID pointer
+    appendLe32(stub, direction);
+    appendLe32(stub, type);
+    appendLe32(stub, 0); // trust attributes
+    appendLe32(stub, 0x00020020); // auth-info pointer
+    appendLe32(stub, 0x000f0fff); // access mask
+
+    appendDeferredChars(stub, partner);
+    appendDeferredChars(stub, flat);
+    alignTo(stub, 4);
+    stub.append(wireSid(sid));
+
+    if (internalBlob) {
+        const QByteArray blob = QByteArray::fromHex("0011223344");
+        appendLe32(stub, quint32(blob.size()));
+        appendLe32(stub, 0x00020021);
+        appendLe32(stub, quint32(blob.size()));
+        stub.append(blob);
+        alignTo(stub, 4);
+        return stub;
+    }
+
+    // lsa_TrustDomainInfoAuthInfo: counts and four pointers, then the buffers
+    // they point at. Only the incoming current secret is set.
+    appendLe32(stub, 1); // incoming_count
+    appendLe32(stub, 0x00020022); // incoming_current
+    appendLe32(stub, 0);          // incoming_previous
+    appendLe32(stub, 0);          // outgoing_count
+    appendLe32(stub, 0);          // outgoing_current
+    appendLe32(stub, 0);          // outgoing_previous
+
+    const QByteArray secret = QByteArray("s3cret");
+    alignTo(stub, 8);
+    stub.append(QByteArray(8, '\0')); // last_update_time (NTTIME)
+    appendLe32(stub, 2);              // TRUST_AUTH_TYPE_CLEAR
+    appendLe32(stub, quint32(secret.size()));
+    appendLe32(stub, 0x00020023);
+    appendLe32(stub, quint32(secret.size()));
+    stub.append(secret);
+    alignTo(stub, 4);
+    return stub;
+}
+
+// An lsa_String the way a client marshals it: the header, the varying buffer
+// it points at, and only then the following scalar.
+void appendInlineString(QByteArray &out, const QString &text, quint32 referent)
+{
+    appendLe16(out, quint16(text.size() * 2));
+    appendLe16(out, quint16(text.size() * 2));
+    appendLe32(out, referent);
+    appendLe32(out, quint32(text.size()));
+    appendLe32(out, 0);
+    appendLe32(out, quint32(text.size()));
+    appendUtf16(out, text);
+    alignTo(out, 4);
+}
+
+// LsarOpenTrustedDomainByName: the policy handle, an in-line lsa_String and
+// the access mask.
+QByteArray openTrustByNameStub(const QByteArray &handle, const QString &name)
+{
+    QByteArray stub = handle;
+    appendInlineString(stub, name, 0x00020011);
+    appendLe32(stub, 0x000f0fff);
+    return stub;
 }
 
 // The bytes this endpoint puts on the wire, in the order MS-LSAD puts them: the
@@ -109,6 +251,8 @@ private slots:
     void alignsThePolicyArmsApparentlyTrivialLevelsHide();
     void answersThePrivilegeDisplayName();
     void refusesUnknownHandlesAndClasses();
+    void createsQueriesEnumeratesAndDeletesATrust();
+    void refusesDuplicateAndUnknownTrusts();
 };
 
 void LsadTest::answersTheDomainIdentity()
@@ -282,6 +426,171 @@ void LsadTest::refusesUnknownHandlesAndClasses()
     const QByteArray afterClose =
         server.handleCall(Lsad::OpQueryInformationPolicy2, queryStub(handle, 3));
     QCOMPARE(lastWord(afterClose), 0xc0000008u);
+}
+
+void LsadTest::createsQueriesEnumeratesAndDeletesATrust()
+{
+    LsadServer server;
+    server.setConfig(testConfig());
+    QList<DirectoryObject> store;
+    server.setObjectProvider([&store]() { return store; });
+    Lsad::WriteBackend writes;
+    writes.createTrust = [&store](DirectoryObject *object, QString *) {
+        store.append(*object);
+        return true;
+    };
+    writes.removeTrust = [&store](const QString &dn, QString *) {
+        for (int i = 0; i < store.size(); ++i) {
+            if (store.at(i).id == dn) {
+                store.removeAt(i);
+                return true;
+            }
+        }
+        return false;
+    };
+    server.setWriteBackend(writes);
+
+    const QByteArray policy =
+        server.handleCall(Lsad::OpOpenPolicy2, openPolicyStub()).left(20);
+    const QByteArray created = server.handleCall(
+        Lsad::OpCreateTrustedDomainEx,
+        createTrustStub(policy, QStringLiteral("fabrikam.local"), QStringLiteral("FABRIKAM"),
+                        QStringLiteral("S-1-5-21-9-8-7"), 3, 2));
+    QCOMPARE(lastWord(created), 0u);
+    QCOMPARE(created.size(), 24);
+    QVERIFY(created.left(20) != QByteArray(20, '\0'));
+
+    // The trust is the trustedDomain object under CN=System that a Windows DC
+    // stores, with the partner, direction and SID the call carried.
+    QCOMPARE(store.size(), 1);
+    const DirectoryObject &trust = store.first();
+    QCOMPARE(trust.id, QStringLiteral("CN=FABRIKAM,CN=System,DC=corp,DC=example,DC=com"));
+    QVERIFY(trust.attributes.value(QStringLiteral("objectClass"))
+                .contains(QLatin1String("trustedDomain")));
+    QCOMPARE(trust.attributes.value(QStringLiteral("trustPartner")),
+             QStringLiteral("fabrikam.local"));
+    QCOMPARE(trust.attributes.value(QStringLiteral("trustDirection")), QStringLiteral("3"));
+    QCOMPARE(trust.attributes.value(QStringLiteral("securityIdentifier")),
+             QStringLiteral("S-1-5-21-9-8-7"));
+    QCOMPARE(trust.attributes.value(QStringLiteral("trustAuthIncoming")),
+             QStringLiteral("2:") + QString::fromLatin1(QByteArray("s3cret").toHex()));
+    // The clear secret is the trust password, so the inter-realm keys the KDC
+    // uses are derived from it, exactly as a Windows DC does.
+    QCOMPARE(trust.attributes.value(QStringLiteral("kerberosSalt")),
+             QStringLiteral("CORP.EXAMPLE.COM+FABRIKAM.LOCAL"));
+    QVERIFY(!trust.attributes.value(QStringLiteral("aes128Key")).isEmpty());
+    QVERIFY(!trust.attributes.value(QStringLiteral("aes256Key")).isEmpty());
+
+    const QByteArray trustHandle = created.left(20);
+
+    // QueryTrustedDomainInfo level 6: the InfoEx fixed half names both names and
+    // the SID pointer, then the direction, type and attributes.
+    QByteArray query = trustHandle;
+    appendLe16(query, 6);
+    const QByteArray info = server.handleCall(Lsad::OpQueryTrustedDomainInfo, query);
+    QCOMPARE(lastWord(info), 0u);
+    QVERIFY(readLe32At(info, 0) != 0); // information pointer
+    QCOMPARE(readLe16At(info, 4), quint16(6));
+    QCOMPARE(readLe32At(info, 28), 3u); // trust_direction
+    QCOMPARE(readLe32At(info, 32), 2u); // trust_type
+    QVERIFY(readLe32At(info, 24) != 0); // the SID's referent
+    QVERIFY(info.contains(utf16Bytes(QStringLiteral("fabrikam.local"))));
+    QVERIFY(info.contains(utf16Bytes(QStringLiteral("FABRIKAM"))));
+
+    // The same information by name, which is what a client that knows only the
+    // partner name asks for.
+    QByteArray byName = policy;
+    appendInlineString(byName, QStringLiteral("FABRIKAM"), 0x00020011);
+    appendLe16(byName, 6);
+    const QByteArray byNameReply = server.handleCall(Lsad::OpQueryTrustedDomainInfoByName, byName);
+    QCOMPARE(lastWord(byNameReply), 0u);
+    QCOMPARE(readLe32At(byNameReply, 28), 3u);
+
+    // Open by name hands out a trust handle for the information calls.
+    const QByteArray opened =
+        server.handleCall(Lsad::OpOpenTrustedDomainByName,
+                          openTrustByNameStub(policy, QStringLiteral("FABRIKAM")));
+    QCOMPARE(lastWord(opened), 0u);
+    QCOMPARE(opened.size(), 24);
+    QVERIFY(opened.left(20) != QByteArray(20, '\0'));
+
+    // EnumTrustedDomainsEx: one entry, the partner's names and direction.
+    QByteArray enumerate = policy;
+    appendLe32(enumerate, 0);
+    appendLe32(enumerate, 0);
+    const QByteArray list = server.handleCall(Lsad::OpEnumTrustedDomainsEx, enumerate);
+    QCOMPARE(lastWord(list), 0u);
+    QCOMPARE(readLe32At(list, 4), 1u); // count
+    QVERIFY(readLe32At(list, 8) != 0); // array pointer
+    QVERIFY(list.contains(utf16Bytes(QStringLiteral("fabrikam.local"))));
+
+    // Delete by SID removes the object; the enumeration then reports no more
+    // entries rather than an empty success.
+    QByteArray remove = policy;
+    appendLe32(remove, 0x00020011);
+    remove.append(wireSid(QStringLiteral("S-1-5-21-9-8-7")));
+    QCOMPARE(lastWord(server.handleCall(Lsad::OpDeleteTrustedDomain, remove)), 0u);
+    QVERIFY(store.isEmpty());
+    const QByteArray gone = server.handleCall(Lsad::OpEnumTrustedDomainsEx, enumerate);
+    QCOMPARE(lastWord(gone), 0x8000001au); // STATUS_NO_MORE_ENTRIES
+    QCOMPARE(readLe32At(gone, 4), 0u);
+}
+
+void LsadTest::refusesDuplicateAndUnknownTrusts()
+{
+    LsadServer server;
+    server.setConfig(testConfig());
+    QList<DirectoryObject> store;
+    server.setObjectProvider([&store]() { return store; });
+    Lsad::WriteBackend writes;
+    writes.createTrust = [&store](DirectoryObject *object, QString *) {
+        store.append(*object);
+        return true;
+    };
+    writes.removeTrust = [](const QString &, QString *) { return false; };
+    server.setWriteBackend(writes);
+
+    const QByteArray policy =
+        server.handleCall(Lsad::OpOpenPolicy2, openPolicyStub()).left(20);
+    const auto create = [&](const QString &flat, bool internal) {
+        return server.handleCall(
+            internal ? Lsad::OpCreateTrustedDomainEx2 : Lsad::OpCreateTrustedDomainEx,
+            createTrustStub(policy, QStringLiteral("tailspin.local"), flat,
+                            QStringLiteral("S-1-5-21-4-5-6"), 3, 2, internal));
+    };
+    QCOMPARE(lastWord(create(QStringLiteral("TAILSPIN"), true)), 0u);
+    QCOMPARE(store.size(), 1);
+    // The Ex2 form carries the opaque internal blob; the object keeps it.
+    QCOMPARE(store.first().attributes.value(QStringLiteral("msDS-AuthInfoInternal")),
+             QStringLiteral("0011223344"));
+
+    // The same flat name twice is a collision, not a second trust.
+    QCOMPARE(lastWord(create(QStringLiteral("TAILSPIN"), false)), 0xc0000035u);
+    QCOMPARE(store.size(), 1);
+
+    // A name nothing created is not found on open, and an unknown SID is not
+    // found on delete.
+    const QByteArray missing =
+        server.handleCall(Lsad::OpOpenTrustedDomainByName,
+                          openTrustByNameStub(policy, QStringLiteral("CONTOSO")));
+    QCOMPARE(lastWord(missing), 0xc0000034u);
+    QCOMPARE(missing.left(20), QByteArray(20, '\0'));
+
+    QByteArray remove = policy;
+    appendLe32(remove, 0x00020011);
+    remove.append(wireSid(QStringLiteral("S-1-5-21-1-1-1")));
+    QCOMPARE(lastWord(server.handleCall(Lsad::OpDeleteTrustedDomain, remove)), 0xc0000034u);
+
+    // Level 7 carries the trust secret; it is refused rather than answered with
+    // an empty password a client might install as the trust key.
+    const QByteArray opened =
+        server.handleCall(Lsad::OpOpenTrustedDomainByName,
+                          openTrustByNameStub(policy, QStringLiteral("TAILSPIN")));
+    QByteArray query = opened.left(20);
+    appendLe16(query, 7);
+    const QByteArray refused = server.handleCall(Lsad::OpQueryTrustedDomainInfo, query);
+    QCOMPARE(lastWord(refused), 0xc0000003u); // STATUS_INVALID_INFO_CLASS
+    QCOMPARE(readLe32At(refused, 0), 0u);
 }
 
 QTEST_MAIN(LsadTest)

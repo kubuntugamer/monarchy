@@ -467,9 +467,11 @@ what a Windows 2000 external or forest trust is: the trust account in
 may be issued into the peer realm or accepted from it, a request for a service
 in a trusted realm is answered with a referral TGT (`krbtgt/PEER@OURS`) sealed
 with that key and carrying a PAC re-signed for the trust boundary, and an
-incoming `krbtgt/OURS@PEER` TGT is opened with the same key. Not implemented:
-transited-realm encoding beyond one hop, SID filtering and selective
-authentication, and trust-password rotation.
+incoming `krbtgt/OURS@PEER` TGT is opened with the same key. That object is
+what `LsarCreateTrustedDomainEx` over `lsarpc` writes, secret and keys
+included, so a trust can be created over the protocol rather than by editing
+the store. Not implemented: transited-realm encoding beyond one hop, SID
+filtering and selective authentication, and trust-password rotation.
 
 Both SASL security layers are implemented: RFC 4752/4121/1964 for GSSAPI and
 MS-NLMP §3.4 signing and sealing for NTLM, each carried in the RFC 4422
@@ -578,7 +580,10 @@ directions — `LsarLookupNames`/`LsarLookupSids`, paged with
 `PrivDisplayName`), account rights and system-access masks written to the
 account's `userRight` in the directory (LDAP shows them, they survive a
 restart), secrets and private data, `LsarGetUserName`, the policy security
-descriptor, and `LsarEnumTrustDom` answering empty, as a standalone DC. The
+descriptor, and the trusted-domain calls — create (`…Ex`/`…Ex2`), open by SID or
+name, query (name and info-ex), enumerate and delete. A trust is the
+`trustedDomain` object under `CN=System` a Windows DC stores, and its clear
+secret becomes the inter-realm `krbtgt` keys. The
 independent check is `scripts/lsad-conformance.py`: 50 checks against a live
 endpoint through Samba's `samba.dcerpc.lsa` (pidl's decoder, the reference the
 layout is written against) and through impacket's `lsad`/`lsat` clients.
@@ -632,14 +637,15 @@ encryption or preauth integrity, and `IPC$` is the only share — `\pipe\samr`,
 `\pipe\lsarpc`, `\pipe\netlogon` and `\pipe\epmapper` are reachable over SMB2
 (see below), but a directory browse is empty. Netlogon now serves the
 secure-channel calls, but no real member has been driven through a domain join
-against it here, and LSAD's trusted-domain calls are still refused because
-creation has not been wired to the new channel. A logon week written over SAMR is
+against it here, and LSAD trusts are stored and queryable but their secure
+channel and password rollover are not served. A logon week written over SAMR is
 stored and read back, but nothing consults it at logon yet, so it restricts
 nobody.
 `monarchy-rpc-probe` is the development endpoint used to drive that interop by
 hand, and `STATUS.md` is the 0.1.0 release contract.
 
-Not yet implemented: PKINIT and S4U, the rest of SAMR, LSAD trusted domains,
+Not yet implemented: PKINIT and S4U, the rest of SAMR, trust-password rotation
+and the Netlogon trust channel,
 `DsReplicaAdd` and multi-DC replication (two Monarchy DCs, or
 Samba/Windows peers),
 NTLM over raw SMB/DCE, GPO editing and client-side extension processing, the
