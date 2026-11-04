@@ -108,27 +108,27 @@ exactly as it would to a remote domain controller. Ordinary Kerberos clients
 
 ## Install
 
-One command builds everything, runs the test suite, installs the console,
-daemon and provisioner, provisions the domain, installs the systemd unit and
-starts the service:
+Run the installer with no options on a terminal and it walks through a
+`dcpromo`-style promotion, then builds, tests, installs, provisions and starts
+the service:
 
 ```sh
-sudo scripts/install-monarchy.sh --realm CORP.EXAMPLE.COM --dc-ip 192.168.1.50
-```
-
-For a `dcpromo`-style promotion, run the wizard instead:
-
-```sh
-sudo scripts/dcpromo
-# or: sudo scripts/install-monarchy.sh --wizard
+sudo scripts/install-monarchy.sh
 ```
 
 It asks for the domain FQDN, NetBIOS name, domain controller IPv4 address,
 Administrator password and resolver choice, then prints a promotion summary
-before touching the machine. The password is required (use `--adminpass` to
-pre-set it); it is never generated automatically. This build creates a **new
-forest only**; the wizard states that it cannot join an existing domain or add
-a replica DC.
+before touching the machine. The password is required and confirmed; it is
+never generated automatically. This build creates a **new forest only**; the
+wizard states that it cannot join an existing domain or add a replica DC.
+`sudo scripts/dcpromo` and `--wizard` open the same wizard directly.
+
+For unattended installs, supply the answers as flags instead:
+
+```sh
+sudo scripts/install-monarchy.sh --realm CORP.EXAMPLE.COM \
+  --dc-ip 192.168.1.50 --adminpass 'Choose-A-Password!'
+```
 
 Interactive runs prompt for the Administrator password twice; unattended runs
 must pass `--adminpass`. Without `--realm` the script provisions

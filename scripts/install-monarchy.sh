@@ -20,6 +20,7 @@
 
 set -euo pipefail
 
+ORIGINAL_ARGS=$#
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="$ROOT/build"
 PREFIX=""
@@ -76,7 +77,9 @@ Install mode
                       no systemd (default for a non-root run)
   --wizard, --dcpromo Interactively promote this machine to a new forest:
                       asks for the domain, NetBIOS name, DC address and
-                      Administrator password, then shows a summary
+                      Administrator password, then shows a summary.
+                      Also starts automatically when run with no options
+                      on a terminal
 
 Domain
   --realm REALM       Kerberos realm (default: MONARCHY.EXAMPLE.COM)
@@ -157,6 +160,12 @@ fi
 # relative --prefix or --dcdir.
 PREFIX="$(realpath -m "$PREFIX")"
 DCDIR="$(realpath -m "$DCDIR")"
+
+# A bare `sudo scripts/install-monarchy.sh` on a terminal means "guide me".
+# Explicit flags still select the unattended/scripted path.
+if [[ $WIZARD -eq 0 && $ORIGINAL_ARGS -eq 0 && $EUID -eq 0 && -t 0 ]]; then
+    WIZARD=1
+fi
 
 if [[ -z "$JOBS" ]]; then
     JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)"
