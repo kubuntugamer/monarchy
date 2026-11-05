@@ -12,6 +12,7 @@
 #include <QtTest>
 
 #include "Drs.h"
+#include "LdapServer.h"
 #include "Ndr.h"
 
 namespace {
@@ -330,6 +331,111 @@ private:
     }
 
 private slots:
+    // A deletion is not an absence: the object leaves the live store but stays
+    // as a tombstone, and the DRS chain has to carry it with isDeleted and
+    // whenChanged so a partner applies the deletion instead of keeping a stale
+    // copy. Driven through LdapServer::removeObject, the path LDAP and SAMR
+    // deletions take.
+    void deletedObjectsReplicateAsTombstones()
+    {
+        LdapServer store;
+        DirectoryObject domain;
+        domain.id = QStringLiteral("DC=corp,DC=example,DC=com");
+        domain.name = QStringLiteral("corp.example.com");
+        domain.type = QStringLiteral("Domain");
+        store.addObject(domain);
+
+        DirectoryObject user;
+        user.id = QStringLiteral("CN=alice,CN=Users,DC=corp,DC=example,DC=com");
+        user.name = QStringLiteral("alice");
+        user.type = QStringLiteral("User");
+        user.attributes.insert(QStringLiteral("sAMAccountName"), QStringLiteral("alice"));
+        user.attributes.insert(QStringLiteral("description"), QStringLiteral("temporary"));
+        user.attributes.insert(QStringLiteral("objectGUID"),
+                               QStringLiteral("{0f8fad5b-d9cb-469f-a165-70867728950e}"));
+        store.addObject(user);
+
+        QVERIFY(store.removeObject(user.id));
+        for (const DirectoryObject &object : store.objects()) {
+            QVERIFY(object.id.compare(user.id, Qt::CaseInsensitive) != 0);
+        }
+        QCOMPARE(store.tombstones().size(), 1);
+        const DirectoryObject tombstone = store.tombstones().first();
+        QCOMPARE(tombstone.attributes.value(QStringLiteral("isDeleted")),
+                 QStringLiteral("TRUE"));
+        QVERIFY(tombstone.attributes.value(QStringLiteral("description")).isEmpty());
+        QCOMPARE(tombstone.attributes.value(QStringLiteral("objectGUID")),
+                 QStringLiteral("{0f8fad5b-d9cb-469f-a165-70867728950e}"));
+        QVERIFY(tombstone.id.contains(QChar(u'\0') + QStringLiteral("ADEL:")));
+
+        DrsServer server;
+        server.setConfig(config());
+        server.setObjectProvider([&store]() {
+            return store.objects() + store.tombstones();
+        });
+
+        const QByteArray bindReply = server.handleCall(0, bindRequest());
+        const QByteArray handle = bindReply.mid(64, 20);
+        const QByteArray reply = server.handleCall(
+            3, getNcChangesRequest(handle, QStringLiteral("DC=corp,DC=example,DC=com")));
+        QVERIFY(reply.size() > 256);
+        QVERIFY(readLe32(reply, 112) >= 2); // the NC head and the tombstone
+
+        Ndr::Reader reader(reply);
+        QVERIFY(reader.skip(148));
+        QString pNcDn;
+        QVERIFY(walkDsName(&reader, &pNcDn));
+        quint32 count = 0, version = 0, reserved1 = 0, cursors = 0, reserved2 = 0;
+        QVERIFY(reader.u32(&count));
+        QVERIFY(reader.u32(&version));
+        QVERIFY(reader.u32(&reserved1));
+        QVERIFY(reader.u32(&cursors));
+        QVERIFY(reader.u32(&reserved2));
+        QVERIFY(reader.skip(16)); // invocation id
+        reader.align(8);
+        quint64 usnHigh = 0, lastSync = 0;
+        QVERIFY(reader.u64(&usnHigh));
+        QVERIFY(reader.u64(&lastSync));
+        QVERIFY(usnHigh > 0);
+
+        // The prefix table, then the OID bodies, before the chain begins.
+        quint32 prefixCount = 0;
+        QVERIFY(reader.u32(&prefixCount));
+        QCOMPARE(prefixCount, quint32(19));
+        QVector<quint32> lengths;
+        for (quint32 i = 0; i < prefixCount; ++i) {
+            quint32 ndx = 0, length = 0, elementsRef = 0;
+            QVERIFY(reader.u32(&ndx));
+            QVERIFY(reader.u32(&length));
+            QVERIFY(reader.u32(&elementsRef));
+            lengths.append(length);
+        }
+        for (quint32 length : lengths) {
+            quint32 maxCount = 0;
+            QVERIFY(reader.u32(&maxCount));
+            QCOMPARE(maxCount, length);
+            QByteArray oid;
+            QVERIFY(reader.bytes(int(length), &oid));
+        }
+
+        QList<ChainEntry> entries;
+        QVERIFY(walkChain(&reader, &entries));
+        const ChainEntry *tomb = nullptr;
+        for (const ChainEntry &entry : entries) {
+            if (entry.dn.contains(QChar(u'\0')))
+                tomb = &entry;
+        }
+        QVERIFY(tomb != nullptr);
+        // isDeleted: BOOLEAN, one byte, TRUE.
+        QCOMPARE(tomb->firstValue.value(0x00090003u), QByteArray(1, '\x01'));
+        // whenChanged: FILETIME, eight bytes, so a partner can ageing it.
+        QCOMPARE(tomb->firstValue.value(0x00020003u).size(), 8);
+        // The stripped account attributes stay stripped, the GUID survives.
+        QVERIFY(!tomb->firstValue.contains(0x000900DDu)); // sAMAccountName
+        QVERIFY(!tomb->firstValue.contains(0x0000000Du)); // description
+        QVERIFY(tomb->firstValue.contains(0x00090002u));  // objectGUID
+    }
+
     void drsBindAdvertisesTheReplyShapes()
     {
         DrsServer server;

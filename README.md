@@ -705,14 +705,16 @@ provenance and licences) are held in `reference/specs/`. Everything else — the
 bad-password and logon counters, the domain information *set* calls, and aliases
 — is absent and is not claimed to work; `DsReplicaAdd` with the multi-DC half
 of replication is not implemented, nor is SMB 3.x, so there is no SMB
-encryption or preauth integrity, and `IPC$` is the only share — `\pipe\samr`,
-`\pipe\lsarpc`, `\pipe\netlogon` and `\pipe\epmapper` are reachable over SMB2
-(see below), but a directory browse is empty. Netlogon now serves the
+encryption or preauth integrity. `IPC$` carries the named pipes
+`\pipe\samr`, `\pipe\lsarpc`, `\pipe\netlogon` and `\pipe\epmapper`, and
+`SYSVOL` and `NETLOGON` are read-only disk shares over both SMB2 and SMB1 (see
+below). Netlogon now serves the
 secure-channel calls, but no real member has been driven through a domain join
 against it here, and LSAD trusts are stored and queryable but their secure
 channel and password rollover are not served. A logon week written over SAMR is
-stored and read back, but nothing consults it at logon yet, so it restricts
-nobody.
+enforced at logon — by the KDC, by LDAP binds and by Netlogon — and so is the
+account's `userWorkstations` list, which Netlogon checks against the workstation
+the caller names.
 `monarchy-rpc-probe` is the development endpoint used to drive that interop by
 hand, and `STATUS.md` is the 0.1.0 release contract.
 

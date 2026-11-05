@@ -4,6 +4,7 @@
 #include "Drs.h"
 
 #include <QCryptographicHash>
+#include <QDateTime>
 
 #include <algorithm>
 
@@ -154,6 +155,8 @@ constexpr quint32 kAttidUserAccountControl = 0x00090008u; // 1.2.840.113556.1.4.
 constexpr quint32 kAttidObjectSid = 0x00090092u;          // 1.2.840.113556.1.4.146
 constexpr quint32 kAttidSamAccountName = 0x000900DDu;     // 1.2.840.113556.1.4.221
 constexpr quint32 kAttidUserPrincipalName = 0x00090290u;  // 1.2.840.113556.1.4.656
+constexpr quint32 kAttidIsDeleted = 0x00090003u;          // 1.2.840.113556.1.4.3
+constexpr quint32 kAttidWhenChanged = 0x00020003u;        // 1.2.840.113556.1.2.3
 constexpr quint32 kAttidReply = kAttidSamAccountName;     // placeholder, unused
 
 
@@ -322,6 +325,20 @@ QList<AttrValue> attrValues(const DirectoryObject &object, const QUuid &guid)
         for (const QString &memberDn : object.members)
             members.append(dsNameBytes(memberDn, objectGuidFor(memberDn), QString()));
         add(kAttidMember, members);
+    }
+    // A tombstone is told apart by isDeleted alone: the store has already
+    // stripped everything else a normal object serves.
+    if (object.attributes.value(QStringLiteral("isDeleted"))
+            .compare(QLatin1String("TRUE"), Qt::CaseInsensitive) == 0)
+        add(kAttidIsDeleted, {QByteArray(1, '\x01')}); // BOOLEAN syntax: one byte
+    const QDateTime changed =
+        QDateTime::fromString(object.attributes.value(QStringLiteral("whenChanged")),
+                              Qt::ISODate);
+    if (changed.isValid()) {
+        QByteArray fileTime; // 100-ns ticks since 1601-01-01
+        putLe64(fileTime,
+                quint64((changed.toSecsSinceEpoch() + 11644473600LL) * 10000000LL));
+        add(kAttidWhenChanged, {fileTime});
     }
     const QString objectClass = object.type == QStringLiteral("User")
         ? QStringLiteral("user")
@@ -1571,7 +1588,15 @@ QList<DirectoryObject> DrsServer::directory() const
 
 quint64 DrsServer::storeUsn(const DirectoryObject &object) const
 {
-    // Records do not change at runtime; serve a stable per-object uSNChanged.
+    // The store stamps uSNChanged on every write, which is what a replication
+    // cursor has to follow — a tombstone is ordered by the USN its deletion
+    // was stamped with. A hand-built fixture without the attribute keeps the
+    // stable derived value the earlier suites pin.
+    bool ok = false;
+    const quint64 stored =
+        object.attributes.value(QStringLiteral("uSNChanged")).toULongLong(&ok);
+    if (ok && stored != 0)
+        return stored;
     return 10000u + quint64(qHash(object.id)) % 900000u;
 }
 

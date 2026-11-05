@@ -5,6 +5,8 @@
 
 **Date:** 2026-10-19 · **Method:** read-only source audit of `samba-4.24.7/` (the only AD implementation in the 13 local trees) against Microsoft's published behaviour, plus verification of Microsoft's own conformance test suites. Every claim below is tied to a verified path or an explicit upstream statement.
 
+**Re-based 2026-11-04.** Sections 2 and 3 score **Samba 4.24.7**, which was the only implementation in the tree when they were written. Monarchy now answers the protocols itself from `engine/`, and §2.5 below scores the same 39 gaps against that engine. §3 is kept as the Samba-scoped original: it is still the right reference for what a Samba-derived product would inherit, and it is no longer a description of this tree.
+
 ---
 
 ## 0. The requirement and its consequences
@@ -83,6 +85,62 @@ This is **not** a greenfield project. The following are already 1:1-capable toda
 | Large regression suite (deviation catalogue) | `python/samba/tests/{krb5,ldap,samba_tool,gpo}/`, `selftest/knownfail.d/*` |
 
 **So the task is not "build AD" — it is "close Samba's AD-DS deltas".**
+
+---
+
+## 2.5 Re-base against the Monarchy engine (2026-11-04)
+
+The tree now builds its own DC: `monarchy-ui` and `monarchy-dcd` answer LDAP, Kerberos, kpasswd, SAMR, LSAD, Netlogon, DRSR, the endpoint mapper, SMB1/SMB2 and DNS from `engine/`, over the store the provisioner creates. The root DSE publishes **functional level 0** — the Windows 2000 behaviour level — and lists only the control it implements (`engine/LdapServer.cpp:704-718`). Every row below is therefore scored against a single-DC, FL 0 engine.
+
+Status is what the code does, not what the specs allow. **Absent** means no code path in `engine/`, `backend/` or `ui/src/` implements the behaviour (searched for the attribute, interface and call names); it does not mean the feature is impossible. **Partial** means some of the surface works and the named remainder does not.
+
+| # | Status | What this tree does | Evidence |
+|---|---|---|---|
+| G1 | absent | Publishes `domainControllerFunctionality`/`domainFunctionality`/`forestFunctionality` = 0; no `msDS-Behavior-Version` and no functional-level claim anywhere | `engine/LdapServer.cpp:704-718` |
+| G2 | absent | No claims or Dynamic Access Control code; the only "claims" match is prose in a header comment | `engine/Netlogon.h:20` |
+| G3 | absent | No schema NC content or LDF import; nothing answers `CN=Schema`/`subSchema` | no match in `engine/` |
+| G4 | absent | No delegated MSA | — |
+| G5 | absent | No LAPS behaviour | — |
+| G6 | absent | No `msDS-KeyCredentialLink` handling | — |
+| G7 | absent | No Central Access Policy engine | — |
+| G8 | absent | DRSR serves uncompressed `DsGetNCChanges` only; no compression path exists to gate | `engine/Drs.cpp` |
+| G9 | absent | SYSVOL is served from the filesystem over SMB2/SMB1; no FRS or DFS-R | `engine/Smb2.cpp`, `engine/Smb1.cpp`, `engine/LdapServer.cpp:708` |
+| G10 | absent | No read-only DC; DC info reports `fIsRodc` = 0 | `engine/Drs.cpp:1322` |
+| G11 | partial | `DsBind`, `DsGetNCChanges` (V6), `DsCrackNames`, `DsGetDomainControllerInfo`, `DsReplicaSync`, `DsUpdateRefs` for one naming context, with deletion tombstones exported and objects ordered by the store's `uSNChanged`; `DsReplicaAdd` refused, no linked-value hysteresis | `engine/Drs.cpp` |
+| G12 | partial | Global Catalog is the same store on 3268; deletions are kept as tombstones (`isDeleted`, `whenChanged`, a `<rdn>\0ADEL:<guid>` RDN) and exported over DRS, but there is no tombstone lifetime or garbage collection | `engine/LdapServer.cpp`, `engine/Drs.cpp` |
+| G13 | absent | No MS-KKDCP `/KdcProxy` | — |
+| G14 | absent | No Kerberos claims or compound identity | — |
+| G15 | absent | No authentication policies or silos | — |
+| G16 | absent | No PKINIT; no X.509/CMS path | — |
+| G17 | n/a | The KDC is Monarchy's own, not MIT's kdb path | `engine/Kdc.cpp` |
+| G18 | absent | StartTLS exists, but no LDAP signing requirement, no `dsHeuristics` policy | `engine/LdapServer.cpp` |
+| G19 | partial | Only paged results is advertised; SD-flag and extended-DN control revisions are not | `engine/LdapServer.cpp:717` |
+| G20 | closed | Catalog listener on `gcPort` (3268) serves the same store; provisioning creates `NTDS Settings` with IS_GC | `engine/LdapServer.cpp`, `engine/Provisioner.cpp` |
+| G21 | absent | No ADWS, so the PowerShell `ActiveDirectory` module has nothing to talk to | no match in `engine/` |
+| G22 | absent | No MS-W32T and no MS-SNTP | — |
+| G23 | partial | SAMR, LSAD and NRPC are broad (writes, rights, secrets, trust objects, machine password, SamLogon, locator); aliases, `SamrSetInformationDomain`, bad-password/logon counters and the Netlogon trust channel are missing | `engine/Samr.cpp`, `engine/Lsad.cpp`, `engine/Netlogon.cpp` |
+| G24 | partial | Aggregates 21/23/25 carry strings, flags, expiry, parameters and the logon week, and `userWorkstations` is now enforced at logon; no PSO or newer information classes | `engine/Samr.cpp`, `engine/WorkstationRestriction.cpp` |
+| G25 | partial | `scripts/check-dc-health.sh` and per-protocol conformance scripts from a Linux host; no `dcdiag`/`ntdsutil` equivalents | `scripts/` |
+| G26 | partial | Provisioning writes the GPO objects, `gPLink` and their SYSVOL content; no GPO editing or link management | `engine/Provisioner.cpp` |
+| G27 | absent | No client-side extension processing | — |
+| G28 | absent | No DFS referral service | — |
+| G29 | absent | No SMB Direct/RDMA | — |
+| G30 | partial | SMB 2.0.2/2.1 with signing; no 3.x, so no encryption and no preauth integrity | `engine/Smb2.cpp` |
+| G31 | absent | EDNS DO bit is read; nothing signs, so no DNSSEC | `engine/DnsServer.cpp:741-747` |
+| G32 | absent | No aging or scavenging | — |
+| G33 | partial | The locator advertises `TIMESERV`; no time service and no signed NTP | `engine/Netlogon.cpp` |
+| G34 | partial | Trust objects, secrets, inter-realm keys, direction, SID and the Netlogon trust-channel authentication exist; no forest trust info, no 30-day rollover, no RPC schannel, no SID filtering or selective authentication | `engine/Lsad.cpp`, `engine/Netlogon.cpp` |
+| G35 | absent | No AD LDS | — |
+| G36 | absent | No AD CS | — |
+| G37 | absent | No AD FS | — |
+| G38 | absent | No AD RMS | — |
+| G39 | absent | No WMI/WBEM surface | — |
+
+**Score: 1 closed, 1 not applicable, 10 partial, 27 absent.**
+
+What that means for the target set in §1.5: at FL 0 the engine covers the directory, authentication, RPC administration, SMB, DNS and account-restriction core that a Windows 2000-era domain uses, and it is deliberately missing everything the later functional levels added. The register's critical path therefore reduces to three items on this tree — **multi-DC replication** (G11/G12: tombstones, `DsReplicaAdd`, a second DC), **the trust edges** (G34: forest trust info, rollover, schannel) and **GPO write/CSE** (G26/G27) — with ADWS (G21) gating Windows tooling parity and SMB 3.x (G30) gating encryption.
+
+**What is still not proven.** Every verification in this tree is against independent clients: impacket, Samba's NDR clients and `smbclient`, MIT krb5, `dig`/`nsupdate`, OpenSSL. That establishes **L1 (wire interop)**. The register's L2/L3 acceptance criterion — the Microsoft Windows Protocol Test Suites (`ADFamily`, `Kerberos`, `MS-XCA`) and bidirectional DRS against a real Windows DC — has not been run, and no `DEVIATIONS.md` or published scorecard exists yet (§5.3, §7.2). On this tree, as of 2026-11-04, `ctest` runs 18 suites and all 18 pass.
 
 ---
 

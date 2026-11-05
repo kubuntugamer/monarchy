@@ -23,6 +23,7 @@
 #include <QJsonObject>
 #include <QRandomGenerator>
 #include <QSet>
+#include <QUuid>
 #include <algorithm>
 #include <functional>
 
@@ -406,6 +407,7 @@ quint16 LdapServer::serverPort() const { return m_server ? m_server->serverPort(
 
 void LdapServer::setObjects(const QList<DirectoryObject> &objects) {
     m_objects = objects;
+    m_tombstones.clear();
     normalizeMembership();
     ensureRootDse();
 }
@@ -743,6 +745,47 @@ bool LdapServer::removeObject(const QString &dn) {
     for (int i = 0; i < m_objects.size(); i++) {
         if (m_objects[i].id.compare(dn, Qt::CaseInsensitive) == 0) {
             const QString removed = m_objects[i].id;
+
+            // AD does not erase a deleted object; it keeps a tombstone so the
+            // deletion replicates. Only the identity attributes survive
+            // (MS-ADTS 3.1.1.3.3), the RDN is mangled with \0ADEL:<guid> so the
+            // original name is free again, and the new uSNChanged puts the
+            // deletion after every live object a replication cursor has passed.
+            DirectoryObject tombstone;
+            tombstone.id = m_objects[i].id;
+            tombstone.name = m_objects[i].name;
+            tombstone.type = m_objects[i].type;
+            tombstone.description = m_objects[i].description;
+            tombstone.kind = m_objects[i].kind;
+            for (const QString &keep : {QStringLiteral("objectGUID"),
+                                        QStringLiteral("objectSid"),
+                                        QStringLiteral("whenCreated")}) {
+                if (m_objects[i].attributes.contains(keep))
+                    tombstone.attributes.insert(keep, m_objects[i].attributes.value(keep));
+            }
+            QString guid = tombstone.attributes.value(QStringLiteral("objectGUID"));
+            if (guid.isEmpty()) {
+                guid = QUuid::createUuid().toString(QUuid::WithoutBraces);
+                tombstone.attributes.insert(QStringLiteral("objectGUID"), guid);
+            }
+            QString bare = guid;
+            bare.remove(QLatin1Char('{'));
+            bare.remove(QLatin1Char('}'));
+            const int comma = tombstone.id.indexOf(QLatin1Char(','));
+            const QString rdn = comma < 0 ? tombstone.id : tombstone.id.left(comma);
+            const QString rest = comma < 0 ? QString() : tombstone.id.mid(comma);
+            if (rdn.contains(QLatin1Char('='))) {
+                tombstone.id = rdn + QChar(u'\0') + QStringLiteral("ADEL:") + bare + rest;
+                tombstone.name = tombstone.name + QChar(u'\0')
+                    + QStringLiteral("ADEL:") + bare;
+            }
+            tombstone.attributes.insert(QStringLiteral("isDeleted"), QStringLiteral("TRUE"));
+            tombstone.attributes.insert(QStringLiteral("whenChanged"),
+                                        QDateTime::currentDateTimeUtc().toString(Qt::ISODate));
+            tombstone.attributes.insert(QStringLiteral("uSNChanged"),
+                                        QString::number(nextUsn()));
+            m_tombstones.append(tombstone);
+
             m_objects.removeAt(i);
             // A deleted object must not stay behind in any group's member list.
             for (DirectoryObject &object : m_objects) {
@@ -753,7 +796,6 @@ bool LdapServer::removeObject(const QString &dn) {
                                      object.members.end());
             }
             normalizeMembership();
-            nextUsn();
             ensureRootDse();
             return true;
         }

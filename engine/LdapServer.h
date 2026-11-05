@@ -72,6 +72,13 @@ public:
     // In-memory store.
     void setObjects(const QList<DirectoryObject> &objects);
     QList<DirectoryObject> objects() const { return m_objects; }
+    // Deleted objects, kept the way AD keeps them: the object survives as a
+    // tombstone (isDeleted TRUE, whenChanged stamped, most attributes stripped,
+    // its RDN mangled to `<rdn>\0ADEL:<guid>`) so replication can carry the
+    // deletion to a partner. They are deliberately not part of objects(): LDAP
+    // never returns them, and the original DN is free for a new object. They
+    // live in memory with the rest of the store and are not purged.
+    QList<DirectoryObject> tombstones() const { return m_tombstones; }
     bool loadFromFile(const QString &path);
     bool saveToFile(const QString &path) const;
 
@@ -290,6 +297,7 @@ private:
     QSslKey m_tlsKey;
     bool m_tlsAvailable = false;
     QList<DirectoryObject> m_objects;
+    QList<DirectoryObject> m_tombstones;
     QList<ClientState *> m_clients;
     QMap<QString, Credential> m_credentials; // lower-cased DN -> verifier
     long long m_usn = 1000;

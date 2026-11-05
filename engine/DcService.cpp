@@ -509,7 +509,11 @@ bool DcService::start(const QString &dcDir)
     m_drsServer->setDomainNames(drsConfig.netbios,
                                 dcHost.section(QLatin1Char('.'), 0, 0).toUpper(),
                                 dnsDomain);
-    m_drsServer->setObjectProvider([this]() { return m_ldapServer->objects(); });
+    // Tombstones are part of what a replication partner has to see: the live
+    // store alone would leave a deleted object alive on the other side.
+    m_drsServer->setObjectProvider([this]() {
+        return m_ldapServer->objects() + m_ldapServer->tombstones();
+    });
     m_drsServer->setAuthenticator(authenticator);
     connect(m_drsServer, &DrsServer::requestReceived, this,
             [this](const QString &operation) { emit statusMessage(operation); });
