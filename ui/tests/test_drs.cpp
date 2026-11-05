@@ -331,6 +331,35 @@ private:
     }
 
 private slots:
+    // MS-DRSR assigns the replication lifecycle calls opnums 2 and 4; 21 and 22
+    // are DsGetMemberships2 and DsReplicaVerifyObjects. Answering the wrong
+    // numbers means a real client triggering replication is told the call is
+    // unsupported.
+    void replicaSyncAndUpdateRefsAnswerAtTheirSpecOpmums()
+    {
+        DrsServer server;
+        server.setConfig(config());
+        server.setObjectProvider([this]() { return fixture(); });
+
+        const QByteArray bindReply = server.handleCall(0, bindRequest());
+        const QByteArray handle = bindReply.mid(64, 20);
+
+        for (quint16 opnum : {quint16(2), quint16(4)}) {
+            const QByteArray reply = server.handleCall(opnum, handle);
+            QCOMPARE(reply.size(), 4);
+            QCOMPARE(readLe32(reply, 0), quint32(0));
+        }
+
+        // A forged handle is still refused, so these are not unconditional.
+        QByteArray forged(20, '\x7f');
+        QCOMPARE(readLe32(server.handleCall(2, forged), 0), quint32(0x000006f7));
+        QCOMPARE(readLe32(server.handleCall(4, forged), 0), quint32(0x000006f7));
+
+        // The numbers those methods actually own must not be answered here.
+        QCOMPARE(readLe32(server.handleCall(21, handle), 0), quint32(0x57));
+        QCOMPARE(readLe32(server.handleCall(22, handle), 0), quint32(0x57));
+    }
+
     // A deletion is not an absence: the object leaves the live store but stays
     // as a tombstone, and the DRS chain has to carry it with isDeleted and
     // whenChanged so a partner applies the deletion instead of keeping a stale
@@ -718,7 +747,7 @@ private slots:
 
         // An unimplemented opnum answers ERROR_INVALID_PARAMETER, not a
         // reply that pretends to be understood.
-        const QByteArray unsupported = server.handleCall(5, QByteArray());
+        const QByteArray unsupported = server.handleCall(8, QByteArray());
         QCOMPARE(unsupported.size(), 4);
         QCOMPARE(readLe32(unsupported, 0), quint32(0x57));
 

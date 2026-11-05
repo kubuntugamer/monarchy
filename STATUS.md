@@ -57,8 +57,8 @@ capped at `cMaxObjects` with `fMoreData` for the rest, and the object chain
 marshalled the way the peer walks it (REPLENTINFLIST → ENTINF → ATTRBLOCK →
 interleaved ATTR triples → per-value conformant arrays, DSNAME with its
 conformant string head). `EXOP_REPL_OBJ` targets one object by DN, GUID or
-SID; `DsReplicaSync`/`DsUpdateRefs` are answered as the lifecycle calls a
-cycle makes. `DsCrackNames` translates FQDN, canonical, NT4 (with and
+SID; `DsReplicaSync` (opnum 2) and `DsUpdateRefs` (opnum 4) are answered as the
+lifecycle calls a cycle makes. `DsCrackNames` translates FQDN, canonical, NT4 (with and
 without the domain), UPN, display name, GUID, SID and DNS-domain forms
 against the same directory, and `DsGetDomainControllerInfo` (levels 1/2/3
 plus the connection arm) describes this DC — level 2 carrying the NTDS
@@ -104,7 +104,7 @@ failure) |
   in the serving process (they are not persisted, and nothing encrypts them at
   rest), and the per-account system-access mask is per handle rather than
   written to the directory.
-- **DRSR `DsReplicaAdd`** (opnum 25): with one DC and one naming context
+- **DRSR `DsReplicaAdd`** (opnum 5): with one DC and one naming context
   there is no replica to add, so the call is refused with
   `ERROR_INVALID_PARAMETER` rather than accepted and silently dropped.
 - **Netlogon beyond the calls above**: no Windows or Samba member has been

@@ -1245,7 +1245,7 @@ QByteArray DrsServer::drsUnbind(const QByteArray &stub)
     return writer.take();
 }
 
-// DsReplicaSync (opnum 21) and DsUpdateRefs (opnum 22): the lifecycle calls a
+// DsReplicaSync (opnum 2) and DsUpdateRefs (opnum 4): the lifecycle calls a
 // replication cycle makes around GetNCChanges. Both answer from handle
 // validity; the cycle itself is served by DsGetNCChanges.
 QByteArray DrsServer::drsReplicaSync(const QByteArray &stub)
@@ -1615,9 +1615,9 @@ QByteArray DrsServer::handleCall(quint16 opnum, const QByteArray &stub)
         return drsCrackNames(stub);
     case 16:
         return drsDomainControllerInfo(stub);
-    case 21:
+    case 2:
         return drsReplicaSync(stub);
-    case 22:
+    case 4:
         return drsUpdateRefs(stub);
     default:
         // Only the calls this server implements are described; the rest are
