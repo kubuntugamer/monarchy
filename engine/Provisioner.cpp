@@ -378,6 +378,8 @@ ProvisionResult provisionDomain(const ProvisionConfig &config)
     // The Global Catalog has no unprivileged equivalent: 3268 is already above
     // 1024, so it is the same number in a dev run as on a real DC.
     const quint16 gcPort = 3268;
+    // kpasswd is 464 on a real DC; a rootless dev run moves it with the rest.
+    const quint16 kpasswdPort = config.devPorts ? 1464 : 464;
 
     QString target = config.targetDir;
     if (target.isEmpty()) {
@@ -503,6 +505,21 @@ ProvisionResult provisionDomain(const ProvisionConfig &config)
     krbtgt.attributes.insert(QStringLiteral("ntHash"), randomKeyHex());
     Krb5::storeRandomKeys(krbtgt);
     krbtgt.attributes.insert(QStringLiteral("msDS-KeyVersionNumber"), QStringLiteral("1"));
+
+    // The service principal a client asks the KDC for before it can change a
+    // password (RFC 3244 §2). Its key is random, like krbtgt's: nobody logs on
+    // as the service, they only present a ticket for it.
+    // NORMAL_ACCOUNT, not disabled: the KDC refuses an initial ticket for a
+    // disabled principal, and this account exists only to hold the key.
+    DirectoryObject &kadmin = b.addUser(
+        QStringLiteral("kadmin"), 503, QStringLiteral("kadmin"), 512,
+        QStringLiteral("Kerberos password change service account"));
+    kadmin.attributes.insert(QStringLiteral("showInAdvancedViewOnly"), QStringLiteral("TRUE"));
+    kadmin.attributes.insert(QStringLiteral("servicePrincipalName"),
+                             QStringLiteral("kadmin/changepw"));
+    kadmin.attributes.insert(QStringLiteral("ntHash"), randomKeyHex());
+    Krb5::storeRandomKeys(kadmin);
+    kadmin.attributes.insert(QStringLiteral("msDS-KeyVersionNumber"), QStringLiteral("1"));
 
     // --- Groups ----------------------------------------------------------
     b.addGroup(QStringLiteral("Domain Admins"), 512,
@@ -774,7 +791,7 @@ ProvisionResult provisionDomain(const ProvisionConfig &config)
     {
         DnsServer dns;
         dns.loadAdZone(b.dnsDomain, result.dcHost, dcIp, ldapPort, gcPort,
-                       QStringLiteral("Default-First-Site-Name"));
+                       QStringLiteral("Default-First-Site-Name"), kpasswdPort, kdcPort);
         QString zoneError;
         if (!dns.saveZone(result.zonePath, &zoneError)) {
             result.error = zoneError;
@@ -803,6 +820,7 @@ ProvisionResult provisionDomain(const ProvisionConfig &config)
                            "[realms]\n"
                            "    %1 = {\n"
                            "        kdc = %2:%3\n"
+                           "        kpasswd_server = %2:%5\n"
                            "    }\n"
                            "\n"
                            "[domain_realm]\n"
@@ -810,7 +828,8 @@ ProvisionResult provisionDomain(const ProvisionConfig &config)
                            "    %4 = %1\n")
                 .arg(realm, dcIp)
                 .arg(kdcPort)
-                .arg(result.dnsDomain);
+                .arg(result.dnsDomain)
+                .arg(kpasswdPort);
         if (!writeFile(result.krb5ConfPath, contents.toUtf8(), &error)) {
             result.error = error;
             return result;
@@ -842,6 +861,7 @@ ProvisionResult provisionDomain(const ProvisionConfig &config)
     conf.setValue(QStringLiteral("smbPort"), config.smbPort);
     conf.setValue(QStringLiteral("netlogonPort"), 1037);
     conf.setValue(QStringLiteral("kdcPort"), kdcPort);
+    conf.setValue(QStringLiteral("kpasswdPort"), kpasswdPort);
     conf.setValue(QStringLiteral("krb5ConfPath"), result.krb5ConfPath);
     conf.setValue(QStringLiteral("dcName"), b.dcName);
     conf.setValue(QStringLiteral("dcHost"), result.dcHost);

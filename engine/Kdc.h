@@ -55,6 +55,7 @@ public:
         QString clientPrincipal;
         QString servicePrincipal;
         QByteArray sessionKey;
+        int sessionEtype = 0;
         // GSS-API context key: the subkey the initiator proposed (which the
         // AP-REP echoes), otherwise the ticket's session key. Per-message
         // tokens are sealed with it.
@@ -69,6 +70,15 @@ public:
         quint32 sendSeq = 0;
         // The PAC carried by the service ticket, signature-verified.
         QByteArray pac;
+        // The subsession key from the authenticator, empty when the client
+        // sent none. kpasswd seals its KRB-PRIV under it (RFC 3244 §2).
+        QByteArray subkey;
+        int subkeyEtype = 0;
+        // The authenticator's timestamp and sequence number, which a kpasswd
+        // reply echoes: RFC 3244 requires the reply's seq-number to match.
+        qint64 ctime = 0;
+        quint32 cusec = 0;
+        quint32 clientSeq = 0;
     };
 
     // Accepts a Kerberos AP-REQ (bare or wrapped in a GSS-API initial context
@@ -114,6 +124,8 @@ private:
         QString srealm;
         quint32 nonce = 0;
         quint32 options = 0;
+        // Requested end time; a reply must not outlive it (RFC 4120 §3.1.3).
+        qint64 till = 0;
         QList<int> etypes;
         bool hasEncTimestamp = false;
         QByteArray encTimestamp;
@@ -162,7 +174,9 @@ private:
     bool verifyAuthenticator(const QByteArray &apReqDer, const OpenedTicket &ticket,
                              int usage, QByteArray *replyToken, QString *error,
                              QByteArray *subkeyOut = nullptr,
-                             int *subkeyEtypeOut = nullptr);
+                             int *subkeyEtypeOut = nullptr,
+                             quint32 *seqOut = nullptr, qint64 *ctimeOut = nullptr,
+                             quint32 *cusecOut = nullptr);
     // Opens the service ticket an AP-REQ carries against the directory.
     bool openApReq(const QByteArray &apReqDer, OpenedTicket *ticket, Krb5::Principal *service,
                    QString *serviceName, QString *error);
@@ -174,8 +188,13 @@ private:
     QByteArray handleTgsReq(const KdcRequest &request);
     QByteArray preauthRequired(const KdcRequest &request, const QString &salt,
                                const QList<int> &etypes) const;
+    // `service`/`serviceName` carry an initial ticket for a service principal,
+    // which RFC 4120 §3.1.3 allows an AS-REQ to name — how a client gets its
+    // kadmin/changepw ticket for kpasswd. Empty means the TGT.
     QByteArray issueAsRep(const KdcRequest &request, const Krb5::Principal &client,
-                          int etype, const QByteArray &timestamp) const;
+                          int etype, const QByteArray &timestamp,
+                          const Krb5::Principal &service = Krb5::Principal(),
+                          const QString &serviceName = QString()) const;
     QByteArray issueTgsRep(const KdcRequest &request, const OpenedTicket &tgt,
                            const QByteArray &subkey, int subkeyEtype) const;
     QByteArray krbError(int code, const QString &realm, const QString &cname,

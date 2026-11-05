@@ -9,6 +9,7 @@
 class LdapServer;
 class DnsServer;
 class Kdc;
+class KpasswdServer;
 class SamrServer;
 class LsadServer;
 class NetlogonServer;
@@ -55,6 +56,7 @@ private:
     LdapServer *m_ldapServer = nullptr;
     DnsServer *m_dnsServer = nullptr;
     Kdc *m_kdc = nullptr;
+    KpasswdServer *m_kpasswdServer = nullptr;
     SamrServer *m_samrServer = nullptr;
     LsadServer *m_lsadServer = nullptr;
     NetlogonServer *m_netlogonServer = nullptr;

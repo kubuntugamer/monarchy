@@ -46,8 +46,8 @@ exactly as it would to a remote domain controller. Ordinary Kerberos clients
   every group.
 - **KDC (`engine/`)** — a Kerberos 5 KDC (RFC 4120) serving TCP and UDP on **88**
   for a provisioned domain (`kdcPort` from `dc.conf`; provisioning defaults to
-  AD's native bindings — DNS 53, LDAP 389, Kerberos 88, SMB 445, epm 135,
-  SAMR/LSAD 49152/49153 — because the daemon runs as a root service with
+  AD's native bindings — DNS 53, LDAP 389, Kerberos 88, kpasswd 464, SMB 445,
+  epm 135, SAMR/LSAD 49152/49153 — because the daemon runs as a root service with
   `CAP_NET_BIND_SERVICE`; `--dev-ports` provisions the unprivileged set a
   rootless console run can bind). Accounts carry
   AES-128/AES-256 (RFC 3962, PBKDF2 + n-fold string-to-key) and RC4-HMAC
@@ -68,17 +68,26 @@ exactly as it would to a remote domain controller. Ordinary Kerberos clients
   modify it, so a standard user's ticket can read but not write. It also verifies AP-REQs for LDAP
   SASL `GSSAPI` — Authenticator decryption, 5-minute clock skew, a replay
   cache, and both PAC signatures — returning a GSS-API AP-REP so mutual
-  authentication and the SASL security layer succeed. `monarchy-provision`
+  authentication and the SASL security layer succeed. It also serves the
+  **change-password service on 464** (RFC 3244, `engine/Kpasswd.cpp`): a
+  `kadmin/changepw` ticket is verified by that same acceptor, the new password
+  arrives in a KRB-PRIV sealed under the authenticator's subsession key, and
+  the write goes through the password path LDAP and SAMR use — so what
+  `kpasswd` or `krb5_set_password` sets is what Kerberos, NTLM and simple bind
+  accept next. `monarchy-provision`
   writes a `krb5.conf` that points at the new realm, so `kinit` needs no
   hand-written stanza.
 - **DNS engine (`engine/`)** — an authoritative UDP zone for the domain
-  (RFC 1035) that publishes the full domain-controller locator set a client
+  (RFC 1035) that publishes the domain-controller locator set a client
   looks for: `_ldap._tcp` for the domain, `dc._msdcs`, the site-scoped
   `_sites._msdcs` names, `_kerberos`, `_kpasswd`, `_gc` and the PDC record,
   plus SOA/NS/A. It applies RFC 2136 dynamic updates (prerequisites, `IN`/
   `ANY`/`NONE` update classes, `NOTZONE`/`NOTAUTH`/`REFUSED`/`YX*`/`NX*`
   rcodes), bumps the SOA serial, and persists the zone to `dnszone.json`.
-  It is authoritative only — it does not recurse.
+  On start the daemon also holds its zone to what it actually serves: a missing
+  or stale `_ldap`/`_kerberos`/`_kpasswd`/`_gc`/PDC locator is repaired in
+  place and persisted, so an upgraded DC cannot keep pointing clients at a port
+  nothing answers. It is authoritative only — it does not recurse.
 - **Provisioning (`engine/`)** — `monarchy-provision` creates a domain from
   Monarchy's own code: domain/configuration/schema NCs, default containers, the
   built-in accounts and groups with RIDs, this DC's computer object, SYSVOL
@@ -102,7 +111,7 @@ exactly as it would to a remote domain controller. Ordinary Kerberos clients
   (secure channel, machine-password write, SamLogon validation and the DC
   locator), the
   **endpoint mapper**, and **SMB2** with `IPC$` named pipes into those same
-  endpoints.
+  endpoints, plus the read-only `SYSVOL`/`NETLOGON` disk shares.
 - **Wiring** — the console hosts the engine on ports 1389 (LDAP), 8888 (KDC)
   and 1053 (DNS), the DCE/RPC endpoints on `samrPort` 1035, `lsadPort` 1036,
   `netlogonPort` 1037
@@ -254,9 +263,18 @@ journal (`journalctl -u monarchy-dcd`). A machine with no provisioned domain
 fails once at boot instead of restarting in a loop. After changing `dc.conf`,
 run `sudo systemctl restart monarchy-dcd`; no reboot is needed.
 
+`sudo scripts/check-dc-health.sh [dcdir]` answers the question a status line
+cannot: does everything this DC advertises actually respond? It connects to
+every port named in `dc.conf`, then asks the zone it serves for its SRV locator
+records and connects to each port they name, so a record pointing at a dead
+port is reported by the installer instead of by a client later.
+`scripts/install-dc-services.sh` runs it after restarting the unit and exits
+non-zero if a locator is advertised but nothing is listening.
+
 The unit carries `AmbientCapabilities=CAP_NET_BIND_SERVICE`, and provisioning
-itself defaults to the real-DC ports (DNS 53, LDAP 389, Kerberos 88, SMB 445,
-epm 135), so the service binds them right away the same way `lsass.exe` does.
+itself defaults to the real-DC ports (DNS 53, LDAP 389, Kerberos 88, kpasswd
+464, SMB 445, epm 135), so the service binds them right away the same way
+`lsass.exe` does.
 Provision with `--dev-ports` only for a rootless machine.
 
 On a host running `systemd-resolved`, its stub listener occupies port 53.
@@ -276,7 +294,8 @@ default.
 
 The daemon serves the provisioned domain on **LDAP 389**, the Global Catalog
 on **3268**, the KDC on
-**88** and **DNS 53**, the DCE/RPC endpoints on `samrPort` 49152,
+**88**, Kerberos password change on **464** (`kpasswdPort`, TCP and UDP) and
+**DNS 53**, the DCE/RPC endpoints on `samrPort` 49152,
 `lsadPort` 49153, `netlogonPort` 1037 and `drsPort` 1038 (loopback), the endpoint mapper on
 `epmPort` and SMB2 on `smbPort`. The console is a pure client: it reads the
 provisioned domain's `dc.conf` (or `MONARCHY_DCDIR`) for the port, asks the
@@ -311,7 +330,7 @@ directory is provisioned or connected.
 
 ## Tests
 
-`ctest` runs fourteen suites:
+`ctest` runs seventeen suites:
 
 - `monarchy-ui-tests` — container filtering, navigation history, view modes, CSV
   export, property-sheet edits, membership add/remove in the property sheet
@@ -356,6 +375,14 @@ directory is provisioned or connected.
   `ALPHA`, then a service ticket for `BETA` — the referral TGT from `ALPHA`, the
   cross-realm TGT accepted by `BETA`, and the resulting AP-REQ verified by
   `BETA`'s directory.
+- `monarchy-kpasswd-tests` — the change-password service on 464 driven by MIT's
+  own client, `krb5_change_password` and `krb5_set_password`, which verify the
+  reply's AP-REP and KRB-PRIV key themselves: a user changes its own password
+  and the new one opens a TGT while the old one does not, the stored NT hash is
+  the new password's, a weak password is refused with `KRB5_KPASSWD_SOFTERROR`
+  and leaves the old credential in place, an administrator sets another
+  account's password, and a standard user is refused `KRB5_KPASSWD_ACCESSDENIED`
+  when it tries the same. Without MIT krb5 the case is skipped, not faked.
 - `monarchy-dns-tests` — drives the DNS engine over real UDP: the complete DC
   locator record set and its ports, SRV/A/ANY queries, refusal of out-of-zone
   queries, dynamic update add/delete/single-value delete, prerequisite and
@@ -365,6 +392,11 @@ directory is provisioned or connected.
   SIDs, group links, policy files, secrets and root DSE, then binds and searches
   the provisioned store over real LDAP (including rejection of a wrong
   password and of an unknown account).
+- `monarchy-logonhours-tests` — the account week the logon paths consult: the
+  Sunday-first UTC hour mapping across all 168 bits, the first and last bit of
+  the bitmap, the hours either side of a set bit, an unset value meaning no
+  restriction, and a truncated value that is silent about the hours it does not
+  cover.
 - `monarchy-netlogon-tests` — the Netlogon (MS-NRPC) endpoint: the
   secure-channel handshake at every crypto level the server negotiates
   (legacy DES, strong-key MD4, AES), the original and flags-carrying
@@ -399,7 +431,18 @@ directory is provisioned or connected.
   handle marshallings, paging, `ept_map` against a captured request, and the
   management-opnum refusals.
 - `monarchy-smb-tests` — dialect negotiation, the tree connect to `IPC$`,
-  pipe open/close, and a full DCE/RPC bind carried through a pipe.
+  pipe open/close, a full DCE/RPC bind carried through a pipe, and the SYSVOL
+  disk share: an unauthenticated tree connect refused, an authenticated one
+  answered as a read-only disk share, a GPO file opened and read at an offset,
+  a directory listed in `FILE_ID_BOTH_DIR_INFORMATION` and drained to
+  `STATUS_NO_MORE_FILES`, and writes and delete-on-close refused with
+  access denied.
+- `monarchy-smb1-tests` — the same shares over NT LM 0.12, the dialect a
+  Windows 2000 client speaks: an authenticated tree connect to `SYSVOL`, a GPO
+  file opened by a path whose case differs from the store and whose name carries
+  the UTF-16 terminator the client includes in `NameLength`, read at an offset,
+  the attributes a client asks for by file id before reading, an anonymous
+  connect refused, an unknown share refused, `..` refused, and writes refused.
 - `monarchy-ldap-tests` — request controls: paged results (pages, total
   count, resume cookie, abandon, a foreign cookie refused), and an unknown
   critical control refused with `unavailableCriticalExtension`.
@@ -610,14 +653,36 @@ field by field, and `scripts/drs-conformance.py` drives the DCSync-shaped
 sequence over impacket's independent NDR behind an authenticated NTLMSSP bind
 at `PKT_PRIVACY` (6 checks). `DsReplicaAdd` and the multi-DC half remain.
 
-**SMB2 and named pipes** (`engine/Smb2.cpp`): dialect negotiation (2.0.2/2.1),
-session setup carrying SPNEGO/NTLMSSP verified by the same authenticator SAMR
-and LSAD use, SMB2 signing (HMAC-SHA256 over the exported session key, with the
-key-exchange RC4 step), and `IPC$` pipe I/O. Each pipe is a headless channel
-into that interface's own `RpcServer`, so `\\dc\pipe\samr` runs exactly the
-bind, dispatch and fault code the TCP endpoint runs. Live against a provisioned
-DC, impacket over `ncacn_np` enumerates the SAMR domain and opens the LSAD
-policy, and Samba's own `smbclient -L` authenticates and lists the server.
+**SMB2, named pipes and the domain's file shares** (`engine/Smb2.cpp`): dialect
+negotiation (2.0.2/2.1), session setup carrying SPNEGO/NTLMSSP verified by the
+same authenticator SAMR and LSAD use, SMB2 signing (HMAC-SHA256 over the
+exported session key, with the key-exchange RC4 step), `IPC$` pipe I/O and disk
+shares. Each pipe is a headless channel into that interface's own `RpcServer`,
+so `\\dc\pipe\samr` runs exactly the bind, dispatch and fault code the TCP
+endpoint runs. `\\dc\SYSVOL` maps to the directory that holds the domain folder
+and `\\dc\NETLOGON` to that domain's `scripts`, both read-only and both open
+only to an authenticated session; create, positional read, `QUERY_DIRECTORY`
+(the directory classes a redirector asks for), `QUERY_INFO` (file basic,
+standard, all, network-open and volume/size/attribute information) and close
+are served, and every write, set-info and delete is answered with access
+denied. Paths are resolved case-insensitively inside the share root, and `..`
+is refused rather than normalised. Live against a provisioned DC, impacket over
+`ncacn_np` enumerates the SAMR domain and opens the LSAD policy, and Samba's own
+`smbclient` authenticates, lists SYSVOL recursively, fetches a GPO's
+`registry.pol` byte for byte, and is refused (access denied) when it tries to
+write.
+
+SMB1 (`engine/Smb1.cpp`) serves the same two shares to clients that never
+negotiate SMB2: a Windows 2000 workstation, or `smbclient -m NT1`. Tree connect
+needs an authenticated session, names are resolved case-insensitively inside the
+share root, and `NT_CREATE_ANDX`, positional `READ_ANDX`, the TRANS2
+query-by-path and query-by-file-id that a client makes before reading, and close
+are served; every write, mkdir, delete and set-info is answered with access
+denied. Directory enumeration (`TRANS2 FIND_FIRST2`) is not implemented, so a
+client can read a named file but cannot list a directory. Live against a
+provisioned DC, `smbclient -m NT1` fetches a policy's `GPT.INI` and a NETLOGON
+logon script byte for byte, and an anonymous session is refused with logon
+failure.
 
 **Endpoint mapper** (`engine/Epm.cpp`): `ept_lookup` and `ept_map` on `epmPort`
 (135 by default, `epmPort` in `dc.conf`), so a client that knows an interface

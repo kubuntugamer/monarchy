@@ -438,6 +438,7 @@ bool findPrincipal(const QList<DirectoryObject> &objects, const QString &princip
             const quint32 uac =
                 object.attributes.value(QStringLiteral("userAccountControl")).toUInt();
             out->disabled = (uac & 0x2u) != 0;
+            out->logonHours = object.attributes.value(QStringLiteral("logonHours"));
         }
         return true;
     }

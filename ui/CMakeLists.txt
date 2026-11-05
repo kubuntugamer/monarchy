@@ -56,6 +56,11 @@ add_library(monarchy-ui-core STATIC
     ../engine/Pac.cpp
     ../engine/Kdc.h
     ../engine/Kdc.cpp
+    ../engine/Kpasswd.h
+    ../engine/Kpasswd.cpp
+    ../engine/LogonHours.h
+    ../engine/LogonHours.cpp
+    ../engine/SmbPaths.h
     ../engine/Ndr.h
     ../engine/Ndr.cpp
     ../engine/Rpc.h
@@ -251,6 +256,29 @@ if(BUILD_TESTING)
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
     )
 
+    # kpasswd (RFC 3244): the change/set password service on 464, driven by
+    # MIT's krb5_change_password / krb5_set_password — the same client a user's
+    # `kpasswd` runs. Without MIT krb5 the case is skipped rather than faked.
+    add_executable(monarchy-kpasswd-tests
+        tests/test_kpasswd.cpp
+    )
+
+    target_link_libraries(monarchy-kpasswd-tests PRIVATE
+        monarchy-ui-core
+        Qt6::Test
+    )
+
+    if(KRB5_INCLUDE_DIR AND KRB5_LIBRARY)
+        target_include_directories(monarchy-kpasswd-tests PRIVATE ${KRB5_INCLUDE_DIR})
+        target_link_libraries(monarchy-kpasswd-tests PRIVATE ${KRB5_LIBRARY})
+        target_compile_definitions(monarchy-kpasswd-tests PRIVATE MONARCHY_WITH_KRB5)
+    endif()
+
+    add_test(NAME monarchy-kpasswd-tests COMMAND monarchy-kpasswd-tests)
+    set_tests_properties(monarchy-kpasswd-tests PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+    )
+
     # Netlogon secure-channel negotiation against independent crypto vectors.
     add_executable(monarchy-netlogon-tests
         tests/test_netlogon.cpp
@@ -332,12 +360,44 @@ if(BUILD_TESTING)
         tests/test_smb2.cpp
     )
 
+    # SMB1 is the dialect Windows 2000 speaks, so its disk shares are proven
+    # separately: tree connect, open by a case-insensitive path, read, refuse
+    # writes and traversal.
+    add_executable(monarchy-smb1-tests
+        tests/test_smb1.cpp
+    )
+
+    target_link_libraries(monarchy-smb1-tests PRIVATE
+        monarchy-ui-core
+        Qt6::Test
+    )
+
     target_link_libraries(monarchy-smb-tests PRIVATE
         monarchy-ui-core
         Qt6::Test
     )
 
+    # The account-time policy: the 21-byte UTC week the logon paths consult.
+    add_executable(monarchy-logonhours-tests
+        tests/test_logonhours.cpp
+    )
+
+    target_link_libraries(monarchy-logonhours-tests PRIVATE
+        monarchy-ui-core
+        Qt6::Test
+        Qt6::Core
+    )
+
+    add_test(NAME monarchy-logonhours-tests COMMAND monarchy-logonhours-tests)
+    set_tests_properties(monarchy-logonhours-tests PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+    )
+
     add_test(NAME monarchy-smb-tests COMMAND monarchy-smb-tests)
+    add_test(NAME monarchy-smb1-tests COMMAND monarchy-smb1-tests)
+    set_tests_properties(monarchy-smb1-tests PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+    )
     set_tests_properties(monarchy-smb-tests PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
     )

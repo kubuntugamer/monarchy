@@ -5,11 +5,14 @@
 
 #include "Gss.h"
 #include "Ntlm.h"
+#include "SmbPaths.h"
 
 #include <QCryptographicHash>
 #include <QRandomGenerator>
 #include <QDateTime>
 #include <QDebug>
+#include <QFile>
+#include <QFileInfo>
 
 namespace {
 
@@ -55,6 +58,13 @@ quint64 fileTimeNow()
     // 100ns intervals since 1601-01-01.
     const qint64 unixMs = QDateTime::currentMSecsSinceEpoch();
     return quint64(unixMs + 11644473600000LL) * 10000ULL;
+}
+
+quint64 fileTime(const QDateTime &time)
+{
+    if (!time.isValid())
+        return 0;
+    return quint64(time.toMSecsSinceEpoch() + 11644473600000LL) * 10000ULL;
 }
 
 QByteArray nbtFrame(const QByteArray &message)
@@ -129,8 +139,10 @@ Header parseHeader(const QByteArray &message)
 namespace Smb1 {
 
 Session::Session(QHash<QString, RpcServer *> pipes, Rpc::Authenticator authenticator,
-                 QString domain, QString serverName, QString dnsDomain)
+                 QString domain, QString serverName, QString dnsDomain,
+                 QHash<QString, QString> shares)
     : m_pipes(std::move(pipes))
+    , m_shares(std::move(shares))
     , m_authenticator(std::move(authenticator))
     , m_domain(std::move(domain))
     , m_serverName(std::move(serverName))
@@ -250,6 +262,8 @@ QByteArray Session::feed(const QByteArray &message)
         return writeAndX(message);
     case CmdTrans:
         return transact(message);
+    case CmdTrans2:
+        return trans2(message);
     default:
         if (qEnvironmentVariableIsEmpty("MONARCHY_SMB1_TRACE"))
             return unsupported(header.command);
@@ -408,10 +422,21 @@ QByteArray Session::treeConnect(const QByteArray &message)
     const QString path = stringAt(header.data, passwordLength);
     const int slash = path.lastIndexOf(QLatin1Char('\\'));
     const QString share = slash >= 0 ? path.mid(slash + 1) : path;
-    if (share.compare(QStringLiteral("IPC$"), Qt::CaseInsensitive) != 0) {
+    // The disk shares a member reads its policy from, and the pipe share every
+    // DCE/RPC call rides on. Anything else is not shared by this server.
+    const bool isIpc = share.compare(QStringLiteral("IPC$"), Qt::CaseInsensitive) == 0;
+    const QString shareRoot = m_shares.value(share.toLower());
+    if (!isIpc && shareRoot.isEmpty()) {
         if (m_notifier)
             m_notifier(QStringLiteral("SMB1 tree connect %1 refused").arg(share));
         return reply(message, kStatusBadNetworkName, QByteArray(), QByteArray());
+    }
+    // A disk share, unlike IPC$, is only for an authenticated session: the
+    // domain's policy files are not anonymous-readable on Windows either.
+    if (!isIpc && !m_authenticated) {
+        if (m_notifier)
+            m_notifier(QStringLiteral("SMB1 tree connect %1 refused (anonymous)").arg(share));
+        return reply(message, kStatusAccessDenied, QByteArray(), QByteArray());
     }
 
     const quint16 tid = ++m_nextTree;
@@ -425,7 +450,8 @@ QByteArray Session::treeConnect(const QByteArray &message)
     putLe16(words, 0);
     putLe16(words, 0x0001); // OptionalSupport: SMB_SUPPORT_SEARCH_BITS
 
-    QByteArray data("IPC", 3);
+    // Service: "IPC" for the pipe share, "A:" for a disk share.
+    QByteArray data = isIpc ? QByteArray("IPC", 3) : QByteArray("A:", 2);
     data.append(char(0));
     data.append(char(0)); // pad so the Unicode name starts on an even offset
     data.append(toUtf16Bytes(QStringLiteral("NTFS")));
@@ -481,10 +507,71 @@ QByteArray Session::ntCreate(const QByteArray &message)
     } else {
         name = QString::fromLatin1(header.data.left(int(nameLength)));
     }
+    // Clients pad the name to an even length, and some include the UTF-16
+    // terminator in NameLength, so drop any trailing NULs before using it.
+    while (name.endsWith(QChar(0)))
+        name.chop(1);
     while (name.startsWith(QLatin1Char('\\')))
         name.remove(0, 1);
     if (name.startsWith(QStringLiteral("pipe\\"), Qt::CaseInsensitive))
         name.remove(0, 5);
+
+    // A name opened inside a disk share is a file or directory under that
+    // share's root, resolved case-insensitively and never allowed to climb
+    // out of it. Writes are not accepted: SYSVOL and NETLOGON are read-only
+    // here, as they are until a GPO editor exists to write them.
+    const QString shareName = m_trees.value(header.tid);
+    const QString shareRoot = m_shares.value(shareName.toLower());
+    if (!shareRoot.isEmpty()) {
+        if (!m_authenticated)
+            return reply(message, kStatusAccessDenied, QByteArray(68, '\0'), QByteArray());
+        QString relative;
+        QString resolved;
+        if (SmbPaths::safeRelativeName(name, &relative))
+            resolved = SmbPaths::resolveCaseInsensitive(shareRoot, relative);
+        const QFileInfo info(resolved);
+        if (resolved.isEmpty() || !info.exists())
+            return reply(message, kStatusObjectNameNotFound, QByteArray(68, '\0'), QByteArray());
+
+        OpenFile file;
+        file.kind = info.isDir() ? OpenFile::Kind::DiskDirectory : OpenFile::Kind::DiskFile;
+        file.name = name;
+        file.path = resolved;
+        file.size = info.isDir() ? 0 : info.size();
+        const quint16 fileId = ++m_nextFid;
+        m_files.insert(fileId, file);
+        if (m_notifier)
+            m_notifier(QStringLiteral("SMB1 open \\\\%1\\%2").arg(shareName, relative));
+
+        const quint64 created = fileTime(info.birthTime().isValid() ? info.birthTime()
+                                                                    : info.lastModified());
+        const quint64 accessed = fileTime(info.lastRead());
+        const quint64 written = fileTime(info.lastModified());
+        QByteArray words;
+        words.append(char(0xff)); // AndXCommand
+        words.append(char(0));
+        putLe16(words, 0);
+        words.append(char(0)); // OplockLevel
+        putLe16(words, fileId);
+        putLe32(words, 1);      // CreateAction: FILE_OPENED
+        putLe32(words, quint32(created & 0xffffffffu));
+        putLe32(words, quint32(created >> 32));
+        putLe32(words, quint32(accessed & 0xffffffffu));
+        putLe32(words, quint32(accessed >> 32));
+        putLe32(words, quint32(written & 0xffffffffu));
+        putLe32(words, quint32(written >> 32));
+        putLe32(words, quint32(written & 0xffffffffu));
+        putLe32(words, quint32(written >> 32));
+        putLe32(words, info.isDir() ? 0x10u : 0x80u); // FileAttributes
+        putLe32(words, quint32(file.size));           // AllocationSize
+        putLe32(words, 0);
+        putLe32(words, quint32(file.size));           // EndOfFile
+        putLe32(words, 0);
+        putLe16(words, 0);                            // FileType: disk
+        putLe16(words, 0);                            // DeviceState
+        words.append(char(info.isDir() ? 1 : 0));     // Directory
+        return reply(message, kStatusSuccess, words, QByteArray());
+    }
 
     RpcServer *endpoint = m_pipes.value(name.toLower());
     if (!m_trees.contains(header.tid) || !endpoint) {
@@ -560,8 +647,18 @@ QByteArray Session::readAndX(const QByteArray &message)
     if (it == m_files.end())
         return reply(message, kStatusInvalidHandle, QByteArray(24, '\0'), QByteArray());
 
-    QByteArray data = it->pending;
-    it->pending.clear();
+    QByteArray data;
+    if (it->kind == OpenFile::Kind::DiskFile) {
+        const quint32 offset = readLe32(header.words, 6);
+        QFile file(it->path);
+        if (!file.open(QIODevice::ReadOnly))
+            return reply(message, kStatusAccessDenied, QByteArray(24, '\0'), QByteArray());
+        file.seek(qint64(offset));
+        data = file.read(maxCount);
+    } else {
+        data = it->pending;
+        it->pending.clear();
+    }
     if (data.size() > int(maxCount))
         data.truncate(maxCount);
 
@@ -599,6 +696,10 @@ QByteArray Session::writeAndX(const QByteArray &message)
     auto it = m_files.find(fid);
     if (it == m_files.end())
         return reply(message, kStatusInvalidHandle, QByteArray(12, '\0'), QByteArray());
+    if (it->kind != OpenFile::Kind::Pipe) {
+        // SYSVOL and NETLOGON are delivered read-only.
+        return reply(message, kStatusAccessDenied, QByteArray(6, '\0'), QByteArray());
+    }
     QByteArray data;
     if (dataOffset < message.size())
         data = message.mid(dataOffset, dataLength);
@@ -669,6 +770,141 @@ QByteArray Session::transact(const QByteArray &message)
     data.append(out);
     if (data.size() % 2)
         data.append(char(0));
+    return reply(message, kStatusSuccess, words, data);
+}
+
+// TRANS2. A client that already has a file open still asks for its attributes
+// through SMB_COM_TRANSACTION2 before reading it, so QUERY_PATH_INFORMATION has
+// to answer or the transfer stalls on a reply that never comes.
+QByteArray Session::trans2(const QByteArray &message)
+{
+    const Header header = parseHeader(message);
+    const quint8 setupCount = header.words.isEmpty() ? 0 : quint8(header.words.at(26));
+    if (setupCount < 1 || header.words.size() < 30)
+        return reply(message, kStatusNotSupported, QByteArray(), QByteArray());
+    const quint16 subcommand = readLe16(header.words, 28);
+    const quint16 parameterCount = readLe16(header.words, 18);
+    const quint16 parameterOffset = readLe16(header.words, 20);
+    QByteArray parameters;
+    if (parameterOffset < message.size())
+        parameters = message.mid(parameterOffset, int(parameterCount));
+
+    const QString shareName = m_trees.value(header.tid);
+    const QString shareRoot = m_shares.value(shareName.toLower());
+    if (shareRoot.isEmpty())
+        return reply(message, kStatusBadNetworkName, QByteArray(), QByteArray());
+    if (!m_authenticated)
+        return reply(message, kStatusAccessDenied, QByteArray(), QByteArray());
+
+    // QUERY_PATH_INFORMATION names the file; QUERY_FILE_INFORMATION names the
+    // handle the client already has, which is what a 2000 client asks for
+    // before reading a file it just created.
+    quint16 level = 0;
+    QString resolved;
+    if (subcommand == 0x0007) {
+        const quint16 fid = readLe16(parameters, 0);
+        level = readLe16(parameters, 2);
+        auto it = m_files.find(fid);
+        if (it == m_files.end() || it->kind == OpenFile::Kind::Pipe)
+            return reply(message, kStatusInvalidHandle, QByteArray(), QByteArray());
+        resolved = it->path;
+    } else if (subcommand == 0x0005) {
+        level = readLe16(parameters, 0);
+        QString name;
+        if (m_unicode) {
+            QByteArray bytes;
+            for (int i = 6; i + 1 < parameters.size(); i += 2) {
+                if (parameters.at(i) == '\0' && parameters.at(i + 1) == '\0')
+                    break;
+                bytes.append(parameters.at(i));
+                bytes.append(parameters.at(i + 1));
+            }
+            name = fromUtf16(bytes);
+        } else {
+            const int nul = parameters.indexOf('\0', 6);
+            name = QString::fromLatin1(parameters.mid(6, nul < 0 ? -1 : nul - 6));
+        }
+        while (name.startsWith(QLatin1Char('\\')))
+            name.remove(0, 1);
+        QString relative;
+        if (SmbPaths::safeRelativeName(name, &relative))
+            resolved = SmbPaths::resolveCaseInsensitive(shareRoot, relative);
+    } else {
+        return reply(message, kStatusNotSupported, QByteArray(), QByteArray());
+    }
+
+    const QFileInfo info(resolved);
+    if (resolved.isEmpty() || !info.exists())
+        return reply(message, kStatusObjectNameNotFound, QByteArray(), QByteArray());
+
+    const quint64 created = fileTime(info.birthTime().isValid() ? info.birthTime()
+                                                                : info.lastModified());
+    const quint64 accessed = fileTime(info.lastRead());
+    const quint64 written = fileTime(info.lastModified());
+    const quint32 attributes = info.isDir() ? 0x10u : 0x80u;
+    QByteArray infoBytes;
+    if (level == 0x0101 || level == 0x0107) { // SMB_QUERY_FILE_BASIC_INFO
+        putLe32(infoBytes, quint32(created & 0xffffffffu));
+        putLe32(infoBytes, quint32(created >> 32));
+        putLe32(infoBytes, quint32(accessed & 0xffffffffu));
+        putLe32(infoBytes, quint32(accessed >> 32));
+        putLe32(infoBytes, quint32(written & 0xffffffffu));
+        putLe32(infoBytes, quint32(written >> 32));
+        putLe32(infoBytes, quint32(written & 0xffffffffu));
+        putLe32(infoBytes, quint32(written >> 32));
+        putLe32(infoBytes, attributes);
+        putLe32(infoBytes, 0);
+    }
+    if (level == 0x0102 || level == 0x0107) { // SMB_QUERY_FILE_STANDARD_INFO
+        putLe32(infoBytes, quint32(info.size()));
+        putLe32(infoBytes, 0);
+        putLe32(infoBytes, quint32(info.size()));
+        putLe32(infoBytes, 0);
+        putLe32(infoBytes, 1);     // NumberOfLinks
+        infoBytes.append(char(0)); // DeletePending
+        infoBytes.append(char(info.isDir() ? 1 : 0));
+    }
+    if (level == 0x0107) { // the rest of SMB_QUERY_FILE_ALL_INFO
+        putLe32(infoBytes, 0); // Internal: IndexNumber
+        putLe32(infoBytes, 0);
+        putLe32(infoBytes, 0); // Ea: EaSize
+        putLe32(infoBytes, 0); // Access: AccessMask
+        putLe32(infoBytes, 0); // Position: CurrentByteOffset
+        putLe32(infoBytes, 0);
+        putLe32(infoBytes, 0); // Mode
+        putLe32(infoBytes, 0); // Alignment
+        QByteArray nameBytes;
+        const QString base = info.fileName();
+        for (QChar ch : base) {
+            const char16_t unit = ch.unicode();
+            nameBytes.append(char(unit & 0xff));
+            nameBytes.append(char((unit >> 8) & 0xff));
+        }
+        putLe32(infoBytes, quint32(nameBytes.size()));
+        infoBytes.append(nameBytes);
+        if (infoBytes.size() % 2)
+            infoBytes.append(char(0));
+    }
+    if (level != 0x0101 && level != 0x0102 && level != 0x0107)
+        return reply(message, kStatusNotSupported, QByteArray(), QByteArray());
+
+    QByteArray params;
+    putLe16(params, 0); // EAErrorOffset
+    QByteArray words;
+    putLe16(words, quint16(params.size()));      // TotalParameterCount
+    putLe16(words, quint16(infoBytes.size()));   // TotalDataCount
+    putLe16(words, 0);                           // Reserved
+    putLe16(words, quint16(params.size()));      // ParameterCount
+    putLe16(words, 56);                          // ParameterOffset
+    putLe16(words, 0);                           // ParameterDisplacement
+    putLe16(words, quint16(infoBytes.size()));   // DataCount
+    putLe16(words, quint16(56 + params.size())); // DataOffset
+    putLe16(words, 0);                           // DataDisplacement
+    words.append(char(0));                       // SetupCount
+    words.append(char(0));                       // Reserved2
+    QByteArray data(1, '\0'); // pad so parameters start at offset 56
+    data.append(params);
+    data.append(infoBytes);
     return reply(message, kStatusSuccess, words, data);
 }
 

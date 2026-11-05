@@ -3,7 +3,12 @@
 
 #include <QtTest>
 
+#include <QDir>
+#include <QFile>
+#include <QTemporaryDir>
+
 #include "Epm.h"
+#include "Ntlm.h"
 #include "Smb2.h"
 
 namespace {
@@ -99,6 +104,150 @@ QByteArray utf16(const QString &text)
     return out;
 }
 
+QByteArray ntlmNegotiate()
+{
+    QByteArray token("NTLMSSP", 7);
+    token.append(char(0));
+    putLe32(token, 1);          // NEGOTIATE_MESSAGE
+    putLe32(token, 0x00000201); // flags: unicode, NTLM, session security
+    return token;
+}
+
+// An AUTHENTICATE the server's parser accepts. The authenticator this test
+// installs accepts any response, so the token only has to be well formed.
+QByteArray ntlmAuthenticate(const QString &domain, const QString &user,
+                            const QByteArray &response)
+{
+    const QByteArray d = utf16(domain);
+    const QByteArray u = utf16(user);
+    QByteArray token("NTLMSSP", 7);
+    token.append(char(0));
+    putLe32(token, 3); // AUTHENTICATE_MESSAGE
+    int offset = 64;
+    const auto field = [&offset](const QByteArray &data) {
+        QByteArray f;
+        putLe16(f, quint16(data.size()));
+        putLe16(f, quint16(data.size()));
+        putLe32(f, quint32(offset));
+        offset += data.size();
+        return f;
+    };
+    token.append(field(QByteArray())); // LmChallengeResponse
+    token.append(field(response));     // NtChallengeResponse
+    token.append(field(d));
+    token.append(field(u));
+    token.append(field(QByteArray())); // Workstation
+    token.append(field(QByteArray())); // EncryptedRandomSessionKey
+    putLe32(token, 0x00000201);
+    token.append(response);
+    token.append(d);
+    token.append(u);
+    return token;
+}
+
+QByteArray sessionSetup(quint64 messageId, const QByteArray &token)
+{
+    QByteArray body;
+    putLe16(body, 9);   // StructureSize
+    putLe16(body, 0);   // Flags
+    putLe32(body, 0);   // SecurityMode, Capabilities
+    putLe32(body, 0);   // Channel
+    putLe16(body, 64 + 24); // SecurityBufferOffset
+    putLe16(body, quint16(token.size()));
+    putLe64(body, 0);   // PreviousSessionId
+    body.append(token);
+    return header(Smb2::CmdSessionSetup, messageId, 0, 0) + body;
+}
+
+QByteArray treeConnectTo(quint64 messageId, quint64 sessionId, const QString &share)
+{
+    const QByteArray path = utf16(QStringLiteral("\\\\127.0.0.1\\") + share);
+    QByteArray body;
+    putLe16(body, 9);          // StructureSize
+    putLe16(body, 0);          // Reserved
+    putLe16(body, 64 + 8);     // PathOffset
+    putLe16(body, quint16(path.size()));
+    body.append(path);
+    return header(Smb2::CmdTreeConnect, messageId, sessionId, 0) + body;
+}
+
+QByteArray createRequest(quint64 messageId, quint64 sessionId, quint32 treeId,
+                         const QString &name, quint32 options, quint32 access)
+{
+    const QByteArray encoded = utf16(name);
+    QByteArray body;
+    putLe16(body, 57);      // StructureSize
+    body.append(char(0));   // SecurityFlags
+    body.append(char(0));   // RequestedOplockLevel
+    putLe32(body, 2);       // ImpersonationLevel: impersonation
+    putLe64(body, 0);       // SmbCreateFlags
+    putLe64(body, 0);       // Reserved
+    putLe32(body, access);  // DesiredAccess
+    putLe32(body, 0);       // FileAttributes
+    putLe32(body, 7);       // ShareAccess
+    putLe32(body, 1);       // CreateDisposition: FILE_OPEN
+    putLe32(body, options); // CreateOptions
+    putLe16(body, quint16(name.isEmpty() ? 0 : 64 + 56)); // NameOffset
+    putLe16(body, quint16(encoded.size()));
+    putLe32(body, 0);       // CreateContextsOffset
+    putLe32(body, 0);       // CreateContextsLength
+    body.append(encoded);
+    return header(Smb2::CmdCreate, messageId, sessionId, treeId) + body;
+}
+
+QByteArray readRequest(quint64 messageId, quint64 sessionId, quint32 treeId, quint64 id,
+                       quint64 offset, quint32 length)
+{
+    QByteArray body;
+    putLe16(body, 49); // StructureSize
+    body.append(char(0)); // Padding
+    body.append(char(0)); // Flags
+    putLe32(body, length);
+    putLe64(body, offset);
+    putLe64(body, id);
+    putLe64(body, id);
+    putLe32(body, 0);  // MinimumCount
+    putLe32(body, 0);  // Channel
+    putLe32(body, 0);  // RemainingBytes
+    putLe16(body, 0);  // ReadChannelInfoOffset
+    putLe16(body, 0);  // ReadChannelInfoLength
+    return header(Smb2::CmdRead, messageId, sessionId, treeId) + body;
+}
+
+QByteArray queryDirectoryRequest(quint64 messageId, quint64 sessionId, quint32 treeId,
+                                 quint64 id, const QString &pattern, quint8 infoClass)
+{
+    const QByteArray encoded = utf16(pattern);
+    QByteArray body;
+    putLe16(body, 33); // StructureSize
+    body.append(char(infoClass));
+    body.append(char(0)); // Flags: no restart
+    putLe32(body, 0);     // FileIndex
+    putLe64(body, id);
+    putLe64(body, id);
+    putLe16(body, quint16(pattern.isEmpty() ? 0 : 64 + 32)); // FileNameOffset
+    putLe16(body, quint16(encoded.size()));
+    putLe32(body, 65536); // OutputBufferLength
+    body.append(encoded);
+    return header(Smb2::CmdQueryDirectory, messageId, sessionId, treeId) + body;
+}
+
+QByteArray setInfoRequest(quint64 messageId, quint64 sessionId, quint32 treeId, quint64 id)
+{
+    QByteArray body;
+    putLe16(body, 33); // StructureSize
+    body.append(char(1)); // InfoType: file
+    body.append(char(0x0d)); // FileDispositionInformation
+    putLe32(body, 1);  // BufferLength
+    putLe16(body, 64 + 32); // BufferOffset
+    putLe16(body, 0);  // Reserved
+    putLe32(body, 0);  // AdditionalInformation
+    putLe64(body, id);
+    putLe64(body, id);
+    body.append(char(1)); // DeleteFile
+    return header(Smb2::CmdSetInfo, messageId, sessionId, treeId) + body;
+}
+
 } // namespace
 
 class Smb2Test : public QObject
@@ -110,6 +259,7 @@ private slots:
     void opensATreeAndAPipe();
     void refusesAnUnknownPipeAndUnknownShare();
     void carriesADceBindThroughThePipe();
+    void servesADiskShareReadOnly();
 };
 
 void Smb2Test::negotiatesTheHighestOfferedDialect()
@@ -337,6 +487,125 @@ void Smb2Test::carriesADceBindThroughThePipe()
     QVERIFY(dataLength >= 16);
     const QByteArray pdu = read.mid(16, int(dataLength));
     QCOMPARE(quint8(pdu.at(2)), quint8(12)); // bind_ack
+}
+
+// A disk share is what a member reads its GPOs through: tree connect, open,
+// positional read, a directory listing in the class the redirector asked for,
+// and a refusal for every write.
+void Smb2Test::servesADiskShareReadOnly()
+{
+    QTemporaryDir root;
+    QVERIFY(root.isValid());
+    const QString sysvol = root.filePath(QStringLiteral("sysvol/CYBERDYNE.LAN"));
+    const QString guid = QStringLiteral("{31B2F340-016D-11D2-945F-00C04FB984F9}");
+    QVERIFY(QDir().mkpath(sysvol + QStringLiteral("/Policies/") + guid
+                          + QStringLiteral("/Machine")));
+    QFile policy(sysvol + QStringLiteral("/Policies/") + guid
+                 + QStringLiteral("/Machine/registry.pol"));
+    QVERIFY(policy.open(QIODevice::WriteOnly));
+    const QByteArray content("PReg\x01\x00\x00\x00contents", 16);
+    policy.write(content);
+    policy.close();
+
+    Smb2Server server;
+    // The share root is the directory holding the domain folder, so the GPO
+    // path from LDAP (\\dc\SYSVOL\<domain>\Policies\...) resolves as written.
+    server.addShare(QStringLiteral("SYSVOL"), root.filePath(QStringLiteral("sysvol")));
+    // Any principal the directory authenticated; the token itself is proved by
+    // the Netlogon and SAMR suites, this one is about what a session may read.
+    server.setAuthenticator([](const Rpc::AuthRequest &, Ntlm::SessionKeys *keys) {
+        keys->sessionBaseKey = QByteArray(16, 'k');
+        return true;
+    });
+
+    // No session, no share: the answer an anonymous client gets.
+    QByteArray reply = server.feed(nbt(treeConnectTo(1, 0, QStringLiteral("SYSVOL"))));
+    QCOMPARE(statusOf(reply), quint32(Smb2::StatusBadNetworkName));
+
+    server.feed(nbt(sessionSetup(2, ntlmNegotiate())));
+    reply = server.feed(nbt(sessionSetup(3, ntlmAuthenticate(
+        QStringLiteral("CYBERDYNE"), QStringLiteral("alice"),
+        QByteArray(16, 'r') + QByteArray(40, 'b')))));
+    QCOMPARE(statusOf(reply), quint32(Smb2::StatusSuccess));
+    const quint64 sessionId = readLe64(reply, 4 + 40);
+    QVERIFY(sessionId != 0);
+
+    reply = server.feed(nbt(treeConnectTo(4, sessionId, QStringLiteral("SYSVOL"))));
+    QCOMPARE(statusOf(reply), quint32(Smb2::StatusSuccess));
+    const QByteArray tconBody = bodyOf(reply);
+    QCOMPARE(quint8(tconBody.at(2)), quint8(1)); // ShareType: disk
+    QCOMPARE(readLe32(tconBody, 4) & 1u, 1u);    // ShareFlags: read-only
+    const quint32 treeId = readLe32(reply, 4 + 36);
+
+    const QString relative = QStringLiteral("CYBERDYNE.LAN/Policies/") + guid
+                             + QStringLiteral("/Machine/registry.pol");
+    reply = server.feed(nbt(createRequest(5, sessionId, treeId, relative, 0x40, 0x00120089u)));
+    QCOMPARE(statusOf(reply), quint32(Smb2::StatusSuccess));
+    QByteArray body = bodyOf(reply);
+    QCOMPARE(readLe16(body, 0), quint16(89));
+    QCOMPARE(quint64(readLe64(body, 48)), quint64(content.size())); // EndOfFile
+    const quint64 fileId = readLe64(body, 64);
+
+    reply = server.feed(nbt(readRequest(6, sessionId, treeId, fileId, 0, 64)));
+    QCOMPARE(statusOf(reply), quint32(Smb2::StatusSuccess));
+    body = bodyOf(reply);
+    QCOMPARE(quint32(readLe32(body, 4)), quint32(content.size()));
+    QCOMPARE(body.mid(16, content.size()), content);
+
+    // A write and a delete-on-close are both refused.
+    QByteArray writeBody;
+    putLe16(writeBody, 17);
+    putLe16(writeBody, 64 + 16); // DataOffset
+    putLe32(writeBody, 4);       // Length
+    putLe64(writeBody, fileId);
+    putLe64(writeBody, fileId);
+    putLe16(writeBody, 0);
+    putLe16(writeBody, 0);
+    writeBody.append(QByteArray(4, 'x'));
+    reply = server.feed(nbt(header(Smb2::CmdWrite, 7, sessionId, treeId) + writeBody));
+    QCOMPARE(statusOf(reply), quint32(Smb2::StatusAccessDenied));
+    reply = server.feed(nbt(setInfoRequest(8, sessionId, treeId, fileId)));
+    QCOMPARE(statusOf(reply), quint32(Smb2::StatusAccessDenied));
+
+    // The Policies directory lists the policy GUID.
+    reply = server.feed(nbt(createRequest(9, sessionId, treeId,
+                                          QStringLiteral("CYBERDYNE.LAN/Policies"),
+                                          0x01, 0x00100001u)));
+    QCOMPARE(statusOf(reply), quint32(Smb2::StatusSuccess));
+    const quint64 directoryId = readLe64(bodyOf(reply), 64);
+    QCOMPARE(quint8(bodyOf(reply).at(56)) & 0x10, 0x10); // FILE_ATTRIBUTE_DIRECTORY
+
+    reply = server.feed(nbt(queryDirectoryRequest(10, sessionId, treeId, directoryId,
+                                                  QStringLiteral("*"), 0x25)));
+    QCOMPARE(statusOf(reply), quint32(Smb2::StatusSuccess));
+    body = bodyOf(reply);
+    const quint32 length = readLe32(body, 4);
+    const QByteArray listing = body.mid(8, length);
+    // Walk the chain the way a redirector does, collecting names.
+    QStringList names;
+    int at = 0;
+    const auto decode = [&listing](int offset, int length) {
+        QString text;
+        for (int i = 0; i + 1 < length; i += 2)
+            text.append(QChar(quint16(quint8(listing.at(offset + i))
+                                      | (quint16(quint8(listing.at(offset + i + 1))) << 8))));
+        return text;
+    };
+    while (at + 104 <= listing.size()) {
+        const quint32 next = readLe32(listing, at);
+        const quint32 nameLength = readLe32(listing, at + 60);
+        names.append(decode(at + 104, int(nameLength)));
+        if (next == 0)
+            break;
+        at += int(next);
+    }
+    QVERIFY(names.contains(QStringLiteral(".")));
+    QVERIFY(names.contains(guid));
+
+    // A second query drains nothing more.
+    reply = server.feed(nbt(queryDirectoryRequest(11, sessionId, treeId, directoryId,
+                                                  QStringLiteral("*"), 0x25)));
+    QCOMPARE(statusOf(reply), quint32(Smb2::StatusNoMoreFiles));
 }
 
 QTEST_MAIN(Smb2Test)

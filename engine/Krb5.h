@@ -62,6 +62,9 @@ struct Principal {
     QMap<int, QByteArray> keys; // etype -> long-term key
     quint32 kvno = 1;
     bool disabled = false;
+    // The account's logonHours bitmap as the directory stores it (hex), empty
+    // when the account is not restricted. The KDC refuses an AS-REQ outside it.
+    QString logonHours;
 
     bool isValid() const { return !dn.isEmpty() && !keys.isEmpty(); }
     QByteArray keyFor(int etype) const { return keys.value(etype); }

@@ -26,6 +26,7 @@ enum Command : quint8 {
     CmdReadAndX = 0x2e,
     CmdWriteAndX = 0x2f,
     CmdTrans = 0x25,
+    CmdTrans2 = 0x32,
     CmdTreeDisconnect = 0x71,
     CmdNegotiate = 0x72,
     CmdSessionSetupAndX = 0x73,
@@ -37,6 +38,7 @@ enum Command : quint8 {
 constexpr quint32 kStatusSuccess = 0x00000000u;
 constexpr quint32 kStatusMoreProcessingRequired = 0xc0000016u;
 constexpr quint32 kStatusLogonFailure = 0xc000006du;
+constexpr quint32 kStatusAccessDenied = 0xc0000022u;
 constexpr quint32 kStatusBadNetworkName = 0xc00000ccu;
 constexpr quint32 kStatusObjectNameNotFound = 0xc0000034u;
 constexpr quint32 kStatusNotSupported = 0xc00000bbu;
@@ -47,8 +49,13 @@ constexpr quint32 kStatusInvalidHandle = 0xc0000008u;
 class Session
 {
 public:
+    // `shares` maps a share name (lowercased) to the directory behind it. The
+    // pipe map and the disk shares are separate namespaces on one session: a
+    // 2000 client opens \\dc\SYSVOL and \\dc\pipe\samr over the same
+    // connection, exactly as it does on Windows.
     Session(QHash<QString, RpcServer *> pipes, Rpc::Authenticator authenticator,
-            QString domain, QString serverName, QString dnsDomain);
+            QString domain, QString serverName, QString dnsDomain,
+            QHash<QString, QString> shares = QHash<QString, QString>());
 
     static bool isSmb1(const QByteArray &message);
 
@@ -61,7 +68,11 @@ public:
 
 private:
     struct OpenFile {
+        enum class Kind { Pipe, DiskFile, DiskDirectory };
+        Kind kind = Kind::Pipe;
         QString name;
+        QString path;   // resolved absolute path, for a disk object
+        qint64 size = 0;
         RpcServer::Channel *channel = nullptr;
         QByteArray pending;
     };
@@ -77,6 +88,7 @@ private:
     QByteArray readAndX(const QByteArray &message);
     QByteArray writeAndX(const QByteArray &message);
     QByteArray transact(const QByteArray &message);
+    QByteArray trans2(const QByteArray &message);
     QByteArray unsupported(quint8 command);
     bool signatureValid(const QByteArray &message) const;
 
@@ -87,6 +99,7 @@ private:
     void feedPipe(OpenFile *file, const QByteArray &data);
 
     QHash<QString, RpcServer *> m_pipes;
+    QHash<QString, QString> m_shares;
     Rpc::Authenticator m_authenticator;
     QString m_domain;
     QString m_serverName;

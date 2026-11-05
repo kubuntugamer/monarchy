@@ -7,6 +7,7 @@
 #include "Drs.h"
 #include "Epm.h"
 #include "Kdc.h"
+#include "Kpasswd.h"
 #include "LdapServer.h"
 #include "Lsad.h"
 #include "Netlogon.h"
@@ -148,6 +149,84 @@ bool DcService::start(const QString &dcDir)
     } else {
         emit statusMessage(
             tr("Global Catalog served on port %1.").arg(m_ldapServer->gcServerPort()));
+    }
+
+    // A domain provisioned before kpasswd existed has no kadmin/changepw
+    // principal, and the KDC could not issue the ticket the service verifies.
+    // Creating it here is what promotion does on Windows, and it is idempotent:
+    // a domain that already has the principal is left untouched.
+    {
+        bool haveKpasswdPrincipal = false;
+        for (const DirectoryObject &object : m_ldapServer->objects()) {
+            for (const QString &spn : Krb5::servicePrincipalNames(object)) {
+                if (spn.compare(QLatin1String("kadmin/changepw"), Qt::CaseInsensitive) == 0)
+                    haveKpasswdPrincipal = true;
+            }
+        }
+        if (!haveKpasswdPrincipal && !m_baseDn.isEmpty()) {
+            DirectoryObject principal;
+            principal.id = QStringLiteral("CN=kadmin,CN=Users,%1").arg(m_baseDn);
+            principal.name = QStringLiteral("kadmin");
+            principal.type = QStringLiteral("User");
+            principal.kind = ObjectKind::User;
+            principal.container = QStringLiteral("Users");
+            principal.attributes.insert(QStringLiteral("cn"), QStringLiteral("kadmin"));
+            principal.attributes.insert(QStringLiteral("sAMAccountName"),
+                                        QStringLiteral("kadmin"));
+            principal.attributes.insert(QStringLiteral("userAccountControl"),
+                                        QStringLiteral("512"));
+            principal.attributes.insert(QStringLiteral("servicePrincipalName"),
+                                        QStringLiteral("kadmin/changepw"));
+            principal.attributes.insert(QStringLiteral("showInAdvancedViewOnly"),
+                                        QStringLiteral("TRUE"));
+            principal.attributes.insert(
+                QStringLiteral("objectClass"),
+                QStringLiteral("top;person;organizationalPerson;user"));
+            Krb5::storeRandomKeys(principal);
+            principal.attributes.insert(QStringLiteral("msDS-KeyVersionNumber"),
+                                        QStringLiteral("1"));
+            QString error;
+            if (!m_ldapServer->addAccount(&principal, &error)) {
+                emit statusMessage(
+                    tr("Could not add the kpasswd service principal: %1").arg(error));
+            } else {
+                if (!m_storePath.isEmpty())
+                    m_ldapServer->saveToFile(m_storePath);
+                emit statusMessage(tr("Added the kadmin/changepw service principal."));
+            }
+        }
+    }
+
+    // Kerberos change password (RFC 3244) on 464, the port the zone's
+    // `_kpasswd` locator records name. The password is written through the same
+    // path an LDAP or SAMR change takes, so the new password works for
+    // Kerberos, NTLM and simple bind at once.
+    m_kpasswdServer = new KpasswdServer(this);
+    m_kpasswdServer->setKdc(m_kdc);
+    m_kpasswdServer->setObjectProvider([this]() { return m_ldapServer->objects(); });
+    m_kpasswdServer->setPasswordWriter([this](const QString &dn, const QString &password,
+                                              QString *error) {
+        LdapServer::ModifyChange change;
+        change.operation = 2; // replace
+        change.type = QStringLiteral("unicodePwd");
+        change.values = QStringList{password};
+        const int result = m_ldapServer->applyModify(dn, {change});
+        if (result != 0 && error)
+            *error = result == 19
+                         ? QStringLiteral("rejected by the domain password policy")
+                         : QStringLiteral("account not found (%1)").arg(result);
+        if (result == 0 && !m_storePath.isEmpty())
+            m_ldapServer->saveToFile(m_storePath);
+        return result == 0;
+    });
+    connect(m_kpasswdServer, &KpasswdServer::requestReceived, this,
+            &DcService::statusMessage);
+    const int kpasswdPort = dcConfig.value(QStringLiteral("kpasswdPort"), 464).toInt();
+    if (!m_kpasswdServer->listen(quint16(kpasswdPort))) {
+        emit statusMessage(tr("kpasswd failed to listen on port %1.").arg(kpasswdPort));
+    } else {
+        emit statusMessage(tr("Kerberos password change served on port %1.")
+                               .arg(m_kpasswdServer->serverPort()));
     }
 
     // Remote management: the SAMR interface over DCE/RPC, backed by the same
@@ -553,6 +632,25 @@ bool DcService::start(const QString &dcDir)
     m_smbServer->addPipe(QStringLiteral("lsarpc"), m_lsadServer->rpc());
     m_smbServer->addPipe(QStringLiteral("epmapper"), m_epmServer->rpc());
     m_smbServer->addPipe(QStringLiteral("netlogon"), m_netlogonServer->rpc());
+
+    // The domain's SYSVOL tree and the NETLOGON scripts it contains, served as
+    // the disk shares a member reads its GPOs and logon scripts from. The
+    // provisioner wrote them; a directory that predates this build is created
+    // so the shares always name something that exists.
+    QString domainSysvol = dcConfig.value(QStringLiteral("sysvol")).toString();
+    if (domainSysvol.isEmpty())
+        domainSysvol = resolvedDcDir + QStringLiteral("/sysvol/") + dnsDomain;
+    QDir().mkpath(domainSysvol + QStringLiteral("/Policies"));
+    QDir().mkpath(domainSysvol + QStringLiteral("/scripts"));
+    // `\\dc\SYSVOL` is the directory that holds the domain's folder, exactly as
+    // on Windows (%SystemRoot%\SYSVOL\sysvol), so a GPO path of
+    // `\\dc\SYSVOL\<domain>\Policies\{GUID}` resolves; NETLOGON is the domain's
+    // scripts directory under it.
+    const QString sysvolShare = QFileInfo(domainSysvol).absolutePath();
+    m_smbServer->addShare(QStringLiteral("SYSVOL"), sysvolShare);
+    m_smbServer->addShare(QStringLiteral("NETLOGON"), domainSysvol + QStringLiteral("/scripts"));
+    emit statusMessage(tr("SYSVOL and NETLOGON shared from %1.").arg(sysvolShare));
+
     connect(m_smbServer, &Smb2Server::requestReceived, this,
             [this](const QString &operation) { emit statusMessage(operation); });
     const int smbPort = dcConfig.value(QStringLiteral("smbPort"), 445).toInt();
@@ -580,7 +678,18 @@ bool DcService::start(const QString &dcDir)
     m_dnsServer->setForwardingEnabled(dcConfig.value(QStringLiteral("forwarding"), true).toBool());
     if (!m_dnsServer->loadZone(m_zonePath)) {
         m_dnsServer->loadAdZone(dnsDomain, dcHost, dcIp, quint16(ldapPort), quint16(gcPort),
-                                siteName);
+                                siteName, quint16(kpasswdPort), quint16(kdcPort));
+    }
+    // A zone loaded from disk may predate a service this build serves — the
+    // kpasswd locators, for one — so the DC holds its own zone to what it
+    // actually answers before it serves it.
+    if (m_dnsServer->repairAdZoneLocators(dcHost, quint16(ldapPort), quint16(gcPort), siteName,
+                                          quint16(kpasswdPort), quint16(kdcPort))) {
+        QString zoneError;
+        if (!m_zonePath.isEmpty() && !m_dnsServer->saveZone(m_zonePath, &zoneError))
+            emit statusMessage(tr("Could not persist the repaired zone: %1").arg(zoneError));
+        else
+            emit statusMessage(tr("Repaired the domain's service locator records."));
     }
     if (!m_dnsServer->listen(quint16(dcConfig.value(QStringLiteral("dnsPort"), 1053).toInt()))) {
         emit statusMessage(tr("DNS server failed to bind its port."));

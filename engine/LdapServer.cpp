@@ -6,6 +6,7 @@
 #include "Asn1.h"
 #include "Gss.h"
 #include "Kdc.h"
+#include "LogonHours.h"
 #include "Ntlm.h"
 
 #include <QtNetwork/QTcpSocket>
@@ -1356,6 +1357,7 @@ QByteArray LdapServer::handleBind(ClientState *st, int msgId, const QByteArray &
         QByteArray salt;
         QByteArray hash;
         QByteArray ntHashHex;
+        QString logonHours;
         bool haveVerifier = false;
         bool anyVerifier = !m_credentials.isEmpty();
         quint32 accountControl = 0;
@@ -1375,6 +1377,7 @@ QByteArray LdapServer::handleBind(ClientState *st, int msgId, const QByteArray &
                 ntHashHex = objectNtHash.toLatin1();
                 accountControl =
                     object.attributes.value(QStringLiteral("userAccountControl")).toUInt();
+                logonHours = object.attributes.value(QStringLiteral("logonHours"));
                 haveVerifier = true;
             }
         }
@@ -1398,6 +1401,11 @@ QByteArray LdapServer::handleBind(ClientState *st, int msgId, const QByteArray &
         }
         // A disabled account may not authenticate, whatever its password.
         if (haveVerifier && (accountControl & 0x2u)) // ACCOUNTDISABLE
+            return makeBindResponse(msgId, 49);
+        // Nor may an account outside its logonHours. Checked after the password
+        // so a refused hour is indistinguishable from a wrong password.
+        if (haveVerifier
+            && !LogonHours::allowsHex(logonHours, QDateTime::currentDateTimeUtc()))
             return makeBindResponse(msgId, 49);
     }
     return makeBindResponse(msgId, 0); // success
@@ -1512,6 +1520,11 @@ QByteArray LdapServer::handleSaslBind(ClientState *st, int msgId, const QByteArr
 
             if (!Ntlm::verifyNtlmv2(ntHash, authenticate.user, authenticate.domain, challenge,
                                     authenticate.ntResponse))
+                return makeBindResponse(msgId, 49);
+
+            if (!LogonHours::allowsHex(
+                    object.attributes.value(QStringLiteral("logonHours")),
+                    QDateTime::currentDateTimeUtc()))
                 return makeBindResponse(msgId, 49);
 
             // MS-NLMP §3.4: the session base key comes from the proof string,

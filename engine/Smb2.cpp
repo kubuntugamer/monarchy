@@ -4,16 +4,27 @@
 #include "Smb2.h"
 
 #include <QCryptographicHash>
+#include <QDateTime>
 #include <QDebug>
+#include <QDir>
+#include <QFile>
+#include <QFileInfo>
 #include <QList>
 #include <QMessageAuthenticationCode>
+#include <QPair>
 #include <QRandomGenerator>
+#include <QStorageInfo>
+#include <QRegularExpression>
 #include <QTcpServer>
 #include <QTcpSocket>
 
 #include "Gss.h"
 #include "Ntlm.h"
 #include "Smb1.h"
+#include "SmbPaths.h"
+
+using SmbPaths::resolveCaseInsensitive;
+using SmbPaths::safeRelativeName;
 
 
 namespace {
@@ -84,6 +95,14 @@ void setLe32(QByteArray &data, int at, quint32 value)
     data[at + 3] = char((value >> 24) & 0xff);
 }
 
+// Windows FILETIME: 100-nanosecond ticks since 1601-01-01 UTC.
+quint64 fileTime(const QDateTime &time)
+{
+    if (!time.isValid())
+        return 0;
+    return quint64((time.toMSecsSinceEpoch() + 11644473600000LL) * 10000LL);
+}
+
 QString fromUtf16(const QByteArray &bytes)
 {
     QString text;
@@ -120,8 +139,10 @@ bool parseAuthenticate(const QByteArray &token, Rpc::AuthRequest *request,
     request->ntResponse = field(20);
     request->domain = fromUtf16(field(28));
     request->user = fromUtf16(field(36));
+    // EncryptedRandomSessionKey (MS-NLMP 2.2.1.3): the sixth security buffer,
+    // after LM, NT, domain, user and workstation.
     if (encryptedSessionKey)
-        *encryptedSessionKey = field(40); // EncryptedRandomSessionKey
+        *encryptedSessionKey = field(52);
     request->flags = readLe32(ntlm, 60);
     return !request->user.isEmpty() && !request->ntResponse.isEmpty();
 }
@@ -139,13 +160,33 @@ struct Smb2Server::Connection {
     // session is authenticated (MS-SMB2 3.2.5.3.1, MS-NLMP 3.4.5.3).
     QByteArray sessionKey;
 
-    struct Pipe {
+    struct Tree {
+        QString name;
+        bool pipe = false;
+        QString path;
+        bool readOnly = true;
+    };
+
+    // A handle is either a named pipe (whole DCE/RPC PDUs in, answers out) or
+    // an open file or directory inside a disk share.
+    struct Handle {
         QString name;
         RpcServer::Channel *channel = nullptr;
         QByteArray pending;
+        QFile *file = nullptr;
+        bool directory = false;
+        bool readOnly = true;
+        // Absolute path of whatever this handle opened inside its share.
+        QString path;
+        // The directory listing, fetched when the query asks for it and
+        // drained across calls by the file index.
+        QList<QPair<QString, QFileInfo>> entries;
+        QString pattern;
+        int entriesServed = 0;
+        bool listed = false;
     };
-    QHash<quint64, Pipe> handles;
-    QHash<quint32, QString> trees;
+    QHash<quint64, Handle> handles;
+    QHash<quint32, Tree> trees;
     // Windows 2000 and other SMB1-only clients keep their own session state on
     // the same connection; created on the first SMB1 message.
     Smb1::Session *smb1 = nullptr;
@@ -172,6 +213,14 @@ void Smb2Server::addPipe(const QString &name, RpcServer *endpoint)
     m_pipes.insert(name.toLower(), endpoint);
 }
 
+void Smb2Server::addShare(const QString &name, const QString &path, bool readOnly)
+{
+    const QFileInfo info(path);
+    if (!info.isDir())
+        return;
+    m_shares.insert(name.toLower(), Share{ info.absoluteFilePath(), readOnly });
+}
+
 void Smb2Server::setAuthenticator(Rpc::Authenticator authenticator)
 {
     m_authenticator = std::move(authenticator);
@@ -193,8 +242,10 @@ bool Smb2Server::listen(quint16 port, const QHostAddress &address)
 void Smb2Server::close()
 {
     for (Connection *connection : m_connections) {
-        for (auto &pipe : connection->handles)
-            delete pipe.channel;
+        for (auto &handle : connection->handles) {
+            delete handle.channel;
+            delete handle.file;
+        }
         delete connection->smb1;
         delete connection;
     }
@@ -269,8 +320,10 @@ void Smb2Server::onDisconnected()
     for (int i = 0; i < m_connections.size(); ++i) {
         if (m_connections[i]->socket == socket) {
             Connection *connection = m_connections[i];
-            for (auto &pipe : connection->handles)
-                delete pipe.channel;
+            for (auto &handle : connection->handles) {
+                delete handle.channel;
+                delete handle.file;
+            }
             delete connection->smb1;
             delete connection;
             m_connections.removeAt(i);
@@ -343,8 +396,13 @@ QByteArray Smb2Server::wildcardAnswer(Connection *connection, const QByteArray &
 QByteArray Smb2Server::handleSmb1(Connection *connection, const QByteArray &message)
 {
     if (!connection->smb1) {
+        // SMB1 resolves the same share names against the same directories, so a
+        // 2000 client and an SMB2 client read the same SYSVOL.
+        QHash<QString, QString> shares;
+        for (auto it = m_shares.constBegin(); it != m_shares.constEnd(); ++it)
+            shares.insert(it.key().toLower(), it.value().path);
         connection->smb1 = new Smb1::Session(m_pipes, m_authenticator, m_domain, m_serverName,
-                                             m_dnsDomain);
+                                             m_dnsDomain, shares);
         connection->smb1->setNotifier(
             [this](const QString &operation) { emit requestReceived(operation); });
     }
@@ -384,6 +442,9 @@ QByteArray Smb2Server::handleMessage(Connection *connection, const QByteArray &m
         }
     }
     const quint32 treeId = readLe32(message, 36);
+    // The header's tree id is the request's, except on a tree connect, where it
+    // is the id the server just allocated (MS-SMB2 3.3.5.6).
+    quint32 responseTreeId = treeId;
     quint32 status = Smb2::StatusSuccess;
     QByteArray body;
 
@@ -395,10 +456,11 @@ QByteArray Smb2Server::handleMessage(Connection *connection, const QByteArray &m
         body = sessionSetup(connection, message.mid(int(Smb2::kHeaderSize)), &status);
         break;
     case Smb2::CmdTreeConnect:
-        body = treeConnect(connection, message.mid(int(Smb2::kHeaderSize)), &status);
+        body = treeConnect(connection, message.mid(int(Smb2::kHeaderSize)), &status,
+                           &responseTreeId);
         break;
     case Smb2::CmdCreate:
-        body = create(connection, message.mid(int(Smb2::kHeaderSize)), &status);
+        body = create(connection, treeId, message.mid(int(Smb2::kHeaderSize)), &status);
         break;
     case Smb2::CmdWrite:
         body = write(connection, message.mid(int(Smb2::kHeaderSize)), &status);
@@ -409,8 +471,17 @@ QByteArray Smb2Server::handleMessage(Connection *connection, const QByteArray &m
     case Smb2::CmdRead:
         body = read(connection, message.mid(int(Smb2::kHeaderSize)), &status);
         break;
+    case Smb2::CmdQueryDirectory:
+        body = queryDirectory(connection, message.mid(int(Smb2::kHeaderSize)), &status);
+        break;
+    case Smb2::CmdQueryInfo:
+        body = queryInfo(connection, message.mid(int(Smb2::kHeaderSize)), &status);
+        break;
+    case Smb2::CmdSetInfo:
+        body = setInfo(connection, message.mid(int(Smb2::kHeaderSize)), &status);
+        break;
     case Smb2::CmdClose:
-        body = closePipe(connection, message.mid(int(Smb2::kHeaderSize)), &status);
+        body = closeHandle(connection, message.mid(int(Smb2::kHeaderSize)), &status);
         break;
     case Smb2::CmdLogoff:
         connection->authenticated = false;
@@ -440,7 +511,7 @@ QByteArray Smb2Server::handleMessage(Connection *connection, const QByteArray &m
     setLe16(reply, 14, 1); // credit granted
     setLe16(reply, 16, quint16(readLe16(message, 16) | Smb2::kFlagsServerToRedirector));
     setLe32(reply, 20, 0); // no compound chain
-    setLe32(reply, 44, treeId);
+    setLe32(reply, 36, responseTreeId);
     // The response carries the session the request named once one exists.
     if (connection->sessionId) {
         for (int i = 0; i < 8; ++i)
@@ -463,7 +534,7 @@ QByteArray Smb2Server::handleMessage(Connection *connection, const QByteArray &m
     }
     if (!qEnvironmentVariableIsEmpty("MONARCHY_SMB_TRACE"))
         qWarning("SMB2 out cmd=%d status=0x%08x bytes=%d body=%s",
-                 command, status, reply.size(),
+                 command, status, int(reply.size()),
                  qPrintable(reply.mid(int(Smb2::kHeaderSize)).left(160).toHex()));
     return nbtFrame(reply);
 }
@@ -566,7 +637,8 @@ QByteArray Smb2Server::sessionSetup(Connection *connection, const QByteArray &bo
     return out;
 }
 
-QByteArray Smb2Server::treeConnect(Connection *connection, const QByteArray &body, quint32 *status)
+QByteArray Smb2Server::treeConnect(Connection *connection, const QByteArray &body, quint32 *status,
+                                  quint32 *treeIdOut)
 {
     const quint16 pathOffset = readLe16(body, 4);
     const quint16 pathLength = readLe16(body, 6);
@@ -576,29 +648,72 @@ QByteArray Smb2Server::treeConnect(Connection *connection, const QByteArray &bod
 
     const int slash = path.lastIndexOf(QLatin1Char('\\'));
     const QString share = slash >= 0 ? path.mid(slash + 1) : path;
-    if (share.compare(QStringLiteral("IPC$"), Qt::CaseInsensitive) != 0) {
-        *status = Smb2::StatusBadNetworkName;
-        QByteArray out;
-        putLe16(out, 16);
-        out.append(QByteArray(14, '\0'));
-        return out;
+
+    Connection::Tree tree;
+    tree.name = share;
+    if (share.compare(QStringLiteral("IPC$"), Qt::CaseInsensitive) == 0) {
+        tree.pipe = true;
+    } else {
+        const auto found = m_shares.constFind(share.toLower());
+        // A share exists only for a principal the domain authenticated: an
+        // anonymous session gets the same answer a Windows DC gives it.
+        if (found == m_shares.constEnd() || !connection->authenticated) {
+            *status = Smb2::StatusBadNetworkName;
+            QByteArray out;
+            putLe16(out, 16);
+            out.append(QByteArray(14, '\0'));
+            return out;
+        }
+        tree.path = found->path;
+        tree.readOnly = found->readOnly;
     }
 
     const quint32 treeId = quint32(++connection->nextTree);
-    connection->trees.insert(treeId, share);
+    connection->trees.insert(treeId, tree);
+    if (treeIdOut)
+        *treeIdOut = treeId;
 
     QByteArray out;
-    putLe16(out, 16);   // StructureSize
-    out.append(char(2)); // ShareType: pipe
-    out.append(char(0)); // Reserved
-    putLe32(out, 0);    // ShareFlags
-    putLe32(out, 0);    // Capabilities
+    putLe16(out, 16);     // StructureSize
+    out.append(char(tree.pipe ? 2 : 1)); // ShareType: pipe or disk
+    out.append(char(0));  // Reserved
+    // A read-only disk share says so, so a client does not attempt writes it
+    // would only have refused.
+    putLe32(out, tree.pipe || !tree.readOnly ? 0u : 0x00000001u); // ShareFlags
+    putLe32(out, 0);      // Capabilities
     putLe32(out, 0x001f01ff); // MaximalAccess
     emit requestReceived(QStringLiteral("SMB2 tree connect %1").arg(share));
     return out;
 }
 
-QByteArray Smb2Server::create(Connection *connection, const QByteArray &body, quint32 *status)
+namespace {
+
+// The 89-byte CREATE response, with everything but the file id left empty: the
+// shape every refusal answer also uses.
+QByteArray createResponse(quint64 id, quint32 attributes, quint64 endOfFile,
+                          const QByteArray &times, quint32 createAction)
+{
+    QByteArray out;
+    putLe16(out, 89);          // StructureSize
+    out.append(char(0));       // OplockLevel
+    out.append(char(0));       // Flags
+    putLe32(out, createAction);
+    out.append(times.left(32).leftJustified(32, '\0')); // four timestamps
+    putLe64(out, (endOfFile + 4095) / 4096 * 4096);     // AllocationSize
+    putLe64(out, endOfFile);                            // EndOfFile
+    putLe32(out, attributes);
+    putLe32(out, 0);           // Reserved2
+    putLe64(out, id);          // FileId.Persistent
+    putLe64(out, id);          // FileId.Volatile
+    putLe32(out, 0);           // CreateContextsOffset
+    putLe32(out, 0);           // CreateContextsLength
+    return out;
+}
+
+} // namespace
+
+QByteArray Smb2Server::create(Connection *connection, quint32 treeId, const QByteArray &body,
+                              quint32 *status)
 {
     const quint16 nameOffset = readLe16(body, 44);
     const quint16 nameLength = readLe16(body, 46);
@@ -608,42 +723,109 @@ QByteArray Smb2Server::create(Connection *connection, const QByteArray &body, qu
     while (name.startsWith(QLatin1Char('\\')))
         name.remove(0, 1);
 
+    const auto treeIt = connection->trees.constFind(treeId);
+    if (treeIt != connection->trees.constEnd() && !treeIt->pipe) {
+        const Connection::Tree &tree = *treeIt;
+        QString relative;
+        if (!safeRelativeName(name, &relative)) {
+            *status = Smb2::StatusObjectNameNotFound;
+            return createResponse(0, 0, 0, QByteArray(), 0);
+        }
+        // Every access that could change the share is refused by a read-only
+        // share before the name is even resolved: data, attributes, delete,
+        // ACLs. A client creating a new name gets access denied, not "not
+        // found", exactly as a Windows read-only share answers it.
+        constexpr quint32 kWriteAccess = 0x00000002u  // FILE_WRITE_DATA / FILE_ADD_FILE
+                                         | 0x00000004u // FILE_APPEND_DATA / ADD_SUBDIRECTORY
+                                         | 0x00000010u // FILE_WRITE_EA
+                                         | 0x00000100u // FILE_WRITE_ATTRIBUTES
+                                         | 0x00010000u // DELETE
+                                         | 0x00040000u // WRITE_DAC
+                                         | 0x00080000u; // WRITE_OWNER
+        const quint32 desiredAccess = readLe32(body, 24);
+        const quint32 createOptions = readLe32(body, 40);
+        const quint32 createDisposition = readLe32(body, 36);
+        if (tree.readOnly
+            && ((desiredAccess & kWriteAccess) || createDisposition == 2 /* FILE_CREATE */
+                || createDisposition == 5 /* FILE_OVERWRITE_IF */)) {
+            *status = Smb2::StatusAccessDenied;
+            return createResponse(0, 0, 0, QByteArray(), 0);
+        }
+
+        const QString full = resolveCaseInsensitive(tree.path, relative);
+        if (full.isEmpty()) {
+            *status = Smb2::StatusObjectNameNotFound;
+            return createResponse(0, 0, 0, QByteArray(), 0);
+        }
+        const QFileInfo info(full);
+
+        const quint64 id = ++connection->nextHandle;
+        Connection::Handle handle;
+        handle.name = relative;
+        handle.path = full;
+        handle.readOnly = tree.readOnly;
+        QByteArray times;
+        quint32 attributes = 0;
+        quint64 endOfFile = 0;
+        if (info.isDir()) {
+            handle.directory = true;
+            attributes = 0x00000010u; // FILE_ATTRIBUTE_DIRECTORY
+        } else if (info.isFile()) {
+            auto *file = new QFile(full);
+            if (!file->open(QIODevice::ReadOnly)) {
+                delete file;
+                *status = Smb2::StatusAccessDenied;
+                return createResponse(0, 0, 0, QByteArray(), 0);
+            }
+            handle.file = file;
+            endOfFile = quint64(file->size());
+            attributes = 0x00000080u; // FILE_ATTRIBUTE_NORMAL
+            const QDateTime modified = info.lastModified();
+            const QDateTime accessed = info.lastRead();
+            const QDateTime changed = info.metadataChangeTime();
+            for (const QDateTime &stamp : { info.birthTime(), accessed, modified, changed })
+                putLe64(times, fileTime(stamp.isValid() ? stamp : modified));
+        } else {
+            *status = Smb2::StatusObjectNameNotFound;
+            return createResponse(0, 0, 0, QByteArray(), 0);
+        }
+        // FILE_DIRECTORY_FILE on a file (or its absence on a directory) is the
+        // mismatch MS-SMB2 3.3.5.9 rejects rather than silently opening.
+        if ((createOptions & 0x00000001u) && !handle.directory) {
+            *status = Smb2::StatusNotADirectory;
+            delete handle.file;
+            return createResponse(0, 0, 0, QByteArray(), 0);
+        }
+        if ((createOptions & 0x00000040u) && handle.directory) { // FILE_NON_DIRECTORY_FILE
+            *status = Smb2::StatusInvalidParameter;
+            return createResponse(0, 0, 0, QByteArray(), 0);
+        }
+        connection->handles.insert(id, handle);
+        emit requestReceived(QStringLiteral("SMB2 open %1%2%3")
+                                 .arg(tree.name, relative.isEmpty() ? QString()
+                                                                  : QStringLiteral("\\"))
+                                 .arg(relative));
+        return createResponse(id, attributes, endOfFile, times, 1); // FILE_OPENED
+    }
+
     RpcServer *endpoint = m_pipes.value(name.toLower());
     if (!endpoint) {
         *status = Smb2::StatusObjectNameNotFound;
-        QByteArray out;
-        putLe16(out, 89);
-        out.append(QByteArray(87, '\0'));
-        return out;
+        return createResponse(0, 0, 0, QByteArray(), 0);
     }
 
     const quint64 id = ++connection->nextHandle;
-    Connection::Pipe pipe;
-    pipe.name = name;
-    pipe.channel = endpoint->newChannel(QStringLiteral("smb2:%1").arg(name));
+    Connection::Handle handle;
+    handle.name = name;
+    handle.channel = endpoint->newChannel(QStringLiteral("smb2:%1").arg(name));
     // The session authenticated the principal; the pipe carries that identity to
     // the endpoint the same way a Windows DC does for \pipe\samr.
     if (connection->authenticated)
-        pipe.channel->setTransportIdentity(connection->user);
-    connection->handles.insert(id, pipe);
+        handle.channel->setTransportIdentity(connection->user);
+    connection->handles.insert(id, handle);
 
-    QByteArray out;
-    putLe16(out, 89);          // StructureSize
-    out.append(char(0));       // OplockLevel
-    out.append(char(0));       // Flags
-    putLe32(out, 1);           // CreateAction: FILE_OPENED
-    for (int i = 0; i < 4; ++i)
-        putLe64(out, 0);       // the four timestamps
-    putLe64(out, 0);           // AllocationSize
-    putLe64(out, 0);           // EndOfFile
-    putLe32(out, 0);           // FileAttributes
-    putLe32(out, 0);           // Reserved
-    putLe64(out, id);          // FileId.Persistent
-    putLe64(out, id);          // FileId.Volatile
-    putLe32(out, 0);           // CreateContextsOffset
-    putLe32(out, 0);           // CreateContextsLength
     emit requestReceived(QStringLiteral("SMB2 open \\pipe\\%1").arg(name));
-    return out;
+    return createResponse(id, 0, 0, QByteArray(), 1); // FILE_OPENED
 }
 
 QByteArray Smb2Server::write(Connection *connection, const QByteArray &body, quint32 *status)
@@ -654,7 +836,9 @@ QByteArray Smb2Server::write(Connection *connection, const QByteArray &body, qui
 
     auto it = connection->handles.find(id);
     if (it == connection->handles.end() || !it->channel) {
-        *status = Smb2::StatusFileClosed;
+        // A disk share is read-only, so this is the refusal a write to it gets.
+        *status = it != connection->handles.end() ? Smb2::StatusAccessDenied
+                                                  : Smb2::StatusFileClosed;
         QByteArray out;
         putLe16(out, 17);
         out.append(QByteArray(15, '\0'));
@@ -789,10 +973,11 @@ QByteArray Smb2Server::ioctlMessage(Connection *connection, const QByteArray &bo
 QByteArray Smb2Server::read(Connection *connection, const QByteArray &body, quint32 *status)
 {
     const quint32 length = readLe32(body, 4);
+    const quint64 offset = readLe64(body, 8);
     const quint64 id = readLe64(body, 16);
 
     auto it = connection->handles.find(id);
-    if (it == connection->handles.end() || !it->channel) {
+    if (it == connection->handles.end() || (!it->channel && !it->file)) {
         *status = Smb2::StatusFileClosed;
         QByteArray out;
         putLe16(out, 17);
@@ -800,22 +985,414 @@ QByteArray Smb2Server::read(Connection *connection, const QByteArray &body, quin
         return out;
     }
 
-    const int take = qMin(int(length), it->pending.size());
-    const QByteArray data = it->pending.left(take);
-    it->pending.remove(0, take);
+    QByteArray data;
+    if (it->file) {
+        // A file read is positional: the client says where, every time.
+        if (!it->file->seek(qint64(offset))) {
+            *status = Smb2::StatusEndOfFile;
+            putLe16(data, 17);
+            data.append(QByteArray(15, '\0'));
+            return data;
+        }
+        data = it->file->read(qint64(length));
+        // A client that asked for more than the file holds gets what is there
+        // and no error: only a read that starts past the end is an EOF.
+        if (data.isEmpty() && offset >= quint64(it->file->size()))
+            *status = Smb2::StatusEndOfFile;
+    } else {
+        const int take = qMin(int(length), it->pending.size());
+        data = it->pending.left(take);
+        it->pending.remove(0, take);
+    }
 
     QByteArray out;
     putLe16(out, 17);   // StructureSize
     out.append(char(Smb2::kHeaderSize + 16)); // DataOffset
     out.append(char(0));                      // Reserved
     putLe32(out, quint32(data.size()));       // DataLength
-    putLe32(out, quint32(it->pending.size())); // DataRemaining
+    putLe32(out, it->channel ? quint32(it->pending.size()) : 0u); // DataRemaining
     putLe32(out, 0);                          // Reserved2
     out.append(data);
     return out;
 }
 
-QByteArray Smb2Server::closePipe(Connection *connection, const QByteArray &body, quint32 *status)
+namespace {
+
+QByteArray toUtf16Bytes(const QString &text)
+{
+    QByteArray out;
+    out.reserve(text.size() * 2);
+    for (const QChar c : text) {
+        out.append(char(c.unicode() & 0xff));
+        out.append(char((c.unicode() >> 8) & 0xff));
+    }
+    return out;
+}
+
+quint32 shareAttributes(const QFileInfo &info)
+{
+    if (info.isDir())
+        return 0x00000010u; // FILE_ATTRIBUTE_DIRECTORY
+    return 0x00000080u;     // FILE_ATTRIBUTE_NORMAL
+}
+
+void appendShareTimes(QByteArray &out, const QFileInfo &info)
+{
+    const QDateTime modified = info.lastModified();
+    for (const QDateTime &stamp : { info.birthTime(), info.lastRead(), modified,
+                                    info.metadataChangeTime() })
+        putLe64(out, fileTime(stamp.isValid() ? stamp : modified));
+}
+
+quint64 allocationSize(const QFileInfo &info)
+{
+    if (info.isDir() || info.size() <= 0)
+        return 0;
+    return quint64((info.size() + 4095) / 4096 * 4096);
+}
+
+// One directory entry in the class the client asked for (MS-FSCC 2.4.10 to
+// 2.4.22). NextEntryOffset is left zero for the caller, which knows which
+// entries are followed by another.
+QByteArray directoryEntry(quint8 infoClass, const QFileInfo &info, const QString &name,
+                          quint32 index, quint64 fileId)
+{
+    const QByteArray encoded = toUtf16Bytes(name);
+    QByteArray out;
+    putLe32(out, 0);     // NextEntryOffset
+    putLe32(out, index); // FileIndex
+    if (infoClass == 0x0c) { // FILE_NAMES_INFORMATION
+        putLe32(out, quint32(encoded.size()));
+        out.append(encoded);
+        return out;
+    }
+    appendShareTimes(out, info);
+    putLe64(out, quint64(info.isDir() ? 0 : qMax<qint64>(0, info.size()))); // EndOfFile
+    putLe64(out, allocationSize(info));
+    putLe32(out, shareAttributes(info));
+    putLe32(out, quint32(encoded.size())); // FileNameLength
+    switch (infoClass) {
+    case 0x01: // FILE_DIRECTORY_INFORMATION
+        break;
+    case 0x02: // FILE_FULL_DIR_INFORMATION
+        putLe32(out, 0); // EaSize
+        break;
+    case 0x03: // FILE_BOTH_DIR_INFORMATION
+    case 0x25: // FILE_ID_BOTH_DIR_INFORMATION
+        putLe32(out, 0);              // EaSize
+        out.append(char(0));          // ShortNameLength
+        out.append(char(0));          // Reserved, which keeps ShortName aligned
+        out.append(QByteArray(24, '\0')); // ShortName
+        if (infoClass == 0x25) {
+            // FileId is a LARGE_INTEGER: Windows emits it 8-byte aligned,
+            // which puts the name at 104 and is what redirectors parse.
+            out.append(QByteArray(2, '\0'));
+            putLe64(out, fileId);
+        }
+        break;
+    case 0x26: // FILE_ID_FULL_DIR_INFORMATION
+        putLe32(out, 0);
+        putLe64(out, fileId);
+        break;
+    default:
+        return QByteArray(); // not a class this server answers
+    }
+    out.append(encoded);
+    return out;
+}
+
+QByteArray queryDirectoryResponse(quint32 status)
+{
+    QByteArray out;
+    putLe16(out, 9);  // StructureSize
+    putLe16(out, quint16(Smb2::kHeaderSize + 8)); // OutputBufferOffset
+    putLe32(out, 0);  // OutputBufferLength
+    return out;
+}
+
+} // namespace
+
+// QUERY_DIRECTORY (MS-SMB2 2.2.27): a read-only share's listing, which is how
+// a member enumerates the Policies directory of the domain's SYSVOL.
+QByteArray Smb2Server::queryDirectory(Connection *connection, const QByteArray &body,
+                                      quint32 *status)
+{
+    const quint8 infoClass = body.size() > 2 ? quint8(body.at(2)) : quint8(0);
+    const quint8 flags = body.size() > 3 ? quint8(body.at(3)) : quint8(0);
+    const quint16 nameOffset = readLe16(body, 24);
+    const quint16 nameLength = readLe16(body, 26);
+    const quint32 outputLength = readLe32(body, 28);
+    const quint64 id = readLe64(body, 8);
+
+    auto it = connection->handles.find(id);
+    if (it == connection->handles.end()) {
+        *status = Smb2::StatusFileClosed;
+        return queryDirectoryResponse(*status);
+    }
+    if (!it->directory) {
+        *status = Smb2::StatusNotADirectory;
+        return queryDirectoryResponse(*status);
+    }
+
+    QString pattern;
+    if (nameOffset >= Smb2::kHeaderSize && nameLength > 0)
+        pattern = fromUtf16(body.mid(int(nameOffset) - int(Smb2::kHeaderSize), nameLength));
+
+    constexpr quint8 kRestartScan = 0x01;
+    constexpr quint8 kReturnSingleEntry = 0x02;
+    constexpr quint8 kReopen = 0x10;
+    if (!it->listed || (flags & (kRestartScan | kReopen)) || it->pattern != pattern) {
+        it->entries.clear();
+        it->entriesServed = 0;
+        it->pattern = pattern;
+        it->listed = true;
+        const QFileInfo directory(it->path);
+        QStringList filters;
+        bool all = pattern.isEmpty() || pattern == QLatin1String("*") || pattern == QLatin1String("*.*");
+        filters << (all ? QStringLiteral("*") : pattern);
+        // Every real server lists the directory and its parent first; a
+        // client that only asked for one name pattern gets just the matches.
+        if (all) {
+            it->entries.append(qMakePair(QStringLiteral("."), directory));
+            const QString parentPath = directory.absolutePath();
+            it->entries.append(qMakePair(QStringLiteral(".."),
+                                         parentPath == directory.absoluteFilePath()
+                                             ? directory
+                                             : QFileInfo(parentPath)));
+        }
+        const QFileInfoList matches =
+            QDir(it->path).entryInfoList(filters, QDir::AllEntries | QDir::Hidden
+                                                     | QDir::NoDotAndDotDot,
+                                         QDir::NoSort);
+        for (const QFileInfo &entry : matches)
+            it->entries.append(qMakePair(entry.fileName(), entry));
+    }
+
+    QByteArray buffer;
+    QList<int> starts;
+    while (it->entriesServed < it->entries.size()) {
+        const QPair<QString, QFileInfo> &entry = it->entries.at(it->entriesServed);
+        QByteArray bytes = directoryEntry(infoClass, entry.second, entry.first,
+                                          quint32(it->entriesServed),
+                                          quint64(qHash(it->path + QLatin1Char('/') + entry.first))
+                                              | 1u);
+        if (bytes.isEmpty()) {
+            *status = Smb2::StatusInvalidParameter;
+            return queryDirectoryResponse(*status);
+        }
+        const int padded = (bytes.size() + 7) & ~7;
+        bytes.append(QByteArray(padded - bytes.size(), '\0'));
+        if (outputLength > 0 && quint32(buffer.size() + bytes.size()) > outputLength) {
+            // The first entry must fit whole, or the answer is that it did not.
+            if (buffer.isEmpty()) {
+                *status = Smb2::StatusBufferOverflow;
+                return queryDirectoryResponse(*status);
+            }
+            break;
+        }
+        starts.append(buffer.size());
+        buffer.append(bytes);
+        ++it->entriesServed;
+        if (flags & kReturnSingleEntry)
+            break;
+    }
+
+    if (buffer.isEmpty()) {
+        *status = it->entries.isEmpty() ? Smb2::StatusNoSuchFile : Smb2::StatusNoMoreFiles;
+        return queryDirectoryResponse(*status);
+    }
+    // Each entry points at the next; the last one ends the chain.
+    for (int i = 0; i < starts.size(); ++i) {
+        const int next = i + 1 < starts.size() ? starts.at(i + 1) - starts.at(i) : 0;
+        setLe32(buffer, starts.at(i), quint32(next));
+    }
+
+    QByteArray out;
+    putLe16(out, 9);  // StructureSize
+    putLe16(out, quint16(Smb2::kHeaderSize + 8)); // OutputBufferOffset
+    putLe32(out, quint32(buffer.size()));
+    out.append(buffer);
+    *status = Smb2::StatusSuccess;
+    emit requestReceived(QStringLiteral("SMB2 list %1%2%3 class 0x%4")
+                             .arg(it->name).arg(it->name.isEmpty() ? QString()
+                                                                  : QStringLiteral("\\"))
+                             .arg(pattern)
+                             .arg(infoClass, 2, 16, QLatin1Char('0')));
+    return out;
+}
+
+// QUERY_INFO (MS-SMB2 2.2.37): file and filesystem attributes, which is what
+// `smbclient` and every mount helper ask for right after opening a file.
+QByteArray Smb2Server::queryInfo(Connection *connection, const QByteArray &body, quint32 *status)
+{
+    const quint8 infoType = body.size() > 2 ? quint8(body.at(2)) : quint8(0);
+    const quint8 infoClass = body.size() > 3 ? quint8(body.at(3)) : quint8(0);
+    const quint32 outputLength = readLe32(body, 4);
+    const quint64 id = readLe64(body, 24);
+
+    auto answer = [status](const QByteArray &buffer, quint32 outLength, quint32 answerStatus) {
+        QByteArray out;
+        putLe16(out, 9); // StructureSize
+        putLe16(out, quint16(Smb2::kHeaderSize + 8)); // OutputBufferOffset
+        if (outLength > 0 && buffer.size() > int(outLength)) {
+            putLe32(out, 0);
+            *status = Smb2::StatusBufferOverflow;
+            return out;
+        }
+        putLe32(out, quint32(buffer.size()));
+        out.append(buffer);
+        *status = answerStatus;
+        return out;
+    };
+
+    emit requestReceived(QStringLiteral("SMB2 query info type %1 class 0x%2")
+                             .arg(infoType)
+                             .arg(infoClass, 2, 16, QLatin1Char('0')));
+
+    auto it = connection->handles.find(id);
+    if (it == connection->handles.end() || it->channel) {
+        *status = it == connection->handles.end() ? Smb2::StatusFileClosed
+                                                  : Smb2::StatusNotSupported;
+        QByteArray out;
+        putLe16(out, 9);
+        putLe16(out, quint16(Smb2::kHeaderSize + 8));
+        putLe32(out, 0);
+        return out;
+    }
+
+    const QFileInfo info(it->path);
+    QByteArray buffer;
+    if (infoType == 1) { // SMB2_0_INFO_FILE
+        switch (infoClass) {
+        case 0x04: // FILE_BASIC_INFORMATION
+            appendShareTimes(buffer, info);
+            putLe32(buffer, shareAttributes(info));
+            putLe32(buffer, 0); // the structure is padded to 8 bytes
+            break;
+        case 0x05: // FILE_STANDARD_INFORMATION
+            putLe64(buffer, allocationSize(info));
+            putLe64(buffer, quint64(info.isDir() ? 0 : info.size()));
+            putLe32(buffer, info.isDir() ? 0 : 1); // NumberOfLinks
+            buffer.append(char(0));                // DeletePending
+            buffer.append(char(info.isDir() ? 1 : 0));
+            buffer.append(QByteArray(2, '\0'));
+            break;
+        case 0x06: // FILE_INTERNAL_INFORMATION
+            putLe64(buffer, quint64(qHash(it->path)) | 1u);
+            break;
+        case 0x07: // FILE_EA_INFORMATION
+            putLe32(buffer, 0);
+            break;
+        case 0x08: // FILE_ACCESS_INFORMATION
+            putLe32(buffer, 0x00120089u); // read data, attributes, read attributes, synchronise
+            break;
+        case 0x09: // FILE_POSITION_INFORMATION
+            putLe64(buffer, info.isDir() ? 0 : quint64(it->file ? it->file->pos() : 0));
+            break;
+        case 0x13: // FILE_MODE_INFORMATION
+            putLe32(buffer, 0);
+            break;
+        case 0x22: // FILE_NETWORK_OPEN_INFORMATION
+            appendShareTimes(buffer, info);
+            putLe64(buffer, allocationSize(info));
+            putLe64(buffer, quint64(info.isDir() ? 0 : info.size()));
+            putLe32(buffer, shareAttributes(info));
+            putLe32(buffer, 0);
+            break;
+        case 0x12: { // FILE_ALL_INFORMATION, which `smbclient` asks for
+            appendShareTimes(buffer, info);
+            putLe32(buffer, shareAttributes(info));
+            putLe32(buffer, 0); // basic information is padded to 8 bytes
+            putLe64(buffer, allocationSize(info));
+            putLe64(buffer, quint64(info.isDir() ? 0 : info.size()));
+            putLe32(buffer, info.isDir() ? 0 : 1); // NumberOfLinks
+            buffer.append(char(0));                // DeletePending
+            buffer.append(char(info.isDir() ? 1 : 0));
+            buffer.append(QByteArray(2, '\0'));
+            putLe64(buffer, quint64(qHash(it->path)) | 1u); // IndexNumber
+            putLe32(buffer, 0);                             // EaSize
+            putLe32(buffer, 0x00120089u);                   // Access
+            putLe64(buffer, quint64(it->file ? it->file->pos() : 0)); // Position
+            putLe32(buffer, 0);                             // Mode
+            putLe32(buffer, 0);                             // Alignment
+            const QByteArray fileName = toUtf16Bytes(info.fileName());
+            putLe32(buffer, quint32(fileName.size()));
+            buffer.append(fileName);
+            break;
+        }
+        case 0x30: { // FILE_ID_INFORMATION
+            putLe64(buffer, quint64(qHash(it->path.section(QLatin1Char('/'), 0, -2))) | 1u);
+            const quint64 fileId = quint64(qHash(it->path)) | 1u;
+            putLe64(buffer, fileId);
+            putLe64(buffer, fileId);
+            break;
+        }
+        default:
+            *status = Smb2::StatusInvalidParameter;
+            return answer(QByteArray(), 0, Smb2::StatusInvalidParameter);
+        }
+        return answer(buffer, outputLength, Smb2::StatusSuccess);
+    }
+    if (infoType == 2) { // SMB2_0_INFO_FILESYSTEM
+        const QStorageInfo storage(it->path);
+        const quint64 blockSize = 4096;
+        const quint64 totalBytes = quint64(storage.bytesTotal() > 0 ? storage.bytesTotal() : 0);
+        const quint64 freeBytes = quint64(storage.bytesAvailable() > 0 ? storage.bytesAvailable() : 0);
+        switch (infoClass) {
+        case 0x01: { // FILE_FS_VOLUME_INFORMATION
+            putLe64(buffer, fileTime(QFileInfo(it->path).birthTime()));
+            putLe32(buffer, quint32(qHash(it->path)) | 1u); // VolumeSerialNumber
+            const QByteArray label = toUtf16Bytes(QStringLiteral("SYSVOL"));
+            putLe32(buffer, quint32(label.size()));
+            buffer.append(char(0)); // SupportsObjects
+            buffer.append(char(0));
+            buffer.append(label);
+            break;
+        }
+        case 0x03: // FILE_FS_SIZE_INFORMATION
+            putLe64(buffer, totalBytes / blockSize);
+            putLe64(buffer, freeBytes / blockSize);
+            putLe32(buffer, 1); // SectorsPerAllocationUnit
+            putLe32(buffer, quint32(blockSize));
+            break;
+        case 0x05: { // FILE_FS_ATTRIBUTE_INFORMATION
+            putLe32(buffer, 0x00000002u | 0x00000004u | 0x00080000u); // case preserved, case sensitive, unicode
+            putLe32(buffer, 255); // MaximumComponentNameLength
+            const QByteArray name = toUtf16Bytes(QStringLiteral("NTFS"));
+            putLe32(buffer, quint32(name.size()));
+            buffer.append(name);
+            break;
+        }
+        case 0x07: // FILE_FS_FULL_SIZE_INFORMATION
+            putLe64(buffer, totalBytes / blockSize);
+            putLe64(buffer, freeBytes / blockSize);
+            putLe64(buffer, freeBytes / blockSize);
+            putLe32(buffer, 1);
+            putLe32(buffer, quint32(blockSize));
+            break;
+        default:
+            return answer(QByteArray(), 0, Smb2::StatusInvalidParameter);
+        }
+        return answer(buffer, outputLength, Smb2::StatusSuccess);
+    }
+    // Security and quota descriptors are not served by these shares.
+    return answer(QByteArray(), 0, Smb2::StatusNotSupported);
+}
+
+// SET_INFO: every write to a read-only share, including the delete-on-close a
+// client sends after opening a file it intended to remove, is refused.
+QByteArray Smb2Server::setInfo(Connection *connection, const QByteArray &body, quint32 *status)
+{
+    const quint64 id = readLe64(body, 16);
+    const auto it = connection->handles.constFind(id);
+    *status = it == connection->handles.constEnd() || it->channel ? Smb2::StatusNotSupported
+                                                                 : Smb2::StatusAccessDenied;
+    QByteArray out;
+    putLe16(out, 2); // StructureSize
+    return out;
+}
+
+QByteArray Smb2Server::closeHandle(Connection *connection, const QByteArray &body, quint32 *status)
 {
     Q_UNUSED(status)
     const quint64 id = readLe64(body, 8);
@@ -823,6 +1400,8 @@ QByteArray Smb2Server::closePipe(Connection *connection, const QByteArray &body,
     if (it != connection->handles.end()) {
         delete it->channel;
         it->channel = nullptr;
+        delete it->file;
+        it->file = nullptr;
         connection->handles.erase(it);
     }
     QByteArray out;

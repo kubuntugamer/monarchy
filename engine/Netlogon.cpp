@@ -12,6 +12,7 @@
 #include "Aes.h"
 #include "Des.h"
 #include "Krb5.h"
+#include "LogonHours.h"
 #include "Ndr.h"
 #include "Ntlm.h"
 
@@ -25,6 +26,7 @@ constexpr quint32 kStatusAccessDenied = 0xc0000022u;
 constexpr quint32 kStatusNoSuchUser = 0xc0000064u;
 constexpr quint32 kStatusWrongPassword = 0xc000006au;
 constexpr quint32 kStatusAccountDisabled = 0xc0000072u;
+constexpr quint32 kStatusAccountRestriction = 0xc000006eu;
 constexpr quint32 kStatusNotSupported = 0xc00000bbu;
 constexpr quint32 kStatusNoTrustSamAccount = 0xc000018bu;
 
@@ -1124,6 +1126,13 @@ QByteArray NetlogonServer::samLogon(const QByteArray &stub, bool withAuthenticat
         return statusOnly(kStatusWrongPassword);
     if (!Ntlm::verifyNtlmv2(ntHash, logon.account, domain, logon.challenge, logon.ntResponse))
         return statusOnly(kStatusWrongPassword);
+
+    // A correct password outside the account's logonHours is refused the way a
+    // Windows DC refuses it, and no last-logon stamp is written for a logon
+    // that did not happen.
+    if (!LogonHours::allowsHex(account.attributes.value(QStringLiteral("logonHours")),
+                               QDateTime::currentDateTimeUtc()))
+        return statusOnly(kStatusAccountRestriction);
 
     // Record the logon the way a DC does. lastLogon is per-DC and always
     // updated; lastLogonTimestamp is the replicated value, refreshed only when

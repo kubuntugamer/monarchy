@@ -75,6 +75,7 @@ chmod 0644 /etc/systemd/system/monarchy-dcd.service
 systemctl daemon-reload
 systemctl enable monarchy-dcd.service
 
+HEALTH=""
 if [[ -f "$DCDIR/dc.conf" ]]; then
     systemctl restart monarchy-dcd.service
     STATE="running"
@@ -84,6 +85,14 @@ if [[ -f "$DCDIR/dc.conf" ]]; then
             printf 'install-dc-services: port 53 is held by another resolver; if it is\n' >&2
             printf '  systemd-resolved, run scripts/install-monarchy.sh --fix-dns53\n' >&2
         fi
+    fi
+    # A restart that leaves a locator record pointing at a dead port is a
+    # failure, not a warning: the check reports it and this script exits with
+    # its status after printing the summary.
+    if "$ROOT/scripts/check-dc-health.sh" "$DCDIR"; then
+        HEALTH="all advertised endpoints answer"
+    else
+        HEALTH="FAILED — see the mismatches above"
     fi
 else
     STATE="waiting for a provisioned domain"
@@ -96,9 +105,14 @@ Monarchy's domain controller is installed and enabled at boot.
   Unit:      systemctl status monarchy-dcd
   State:     $STATE
   Store:     $DCDIR
+  Health:    ${HEALTH:-not checked (no provisioned domain)}
   Provision: sudo -u $SERVICE_USER $PREFIX/bin/monarchy-provision \\
                  $DCDIR --realm MONARCHY.EXAMPLE.COM --adminpass '…' [--force]
-  Provisioning defaults to the native DC ports (53/389/88/135/445). Only for a
+  Provisioning defaults to the native DC ports (53/389/88/464/135/445). Only for a
   rootless dev machine add --dev-ports. After re-provisioning (dc.conf changes):
              sudo systemctl restart monarchy-dcd
 EOF
+
+if [[ "$HEALTH" == FAILED* ]]; then
+    exit 1
+fi

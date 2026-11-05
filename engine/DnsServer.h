@@ -80,10 +80,20 @@ public:
     // domain-controller SRV records for `host`/`ip`. `site` is the AD site the
     // DC belongs to, which decides the _sites._msdcs record names.
     void loadAdZone(const QString &zone, const QString &host, const QString &ip,
-                    quint16 ldapPort, quint16 gcPort, const QString &site);
+                    quint16 ldapPort, quint16 gcPort, const QString &site,
+                    quint16 kpasswdPort = 464, quint16 kdcPort = 88);
 
     // Legacy entry point: builds the zone for `dc1.<zone>` on 127.0.0.1.
     void loadDefaultZone(const QString &zone);
+
+    // Adds or corrects the SRV locators loadAdZone() would publish for this DC
+    // at these ports, in a zone that was loaded from disk: a zone provisioned
+    // by an older build, or one whose records were edited away, is repaired in
+    // place instead of advertising a service nothing answers. Records that are
+    // already right are left untouched. Returns true when the zone changed.
+    bool repairAdZoneLocators(const QString &host, quint16 ldapPort, quint16 gcPort,
+                             const QString &site, quint16 kpasswdPort = 464,
+                             quint16 kdcPort = 88);
 
     void addRecord(const QString &name, quint16 type, quint32 ttl, const QByteArray &rdata);
     void removeRecord(const QString &name, quint16 type);

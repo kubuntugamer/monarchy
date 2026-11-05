@@ -9,18 +9,20 @@
 #include <QHostAddress>
 #include <QObject>
 #include <QString>
+#include <QStringList>
 
 #include "Rpc.h"
 
 class QTcpServer;
 class QTcpSocket;
 
-// SMB2 (MS-SMB2) enough to carry DCE/RPC over named pipes: negotiate, session
-// setup with SPNEGO/NTLMSSP against the same authenticator SAMR and LSAD use,
-// tree connect to IPC$, create on a pipe, and read/write of whole PDUs, which
-// are handed to the interface's own RpcServer through a headless channel. A
-// client that reaches `\\dc\pipe\lsarpc` gets the same bind, authentication and
-// dispatch it would get on `lsadPort`, because it is the same code.
+// SMB2 (MS-SMB2) enough to carry DCE/RPC over named pipes and to serve the
+// domain's file shares: negotiate, session setup with SPNEGO/NTLMSSP against the
+// same authenticator SAMR and LSAD use, tree connect to IPC$ or a disk share,
+// create, read, directory query, close. A client that reaches `\\dc\pipe\lsarpc`
+// gets the same bind, authentication and dispatch it would get on `lsadPort`,
+// because it is the same code; a client that reaches `\\dc\SYSVOL` gets the
+// directory tree under the share root, which is how a member reads its GPOs.
 namespace Smb2 {
 
 // Command codes (MS-SMB2 §2.2.1).
@@ -59,7 +61,14 @@ enum Status : quint32 {
     StatusNotSupported = 0xc00000bbu,
     StatusInvalidParameter = 0xc000000du,
     StatusFileClosed = 0xc0000128u,
-    StatusBufferOverflow = 0x80000005u
+    StatusBufferOverflow = 0x80000005u,
+    StatusNoSuchFile = 0xc000000fu,
+    StatusAccessDenied = 0xc0000022u,
+    StatusInvalidDeviceRequest = 0xc0000010u,
+    StatusNotADirectory = 0xc0000103u,
+    StatusNoMoreFiles = 0x80000006u,
+    StatusEndOfFile = 0xc0000011u,
+    StatusDiskFull = 0xc000007fu
 };
 
 constexpr quint32 kHeaderSize = 64;
@@ -77,6 +86,10 @@ public:
 
     // Registers a pipe name ("samr", "lsarpc") and the endpoint its PDUs go to.
     void addPipe(const QString &name, RpcServer *endpoint);
+    // Exposes a directory as a disk share ("SYSVOL", "NETLOGON"). Only a
+    // client with an authenticated session may connect; a read-only share
+    // refuses every write, set-info and delete with access denied.
+    void addShare(const QString &name, const QString &path, bool readOnly = true);
     // The same authenticator SAMR and LSAD use, so one directory credential
     // opens the pipes as well as the TCP endpoints.
     void setAuthenticator(Rpc::Authenticator authenticator);
@@ -113,18 +126,28 @@ private:
     QByteArray wildcardAnswer(Connection *connection, const QByteArray &message);
     QByteArray negotiate(Connection *connection, const QByteArray &body, quint32 status);
     QByteArray sessionSetup(Connection *connection, const QByteArray &body, quint32 *status);
-    QByteArray treeConnect(Connection *connection, const QByteArray &body, quint32 *status);
-    QByteArray create(Connection *connection, const QByteArray &body, quint32 *status);
+    QByteArray treeConnect(Connection *connection, const QByteArray &body, quint32 *status,
+                           quint32 *treeIdOut);
+    QByteArray create(Connection *connection, quint32 treeId, const QByteArray &body,
+                      quint32 *status);
     QByteArray write(Connection *connection, const QByteArray &body, quint32 *status);
     // FSCTL_PIPE_TRANSCEIVE (the write+read every client writes pipe PDUs with)
     // and friends; rpcclient uses it for every \pipe read and write.
     QByteArray ioctlMessage(Connection *connection, const QByteArray &body, quint32 *status);
     QByteArray read(Connection *connection, const QByteArray &body, quint32 *status);
-    QByteArray closePipe(Connection *connection, const QByteArray &body, quint32 *status);
+    QByteArray queryDirectory(Connection *connection, const QByteArray &body, quint32 *status);
+    QByteArray queryInfo(Connection *connection, const QByteArray &body, quint32 *status);
+    QByteArray setInfo(Connection *connection, const QByteArray &body, quint32 *status);
+    QByteArray closeHandle(Connection *connection, const QByteArray &body, quint32 *status);
 
     QTcpServer *m_server = nullptr;
     QList<Connection *> m_connections;
     QHash<QString, RpcServer *> m_pipes;
+    struct Share {
+        QString path;
+        bool readOnly = true;
+    };
+    QHash<QString, Share> m_shares;
     Rpc::Authenticator m_authenticator;
     QString m_domain;
     QString m_serverName;

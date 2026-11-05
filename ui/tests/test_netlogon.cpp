@@ -319,6 +319,7 @@ private slots:
     void secureChannelNegotiatesCrypto();
     void legacySamLogonAuthenticatesSecureChannel_data();
     void legacySamLogonAuthenticatesSecureChannel();
+    void refusesALogonOutsideLogonHours();
     void passwordSet2WritesTheMachineHash();
     void rejectsAChannelCredentialFromTheWrongPassword();
     void dcLocatorNamesThisDc();
@@ -446,6 +447,91 @@ void NetlogonTest::legacySamLogonAuthenticatesSecureChannel()
     QCOMPARE(writtenAttributes.value(QStringLiteral("logonCount")), QStringLiteral("1"));
     // The previous logon was never recorded, so the replicated stamp is due.
     QVERIFY(writtenAttributes.contains(QStringLiteral("lastLogonTimestamp")));
+}
+
+// An account whose logonHours exclude the current hour is refused the way a
+// Windows DC refuses it, and a logon that did not happen leaves no last-logon
+// stamp behind.
+void NetlogonTest::refusesALogonOutsideLogonHours()
+{
+    NetlogonServer server;
+    Netlogon::Config config;
+    config.netbios = QStringLiteral("CORP");
+    config.realm = QStringLiteral("CORP.EXAMPLE.COM");
+    config.dnsDomain = QStringLiteral("corp.example.com");
+    config.dcName = QStringLiteral("DC1");
+    config.domainSid = QStringLiteral("S-1-5-21-1-2-3");
+    server.setConfig(config);
+
+    DirectoryObject machine;
+    machine.id = QStringLiteral("CN=DC1,OU=Domain Controllers,DC=corp,DC=example,DC=com");
+    machine.kind = ObjectKind::Computer;
+    machine.attributes.insert(QStringLiteral("sAMAccountName"), QStringLiteral("DC1$"));
+    machine.attributes.insert(QStringLiteral("objectSid"), QStringLiteral("S-1-5-21-1-2-3-1000"));
+    const QByteArray machineHash = Ntlm::ntowfV1(QStringLiteral("Mach!neP@ss1"));
+    machine.attributes.insert(QStringLiteral("ntHash"), QString::fromLatin1(machineHash.toHex()));
+
+    DirectoryObject user;
+    user.id = QStringLiteral("CN=alice,CN=Users,DC=corp,DC=example,DC=com");
+    user.kind = ObjectKind::User;
+    user.attributes.insert(QStringLiteral("sAMAccountName"), QStringLiteral("alice"));
+    user.attributes.insert(QStringLiteral("objectSid"), QStringLiteral("S-1-5-21-1-2-3-1100"));
+    const QByteArray userHash = Ntlm::ntowfV1(QStringLiteral("Alice!Password123"));
+    user.attributes.insert(QStringLiteral("ntHash"), QString::fromLatin1(userHash.toHex()));
+    user.attributes.insert(QStringLiteral("userAccountControl"), QStringLiteral("512"));
+    // 21 bytes with every bit clear: no hour of the week is allowed.
+    user.attributes.insert(QStringLiteral("logonHours"),
+                           QString::fromLatin1(QByteArray(21, '\0').toHex()));
+    server.setObjectProvider([machine, user]() { return QList<DirectoryObject>{machine, user}; });
+
+    bool wroteBack = false;
+    Netlogon::WriteBackend writes;
+    writes.updateAccount = [&wroteBack](const QString &, const QMap<QString, QString> &, QString *) {
+        wroteBack = true;
+        return true;
+    };
+    server.setWriteBackend(writes);
+
+    const QByteArray clientChallenge = QByteArray::fromHex("2122232425262728");
+    const QByteArray challengeReply = server.handleCall(
+        Netlogon::OpServerReqChallenge, challengeRequest(QStringLiteral("DC1"), clientChallenge));
+    const QByteArray serverChallenge = challengeReply.left(8);
+    const quint32 flags = Netlogon::kNegStrongKeys | Netlogon::kNegSupportsAes;
+    const QByteArray sessionKey = expectedSessionKey(machineHash, clientChallenge, serverChallenge,
+                                                     flags);
+    const QByteArray authenticateReply = server.handleCall(
+        Netlogon::OpServerAuthenticate3,
+        authenticateRequest(QStringLiteral("DC1$"), QStringLiteral("DC1"),
+                            expectedCredential(clientChallenge, sessionKey, flags), flags));
+    QCOMPARE(readLe32(authenticateReply, 16), quint32(0));
+
+    const QByteArray channelSeed = expectedCredential(serverChallenge, sessionKey, flags);
+    const quint32 timestamp = 43;
+    const QByteArray requestCredential = nextCredential(channelSeed, timestamp, sessionKey, flags, false);
+    // appendNetworkLogon() marshals a fixed client challenge; the response has
+    // to be computed over that same eight bytes.
+    const QByteArray userChallenge = QByteArray::fromHex("0102030405060708");
+    const QByteArray ntResponse = ntlmV2Response(userHash, QStringLiteral("alice"),
+                                                QStringLiteral("CORP"), userChallenge);
+
+    QByteArray request;
+    appendLe32(request, 0);
+    appendPointerString(request, QStringLiteral("DC1"), 0x00021000u);
+    appendLe32(request, 0x00021001u);
+    request.append(authenticatorRequest(requestCredential, timestamp));
+    appendLe32(request, 0x00021002u);
+    request.append(QByteArray(12, '\0'));
+    appendLe16(request, 2);
+    appendLe16(request, 2);
+    appendLe32(request, 0x00021003u);
+    appendNetworkLogon(request, 3, ntResponse, 0);
+
+    const QByteArray reply = server.handleCall(Netlogon::OpLogonSamLogon, request);
+    // The credentials were right, so the answer is the hour restriction rather
+    // than a wrong-password status.
+    QCOMPARE(reply.size(), 4);
+    QCOMPARE(readLe32(reply, 0), quint32(0xc000006eu));
+    QVERIFY(!wroteBack);
 }
 
 void NetlogonTest::secureChannelNegotiatesCrypto()

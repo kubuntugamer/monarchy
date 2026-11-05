@@ -531,8 +531,52 @@ QByteArray DnsServer::srvRdata(quint16 port, const QString &target) const {
     return rdata;
 }
 
+namespace {
+
+struct AdSrvSpec {
+    QString owner;
+    quint16 port;
+};
+
+// Every SRV record a DC of this zone publishes, in the order clients ask for
+// them. loadAdZone() and repairAdZoneLocators() share it so the set a new
+// domain gets and the set an existing one is held to cannot drift apart.
+QList<AdSrvSpec> adSrvSpecs(const QString &zoneName, const QString &site, quint16 ldapPort,
+                            quint16 gcPort, quint16 kpasswdPort, quint16 kdcPort)
+{
+    const QString siteLower = site.toLower();
+    const QString siteDomain = siteLower + QLatin1String("._sites.") + zoneName;
+    const QString msdcs = QStringLiteral("dc._msdcs.") + zoneName;
+    const QString siteMsdcs = siteLower + QLatin1String("._sites.") + msdcs;
+    const QString gcMsdcs = QStringLiteral("gc._msdcs.") + zoneName;
+    return {
+        {QStringLiteral("_ldap._tcp.") + zoneName, ldapPort},
+        {QStringLiteral("_ldap._tcp.") + msdcs, ldapPort},
+        {QStringLiteral("_ldap._tcp.") + siteDomain, ldapPort},
+        {QStringLiteral("_ldap._tcp.") + siteMsdcs, ldapPort},
+        // The KDC; a dev-ports DC serves Kerberos where `kdcPort` says, so the
+        // locator has to follow it rather than assume 88.
+        {QStringLiteral("_kerberos._tcp.") + zoneName, kdcPort},
+        {QStringLiteral("_kerberos._tcp.") + siteDomain, kdcPort},
+        {QStringLiteral("_kerberos._tcp.") + msdcs, kdcPort},
+        {QStringLiteral("_kerberos._udp.") + zoneName, kdcPort},
+        // The password-change service; the locator points where KpasswdServer
+        // listens, which is why it takes the configured port.
+        {QStringLiteral("_kpasswd._tcp.") + zoneName, kpasswdPort},
+        {QStringLiteral("_kpasswd._udp.") + zoneName, kpasswdPort},
+        {QStringLiteral("_gc._tcp.") + zoneName, gcPort},
+        {QStringLiteral("_gc._tcp.") + siteDomain, gcPort},
+        {QStringLiteral("_ldap._tcp.") + gcMsdcs, gcPort},
+        {QStringLiteral("_ldap._tcp.") + siteLower + QLatin1String("._sites.") + gcMsdcs, gcPort},
+        {QStringLiteral("_ldap._tcp.pdc._msdcs.") + zoneName, ldapPort},
+    };
+}
+
+} // namespace
+
 void DnsServer::loadAdZone(const QString &zone, const QString &host, const QString &ip,
-                           quint16 ldapPort, quint16 gcPort, const QString &site) {
+                           quint16 ldapPort, quint16 gcPort, const QString &site,
+                           quint16 kpasswdPort, quint16 kdcPort) {
     m_records.clear();
     m_zone = zone.toLower();
     // AD style serial: yyyymmdd00. Every applied update bumps it.
@@ -579,32 +623,35 @@ void DnsServer::loadAdZone(const QString &zone, const QString &host, const QStri
     if (hostName != zoneName)
         addRecord(zoneName, TypeA, 600, address);
 
-    const QString siteLower = siteName.toLower();
-    const QString siteDomain = siteLower + QLatin1String("._sites.") + zoneName;
-    const QString msdcs = QStringLiteral("dc._msdcs.") + zoneName;
-    const QString siteMsdcs = siteLower + QLatin1String("._sites.") + msdcs;
-    const QString gcMsdcs = QStringLiteral("gc._msdcs.") + zoneName;
-
-    struct SrvSpec { QString owner; quint16 port; };
-    const QList<SrvSpec> specs = {
-        {QStringLiteral("_ldap._tcp.") + zoneName, ldapPort},
-        {QStringLiteral("_ldap._tcp.") + msdcs, ldapPort},
-        {QStringLiteral("_ldap._tcp.") + siteDomain, ldapPort},
-        {QStringLiteral("_ldap._tcp.") + siteMsdcs, ldapPort},
-        {QStringLiteral("_kerberos._tcp.") + zoneName, 88},
-        {QStringLiteral("_kerberos._tcp.") + siteDomain, 88},
-        {QStringLiteral("_kerberos._tcp.") + msdcs, 88},
-        {QStringLiteral("_kerberos._udp.") + zoneName, 88},
-        {QStringLiteral("_kpasswd._tcp.") + zoneName, 464},
-        {QStringLiteral("_kpasswd._udp.") + zoneName, 464},
-        {QStringLiteral("_gc._tcp.") + zoneName, gcPort},
-        {QStringLiteral("_gc._tcp.") + siteDomain, gcPort},
-        {QStringLiteral("_ldap._tcp.") + gcMsdcs, gcPort},
-        {QStringLiteral("_ldap._tcp.") + siteLower + QLatin1String("._sites.") + gcMsdcs, gcPort},
-        {QStringLiteral("_ldap._tcp.pdc._msdcs.") + zoneName, ldapPort},
-    };
-    for (const SrvSpec &spec : specs)
+    for (const AdSrvSpec &spec :
+         adSrvSpecs(zoneName, siteName, ldapPort, gcPort, kpasswdPort, kdcPort))
         addRecord(spec.owner, TypeSrv, 600, srvRdata(spec.port, hostName));
+}
+
+bool DnsServer::repairAdZoneLocators(const QString &host, quint16 ldapPort, quint16 gcPort,
+                                     const QString &site, quint16 kpasswdPort, quint16 kdcPort)
+{
+    if (m_zone.isEmpty())
+        return false;
+    const QString hostName = host.toLower();
+    const QString siteName = site.isEmpty() ? QStringLiteral("Default-First-Site-Name") : site;
+    bool changed = false;
+    for (const AdSrvSpec &spec :
+         adSrvSpecs(m_zone, siteName, ldapPort, gcPort, kpasswdPort, kdcPort)) {
+        const QByteArray wanted = srvRdata(spec.port, hostName);
+        const QList<Record> existing = records(spec.owner, TypeSrv);
+        // Exactly the record a client should find: leave it alone, so a zone
+        // that is already correct is not rewritten on every start.
+        if (existing.size() == 1 && existing.first().rdata == wanted)
+            continue;
+        if (!existing.isEmpty())
+            removeRecord(spec.owner, TypeSrv);
+        addRecord(spec.owner, TypeSrv, 600, wanted);
+        changed = true;
+    }
+    if (changed)
+        bumpSerial();
+    return changed;
 }
 
 void DnsServer::loadDefaultZone(const QString &zone) {

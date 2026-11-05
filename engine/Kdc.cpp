@@ -13,6 +13,7 @@
 
 #include "Asn1.h"
 #include "Krb5.h"
+#include "LogonHours.h"
 #include "Pac.h"
 
 namespace {
@@ -511,6 +512,7 @@ bool Kdc::parseRequest(const QByteArray &der, quint8 expectedTag, KdcRequest *ou
     decodePrincipal(Asn1::child(body, 0xA3), &out->sname, &out->srealm);
     out->nonce = quint32(decodeInteger(Asn1::child(body, 0xA7)));
     out->options = decodeBits(Asn1::child(body, 0xA0));
+    out->till = decodeTime(Asn1::child(body, 0xA5));
 
     if (const Asn1::Element *etypesTag = Asn1::child(body, 0xA8)) {
         Asn1::Element etypes;
@@ -630,6 +632,27 @@ QByteArray Kdc::handleAsReq(const KdcRequest &request)
     if (clientTime <= 0 || qAbs(now - clientTime) > Krb5::kClockSkewSeconds)
         return krbError(kErrPreauthFailed, realm, request.cname);
 
+    // A valid password outside the account's allowed hours still gets no TGT.
+    // The check sits after pre-authentication, so the refusal never reveals
+    // whether a password was right.
+    if (!LogonHours::allowsHex(client.logonHours, QDateTime::currentDateTimeUtc()))
+        return krbError(kErrClientRevoked, realm, request.cname);
+
+    // An AS-REQ may ask for a service ticket rather than a TGT. A client does
+    // exactly that to obtain kadmin/changepw before changing a password, so the
+    // request's sname is honoured instead of being assumed to be krbtgt.
+    const QString tgtName = QStringLiteral("krbtgt/%1").arg(realm);
+    if (!request.sname.isEmpty()
+        && request.sname.compare(tgtName, Qt::CaseInsensitive) != 0) {
+        Krb5::Principal service;
+        if (!Krb5::findPrincipal(directory(),
+                                 request.sname + QLatin1Char('@') + realm, realm, &service))
+            return krbError(kErrSPrincipalUnknown, realm, request.cname);
+        if (service.disabled)
+            return krbError(kErrClientRevoked, realm, request.cname);
+        return issueAsRep(request, client, etype, timestamp, service, request.sname);
+    }
+
     return issueAsRep(request, client, etype, timestamp);
 }
 
@@ -646,22 +669,37 @@ int asRepUsage(int etype)
 } // namespace
 
 QByteArray Kdc::issueAsRep(const KdcRequest &request, const Krb5::Principal &client,
-                           int etype, const QByteArray &timestamp) const
+                           int etype, const QByteArray &timestamp,
+                           const Krb5::Principal &service, const QString &serviceName) const
 {
     Q_UNUSED(timestamp)
     const QByteArray clientKey = client.keyFor(etype);
     const QString realm = Krb5::canonicalRealm(m_config.realm);
+    // The krbtgt account always supplies the KDC signature of the PAC; the
+    // ticket itself is sealed with the requested service's key when the AS-REQ
+    // named one, and with krbtgt's when it asked for a TGT.
     Krb5::Principal krbtgt;
     if (!Krb5::findPrincipal(directory(), QStringLiteral("krbtgt/%1").arg(realm), realm,
                              &krbtgt))
         return krbError(kErrSPrincipalUnknown, realm, request.cname);
 
-    const int ticketEtype = preferredEtype(krbtgt);
+    const bool forService = service.isValid() && !serviceName.isEmpty();
+    const Krb5::Principal ticketPrincipal = forService ? service : krbtgt;
+    const QString sname = forService ? serviceName
+                                     : QStringLiteral("krbtgt/%1").arg(realm);
+    const int ticketEtype = preferredEtype(ticketPrincipal);
     if (ticketEtype == 0)
+        return krbError(kErrSPrincipalUnknown, realm, request.cname);
+    const int kdcEtype = preferredEtype(krbtgt);
+    if (kdcEtype == 0)
         return krbError(kErrSPrincipalUnknown, realm, request.cname);
 
     const qint64 now = QDateTime::currentSecsSinceEpoch();
-    const qint64 endtime = now + kTicketLifetime;
+    // The client's requested end time caps the ticket: a client that asks for a
+    // five-minute ticket (kpasswd does, for its kadmin/changepw ticket) must not
+    // be handed one that outlives the request, or it rejects the reply.
+    const qint64 endtime = request.till > 0 ? qMin(now + kTicketLifetime, request.till)
+                                            : now + kTicketLifetime;
     const QByteArray sessionKey = Krb5::randomKey(etype);
     quint32 flags = kFlagInitial | kFlagPreAuthent;
     if (request.options & kFlagForwardable)
@@ -669,14 +707,14 @@ QByteArray Kdc::issueAsRep(const KdcRequest &request, const Krb5::Principal &cli
     if (request.options & kFlagProxiable)
         flags |= kFlagProxiable;
 
-    // A PAC for the client, sealed with the krbtgt key for both signatures: the
-    // TGT is a ticket to krbtgt itself, so the service and KDC keys coincide.
+    // A PAC for the client, signed for the ticket's service and by the KDC. A
+    // TGT's service key is krbtgt's, so both signatures coincide there.
     QByteArray authorizationData;
     Pac::Keys pacKeys;
-    pacKeys.serviceKey = krbtgt.keyFor(ticketEtype);
+    pacKeys.serviceKey = ticketPrincipal.keyFor(ticketEtype);
     pacKeys.serviceEtype = ticketEtype;
-    pacKeys.kdcKey = krbtgt.keyFor(ticketEtype);
-    pacKeys.kdcEtype = ticketEtype;
+    pacKeys.kdcKey = krbtgt.keyFor(kdcEtype);
+    pacKeys.kdcEtype = kdcEtype;
     for (const DirectoryObject &object : directory()) {
         if (object.id.compare(client.dn, Qt::CaseInsensitive) != 0)
             continue;
@@ -687,9 +725,8 @@ QByteArray Kdc::issueAsRep(const KdcRequest &request, const Krb5::Principal &cli
         break;
     }
 
-    const QString sname = QStringLiteral("krbtgt/%1").arg(realm);
     const QByteArray ticketCipher =
-        Krb5::encrypt(ticketEtype, 2, krbtgt.keyFor(ticketEtype),
+        Krb5::encrypt(ticketEtype, 2, ticketPrincipal.keyFor(ticketEtype),
                       encTicketPart(flags, sessionKey, etype, realm, request.cname, now,
                                     endtime, authorizationData));
     // The reply's encrypted part is sealed with the client's long-term key, so
@@ -708,8 +745,8 @@ QByteArray Kdc::issueAsRep(const KdcRequest &request, const Krb5::Principal &cli
     content.append(contextTag(2, Asn1::sequence(etypeInfo2Padata(client.salt, {etype}))));
     content.append(kerberosString(3, realm));
     content.append(taggedPrincipal(4, request.cname));
-    content.append(
-        contextTag(5, ticket(realm, sname, ticketEtype, int(krbtgt.kvno), ticketCipher)));
+    content.append(contextTag(5, ticket(realm, sname, ticketEtype, int(ticketPrincipal.kvno),
+                                        ticketCipher)));
     content.append(contextTag(6, encryptedData(etype, 0, encPart)));
     return Asn1::tlv(kAsRepTag, Asn1::sequence(content));
 }
@@ -811,7 +848,9 @@ QByteArray Kdc::issueTgsRep(const KdcRequest &request, const OpenedTicket &tgt,
         return krbError(kErrEtypeNoSupp, realm, tgt.client);
 
     const qint64 now = QDateTime::currentSecsSinceEpoch();
-    const qint64 endtime = qMin(tgt.endtime, now + kTicketLifetime);
+    qint64 endtime = qMin(tgt.endtime, now + kTicketLifetime);
+    if (request.till > 0)
+        endtime = qMin(endtime, request.till);
     const QByteArray sessionKey = Krb5::randomKey(sessionEtype);
     const quint32 flags =
         tgt.flags & (kFlagForwardable | kFlagProxiable | kFlagRenewable);
@@ -1137,7 +1176,8 @@ bool Kdc::readAuthenticator(const QByteArray &apReqDer, const OpenedTicket &tick
 
 bool Kdc::verifyAuthenticator(const QByteArray &apReqDer, const OpenedTicket &ticket,
                              int usage, QByteArray *replyToken, QString *error,
-                             QByteArray *subkeyOut, int *subkeyEtypeOut)
+                             QByteArray *subkeyOut, int *subkeyEtypeOut,
+                             quint32 *seqOut, qint64 *ctimeOut, quint32 *cusecOut)
 {
     AuthenticatorFields fields;
     if (!readAuthenticator(apReqDer, ticket, usage, &fields, error))
@@ -1147,6 +1187,12 @@ bool Kdc::verifyAuthenticator(const QByteArray &apReqDer, const OpenedTicket &ti
         *subkeyOut = fields.subkey;
     if (subkeyEtypeOut)
         *subkeyEtypeOut = fields.subkeyEtype;
+    if (seqOut)
+        *seqOut = fields.seq;
+    if (ctimeOut)
+        *ctimeOut = fields.ctime;
+    if (cusecOut)
+        *cusecOut = fields.usec;
 
     if (!replyToken)
         return true;
@@ -1290,7 +1336,11 @@ bool Kdc::acceptApReq(const QByteArray &token, ApResult *out, QString *error)
     QByteArray reply;
     QByteArray subkey;
     int subkeyEtype = 0;
-    if (!verifyAuthenticator(apReqDer, ticket, 11, &reply, error, &subkey, &subkeyEtype))
+    quint32 clientSeq = 0;
+    qint64 ctime = 0;
+    quint32 cusec = 0;
+    if (!verifyAuthenticator(apReqDer, ticket, 11, &reply, error, &subkey, &subkeyEtype,
+                             &clientSeq, &ctime, &cusec))
         return false;
 
     QByteArray pac;
@@ -1301,6 +1351,7 @@ bool Kdc::acceptApReq(const QByteArray &token, ApResult *out, QString *error)
         out->clientPrincipal = ticket.client;
         out->servicePrincipal = serviceName;
         out->sessionKey = ticket.sessionKey;
+        out->sessionEtype = ticket.sessionEtype;
         // What the authenticated context seals with: the initiator's subkey
         // when it proposed one (GSS-API always does), else the session key.
         const bool usableSubkey =
@@ -1309,6 +1360,11 @@ bool Kdc::acceptApReq(const QByteArray &token, ApResult *out, QString *error)
         out->contextEtype = usableSubkey ? subkeyEtype : ticket.sessionEtype;
         out->replyToken = reply;
         out->pac = pac;
+        out->subkey = usableSubkey ? subkey : QByteArray();
+        out->subkeyEtype = usableSubkey ? subkeyEtype : 0;
+        out->ctime = ctime;
+        out->cusec = cusec;
+        out->clientSeq = clientSeq;
 
         Krb5::Principal client;
         if (Krb5::findPrincipal(directory(),
@@ -1378,6 +1434,7 @@ bool Kdc::acceptDceApReq(const QByteArray &token, ApResult *out, QString *error)
         out->clientPrincipal = ticket.client;
         out->servicePrincipal = serviceName;
         out->sessionKey = ticket.sessionKey;
+        out->sessionEtype = ticket.sessionEtype;
         out->contextKey = acceptorSubkey;
         out->contextEtype = ticket.sessionEtype;
         out->replyToken = reply;

@@ -280,6 +280,7 @@ class DnsTest : public QObject
 
 private slots:
     void publishesAdServiceRecords();
+    void repairsAdZoneLocators();
     void answersQueriesOverUdp();
     void refusesOutOfZoneQueries();
     void answersQueriesOverTcp();
@@ -293,9 +294,11 @@ private slots:
 void DnsTest::publishesAdServiceRecords()
 {
     DnsServer server;
+    // The dev-ports set: LDAP, kpasswd and the KDC all elsewhere, so a locator
+    // that assumed 88 or 464 would point a client at nothing.
     server.loadAdZone(QStringLiteral("monarchy.example.com"),
                       QStringLiteral("monarchydc1.monarchy.example.com"), QStringLiteral("10.0.0.10"),
-                      1389, 3268, QStringLiteral("Default-First-Site-Name"));
+                      1389, 3268, QStringLiteral("Default-First-Site-Name"), 1464, 8888);
 
     QCOMPARE(server.zone(), QStringLiteral("monarchy.example.com"));
 
@@ -327,11 +330,11 @@ void DnsTest::publishesAdServiceRecords()
         {QStringLiteral("_ldap._tcp.default-first-site-name._sites.monarchy.example.com"), 1389},
         {QStringLiteral("_ldap._tcp.default-first-site-name._sites.dc._msdcs.monarchy.example.com"),
          1389},
-        {QStringLiteral("_kerberos._tcp.monarchy.example.com"), 88},
-        {QStringLiteral("_kerberos._tcp.dc._msdcs.monarchy.example.com"), 88},
-        {QStringLiteral("_kerberos._udp.monarchy.example.com"), 88},
-        {QStringLiteral("_kpasswd._tcp.monarchy.example.com"), 464},
-        {QStringLiteral("_kpasswd._udp.monarchy.example.com"), 464},
+        {QStringLiteral("_kerberos._tcp.monarchy.example.com"), 8888},
+        {QStringLiteral("_kerberos._tcp.dc._msdcs.monarchy.example.com"), 8888},
+        {QStringLiteral("_kerberos._udp.monarchy.example.com"), 8888},
+        {QStringLiteral("_kpasswd._tcp.monarchy.example.com"), 1464},
+        {QStringLiteral("_kpasswd._udp.monarchy.example.com"), 1464},
         {QStringLiteral("_gc._tcp.monarchy.example.com"), 3268},
         {QStringLiteral("_gc._tcp.default-first-site-name._sites.monarchy.example.com"), 3268},
         {QStringLiteral("_ldap._tcp.gc._msdcs.monarchy.example.com"), 3268},
@@ -350,6 +353,59 @@ void DnsTest::publishesAdServiceRecords()
         QCOMPARE(srvTarget(records.first().rdata),
                  QStringLiteral("monarchydc1.monarchy.example.com"));
     }
+}
+
+void DnsTest::repairsAdZoneLocators()
+{
+    const QString zone = QStringLiteral("monarchy.example.com");
+    const QString host = QStringLiteral("monarchydc1.monarchy.example.com");
+    const QString site = QStringLiteral("Default-First-Site-Name");
+
+    DnsServer server;
+    // An older provision: LDAP on the dev port, and no kpasswd service at all.
+    server.loadAdZone(zone, host, QStringLiteral("10.0.0.10"), 1389, 3268, site);
+    server.removeRecord(QStringLiteral("_kpasswd._tcp.") + zone, DnsServer::TypeSrv);
+    server.removeRecord(QStringLiteral("_kpasswd._udp.") + zone, DnsServer::TypeSrv);
+
+    QVERIFY(server.repairAdZoneLocators(host, 389, 3268, site, 464, 8888));
+
+    const QList<DnsServer::Record> ldap =
+        server.records(QStringLiteral("_ldap._tcp.") + zone, DnsServer::TypeSrv);
+    QCOMPARE(ldap.size(), 1);
+    int pos = 4; // priority + weight
+    quint16 port = 0;
+    QVERIFY(take16(ldap.first().rdata, pos, &port));
+    QCOMPARE(port, quint16(389));
+
+    // The removed locators come back at the port the service really uses.
+    for (const QString &owner : {QStringLiteral("_kpasswd._tcp."),
+                                 QStringLiteral("_kpasswd._udp.")}) {
+        const QList<DnsServer::Record> records =
+            server.records(owner + zone, DnsServer::TypeSrv);
+        QCOMPARE(records.size(), 1);
+        int at = 4;
+        quint16 kpasswdPort = 0;
+        QVERIFY(take16(records.first().rdata, at, &kpasswdPort));
+        QCOMPARE(kpasswdPort, quint16(464));
+    }
+
+    // A KDC this build serves on 8888 must not stay advertised at 88, the port
+    // a native-binding DC uses; the repair follows the port actually bound.
+    for (const QString &owner : {QStringLiteral("_kerberos._tcp."),
+                                 QStringLiteral("_kerberos._tcp.dc._msdcs."),
+                                 QStringLiteral("_kerberos._udp.")}) {
+        const QList<DnsServer::Record> records =
+            server.records(owner + zone, DnsServer::TypeSrv);
+        QCOMPARE(records.size(), 1);
+        int at = 4;
+        quint16 kdcPort = 0;
+        QVERIFY(take16(records.first().rdata, at, &kdcPort));
+        QCOMPARE(kdcPort, quint16(8888));
+    }
+
+    // A zone that already matches is not rewritten, so a start does not bump
+    // the serial for nothing.
+    QVERIFY(!server.repairAdZoneLocators(host, 389, 3268, site, 464, 8888));
 }
 
 void DnsTest::answersQueriesOverUdp()
