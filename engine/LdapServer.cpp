@@ -803,6 +803,104 @@ bool LdapServer::removeObject(const QString &dn) {
     return false;
 }
 
+int LdapServer::applyReplication(const QList<DirectoryObject> &incoming)
+{
+    int applied = 0;
+    for (const DirectoryObject &change : incoming) {
+        if (change.id.isEmpty())
+            continue; // the root DSE is derived from the store, not replicated
+        const bool deleted = change.attributes.value(QStringLiteral("isDeleted"))
+                                 .compare(QLatin1String("TRUE"), Qt::CaseInsensitive) == 0;
+        const QString changeGuid =
+            change.attributes.value(QStringLiteral("objectGUID")).toLower();
+
+        const auto sameObject = [&changeGuid, &change](const DirectoryObject &candidate) {
+            if (candidate.id.isEmpty())
+                return false;
+            const QString candidateGuid =
+                candidate.attributes.value(QStringLiteral("objectGUID")).toLower();
+            if (!changeGuid.isEmpty() && !candidateGuid.isEmpty())
+                return candidateGuid.compare(changeGuid, Qt::CaseInsensitive) == 0;
+            return !changeGuid.isEmpty() && candidateGuid.isEmpty()
+                ? false
+                : candidate.id.compare(change.id, Qt::CaseInsensitive) == 0;
+        };
+
+        int liveIndex = -1;
+        for (int i = 0; i < m_objects.size(); ++i) {
+            if (sameObject(m_objects[i])) {
+                liveIndex = i;
+                break;
+            }
+        }
+
+        if (deleted) {
+            if (liveIndex >= 0) {
+                // The local copy becomes the tombstone, so the deletion is
+                // stamped here and the object leaves every group it was in.
+                if (!changeGuid.isEmpty()
+                    && m_objects[liveIndex].attributes
+                           .value(QStringLiteral("objectGUID")).isEmpty())
+                    m_objects[liveIndex].attributes.insert(QStringLiteral("objectGUID"),
+                                                           changeGuid);
+                if (removeObject(m_objects[liveIndex].id))
+                    ++applied;
+                continue;
+            }
+            bool known = false;
+            for (const DirectoryObject &tombstone : m_tombstones) {
+                if (sameObject(tombstone)) {
+                    known = true;
+                    break;
+                }
+            }
+            if (!known) {
+                DirectoryObject tombstone = change;
+                if (tombstone.attributes.value(QStringLiteral("whenChanged")).isEmpty())
+                    tombstone.attributes.insert(QStringLiteral("whenChanged"),
+                                                QDateTime::currentDateTimeUtc()
+                                                    .toString(Qt::ISODate));
+                tombstone.attributes.insert(QStringLiteral("uSNChanged"),
+                                            QString::number(nextUsn()));
+                m_tombstones.append(tombstone);
+                ++applied;
+            }
+            continue;
+        }
+
+        // A tombstoned object stays deleted: AD will not reanimate one without
+        // the recycle-bin operation, so a stale live copy is ignored.
+        bool tombstoned = false;
+        for (const DirectoryObject &tombstone : m_tombstones) {
+            if (sameObject(tombstone)) {
+                tombstoned = true;
+                break;
+            }
+        }
+        if (tombstoned)
+            continue;
+
+        if (liveIndex >= 0) {
+            DirectoryObject &target = m_objects[liveIndex];
+            const QString localDn = target.id;
+            target = change;
+            target.id = localDn; // the local DN names the object here
+            target.attributes.insert(QStringLiteral("uSNChanged"),
+                                     QString::number(nextUsn()));
+            ++applied;
+        } else {
+            DirectoryObject created = change;
+            created.attributes.insert(QStringLiteral("uSNChanged"),
+                                      QString::number(nextUsn()));
+            m_objects.append(created);
+            ++applied;
+        }
+    }
+    normalizeMembership();
+    ensureRootDse();
+    return applied;
+}
+
 void LdapServer::normalizeMembership() {
     QSet<QString> knownDns;
     QHash<QString, QString> dnByName;

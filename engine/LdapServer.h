@@ -97,6 +97,13 @@ public:
     }
     bool removeObject(const QString &dn);
     bool modifyObject(const QString &dn, const QMap<QString, QString> &attrs);
+    // Apply one replication cycle from another DC. A live object is created or
+    // updated in place (matched by objectGUID, then by DN); an isDeleted
+    // entry removes the local copy and is kept as a tombstone. A live copy of
+    // an object that is already a tombstone here is not resurrected, and
+    // applying the same cycle twice changes nothing the second time. The root
+    // DSE is derived, so it is never applied. Returns the objects acted on.
+    int applyReplication(const QList<DirectoryObject> &incoming);
     // Creates an account the way SAMR does: allocates the next relative id in
     // this domain's SID space, stamps objectSid, and stores the object. Refuses
     // a duplicate sAMAccountName so name-to-RID stays a function.

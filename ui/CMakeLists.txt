@@ -412,6 +412,21 @@ if(BUILD_TESTING)
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
     )
 
+    add_executable(monarchy-replication-tests
+        tests/test_replication.cpp
+    )
+
+    target_link_libraries(monarchy-replication-tests PRIVATE
+        monarchy-ui-core
+        Qt6::Test
+        Qt6::Core
+    )
+
+    add_test(NAME monarchy-replication-tests COMMAND monarchy-replication-tests)
+    set_tests_properties(monarchy-replication-tests PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+    )
+
     add_test(NAME monarchy-smb-tests COMMAND monarchy-smb-tests)
     add_test(NAME monarchy-smb1-tests COMMAND monarchy-smb1-tests)
     set_tests_properties(monarchy-smb1-tests PROPERTIES

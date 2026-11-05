@@ -95,7 +95,7 @@ this tree.
 Protocol Test Suites (`ADFamily`, `Kerberos`, `MS-XCA`) plus bidirectional DRS against a real
 Windows DC.
 **Monarchy:** Everything proven so far is L1 wire interop against independent clients — impacket,
-Samba's NDR clients and `smbclient`, MIT krb5, `dig`/`nsupdate`, OpenSSL — and the 18-suite `ctest`
+Samba's NDR clients and `smbclient`, MIT krb5, `dig`/`nsupdate`, OpenSSL — and the 19-suite `ctest`
 run on 2026-11-04.
 **Why listed:** Without this entry, a reader could mistake an unrun suite for a passing one. It is
 recorded as a limitation, not accepted as sufficient.
