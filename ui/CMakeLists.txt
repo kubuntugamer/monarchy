@@ -60,6 +60,8 @@ add_library(monarchy-ui-core STATIC
     ../engine/Kpasswd.cpp
     ../engine/LogonHours.h
     ../engine/LogonHours.cpp
+    ../engine/WorkstationRestriction.h
+    ../engine/WorkstationRestriction.cpp
     ../engine/SmbPaths.h
     ../engine/Ndr.h
     ../engine/Ndr.cpp
@@ -390,6 +392,23 @@ if(BUILD_TESTING)
 
     add_test(NAME monarchy-logonhours-tests COMMAND monarchy-logonhours-tests)
     set_tests_properties(monarchy-logonhours-tests PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+    )
+
+    # The account-workstation policy: the userWorkstations list a logon is
+    # checked against.
+    add_executable(monarchy-workstation-tests
+        tests/test_workstation.cpp
+    )
+
+    target_link_libraries(monarchy-workstation-tests PRIVATE
+        monarchy-ui-core
+        Qt6::Test
+        Qt6::Core
+    )
+
+    add_test(NAME monarchy-workstation-tests COMMAND monarchy-workstation-tests)
+    set_tests_properties(monarchy-workstation-tests PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
     )
 

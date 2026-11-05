@@ -13,6 +13,7 @@
 #include "Des.h"
 #include "Krb5.h"
 #include "LogonHours.h"
+#include "WorkstationRestriction.h"
 #include "Ndr.h"
 #include "Ntlm.h"
 
@@ -27,6 +28,7 @@ constexpr quint32 kStatusNoSuchUser = 0xc0000064u;
 constexpr quint32 kStatusWrongPassword = 0xc000006au;
 constexpr quint32 kStatusAccountDisabled = 0xc0000072u;
 constexpr quint32 kStatusAccountRestriction = 0xc000006eu;
+constexpr quint32 kStatusInvalidWorkstation = 0xc0000070u;
 constexpr quint32 kStatusNotSupported = 0xc00000bbu;
 constexpr quint32 kStatusNoTrustSamAccount = 0xc000018bu;
 
@@ -1133,6 +1135,16 @@ QByteArray NetlogonServer::samLogon(const QByteArray &stub, bool withAuthenticat
     if (!LogonHours::allowsHex(account.attributes.value(QStringLiteral("logonHours")),
                                QDateTime::currentDateTimeUtc()))
         return statusOnly(kStatusAccountRestriction);
+
+    // The account may also name the workstations it logs on from. The list is
+    // the directory's userWorkstations value and the name is the one the caller
+    // put in NETLOGON_LOGON_INFO, so this is the only logon path where the
+    // restriction can be checked against something on the wire. Like the week,
+    // it sits after the password, so a wrong password is still answered as a
+    // wrong password for a restricted account.
+    if (!WorkstationRestriction::allows(
+            account.attributes.value(QStringLiteral("userWorkstations")), logon.workstation))
+        return statusOnly(kStatusInvalidWorkstation);
 
     // Record the logon the way a DC does. lastLogon is per-DC and always
     // updated; lastLogonTimestamp is the replicated value, refreshed only when

@@ -170,7 +170,8 @@ QByteArray authenticatorRequest(const QByteArray &credential, quint32 timestamp)
 }
 
 void appendNetworkLogon(QByteArray &out, quint16 validationLevel, const QByteArray &ntResponse,
-                        quint32 extraFlags = 0)
+                        quint32 extraFlags = 0,
+                        const QString &workstation = QStringLiteral("CLIENT"))
 {
     // These call-level fields precede the deferred NETLOGON_LEVEL referent.
     appendLe16(out, validationLevel);
@@ -187,7 +188,11 @@ void appendNetworkLogon(QByteArray &out, quint16 validationLevel, const QByteArr
     while (out.size() % 8 != 0) out.append(char(0)); // OLD_LARGE_INTEGER alignment
     appendLe64(out, 0); // Reserved
     appendLe16(out, 10); appendLe16(out, 10); appendLe32(out, 0x00020002u); // account buffer
-    appendLe16(out, 12); appendLe16(out, 12); appendLe32(out, 0x00020003u); // workstation
+    // The deferred array names the characters only; the header's Length agrees
+    // with it, which is what parseNetworkInfo checks before reading it.
+    const quint16 workstationBytes = quint16(workstation.size() * 2);
+    appendLe16(out, workstationBytes); appendLe16(out, workstationBytes);
+    appendLe32(out, 0x00020003u); // workstation
     out.append(QByteArray::fromHex("0102030405060708")); // challenge
     while (out.size() % 4 != 0) out.append(char(0));
     appendLe16(out, quint16(ntResponse.size())); appendLe16(out, quint16(ntResponse.size()));
@@ -206,7 +211,7 @@ void appendNetworkLogon(QByteArray &out, quint16 validationLevel, const QByteArr
     };
     appendDeferredString(QStringLiteral("CORP"), 0x00020001u);
     appendDeferredString(QStringLiteral("alice"), 0x00020002u);
-    appendDeferredString(QStringLiteral("CLIENT"), 0x00020003u);
+    appendDeferredString(workstation, 0x00020003u);
     while (out.size() % 4 != 0) out.append(char(0));
     appendLe32(out, quint32(ntResponse.size())); appendLe32(out, 0);
     appendLe32(out, quint32(ntResponse.size()));
@@ -295,6 +300,70 @@ ChannelFixture openChannel(NetlogonServer &server, const QByteArray &machineHash
     return out;
 }
 
+// A SamLogon the way the logon-hours case builds it: the caller's channel
+// credential, a timestamp, and the workstation the caller names.
+QByteArray samLogonRequest(const QString &workstation, const QByteArray &requestCredential,
+                           quint32 timestamp, const QByteArray &ntResponse)
+{
+    QByteArray request;
+    appendLe32(request, 0); // NULL LogonServer pointer
+    appendPointerString(request, QStringLiteral("DC1"), 0x00021000u); // ComputerName
+    appendLe32(request, 0x00021001u); // Authenticator pointer
+    request.append(authenticatorRequest(requestCredential, timestamp));
+    appendLe32(request, 0x00021002u); // ReturnAuthenticator pointer
+    request.append(QByteArray(12, '\0'));
+    appendLe16(request, 2); // LogonLevel
+    appendLe16(request, 2); // NETLOGON_LEVEL's NDR32 union discriminator
+    appendLe32(request, 0x00021003u); // LogonNetwork referent
+    appendNetworkLogon(request, 3, ntResponse, 0, workstation);
+    return request;
+}
+
+// A DC with one machine account and one user account carrying `workstations`
+// as its userWorkstations value.
+struct WorkstationLogon {
+    NetlogonServer server;
+    ChannelFixture channel;
+    QByteArray userHash;
+    bool wroteBack = false;
+};
+
+void prepareWorkstationLogon(WorkstationLogon *fixture, const QString &workstations)
+{
+    Netlogon::Config config;
+    config.netbios = QStringLiteral("CORP");
+    config.realm = QStringLiteral("CORP.EXAMPLE.COM");
+    config.dnsDomain = QStringLiteral("corp.example.com");
+    config.dcName = QStringLiteral("DC1");
+    config.domainSid = QStringLiteral("S-1-5-21-1-2-3");
+    fixture->server.setConfig(config);
+
+    const QByteArray machineHash = Ntlm::ntowfV1(QStringLiteral("Mach!neP@ss1"));
+    DirectoryObject machine = machineAccount(machineHash);
+
+    fixture->userHash = Ntlm::ntowfV1(QStringLiteral("Alice!Password123"));
+    DirectoryObject user;
+    user.id = QStringLiteral("CN=alice,CN=Users,DC=corp,DC=example,DC=com");
+    user.kind = ObjectKind::User;
+    user.attributes.insert(QStringLiteral("sAMAccountName"), QStringLiteral("alice"));
+    user.attributes.insert(QStringLiteral("objectSid"), QStringLiteral("S-1-5-21-1-2-3-1100"));
+    user.attributes.insert(QStringLiteral("ntHash"), QString::fromLatin1(fixture->userHash.toHex()));
+    user.attributes.insert(QStringLiteral("userAccountControl"), QStringLiteral("512"));
+    if (!workstations.isEmpty())
+        user.attributes.insert(QStringLiteral("userWorkstations"), workstations);
+    fixture->server.setObjectProvider([machine, user]() {
+        return QList<DirectoryObject>{machine, user};
+    });
+
+    Netlogon::WriteBackend writes;
+    writes.updateAccount = [fixture](const QString &, const QMap<QString, QString> &, QString *) {
+        fixture->wroteBack = true;
+        return true;
+    };
+    fixture->server.setWriteBackend(writes);
+    fixture->channel = openChannel(fixture->server, machineHash);
+}
+
 QByteArray dsrGetDcNameEx2Request(const QString &domain)
 {
     QByteArray stub;
@@ -320,6 +389,8 @@ private slots:
     void legacySamLogonAuthenticatesSecureChannel_data();
     void legacySamLogonAuthenticatesSecureChannel();
     void refusesALogonOutsideLogonHours();
+    void refusesALogonFromAnotherWorkstation();
+    void allowsALogonFromAListedWorkstation();
     void passwordSet2WritesTheMachineHash();
     void rejectsAChannelCredentialFromTheWrongPassword();
     void dcLocatorNamesThisDc();
@@ -532,6 +603,58 @@ void NetlogonTest::refusesALogonOutsideLogonHours()
     QCOMPARE(reply.size(), 4);
     QCOMPARE(readLe32(reply, 0), quint32(0xc000006eu));
     QVERIFY(!wroteBack);
+}
+
+// An account whose userWorkstations list does not name the caller is refused
+// with the workstation status Windows uses, and nothing is stamped.
+void NetlogonTest::refusesALogonFromAnotherWorkstation()
+{
+    WorkstationLogon logon;
+    prepareWorkstationLogon(&logon, QStringLiteral("WS1, WS2"));
+    QVERIFY(logon.channel.ok);
+
+    const quint32 timestamp = 43;
+    const QByteArray credential = nextCredential(logon.channel.seed, timestamp,
+                                                 logon.channel.sessionKey, logon.channel.flags, false);
+    const QByteArray ntResponse = ntlmV2Response(
+        logon.userHash, QStringLiteral("alice"), QStringLiteral("CORP"),
+        QByteArray::fromHex("0102030405060708"));
+    const QByteArray reply = logon.server.handleCall(
+        Netlogon::OpLogonSamLogon,
+        samLogonRequest(QStringLiteral("CLIENT"), credential, timestamp, ntResponse));
+
+    QCOMPARE(reply.size(), 4);
+    QCOMPARE(readLe32(reply, 0), quint32(0xc0000070u));
+    QVERIFY(!logon.wroteBack);
+}
+
+// The same account logs on when the caller names a listed workstation: the list
+// is a set of NetBIOS names, so case does not matter.
+void NetlogonTest::allowsALogonFromAListedWorkstation()
+{
+    WorkstationLogon logon;
+    prepareWorkstationLogon(&logon, QStringLiteral("WS1, WS2"));
+    QVERIFY(logon.channel.ok);
+
+    const quint32 timestamp = 44;
+    const QByteArray credential = nextCredential(logon.channel.seed, timestamp,
+                                                 logon.channel.sessionKey, logon.channel.flags, false);
+    const QByteArray ntResponse = ntlmV2Response(
+        logon.userHash, QStringLiteral("alice"), QStringLiteral("CORP"),
+        QByteArray::fromHex("0102030405060708"));
+    const QByteArray reply = logon.server.handleCall(
+        Netlogon::OpLogonSamLogon,
+        samLogonRequest(QStringLiteral("ws2"), credential, timestamp, ntResponse));
+
+    QVERIFY2(reply.size() > 24, qPrintable(QStringLiteral("SamLogon returned %1 bytes")
+                                              .arg(reply.size())));
+    QCOMPARE(readLe32(reply, 0), quint32(0x0002f210u));
+    // Validation level 3, validation pointer, success status.
+    QCOMPARE(readLe16(reply, 16), quint16(3));
+    QCOMPARE(readLe32(reply, 24), quint32(1));
+    QCOMPARE(readLe32(reply, 28), quint32(0));
+    QVERIFY(reply.contains(Ndr::utf16le(QStringLiteral("alice"))));
+    QVERIFY(logon.wroteBack);
 }
 
 void NetlogonTest::secureChannelNegotiatesCrypto()
