@@ -133,7 +133,12 @@ native provisioner (`monarchy-provision`) creating a domain from Monarchy's own 
 
 **Phase 4 — GPO + sites (days, AI-assisted)**
 - Default GPO objects, `gPLink` and `GPT.INI`/`registry.pol` in SYSVOL — **done** at provisioning time.
-- Still to come: SYSVOL over SMB, GPO CRUD and link editing in the console, CSE processing,
+- SYSVOL and NETLOGON over SMB — **done**: read-only disk shares on SMB2 (`engine/Smb2`,
+  `monarchy-smb-tests`) and on SMB1/NT LM 0.12 for Windows 2000 clients (`engine/Smb1`,
+  `monarchy-smb1-tests`), both verified live with Samba's `smbclient` reading a GPO file and
+  a logon script byte for byte. SMB1 has no directory enumeration yet (`TRANS2 FIND_FIRST2`),
+  so a 2000 client can fetch a named policy or script but cannot browse a share.
+- Still to come: GPO CRUD and link editing in the console, CSE processing,
   site/subnet/site-link management.
 - Acceptance: GPMC manages Monarchy GPOs; GPOs apply to clients.
 
