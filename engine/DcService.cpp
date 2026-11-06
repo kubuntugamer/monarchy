@@ -16,6 +16,7 @@
 #include "Samr.h"
 #include "Smb2.h"
 
+#include <QDateTime>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -33,6 +34,52 @@
 DcService::DcService(QObject *parent)
     : QObject(parent)
 {
+}
+
+// One pull, then the next cycle is armed from whatever the link asks for. The
+// timer is single-shot precisely because that delay is a function of the clock
+// and the schedule, not a fixed interval.
+void DcService::runReplicaCycle()
+{
+    if (!m_replicationAgent || m_replicationAgent->source().isEmpty())
+        return;
+    QString error;
+    if (m_replicationAgent->pullOnce(&error) < 0) {
+        emit statusMessage(tr("Replication pull from %1 failed: %2")
+                               .arg(m_replicationAgent->source(), error));
+    }
+    armReplicaTimer();
+}
+
+void DcService::armReplicaTimer()
+{
+    if (!m_replicaTimer || !m_replicationAgent) {
+        if (m_replicaTimer)
+            m_replicaTimer->stop();
+        return;
+    }
+    if (m_replicationAgent->source().isEmpty()) {
+        m_replicaTimer->stop();
+        return;
+    }
+
+    const QDateTime now = QDateTime::currentDateTimeUtc();
+    const qint64 delay = ReplicationAgent::nextCycleDelayMs(
+        m_replicaSchedule, m_replicaFlags, m_replicaIntervalSeconds, now);
+    if (delay < 0) {
+        // A schedule with no bit set names no window at all; sleeping forever
+        // would hide that, so the pull parks until the link is edited.
+        emit statusMessage(
+            tr("The replication schedule for %1 allows no interval; the pull stays "
+               "idle until the schedule changes.")
+                .arg(m_replicationAgent->source()));
+        m_replicaTimer->stop();
+        return;
+    }
+    // Re-check at least once a day, so a clock change or a schedule this process
+    // did not see cannot park a pull for a week.
+    m_replicaTimer->start(
+        int(qBound<qint64>(qint64(1000), delay, qint64(24) * 3600 * 1000)));
 }
 
 QString DcService::dnsZone() const
@@ -577,19 +624,11 @@ bool DcService::start(const QString &dcDir)
     connect(m_replicationAgent, &ReplicationAgent::pulled, this,
             [this](const QString &summary) { emit statusMessage(summary); });
 
-    const int replicaSeconds =
+    m_replicaIntervalSeconds =
         qMax(1, dcConfig.value(QStringLiteral("replicaIntervalSeconds"), 300).toInt());
     m_replicaTimer = new QTimer(this);
-    m_replicaTimer->setInterval(replicaSeconds * 1000);
-    connect(m_replicaTimer, &QTimer::timeout, this, [this]() {
-        if (m_replicationAgent->source().isEmpty())
-            return;
-        QString error;
-        if (m_replicationAgent->pullOnce(&error) < 0) {
-            emit statusMessage(tr("Replication pull from %1 failed: %2")
-                                   .arg(m_replicationAgent->source(), error));
-        }
-    });
+    m_replicaTimer->setSingleShot(true);
+    connect(m_replicaTimer, &QTimer::timeout, this, &DcService::runReplicaCycle);
 
     // A DRS address is a bare host, host:port, or an ncacn_ip_tcp binding; the
     // agent needs the host and the port separately.
@@ -614,8 +653,13 @@ bool DcService::start(const QString &dcDir)
                 quint16 port = 0;
                 parseAddress(address, &host, &port);
                 m_replicationAgent->setSource(host, port);
-                if (!m_replicaTimer->isActive())
-                    m_replicaTimer->start();
+                // The link just registered carries the cadence it asked for.
+                if (!m_drsServer->replicaSources().isEmpty()) {
+                    const ReplicaSource &link = m_drsServer->replicaSources().last();
+                    m_replicaSchedule = link.schedule;
+                    m_replicaFlags = link.options;
+                }
+                armReplicaTimer();
                 emit statusMessage(tr("Replication source %1 registered.").arg(address));
             });
 
@@ -634,8 +678,18 @@ bool DcService::start(const QString &dcDir)
                 quint16 port = 0;
                 parseAddress(address, &host, &port);
                 m_replicationAgent->setSource(host, port);
-                if (!m_replicaTimer->isActive())
-                    m_replicaTimer->start();
+                // A schedule edit arrives on the same signal, so the retargeted
+                // pull reads the link's current cadence rather than the old one.
+                m_replicaSchedule.clear();
+                m_replicaFlags = 0;
+                for (const ReplicaSource &link : m_drsServer->replicaSources()) {
+                    if (link.address.compare(address, Qt::CaseInsensitive) == 0) {
+                        m_replicaSchedule = link.schedule;
+                        m_replicaFlags = link.options;
+                        break;
+                    }
+                }
+                armReplicaTimer();
                 emit statusMessage(tr("Replication source %1 changed to %2.")
                                        .arg(previous, address));
             });
@@ -650,7 +704,9 @@ bool DcService::start(const QString &dcDir)
                 if (!m_replicationAgent->source().startsWith(host, Qt::CaseInsensitive))
                     return;
                 m_replicationAgent->setSource(QString(), 0);
-                m_replicaTimer->stop();
+                m_replicaSchedule.clear();
+                m_replicaFlags = 0;
+                armReplicaTimer();
                 emit statusMessage(tr("Replication source %1 retired.").arg(address));
             });
 
@@ -658,10 +714,14 @@ bool DcService::start(const QString &dcDir)
     if (!replicaHost.isEmpty()) {
         m_replicationAgent->setSource(
             replicaHost, quint16(dcConfig.value(QStringLiteral("replicaPort"), 0).toInt()));
-        m_replicaTimer->start();
+        // dc.conf names no link, so no schedule governs this pull: it keeps the
+        // configured interval.
+        m_replicaSchedule.clear();
+        m_replicaFlags = 0;
+        armReplicaTimer();
         emit statusMessage(tr("Pulling replication from %1 every %2s.")
                                .arg(m_replicationAgent->source())
-                               .arg(replicaSeconds));
+                               .arg(m_replicaIntervalSeconds));
     }
 
     // The endpoint mapper: the answer a client gets when it knows an interface

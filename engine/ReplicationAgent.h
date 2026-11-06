@@ -4,6 +4,8 @@
 #ifndef REPLICATIONAGENT_H
 #define REPLICATIONAGENT_H
 
+#include <QByteArray>
+#include <QDateTime>
 #include <QList>
 #include <QObject>
 #include <QString>
@@ -39,6 +41,26 @@ public:
     QString source() const;
     quint64 lastUsn() const { return m_lastUsn; }
     quint32 cycles() const { return m_cycles; }
+
+    // REPLTIMES (MS-DRSR 5.165, the field REPS_FROM calls rtSchedule): 84 bytes,
+    // one bit per 15-minute slot of the week that starts Sunday 00:00 UTC, the
+    // most significant bit of each byte being the earliest slot. The IDL's
+    // drsuapi_DrsOptions names the flag that makes it authoritative:
+    // DRSUAPI_DRS_PER_SYNC (reference/specs/samba-drsuapi.idl).
+    static constexpr quint32 kDrsPerSync = 0x00000040u;
+    static constexpr int kScheduleBytes = 84;
+    static constexpr int kSlotSeconds = 15 * 60;
+    static constexpr int kSlotsPerWeek = 7 * 96;
+
+    static bool slotAllowed(const QByteArray &schedule, const QDateTime &utc);
+    // The first allowed slot boundary strictly after `utc`, or an invalid value
+    // when the schedule names no interval in the whole week.
+    static QDateTime nextSlotStart(const QByteArray &schedule, const QDateTime &utc);
+    // Milliseconds until the next pull: the next allowed slot when the link has
+    // DRS_PER_SYNC, the configured interval otherwise. -1 means the schedule
+    // allows no interval, so the caller should stay idle.
+    static qint64 nextCycleDelayMs(const QByteArray &schedule, quint32 flags,
+                                   int intervalSeconds, const QDateTime &utc);
 
     // One pull: connect, bind, follow fMoreData until the source is drained,
     // apply each cycle, unbind. Returns the objects applied, or -1 with `error`

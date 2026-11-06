@@ -5,6 +5,32 @@
 
 #include "DrsClient.h"
 
+#include <QTimeZone>
+
+namespace {
+
+// The slot a REPLTIMES bit addresses: 15-minute units counted from Sunday
+// 00:00 UTC, 672 to the week.
+int slotIndex(const QDateTime &utc)
+{
+    const QDateTime stamp = utc.toUTC();
+    // QDate::dayOfWeek is Monday=1 .. Sunday=7; the schedule's week opens on
+    // Sunday, so Sunday is day 0 here.
+    const int daysSinceSunday = stamp.date().dayOfWeek() % 7;
+    const int secondsOfDay =
+        stamp.time().hour() * 3600 + stamp.time().minute() * 60 + stamp.time().second();
+    return daysSinceSunday * 96 + secondsOfDay / ReplicationAgent::kSlotSeconds;
+}
+
+bool bitSet(const QByteArray &schedule, int slot)
+{
+    // Within a byte the earliest slot is the most significant bit.
+    const quint8 octet = quint8(schedule.at(slot / 8));
+    return (octet & (0x80u >> (slot % 8))) != 0;
+}
+
+} // namespace
+
 ReplicationAgent::ReplicationAgent(QObject *parent)
     : QObject(parent)
 {
@@ -35,6 +61,48 @@ QString ReplicationAgent::source() const
     if (m_host.isEmpty())
         return QString();
     return QStringLiteral("%1:%2").arg(m_host).arg(m_port == 0 ? m_epmPort : m_port);
+}
+
+bool ReplicationAgent::slotAllowed(const QByteArray &schedule, const QDateTime &utc)
+{
+    if (schedule.size() != kScheduleBytes || !utc.isValid())
+        return false;
+    return bitSet(schedule, slotIndex(utc));
+}
+
+QDateTime ReplicationAgent::nextSlotStart(const QByteArray &schedule, const QDateTime &utc)
+{
+    if (schedule.size() != kScheduleBytes || !utc.isValid())
+        return QDateTime();
+    const qint64 seconds = utc.toUTC().toSecsSinceEpoch();
+    // Start at the first boundary strictly after `utc`, then walk the 672 that
+    // follow it: the same weekday next week addresses the same slot index, so
+    // one pass covers every future slot the schedule can allow.
+    qint64 boundary = seconds - (seconds % kSlotSeconds) + kSlotSeconds;
+    for (int i = 0; i < kSlotsPerWeek; ++i, boundary += kSlotSeconds) {
+        const QDateTime candidate = QDateTime::fromSecsSinceEpoch(boundary, QTimeZone::utc());
+        if (bitSet(schedule, slotIndex(candidate)))
+            return candidate;
+    }
+    return QDateTime();
+}
+
+qint64 ReplicationAgent::nextCycleDelayMs(const QByteArray &schedule, quint32 flags,
+                                          int intervalSeconds, const QDateTime &utc)
+{
+    const qint64 fallback = qint64(qMax(1, intervalSeconds)) * 1000;
+    if (!utc.isValid())
+        return fallback;
+    // MS-DRSR's REPS_FROM: the schedule identifies the intervals a cycle is
+    // initiated in only when periodic replication is enabled, which is what
+    // DRS_PER_SYNC says. Without it the cycle is event-driven, and for this
+    // agent that is the configured interval.
+    if ((flags & kDrsPerSync) == 0 || schedule.size() != kScheduleBytes)
+        return fallback;
+    const QDateTime next = nextSlotStart(schedule, utc);
+    if (!next.isValid())
+        return -1;
+    return qMax<qint64>(1000, utc.toUTC().msecsTo(next));
 }
 
 int ReplicationAgent::pullOnce(QString *error)

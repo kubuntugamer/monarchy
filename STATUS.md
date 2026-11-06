@@ -108,12 +108,14 @@ failure) |
   rest), and the per-account system-access mask is per handle rather than
   written to the directory.
 - **DRSR link schedules**: `DsReplicaMod` (opnum 7) changes a registered
-  link's address, replica flags and schedule, but the pull cadence stays
-  `replicaIntervalSeconds` — the schedule is recorded, not yet used to gate a
-  pull. `DsReplicaGetInfo` NEIGHBORS has no schedule member in MS-DRSR, so the
-  recorded schedule is not readable over the wire, and no per-link sync history
-  is kept: that reply's USNs, timestamps and failure counters are zero because
-  they are unmeasured, not because a sync succeeded. `DsReplicaDel` with
+  link's address, replica flags and schedule, and the schedule now gates the
+  pull: a link whose flags carry `DRSUAPI_DRS_PER_SYNC` is pulled only inside the
+  15-minute slots its `REPLTIMES` sets (Sunday 00:00 UTC first, most significant
+  bit first, re-checked at least daily), while a link without that flag keeps
+  `replicaIntervalSeconds`. `DsReplicaGetInfo` NEIGHBORS has no schedule member
+  in MS-DRSR, so the schedule cannot be read back over the wire, and no per-link
+  sync history is kept: that reply's USNs, timestamps and failure counters are
+  zero because they are unmeasured, not because a sync succeeded. `DsReplicaDel` with
   `DRS_NO_SOURCE` (which expunges a whole NC) is
   refused, and the `UpdateRefs` notification AD sends to the peer on removal is
   not sent. A source added at level 1 of `DsReplicaAdd` carries no source DSA

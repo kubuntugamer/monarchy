@@ -9,6 +9,7 @@
 #include <QtTest>
 
 #include "LdapServer.h"
+#include "ReplicationAgent.h"
 
 namespace {
 
@@ -110,6 +111,61 @@ private slots:
         target.applyReplication(cycleFrom(source));
         QCOMPARE(target.tombstones().size(), tombstoneCount);
         QVERIFY(liveObject(target, QStringLiteral("alice")) == nullptr);
+    }
+
+    // REPLTIMES (MS-DRSR 5.165): 672 bits, 15 minutes each, counted from Sunday
+    // 00:00 UTC, the most significant bit of a byte first. A link asking for
+    // periodic sync is pulled only inside the slots its schedule sets.
+    void scheduleSlotsAreTheQuarterHoursTheSpecNames()
+    {
+        QByteArray schedule(ReplicationAgent::kScheduleBytes, '\0');
+        // Monday 2026-11-09 03:15 UTC is one day past Sunday and 13 quarter-hours
+        // into the day.
+        const int slot = 96 + 13;
+        schedule[slot / 8] = char(0x80u >> (slot % 8));
+
+        const QDateTime monday315(QDate(2026, 11, 9), QTime(3, 15), Qt::UTC);
+        QVERIFY(ReplicationAgent::slotAllowed(schedule, monday315));
+        QVERIFY(!ReplicationAgent::slotAllowed(
+            schedule, QDateTime(QDate(2026, 11, 9), QTime(3, 30), Qt::UTC)));
+        QCOMPARE(ReplicationAgent::nextSlotStart(schedule, monday315.addSecs(-900)),
+                 monday315);
+        // From Tuesday the next allowed slot is the following Monday.
+        QCOMPARE(ReplicationAgent::nextSlotStart(
+                     schedule, QDateTime(QDate(2026, 11, 10), QTime(9, 0), Qt::UTC)),
+                 QDateTime(QDate(2026, 11, 16), QTime(3, 15), Qt::UTC));
+    }
+
+    void theWeekWrapsAfterSevenDays()
+    {
+        QByteArray schedule(ReplicationAgent::kScheduleBytes, '\0');
+        schedule[0] = char(0x80); // Sunday 00:00
+        const QDateTime sunday(QDate(2026, 11, 8), QTime(0, 0), Qt::UTC);
+        QVERIFY(ReplicationAgent::slotAllowed(schedule, sunday));
+        // The slot ends a second later, and the next one is a week away.
+        QCOMPARE(ReplicationAgent::nextSlotStart(schedule, sunday.addSecs(1)),
+                 QDateTime(QDate(2026, 11, 15), QTime(0, 0), Qt::UTC));
+    }
+
+    void theDelayFollowsTheScheduleOnlyWhenPeriodicSyncIsRequested()
+    {
+        QByteArray schedule(ReplicationAgent::kScheduleBytes, '\0');
+        const int slot = 96 + 13;
+        schedule[slot / 8] = char(0x80u >> (slot % 8));
+        const QDateTime now(QDate(2026, 11, 9), QTime(3, 0), Qt::UTC);
+
+        // DRS_PER_SYNC set: the next cycle waits for the slot.
+        QCOMPARE(ReplicationAgent::nextCycleDelayMs(schedule, ReplicationAgent::kDrsPerSync,
+                                                    300, now),
+                 qint64(15 * 60 * 1000));
+        // Without it the schedule does not govern; the interval does.
+        QCOMPARE(ReplicationAgent::nextCycleDelayMs(schedule, 0, 300, now), qint64(300000));
+        // A schedule with no bit set schedules nothing at all.
+        QCOMPARE(ReplicationAgent::nextCycleDelayMs(QByteArray(84, '\0'),
+                                                    ReplicationAgent::kDrsPerSync, 300, now),
+                 qint64(-1));
+        // A blob that is not 84 bytes is not a schedule.
+        QCOMPARE(ReplicationAgent::nextCycleDelayMs(QByteArray(), 0, 300, now), qint64(300000));
     }
 
     void doesNotResurrectADeletedObject()

@@ -4,6 +4,7 @@
 #ifndef DCSERVICE_H
 #define DCSERVICE_H
 
+#include <QByteArray>
 #include <QObject>
 
 class LdapServer;
@@ -55,6 +56,13 @@ signals:
     void statusMessage(const QString &message);
 
 private:
+    // The pull runs on a cadence, not a fixed tick: a link carrying
+    // DRS_PER_SYNC is pulled only inside the slots its REPLTIMES schedule sets,
+    // everything else keeps replicaIntervalSeconds. Both re-arm the single-shot
+    // timer after each cycle and after a link is added, changed or retired.
+    void runReplicaCycle();
+    void armReplicaTimer();
+
     LdapServer *m_ldapServer = nullptr;
     DnsServer *m_dnsServer = nullptr;
     Kdc *m_kdc = nullptr;
@@ -67,6 +75,9 @@ private:
     Smb2Server *m_smbServer = nullptr;
     ReplicationAgent *m_replicationAgent = nullptr;
     QTimer *m_replicaTimer = nullptr;
+    int m_replicaIntervalSeconds = 300;
+    QByteArray m_replicaSchedule;
+    quint32 m_replicaFlags = 0;
 
     bool m_started = false;
     // Store and zone locations resolved from dc.conf at start-up.

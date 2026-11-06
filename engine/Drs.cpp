@@ -1518,9 +1518,9 @@ QByteArray DrsServer::drsReplicaDel(const QByteArray &stub)
 // for keeps its stored value. A source registered at level 1 of DsReplicaAdd
 // has no GUID to match on, so an address match is accepted for it.
 //
-// DRS_UPDATE_SCHEDULE is recorded and reported; the pull cadence is still
-// replicaIntervalSeconds, which STATUS.md states rather than implying the
-// schedule already gates replication.
+// DRS_UPDATE_SCHEDULE is recorded and reported, and it now gates the pull when
+// the link carries DRSUAPI_DRS_PER_SYNC: ReplicationAgent decodes the
+// REPLTIMES bits and the daemon arms its next cycle to the next allowed slot.
 QByteArray DrsServer::drsReplicaMod(const QByteArray &stub)
 {
     Ndr::Reader reader(stub);
