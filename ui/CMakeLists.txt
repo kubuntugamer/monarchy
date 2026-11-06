@@ -65,6 +65,8 @@ add_library(monarchy-ui-core STATIC
     ../engine/LogonHours.cpp
     ../engine/WorkstationRestriction.h
     ../engine/WorkstationRestriction.cpp
+    ../engine/PasswordAge.h
+    ../engine/PasswordAge.cpp
     ../engine/SmbPaths.h
     ../engine/Ndr.h
     ../engine/Ndr.cpp

@@ -7,6 +7,7 @@
 #include "Gss.h"
 #include "Kdc.h"
 #include "LogonHours.h"
+#include "PasswordAge.h"
 #include "Ntlm.h"
 
 #include <QtNetwork/QTcpSocket>
@@ -1609,6 +1610,7 @@ QByteArray LdapServer::handleBind(ClientState *st, int msgId, const QByteArray &
         QByteArray hash;
         QByteArray ntHashHex;
         QString logonHours;
+        qint64 pwdLastSet = 0;
         bool haveVerifier = false;
         bool anyVerifier = !m_credentials.isEmpty();
         quint32 accountControl = 0;
@@ -1629,6 +1631,8 @@ QByteArray LdapServer::handleBind(ClientState *st, int msgId, const QByteArray &
                 accountControl =
                     object.attributes.value(QStringLiteral("userAccountControl")).toUInt();
                 logonHours = object.attributes.value(QStringLiteral("logonHours"));
+                pwdLastSet =
+                    object.attributes.value(QStringLiteral("pwdLastSet")).toLongLong();
                 haveVerifier = true;
             }
         }
@@ -1657,6 +1661,13 @@ QByteArray LdapServer::handleBind(ClientState *st, int msgId, const QByteArray &
         // so a refused hour is indistinguishable from a wrong password.
         if (haveVerifier
             && !LogonHours::allowsHex(logonHours, QDateTime::currentDateTimeUtc()))
+            return makeBindResponse(msgId, 49);
+        // An expired password is refused the same way, for the same reason: the
+        // client proved it knows the password, and only then learns it may not
+        // log on with it. AD answers 49 here too, with the must-change data.
+        if (haveVerifier
+            && PasswordAge::state(pwdLastSet, accountControl, passwordPolicy().maxAge)
+                   != PasswordAge::State::Valid)
             return makeBindResponse(msgId, 49);
     }
     return makeBindResponse(msgId, 0); // success
@@ -1776,6 +1787,11 @@ QByteArray LdapServer::handleSaslBind(ClientState *st, int msgId, const QByteArr
             if (!LogonHours::allowsHex(
                     object.attributes.value(QStringLiteral("logonHours")),
                     QDateTime::currentDateTimeUtc()))
+                return makeBindResponse(msgId, 49);
+
+            // The password proved itself; an account whose credential has aged
+            // out or must be changed is still refused a session.
+            if (PasswordAge::stateFor(object, m_objects) != PasswordAge::State::Valid)
                 return makeBindResponse(msgId, 49);
 
             // MS-NLMP §3.4: the session base key comes from the proof string,

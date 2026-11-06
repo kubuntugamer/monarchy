@@ -15,6 +15,7 @@
 #include "Krb5.h"
 #include "LdapServer.h"
 #include "Ndr.h"
+#include "PasswordAge.h"
 
 namespace {
 
@@ -662,6 +663,23 @@ bool readAllUserInfo(Ndr::Reader &reader, int trailingBytes, IncomingUserInfo *o
 quint64 ntTimeFromUnix(quint64 seconds)
 {
     return seconds * 10000000ull + 116444736000000000ull;
+}
+
+// The instant AD reports for "the password may change" and "the password must
+// change": pwdLastSet plus the policy's delta time, which is negative and in
+// 100-nanosecond units. A policy of zero, an account whose password never
+// expires, and one that has never had a password all mean "never", which SAMR
+// spells as the largest NTTIME.
+quint64 ntTimeFromDelta(quint64 pwdLastSet, quint32 userAccountControl, qint64 delta)
+{
+    constexpr quint32 kDontExpirePassword = 0x10000;
+    if (pwdLastSet == 0)
+        return 0;
+    if ((userAccountControl & kDontExpirePassword) || delta == 0
+        || delta == std::numeric_limits<qint64>::min())
+        return 0x7fffffffffffffffull;
+    const qint64 lifetime = (delta < 0 ? -delta : delta) / 10000000LL;
+    return ntTimeFromUnix(pwdLastSet + quint64(lifetime));
 }
 
 QByteArray sidForRid(const QString &domainSid, quint32 rid)
@@ -1865,11 +1883,19 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
                 const quint64 pwdLastSet =
                     object.attributes.value(QStringLiteral("pwdLastSet")).toULongLong();
                 info.passwordLastSet = pwdLastSet == 0 ? 0 : ntTimeFromUnix(pwdLastSet);
-                info.passwordExpired = pwdLastSet == 0;
-                // No age limits are enforced, so a password never expires and
-                // may be changed at any time; that is what these two report.
-                info.passwordCanChange = 0;
-                info.passwordMustChange = 0x7fffffffffffffffull;
+                // The account tab's three password facts, from the domain policy
+                // the logon paths enforce: whether the credential has aged out or
+                // must be changed, when a change is allowed again, and when one
+                // is required.
+                const LdapServer::PasswordPolicy policy =
+                    LdapServer::passwordPolicyFrom(domainObject());
+                const quint32 accountControl =
+                    object.attributes.value(QStringLiteral("userAccountControl")).toUInt();
+                info.passwordExpired =
+                    PasswordAge::state(pwdLastSet, accountControl, policy.maxAge)
+                    != PasswordAge::State::Valid;
+                info.passwordCanChange = ntTimeFromDelta(pwdLastSet, accountControl, policy.minAge);
+                info.passwordMustChange = ntTimeFromDelta(pwdLastSet, accountControl, policy.maxAge);
                 info.ntPasswordPresent = QByteArray::fromHex(
                                              object.attributes.value(QStringLiteral("ntHash"))
                                                  .toLatin1())

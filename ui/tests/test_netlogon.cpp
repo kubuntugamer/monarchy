@@ -330,7 +330,8 @@ struct WorkstationLogon {
     bool wroteBack = false;
 };
 
-void prepareWorkstationLogon(WorkstationLogon *fixture, const QString &workstations)
+void prepareWorkstationLogon(WorkstationLogon *fixture, const QString &workstations,
+                             const QMap<QString, QString> &accountAttributes = {})
 {
     Netlogon::Config config;
     config.netbios = QStringLiteral("CORP");
@@ -353,8 +354,25 @@ void prepareWorkstationLogon(WorkstationLogon *fixture, const QString &workstati
     user.attributes.insert(QStringLiteral("userAccountControl"), QStringLiteral("512"));
     if (!workstations.isEmpty())
         user.attributes.insert(QStringLiteral("userWorkstations"), workstations);
-    fixture->server.setObjectProvider([machine, user]() {
-        return QList<DirectoryObject>{machine, user};
+    for (auto it = accountAttributes.cbegin(); it != accountAttributes.cend(); ++it)
+        user.attributes.insert(it.key(), it.value());
+
+    // The domain object carries the password policy the logon paths read. AD's
+    // default is 42 days before a password expires and one day before it may be
+    // changed again.
+    DirectoryObject domain;
+    domain.id = QStringLiteral("DC=corp,DC=example,DC=com");
+    domain.name = QStringLiteral("CORP");
+    domain.type = QStringLiteral("domainDNS");
+    domain.kind = ObjectKind::Domain;
+    domain.attributes.insert(QStringLiteral("objectSid"), QStringLiteral("S-1-5-21-1-2-3"));
+    domain.attributes.insert(QStringLiteral("maxPwdAge"),
+                             QStringLiteral("-36288000000000"));
+    domain.attributes.insert(QStringLiteral("minPwdAge"),
+                             QStringLiteral("-864000000000"));
+
+    fixture->server.setObjectProvider([machine, user, domain]() {
+        return QList<DirectoryObject>{machine, user, domain};
     });
 
     Netlogon::WriteBackend writes;
@@ -395,6 +413,9 @@ private slots:
     void locksTheAccountAfterTheThreshold();
     void refusesALogonFromAnotherWorkstation();
     void allowsALogonFromAListedWorkstation();
+    void refusesAnExpiredPassword();
+    void refusesAPasswordThatMustChange();
+    void allowsAnAgedPasswordThatNeverExpires();
     void passwordSet2WritesTheMachineHash();
     void rejectsAChannelCredentialFromTheWrongPassword();
     void dcLocatorNamesThisDc();
@@ -840,6 +861,84 @@ void NetlogonTest::allowsALogonFromAListedWorkstation()
     QCOMPARE(readLe32(reply, 20), quint32(0x0002f200u));
     QCOMPARE(readLe32(reply, int(reply.size()) - 4), quint32(0));
     QVERIFY(reply.contains(Ndr::utf16le(QStringLiteral("alice"))));
+    QVERIFY(logon.wroteBack);
+}
+
+// A password older than the domain's maxPwdAge is proved but not accepted: the
+// caller is told the credit has expired, which is what a Windows DC answers so
+// the workstation can send the user to the change-password prompt.
+void NetlogonTest::refusesAnExpiredPassword()
+{
+    WorkstationLogon logon;
+    const qint64 stale = QDateTime::currentSecsSinceEpoch() - 60 * 86400;
+    prepareWorkstationLogon(&logon, QString(),
+                            {{QStringLiteral("pwdLastSet"), QString::number(stale)}});
+    QVERIFY(logon.channel.ok);
+
+    const quint32 timestamp = 51;
+    const QByteArray credential = nextCredential(logon.channel.seed, timestamp,
+                                                 logon.channel.sessionKey, logon.channel.flags, false);
+    const QByteArray ntResponse = ntlmV2Response(
+        logon.userHash, QStringLiteral("alice"), QStringLiteral("CORP"),
+        QByteArray::fromHex("0102030405060708"));
+    const QByteArray reply = logon.server.handleCall(
+        Netlogon::OpLogonSamLogon,
+        samLogonRequest(QStringLiteral("WS1"), credential, timestamp, ntResponse));
+
+    QCOMPARE(reply.size(), 4);
+    QCOMPARE(readLe32(reply, 0), quint32(0xc0000071u)); // STATUS_PASSWORD_EXPIRED
+    QVERIFY(!logon.wroteBack);
+}
+
+// pwdLastSet zero is the other case a client distinguishes: an administrator
+// demanded a change, which AD reports as a must-change rather than an expiry.
+void NetlogonTest::refusesAPasswordThatMustChange()
+{
+    WorkstationLogon logon;
+    prepareWorkstationLogon(&logon, QString(), {{QStringLiteral("pwdLastSet"), QStringLiteral("0")}});
+    QVERIFY(logon.channel.ok);
+
+    const quint32 timestamp = 52;
+    const QByteArray credential = nextCredential(logon.channel.seed, timestamp,
+                                                 logon.channel.sessionKey, logon.channel.flags, false);
+    const QByteArray ntResponse = ntlmV2Response(
+        logon.userHash, QStringLiteral("alice"), QStringLiteral("CORP"),
+        QByteArray::fromHex("0102030405060708"));
+    const QByteArray reply = logon.server.handleCall(
+        Netlogon::OpLogonSamLogon,
+        samLogonRequest(QStringLiteral("WS1"), credential, timestamp, ntResponse));
+
+    QCOMPARE(reply.size(), 4);
+    QCOMPARE(readLe32(reply, 0), quint32(0xc0000224u)); // STATUS_PASSWORD_MUST_CHANGE
+    QVERIFY(!logon.wroteBack);
+}
+
+// DONT_EXPIRE_PASSWORD is how a service account keeps a credential that never
+// ages out, and it overrides the domain's maximum age.
+void NetlogonTest::allowsAnAgedPasswordThatNeverExpires()
+{
+    WorkstationLogon logon;
+    const qint64 stale = QDateTime::currentSecsSinceEpoch() - 60 * 86400;
+    prepareWorkstationLogon(
+        &logon, QString(),
+        {{QStringLiteral("pwdLastSet"), QString::number(stale)},
+         {QStringLiteral("userAccountControl"), QStringLiteral("66048")}}); // 512 | 0x10000
+    QVERIFY(logon.channel.ok);
+
+    const quint32 timestamp = 53;
+    const QByteArray credential = nextCredential(logon.channel.seed, timestamp,
+                                                 logon.channel.sessionKey, logon.channel.flags, false);
+    const QByteArray ntResponse = ntlmV2Response(
+        logon.userHash, QStringLiteral("alice"), QStringLiteral("CORP"),
+        QByteArray::fromHex("0102030405060708"));
+    const QByteArray reply = logon.server.handleCall(
+        Netlogon::OpLogonSamLogon,
+        samLogonRequest(QStringLiteral("WS1"), credential, timestamp, ntResponse));
+
+    QVERIFY2(reply.size() > 24, qPrintable(QStringLiteral("SamLogon returned %1 bytes")
+                                              .arg(reply.size())));
+    QCOMPARE(readLe32(reply, 0), quint32(0x0002f210u));
+    QCOMPARE(readLe32(reply, int(reply.size()) - 4), quint32(0));
     QVERIFY(logon.wroteBack);
 }
 

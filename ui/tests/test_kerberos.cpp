@@ -935,6 +935,7 @@ private slots:
     void pacAuthorizesWrites();
     void rejectsWrongPassword();
     void rejectsDisabledAccount();
+    void rejectsExpiredPassword();
     void rejectsUnknownService();
     void crossRealmTrust();
 #endif
@@ -1197,6 +1198,33 @@ void KerberosTest::rejectsDisabledAccount()
     QString error;
     QVERIFY(!kinitUser(QStringLiteral("Administrator@CORP.EXAMPLE.COM"),
                        QStringLiteral("Str0ng-Pass!"), &error));
+}
+
+// A password older than the domain's maximum age still pre-authenticates, but
+// it earns no TGT: the KDC answers KDC_ERR_KEY_EXPIRED, which is what makes a
+// client offer to change the password instead of reporting a wrong one.
+void KerberosTest::rejectsExpiredPassword()
+{
+    Fixture fixture;
+    QVERIFY(fixture.provision());
+
+    const QString adminDn = QStringLiteral("CN=Administrator,CN=Users,%1")
+                                .arg(fixture.provisioned.baseDn);
+    LdapServer::ModifyChange aged;
+    aged.operation = 2;
+    aged.type = QStringLiteral("pwdLastSet");
+    aged.values = QStringList{
+        QString::number(QDateTime::currentSecsSinceEpoch() - 60 * 86400)};
+    QCOMPARE(fixture.server->applyModify(adminDn, {aged}), 0);
+    QVERIFY(fixture.startServices());
+
+    QString error;
+    QVERIFY(!kinitUser(QStringLiteral("Administrator@CORP.EXAMPLE.COM"),
+                       QStringLiteral("Str0ng-Pass!"), &error));
+    // The failure is the expiry, not a rejected password.
+    QVERIFY2(error.contains(QStringLiteral("expired"), Qt::CaseInsensitive)
+                 || error.contains(QStringLiteral("KEY_EXPIRED")),
+             qPrintable(error));
 }
 
 void KerberosTest::rejectsUnknownService()

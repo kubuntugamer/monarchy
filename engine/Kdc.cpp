@@ -15,6 +15,7 @@
 #include "Krb5.h"
 #include "LogonHours.h"
 #include "Pac.h"
+#include "PasswordAge.h"
 
 namespace {
 
@@ -38,6 +39,7 @@ constexpr int kErrSPrincipalUnknown = 7;
 constexpr int kErrEtypeNoSupp = 14;
 constexpr int kErrPadTypeNoSupp = 16;
 constexpr int kErrClientRevoked = 18;
+constexpr int kErrKeyExpired = 23;
 constexpr int kErrPreauthFailed = 24;
 constexpr int kErrPreauthRequired = 25;
 constexpr int kErrTicketExpired = 32;
@@ -637,6 +639,25 @@ QByteArray Kdc::handleAsReq(const KdcRequest &request)
     // whether a password was right.
     if (!LogonHours::allowsHex(client.logonHours, QDateTime::currentDateTimeUtc()))
         return krbError(kErrClientRevoked, realm, request.cname);
+
+    // An expired password still pre-authenticates — the client has just proved
+    // it knows the password — but it earns no TGT: AD answers KDC_ERR_KEY_EXPIRED,
+    // which is the code a client turns into a password change. The exception is
+    // the changepw service, which has to stay reachable for an account that
+    // cannot log on to fix the password it is stuck with.
+    const bool wantsChangepw =
+        request.sname.compare(QStringLiteral("kadmin/changepw"), Qt::CaseInsensitive) == 0;
+    if (!wantsChangepw) {
+        PasswordAge::State age = PasswordAge::State::Valid;
+        for (const DirectoryObject &object : directory()) {
+            if (object.id.compare(client.dn, Qt::CaseInsensitive) != 0)
+                continue;
+            age = PasswordAge::stateFor(object, directory(), now);
+            break;
+        }
+        if (age != PasswordAge::State::Valid)
+            return krbError(kErrKeyExpired, realm, request.cname);
+    }
 
     // An AS-REQ may ask for a service ticket rather than a TGT. A client does
     // exactly that to obtain kadmin/changepw before changing a password, so the

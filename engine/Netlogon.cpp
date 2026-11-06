@@ -13,6 +13,7 @@
 #include "Des.h"
 #include "Krb5.h"
 #include "LogonHours.h"
+#include "PasswordAge.h"
 #include "WorkstationRestriction.h"
 #include "Ndr.h"
 #include "Ntlm.h"
@@ -29,6 +30,8 @@ constexpr quint32 kStatusWrongPassword = 0xc000006au;
 constexpr quint32 kStatusAccountDisabled = 0xc0000072u;
 constexpr quint32 kStatusAccountRestriction = 0xc000006eu;
 constexpr quint32 kStatusAccountLockedOut = 0xc0000234u;
+constexpr quint32 kStatusPasswordExpired = 0xc0000071u;
+constexpr quint32 kStatusPasswordMustChange = 0xc0000224u;
 constexpr quint32 kStatusInvalidWorkstation = 0xc0000070u;
 constexpr quint32 kStatusNotSupported = 0xc00000bbu;
 constexpr quint32 kStatusNoTrustSamAccount = 0xc000018bu;
@@ -1201,6 +1204,19 @@ QByteArray NetlogonServer::samLogon(const QByteArray &stub, bool withAuthenticat
     if (!Ntlm::verifyNtlmv2(ntHash, logon.account, domain, logon.challenge, logon.ntResponse)) {
         countBadPassword();
         return statusOnly(kStatusWrongPassword);
+    }
+
+    // A correct password that has aged out is refused next, with the two codes
+    // AD distinguishes: an expired password is STATUS_PASSWORD_EXPIRED and one an
+    // administrator demanded be changed is STATUS_PASSWORD_MUST_CHANGE. Both mean
+    // the password was right, so neither is a bad-password count.
+    switch (PasswordAge::stateFor(account, directory())) {
+    case PasswordAge::State::Expired:
+        return statusOnly(kStatusPasswordExpired);
+    case PasswordAge::State::MustChange:
+        return statusOnly(kStatusPasswordMustChange);
+    case PasswordAge::State::Valid:
+        break;
     }
 
     // A correct password outside the account's logonHours is refused the way a

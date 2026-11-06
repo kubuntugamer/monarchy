@@ -7,6 +7,7 @@
 #include <QTcpSocket>
 
 #include "LdapServer.h"
+#include "Ntlm.h"
 #include "SampleData.h"
 #include "ldap_wire_helpers.h"
 
@@ -37,6 +38,7 @@ class LdapTest : public QObject
 
 private slots:
     void enforcesTheDomainPasswordPolicy();
+    void refusesAnExpiredPasswordAtBind();
     void pagesThroughSearchResults();
     void refusesUnknownCriticalControl();
     void ignoresUnknownOptionalControl();
@@ -108,6 +110,84 @@ void LdapTest::enforcesTheDomainPasswordPolicy()
     QCOMPARE(setPassword(QStringLiteral("correct-horse-9")), 0);
     QCOMPARE(setPassword(QStringLiteral("abcdefghijklm")), 0);
     QCOMPARE(setPassword(QStringLiteral("short")), 19);
+}
+
+// A bind proves the password before it judges the account, and then answers 49
+// for a credential that has aged out — the same answer as a wrong password, so
+// an expired account cannot be told apart from a wrong one by a stranger.
+void LdapTest::refusesAnExpiredPasswordAtBind()
+{
+    const QString domainDn = QStringLiteral("DC=corp,DC=example,DC=com");
+    const QString userDn = QStringLiteral("CN=alice,CN=Users,%1").arg(domainDn);
+    const QString password = QStringLiteral("Alice!Password123");
+
+    DirectoryObject domain;
+    domain.id = domainDn;
+    domain.name = QStringLiteral("CORP");
+    domain.type = QStringLiteral("domainDNS");
+    domain.kind = ObjectKind::Domain;
+    domain.attributes.insert(QStringLiteral("maxPwdAge"),
+                             QStringLiteral("-36288000000000")); // 42 days
+
+    const auto userWith = [&](const QString &pwdLastSet, const QString &accountControl) {
+        DirectoryObject user;
+        user.id = userDn;
+        user.name = QStringLiteral("alice");
+        user.type = QStringLiteral("User");
+        user.kind = ObjectKind::User;
+        user.attributes.insert(QStringLiteral("sAMAccountName"), QStringLiteral("alice"));
+        user.attributes.insert(QStringLiteral("objectSid"),
+                               QStringLiteral("S-1-5-21-1-2-3-1001"));
+        user.attributes.insert(QStringLiteral("ntHash"),
+                               QString::fromLatin1(Ntlm::ntowfV1(password).toHex()));
+        user.attributes.insert(QStringLiteral("userAccountControl"), accountControl);
+        user.attributes.insert(QStringLiteral("pwdLastSet"), pwdLastSet);
+        return user;
+    };
+    const QString stale = QString::number(QDateTime::currentSecsSinceEpoch() - 60 * 86400);
+
+    struct Case {
+        QString pwdLastSet;
+        QString accountControl;
+        int expectedResult;
+    };
+    const QList<Case> cases = {
+        // Sixty days old under a 42-day policy.
+        {stale, QStringLiteral("512"), 49},
+        // Still fresh: the same password binds.
+        {QString::number(QDateTime::currentSecsSinceEpoch()), QStringLiteral("512"), 0},
+        // DONT_EXPIRE_PASSWORD keeps a 60-day-old credential usable.
+        {stale, QStringLiteral("66048"), 0},
+        // pwdLastSet zero is "must change at next logon".
+        {QStringLiteral("0"), QStringLiteral("512"), 49},
+    };
+
+    for (const Case &entry : cases) {
+        LdapServer server;
+        server.setObjects({domain, userWith(entry.pwdLastSet, entry.accountControl)});
+        QVERIFY(server.listen(0));
+
+        QTcpSocket client;
+        client.connectToHost(QHostAddress::LocalHost, server.serverPort());
+        QVERIFY(client.waitForConnected(3000));
+        Reader reader(&client);
+        client.write(bindRequest(1, userDn.toUtf8(), password.toUtf8()));
+        const QByteArray message = reader.next();
+        QVERIFY(!message.isEmpty());
+        int tag = 0;
+        QByteArray op, controls;
+        QVERIFY(splitMessage(message, &tag, &op, &controls));
+        QCOMPARE(tag, 0x61); // bindResponse
+        int pos = 0, innerTag = 0;
+        QByteArray result;
+        QVERIFY(nextElement(op, &pos, &innerTag, &result));
+        QCOMPARE(innerTag, 0x0a); // ENUMERATED resultCode
+        int code = 0;
+        for (char c : result)
+            code = (code << 8) | (unsigned char)c;
+        QCOMPARE(code, entry.expectedResult);
+        client.disconnectFromHost();
+    }
 }
 
 // RFC 2696: a search returns one page at a time, each page announcing the total

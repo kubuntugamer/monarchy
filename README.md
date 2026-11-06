@@ -520,8 +520,10 @@ realm.
 Passwords must meet the domain's minimum length, use three of the four
 character classes when complexity is on, and not repeat one of the remembered
 ones; a password refused by policy leaves the account's previous credential in
-place. Disabled accounts cannot bind by any of the three mechanisms, and an
-account outside its logon week is refused. The sample
+place. Disabled accounts cannot bind by any of the three mechanisms, an
+account outside its logon week is refused, and a password older than the
+domain's `maxPwdAge` is refused at logon on every path — LDAP, Kerberos and
+Netlogon — while kpasswd stays reachable so the account can change it. The sample
 directory has no credentials and therefore still accepts any bind, and LDAP
 traffic is plaintext — use the OpenLDAP build with LDAPS towards a remote
 server.

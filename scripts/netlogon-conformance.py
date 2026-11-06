@@ -63,6 +63,9 @@ STATUS_NO_TRUST_SAM_ACCOUNT = 0xC000018B
 STATUS_USER_EXISTS = 0xC0000063
 STATUS_WRONG_PASSWORD = 0xC000006A
 STATUS_ACCOUNT_LOCKED_OUT = 0xC0000234
+STATUS_PASSWORD_EXPIRED = 0xC0000071
+STATUS_PASSWORD_MUST_CHANGE = 0xC0000224
+STATUS_INVALID_PARAMETER = 0xC000000D
 NETLOGON_NEG_STRONG_KEYS = 0x00004000
 
 failures = []
@@ -80,6 +83,8 @@ CHECKS = [
     'SAMR reports the account logon statistics',
     'SAMR sets and reads back the lockout policy',
     'a locked account is refused with STATUS_ACCOUNT_LOCKED_OUT',
+    'an aged-out password is refused with STATUS_PASSWORD_EXPIRED',
+    'a password that must change is refused with STATUS_PASSWORD_MUST_CHANGE',
 ]
 
 
@@ -116,15 +121,48 @@ def samr_bind(options):
     return dce
 
 
-def machine_account(options):
-    """Create (or find) a machine account and give it a password. Returns the
-    account name, its password, and its RID, or None with the reason."""
+def password_policy(options, min_length, history, properties, max_age, min_age):
+    """Write the domain password policy through SAMR class 1 (MS-SAMR
+    2.2.3.5): the two counts, the flag word, then the two ages as negative
+    100-nanosecond counts."""
+    dce = samr_bind(options)
+    server = samr.hSamrConnect5(dce, '\\\\%s\x00' % options.host,
+                                MAXIMUM_ALLOWED, 1, 3)['ServerHandle']
+    domain_id = samr.hSamrLookupDomainInSamServer(dce, server, options.domain)['DomainId']
+    domain = samr.hSamrOpenDomain(dce, server, MAXIMUM_ALLOWED, domain_id)['DomainHandle']
+
+    def set_delta(field, value):
+        unsigned = value & 0xFFFFFFFFFFFFFFFF
+        field['LowPart'] = unsigned & 0xFFFFFFFF
+        field['HighPart'] = unsigned >> 32
+        if field['HighPart'] >= 0x80000000:
+            field['HighPart'] -= 1 << 32
+
+    buffer = samr.SAMPR_DOMAIN_INFO_BUFFER()
+    buffer['tag'] = 1
+    buffer['Password']['MinPasswordLength'] = min_length
+    buffer['Password']['PasswordHistoryLength'] = history
+    buffer['Password']['PasswordProperties'] = properties
+    set_delta(buffer['Password']['MaxPasswordAge'], max_age)
+    set_delta(buffer['Password']['MinPasswordAge'], min_age)
+    samr.hSamrSetInformationDomain(dce, domain, buffer)
+    samr.hSamrCloseHandle(dce, domain)
+    samr.hSamrCloseHandle(dce, server)
+    return dce
+
+
+def create_account(options, account_type, password_expired=True):
+    """Create an account of `account_type` over SAMR and give it a password.
+    Returns the account name, its password and its RID, or None with the reason.
+    `password_expired` writes the account through SAMR the way an administrator
+    who demands a change at next logon does: pwdLastSet ends up zero."""
     try:
         dce = samr_bind(options)
     except Exception as error:  # noqa: BLE001
         return None, 'SAMR bind failed: %s: %s' % (type(error).__name__, error)
 
-    account = 'CONF%s$' % uuid.uuid4().hex[:6].upper()
+    suffix = '$' if account_type & 0x1000 else ''  # a machine account ends in $
+    account = 'CONF%s%s' % (uuid.uuid4().hex[:6].upper(), suffix)
     password = 'M-' + uuid.uuid4().hex[:20]
     try:
         server = samr.hSamrConnect5(dce, '\\\\%s\x00' % options.host,
@@ -134,7 +172,6 @@ def machine_account(options):
     except Exception as error:  # noqa: BLE001
         return None, 'SAMR domain open failed: %s: %s' % (type(error).__name__, error)
 
-    account_type = getattr(samr, 'USER_WORKSTATION_TRUST_ACCOUNT', 0x1000)
     try:
         created = samr.hSamrCreateUser2InDomain(
             dce, domain, account, account_type, MAXIMUM_ALLOWED)
@@ -148,7 +185,7 @@ def machine_account(options):
         return None, 'machine account already exists: %s' % error
 
     try:
-        write_machine_password(dce, user, password)
+        write_machine_password(dce, user, password, password_expired)
     except Exception as error:  # noqa: BLE001
         return None, 'SamrSetInformationUser2 (password) failed: %s: %s' % (
             type(error).__name__, error)
@@ -157,6 +194,12 @@ def machine_account(options):
     samr.hSamrCloseHandle(dce, domain)
     samr.hSamrCloseHandle(dce, server)
     return (account, password, rid), None
+
+
+def machine_account(options):
+    """A workstation account with a password, which is what a secure channel
+    needs."""
+    return create_account(options, getattr(samr, 'USER_WORKSTATION_TRUST_ACCOUNT', 0x1000))
 
 
 def samr_domain(options):
@@ -302,7 +345,7 @@ def set_credential(target, field, credential):
         target[field] = bytes(value)
 
 
-def write_machine_password(dce, user, password):
+def write_machine_password(dce, user, password, expired=True):
     """Class 25 (SamprUserInternal4InformationNew) with the 532-byte password
     buffer MS-SAMR 2.2.7.6 defines: 512 bytes of UTF-16, the code-unit count,
     then the RC4 salt. Impacket's own helper reads the session key from an SMB
@@ -322,7 +365,7 @@ def write_machine_password(dce, user, password):
     info['I1']['NtOwfPassword']['Buffer'] = NULL
     info['I1']['SecurityDescriptor']['SecurityDescriptor'] = NULL
     info['I1']['LogonHours']['LogonHours'] = NULL
-    info['I1']['PasswordExpired'] = 1
+    info['I1']['PasswordExpired'] = 1 if expired else 0
 
     encoded = password.encode('utf-16le')
     plain = encoded.rjust(512, b'\0') + struct.pack('<I', len(encoded))
@@ -543,6 +586,53 @@ def main():
                     check(CHECKS[8], ok, counters)
                 except Exception as error:  # noqa: BLE001
                     check(CHECKS[8], False, '%s: %s' % (type(error).__name__, error))
+
+            # A password the server can prove but will not accept. Two states
+            # are distinct on the wire, and a workstation turns each into a
+            # different prompt. A one-tick maximum age makes every password
+            # older than the policy, whatever its pwdLastSet.
+            try:
+                password_policy(options, 7, 24, 1, -1, 0)
+                key, seed, code = open_channel(account, password)
+                if code != STATUS_SUCCESS:
+                    raise RuntimeError('channel refused: 0x%08x' % code)
+                try:
+                    samlogon(seed, key, options.user, options.password)
+                    check(CHECKS[11], False, 'an aged-out password was accepted')
+                except Exception as error:  # noqa: BLE001
+                    check(CHECKS[11], getattr(error, 'error_code', None) == STATUS_PASSWORD_EXPIRED,
+                          '%s: %s' % (type(error).__name__, error))
+            except Exception as error:  # noqa: BLE001
+                check(CHECKS[11], False, '%s: %s' % (type(error).__name__, error))
+            finally:
+                # Back to AD's default domain policy, which the checks below
+                # and any later driver expect.
+                try:
+                    password_policy(options, 7, 24, 1, -36288000000000, -864000000000)
+                except Exception:  # noqa: BLE001
+                    pass
+
+            # pwdLastSet zero is the other state: an administrator demanded a
+            # change, which SAMR writes with the PasswordExpired flag and the
+            # logon answers with a must-change rather than an expiry.
+            try:
+                created, reason = create_account(
+                    options, getattr(samr, 'USER_NORMAL_ACCOUNT', 0x10), password_expired=True)
+                if created is None:
+                    raise RuntimeError(reason)
+                pending, pending_password, _ = created
+                key, seed, code = open_channel(account, password)
+                if code != STATUS_SUCCESS:
+                    raise RuntimeError('channel refused: 0x%08x' % code)
+                try:
+                    samlogon(seed, key, pending, pending_password)
+                    check(CHECKS[12], False, 'a password that must change was accepted')
+                except Exception as error:  # noqa: BLE001
+                    check(CHECKS[12],
+                          getattr(error, 'error_code', None) == STATUS_PASSWORD_MUST_CHANGE,
+                          '%s: %s' % (type(error).__name__, error))
+            except Exception as error:  # noqa: BLE001
+                check(CHECKS[12], False, '%s: %s' % (type(error).__name__, error))
 
             # The domain's lockout policy is what turns a counted refusal into
             # a lockout, and a domain administrator sets it over SAMR.

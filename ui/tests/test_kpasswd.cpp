@@ -337,6 +337,7 @@ private slots:
 #ifdef MONARCHY_WITH_KRB5
     void changesOwnPassword();
     void changesOwnPasswordWithInitialServiceTicket();
+    void changesAnExpiredPassword();
     void refusesWeakPassword();
     void setsAnotherAccountsPassword();
     void refusesUnauthorizedSet();
@@ -391,6 +392,43 @@ void KpasswdTest::changesOwnPassword()
         foundHash = true;
     }
     QVERIFY(foundHash);
+}
+
+// The one thing an expired password can still be used for: changing itself. The
+// AS-REQ that names kadmin/changepw is the exception the KDC makes, so the
+// account is not locked out of the only path that fixes it, and the new
+// password opens a TGT the old one never could.
+void KpasswdTest::changesAnExpiredPassword()
+{
+    Fixture fixture;
+    QVERIFY(fixture.start());
+
+    const QString adminDn = QStringLiteral("CN=Administrator,CN=Users,")
+                            + fixture.provisioned.baseDn;
+    LdapServer::ModifyChange aged;
+    aged.operation = 2;
+    aged.type = QStringLiteral("pwdLastSet");
+    aged.values = QStringList{
+        QString::number(QDateTime::currentSecsSinceEpoch() - 60 * 86400)};
+    QCOMPARE(fixture.server->applyModify(adminDn, {aged}), 0);
+
+    PasswordClient client;
+    client.mode = PasswordClient::ChangeOwn;
+    client.initialServiceTicket = true;
+    client.principal = QStringLiteral("Administrator@CORP.EXAMPLE.COM");
+    client.password = QStringLiteral("Str0ng-Pass!");
+    client.newPassword = QStringLiteral("N3w-Pass!expiry");
+    QVERIFY(Fixture::run(client));
+    QVERIFY2(client.outcome.kinitOk, qPrintable(client.outcome.error));
+    QVERIFY2(client.outcome.callOk, qPrintable(client.outcome.error));
+    QCOMPARE(client.outcome.resultCode, 0);
+
+    // The change stamps pwdLastSet, so the new password logs on again.
+    PasswordClient again;
+    again.principal = client.principal;
+    again.password = client.newPassword;
+    QVERIFY(Fixture::run(again));
+    QVERIFY2(again.outcome.kinitOk, qPrintable(again.outcome.error));
 }
 
 void KpasswdTest::changesOwnPasswordWithInitialServiceTicket()
