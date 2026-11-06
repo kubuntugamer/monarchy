@@ -452,6 +452,13 @@ ProvisionResult provisionDomain(const ProvisionConfig &config)
     domain.attributes.insert(QStringLiteral("objectSid"), b.sid);
     domain.attributes.insert(QStringLiteral("instanceType"), QStringLiteral("5"));
     domain.attributes.insert(QStringLiteral("ms-DS-MachineAccountQuota"), QStringLiteral("10"));
+    // The account lockout policy, in AD's own encoding: a threshold of zero
+    // means a bad password is counted but never locks the account, and the two
+    // intervals are negative 100-nanosecond values (30 minutes here).
+    domain.attributes.insert(QStringLiteral("lockoutThreshold"), QStringLiteral("0"));
+    domain.attributes.insert(QStringLiteral("lockoutDuration"), QStringLiteral("-18000000000"));
+    domain.attributes.insert(QStringLiteral("lockoutObservationWindow"),
+                             QStringLiteral("-18000000000"));
     domain.attributes.insert(
         QStringLiteral("gPLink"),
         QStringLiteral("[LDAP://CN=%1,CN=Policies,CN=System,%2;0]")

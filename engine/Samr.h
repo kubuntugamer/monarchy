@@ -56,6 +56,9 @@ enum Opnum : quint16 {
     OpEnumerateDomainsInSamServer = 6,
     OpOpenDomain = 7,
     OpQueryInformationDomain = 8,
+    // SamrSetInformationDomain (9) takes the same handle + information class
+    // and then the arm inline, the way the query answers it.
+    OpSetInformationDomain = 9,
     OpCreateGroupInDomain = 10,
     OpEnumerateGroupsInDomain = 11,
     OpEnumerateUsersInDomain = 13,
@@ -141,6 +144,9 @@ private:
     };
 
     QList<DirectoryObject> directory() const;
+    // The domain NC object: the lockout policy and the domain-wide attributes
+    // live on it.
+    DirectoryObject domainObject() const;
     QList<DirectoryObject> users() const;
     QList<DirectoryObject> groups() const;
     QByteArray newHandle(Handle::Kind kind, const QString &dn, quint32 rid);

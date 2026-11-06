@@ -217,8 +217,9 @@ domain, starts `monarchy-dcd` on free ports (a host that already runs a DC keeps
 `scripts/samr-conformance.py` (the account lifecycle) and
 `scripts/netlogon-conformance.py` (the locator, a machine account created over
 SAMR, the secure channel, a validated NTLMv2 logon, a refused password and the
-`badPwdCount`/`logonCount` it leaves on the account). It needs `impacket` for
-the `python3` on `PATH`.
+`badPwdCount`/`logonCount` it leaves on the account, the lockout policy set and
+read back over SAMR, and an account it locks out). It needs `impacket` for the
+`python3` on `PATH`.
 
 ## Run
 

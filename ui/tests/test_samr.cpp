@@ -486,6 +486,20 @@ void SamrTest::samrDirectoryCalls()
     objects.last().attributes.insert(QStringLiteral("logonCount"), QStringLiteral("7"));
     objects.last().attributes.insert(QStringLiteral("badPwdCount"), QStringLiteral("3"));
 
+    // The domain NC object, which carries the lockout policy.
+    DirectoryObject domainObject;
+    domainObject.id = QStringLiteral("DC=corp,DC=example,DC=com");
+    domainObject.name = QStringLiteral("CORP");
+    domainObject.type = QStringLiteral("domainDNS");
+    domainObject.kind = ObjectKind::Domain;
+    domainObject.attributes.insert(QStringLiteral("objectSid"), QStringLiteral("S-1-5-21-1-2-3"));
+    domainObject.attributes.insert(QStringLiteral("lockoutThreshold"), QStringLiteral("3"));
+    domainObject.attributes.insert(QStringLiteral("lockoutDuration"),
+                                   QStringLiteral("-18000000000"));
+    domainObject.attributes.insert(QStringLiteral("lockoutObservationWindow"),
+                                   QStringLiteral("-18000000000"));
+    objects.append(domainObject);
+
     SamrServer server;
     Samr::Config config;
     config.realm = QStringLiteral("CORP.EXAMPLE.COM");
@@ -518,6 +532,21 @@ void SamrTest::samrDirectoryCalls()
     QCOMPARE(domainReply.size(), 24);
     QCOMPARE(lastWord(domainReply), 0u);
     const QByteArray domainHandle = domainReply.left(20);
+
+    // QueryInformationDomain class 12 reports the domain's lockout policy: the
+    // intervals AD stores as negative values come back as their magnitude, and
+    // the threshold as the number of refusals that locks an account.
+    QByteArray lockoutRequest = domainHandle;
+    lockoutRequest.append(char(12));
+    lockoutRequest.append(QByteArray(2, '\0'));
+    const QByteArray lockoutReply =
+        server.handleCall(Samr::OpQueryInformationDomain, lockoutRequest);
+    QCOMPARE(lastWord(lockoutReply), 0u);
+    QByteArray halfHour(8, '\0');
+    for (int i = 0; i < 8; ++i)
+        halfHour[i] = char((18000000000ull >> (8 * i)) & 0xff);
+    QVERIFY(lockoutReply.contains(halfHour));
+    QVERIFY(lockoutReply.contains(QByteArray::fromHex("03000000"))); // threshold 3
 
     // EnumerateUsersInDomain: both accounts with their RIDs.
     const QByteArray usersReply =

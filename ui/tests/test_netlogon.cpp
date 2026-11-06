@@ -392,6 +392,7 @@ private slots:
     void legacySamLogonAuthenticatesSecureChannel();
     void refusesALogonOutsideLogonHours();
     void countsRefusedPasswords();
+    void locksTheAccountAfterTheThreshold();
     void refusesALogonFromAnotherWorkstation();
     void allowsALogonFromAListedWorkstation();
     void passwordSet2WritesTheMachineHash();
@@ -696,6 +697,97 @@ void NetlogonTest::countsRefusedPasswords()
     // bad_password_count follow the six NTTIMEs and six string headers.
     QCOMPARE(readLe16(reply, 24 + 96), quint16(1)); // logon_count
     QCOMPARE(readLe16(reply, 24 + 98), quint16(0)); // bad_password_count
+}
+
+// The domain policy is what turns a counted refusal into a lockout: at the
+// threshold the DC stamps lockoutTime and refuses even the right password until
+// the duration runs out, after which the account opens again.
+void NetlogonTest::locksTheAccountAfterTheThreshold()
+{
+    Netlogon::Config config;
+    config.netbios = QStringLiteral("CORP");
+    config.realm = QStringLiteral("CORP.EXAMPLE.COM");
+    config.dnsDomain = QStringLiteral("corp.example.com");
+    config.dcName = QStringLiteral("DC1");
+    config.domainSid = QStringLiteral("S-1-5-21-1-2-3");
+
+    const QByteArray machineHash = Ntlm::ntowfV1(QStringLiteral("Mach!neP@ss1"));
+    const QByteArray userHash = Ntlm::ntowfV1(QStringLiteral("Alice!Password123"));
+    DirectoryObject machine = machineAccount(machineHash);
+    DirectoryObject domain;
+    domain.id = QStringLiteral("DC=corp,DC=example,DC=com");
+    domain.kind = ObjectKind::Domain;
+    domain.attributes.insert(QStringLiteral("lockoutThreshold"), QStringLiteral("2"));
+    domain.attributes.insert(QStringLiteral("lockoutDuration"),
+                             QStringLiteral("-18000000000"));
+    domain.attributes.insert(QStringLiteral("lockoutObservationWindow"),
+                             QStringLiteral("-18000000000"));
+    DirectoryObject user;
+    user.id = QStringLiteral("CN=alice,CN=Users,DC=corp,DC=example,DC=com");
+    user.kind = ObjectKind::User;
+    user.attributes.insert(QStringLiteral("sAMAccountName"), QStringLiteral("alice"));
+    user.attributes.insert(QStringLiteral("objectSid"), QStringLiteral("S-1-5-21-1-2-3-1100"));
+    user.attributes.insert(QStringLiteral("ntHash"), QString::fromLatin1(userHash.toHex()));
+    user.attributes.insert(QStringLiteral("userAccountControl"), QStringLiteral("512"));
+    user.attributes.insert(QStringLiteral("badPwdCount"), QStringLiteral("0"));
+    user.attributes.insert(QStringLiteral("badPasswordTime"), QStringLiteral("0"));
+    user.attributes.insert(QStringLiteral("lockoutTime"), QStringLiteral("0"));
+
+    QMap<QString, QString> stored;
+    NetlogonServer server;
+    server.setConfig(config);
+    server.setObjectProvider([machine, domain, user, &stored]() {
+        DirectoryObject current = user;
+        for (auto it = stored.cbegin(); it != stored.cend(); ++it)
+            current.attributes.insert(it.key(), it.value());
+        return QList<DirectoryObject>{machine, domain, current};
+    });
+    Netlogon::WriteBackend backend;
+    backend.updateAccount = [&stored](const QString &, const QMap<QString, QString> &changes,
+                                      QString *) {
+        for (auto it = changes.cbegin(); it != changes.cend(); ++it)
+            stored.insert(it.key(), it.value());
+        return true;
+    };
+    server.setWriteBackend(backend);
+
+    const auto attempt = [&](const QByteArray &ntHash) {
+        ChannelFixture channel = openChannel(server, machineHash);
+        const quint32 timestamp = 61;
+        const QByteArray credential = nextCredential(channel.seed, timestamp,
+                                                     channel.sessionKey, channel.flags, false);
+        const QByteArray ntResponse = ntlmV2Response(
+            ntHash, QStringLiteral("alice"), QStringLiteral("CORP"),
+            QByteArray::fromHex("0102030405060708"));
+        return server.handleCall(
+            Netlogon::OpLogonSamLogon,
+            samLogonRequest(QStringLiteral("CLIENT"), credential, timestamp, ntResponse));
+    };
+    const QByteArray wrongHash = Ntlm::ntowfV1(QStringLiteral("Not!ThePassword9"));
+
+    QCOMPARE(readLe32(attempt(wrongHash), 0), quint32(0xc000006au));
+    // Below the threshold nothing is locked, so the account's own lockoutTime
+    // is still what it was.
+    QVERIFY(!stored.contains(QStringLiteral("lockoutTime")));
+    QCOMPARE(readLe32(attempt(wrongHash), 0), quint32(0xc000006au));
+    const quint64 lockedAt = stored.value(QStringLiteral("lockoutTime")).toULongLong();
+    QVERIFY(lockedAt > 0);
+
+    // The right password is refused while the lockout stands, and the attempt
+    // does not count as another bad password.
+    QCOMPARE(readLe32(attempt(userHash), 0), quint32(0xc0000234u));
+    QCOMPARE(stored.value(QStringLiteral("lockoutTime")).toULongLong(), lockedAt);
+    QCOMPARE(stored.value(QStringLiteral("badPwdCount")), QStringLiteral("2"));
+
+    // Once the duration has passed the account is open again, and the good
+    // logon lifts the lockout.
+    stored.insert(QStringLiteral("lockoutTime"),
+                  QString::number(lockedAt - 2 * 18000000000ull));
+    const QByteArray reply = attempt(userHash);
+    QVERIFY2(reply.size() > 24, qPrintable(QStringLiteral("SamLogon returned %1 bytes")
+                                              .arg(reply.size())));
+    QCOMPARE(stored.value(QStringLiteral("lockoutTime")), QStringLiteral("0"));
+    QCOMPARE(stored.value(QStringLiteral("badPwdCount")), QStringLiteral("0"));
 }
 
 // An account whose userWorkstations list does not name the caller is refused

@@ -587,6 +587,15 @@ QList<DirectoryObject> SamrServer::directory() const
     return m_provider ? m_provider() : QList<DirectoryObject>();
 }
 
+DirectoryObject SamrServer::domainObject() const
+{
+    for (const DirectoryObject &object : directory()) {
+        if (object.kind == ObjectKind::Domain)
+            return object;
+    }
+    return DirectoryObject();
+}
+
 QList<DirectoryObject> SamrServer::users() const
 {
     QList<DirectoryObject> result;
@@ -948,11 +957,23 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
             emit requestReceived(QStringLiteral("QueryInformationDomain(role)"));
             return fixed;
         }
-        case 12: { // DomainLockoutInformation: no lockout is enforced
+        case 12: { // DomainLockoutInformation: the policy the domain object carries
+            // AD stores the two intervals as negative 100-nanosecond values and
+            // SAMR reports their magnitude, so a 30-minute duration is
+            // -18000000000 on disk and 18000000000 on the wire. The threshold
+            // is the number of refusals that locks the account; zero means a
+            // bad password is counted but never locks it.
+            const DirectoryObject domain = domainObject();
+            const qint64 duration =
+                domain.attributes.value(QStringLiteral("lockoutDuration")).toLongLong();
+            const qint64 window =
+                domain.attributes.value(QStringLiteral("lockoutObservationWindow")).toLongLong();
+            const quint32 threshold =
+                domain.attributes.value(QStringLiteral("lockoutThreshold")).toUInt();
             beginArm(12);
-            fixed.append(QByteArray(8, '\0')); // LockoutDuration
-            fixed.append(QByteArray(8, '\0')); // LockoutObservationWindow
-            fixed.append(char(0));             // LockoutThreshold
+            putLe64(fixed, quint64(duration < 0 ? -duration : duration)); // LockoutDuration
+            putLe64(fixed, quint64(window < 0 ? -window : window)); // LockoutObservationWindow
+            fixed.append(char(threshold & 0xff));                   // LockoutThreshold
             fixed.append(char(0));
             fixed.append(char(0));
             fixed.append(char(0));
@@ -967,6 +988,55 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
                                      .arg(infoClass));
             return fixed;
         }
+    }
+    // SamrSetInformationDomain (opnum 9): the write side of the query above,
+    // and the only policy a domain administrator can change over RPC today.
+    // The refusal classes are refused rather than accepted and dropped.
+    case Samr::OpSetInformationDomain: {
+        QByteArray handle;
+        if (!reader.bytes(kHandleSize, &handle))
+            return {};
+        quint16 infoClass = 0;
+        if (!reader.u16(&infoClass))
+            return {};
+        Handle domain;
+        if (!lookupHandle(handle, Handle::Domain, &domain)) {
+            putLe32(fixed, kStatusInvalidHandle);
+            return fixed;
+        }
+        if (infoClass != 12) {
+            putLe32(fixed, kStatusInvalidInfoClass);
+            emit requestReceived(QStringLiteral("SetInformationDomain class %1 unsupported")
+                                     .arg(infoClass));
+            return fixed;
+        }
+        // The arm follows the class inline: two 8-byte intervals and then the
+        // threshold as a USHORT, which is the shape the query answers with.
+        reader.align(8);
+        quint64 duration = 0;
+        quint64 window = 0;
+        quint16 threshold = 0;
+        if (!reader.u64(&duration) || !reader.u64(&window) || !reader.u16(&threshold))
+            return {};
+        const DirectoryObject target = domainObject();
+        const QString dn = target.id.isEmpty() ? m_config.baseDn : target.id;
+        QMap<QString, QString> changes;
+        changes.insert(QStringLiteral("lockoutDuration"), QString::number(-qint64(duration)));
+        changes.insert(QStringLiteral("lockoutObservationWindow"),
+                       QString::number(-qint64(window)));
+        changes.insert(QStringLiteral("lockoutThreshold"), QString::number(threshold));
+        bool ok = !dn.isEmpty();
+        QString error;
+        for (auto it = changes.cbegin(); ok && it != changes.cend(); ++it) {
+            ok = m_writes.set && m_writes.set(dn, it.key(), it.value(), &error);
+        }
+        putLe32(fixed, ok ? kStatusSuccess : kStatusInvalidParameter);
+        emit requestReceived(QStringLiteral("SetInformationDomain(lockout %1, %2, %3) %4")
+                                 .arg(threshold)
+                                 .arg(duration)
+                                 .arg(window)
+                                 .arg(ok ? QStringLiteral("ok") : QStringLiteral("refused")));
+        return fixed;
     }
     // SamrGetGroupsForUser (opnum 39): the RIDs and SE_GROUP attributes of every
     // group the account belongs to, read from the groups' member lists.

@@ -62,6 +62,7 @@ STATUS_NO_SUCH_USER = 0xC0000064
 STATUS_NO_TRUST_SAM_ACCOUNT = 0xC000018B
 STATUS_USER_EXISTS = 0xC0000063
 STATUS_WRONG_PASSWORD = 0xC000006A
+STATUS_ACCOUNT_LOCKED_OUT = 0xC0000234
 NETLOGON_NEG_STRONG_KEYS = 0x00004000
 
 failures = []
@@ -77,6 +78,8 @@ CHECKS = [
     'NetrLogonSamLogon validates the account (NTLMv2)',
     'a refused password is counted on the account',
     'SAMR reports the account logon statistics',
+    'SAMR sets and reads back the lockout policy',
+    'a locked account is refused with STATUS_ACCOUNT_LOCKED_OUT',
 ]
 
 
@@ -154,6 +157,51 @@ def machine_account(options):
     samr.hSamrCloseHandle(dce, domain)
     samr.hSamrCloseHandle(dce, server)
     return (account, password, rid), None
+
+
+def samr_domain(options):
+    """A SAMR connection with the server and domain handles already open."""
+    dce = samr_bind(options)
+    server = samr.hSamrConnect5(dce, '\\\\%s\x00' % options.host,
+                                MAXIMUM_ALLOWED, 1, 3)['ServerHandle']
+    domain_id = samr.hSamrLookupDomainInSamServer(dce, server, options.domain)['DomainId']
+    domain = samr.hSamrOpenDomain(dce, server, MAXIMUM_ALLOWED, domain_id)['DomainHandle']
+    return dce, server, domain
+
+
+def lockout_policy(options, policy=None):
+    """Sets the domain's lockout policy when one is given, then reads it back
+    over SAMR, so the setter and the query both go through the NDR the engine
+    parses. Returns the observed (threshold, duration, window)."""
+    dce, server, domain = samr_domain(options)
+    try:
+        if policy is not None:
+            threshold, duration, window = policy
+            arm = samr.SAMPR_DOMAIN_LOCKOUT_INFORMATION()
+            arm['LockoutDuration'] = duration
+            arm['LockoutObservationWindow'] = window
+            arm['LockoutThreshold'] = threshold
+            request = samr.SamrSetInformationDomain()
+            request['DomainHandle'] = domain
+            request['DomainInformationClass'] = 12
+            # A union cannot be assigned in this release, so the arm is set
+            # through its own key after the tag names it.
+            request['DomainInformation']['tag'] = 12
+            request['DomainInformation'][
+                samr.SAMPR_DOMAIN_INFO_BUFFER.union[12][0]] = arm
+            dce.request(request)
+        response = samr.hSamrQueryInformationDomain(dce, domain, 12)
+        observed = response['Buffer']
+        if 'LockoutThreshold' not in getattr(observed, 'fields', {}):
+            for value in observed.fields.values():
+                if 'LockoutThreshold' in getattr(value, 'fields', {}):
+                    observed = value
+                    break
+        return (int(observed['LockoutThreshold']),
+                int(observed['LockoutDuration']),
+                int(observed['LockoutObservationWindow']))
+    finally:
+        dce.disconnect()
 
 
 def logon_statistics(options):
@@ -427,6 +475,8 @@ def main():
             skip(CHECKS[6], 'no secure channel to log on over')
             skip(CHECKS[7], 'no secure channel to refuse a password on')
             skip(CHECKS[8], 'no account logon to read back')
+            skip(CHECKS[9], 'no machine account to open a secure channel with')
+            skip(CHECKS[10], 'no machine account to open a secure channel with')
         else:
             account, password, rid = machine
             check(CHECKS[4], True, '%s rid %d' % (account, rid))
@@ -493,6 +543,51 @@ def main():
                     check(CHECKS[8], ok, counters)
                 except Exception as error:  # noqa: BLE001
                     check(CHECKS[8], False, '%s: %s' % (type(error).__name__, error))
+
+            # The domain's lockout policy is what turns a counted refusal into
+            # a lockout, and a domain administrator sets it over SAMR.
+            try:
+                observed = lockout_policy(options, (2, 18000000000, 18000000000))
+                check(CHECKS[9], observed == (2, 18000000000, 18000000000), observed)
+            except Exception as error:  # noqa: BLE001
+                check(CHECKS[9], False, '%s: %s' % (type(error).__name__, error))
+
+            # Two refusals reach the threshold and lock the account; the right
+            # password is then refused with a status of its own for the rest of
+            # the duration. Each attempt spends a channel, so each gets a new
+            # handshake.
+            try:
+                refused = []
+                for _ in range(2):
+                    key, seed, code = open_channel(account, password)
+                    if code != STATUS_SUCCESS:
+                        raise RuntimeError('channel refused: 0x%08x' % code)
+                    try:
+                        samlogon(seed, key, options.user, 'Wr0ng-' + uuid.uuid4().hex)
+                        refused.append(STATUS_SUCCESS)
+                    except Exception as error:  # noqa: BLE001
+                        refused.append(getattr(error, 'error_code', None))
+                key, seed, code = open_channel(account, password)
+                if code != STATUS_SUCCESS:
+                    raise RuntimeError('channel refused: 0x%08x' % code)
+                locked = STATUS_SUCCESS
+                try:
+                    samlogon(seed, key, options.user, options.password)
+                except Exception as error:  # noqa: BLE001
+                    locked = getattr(error, 'error_code', None)
+                check(CHECKS[10],
+                      refused == [STATUS_WRONG_PASSWORD, STATUS_WRONG_PASSWORD]
+                      and locked == STATUS_ACCOUNT_LOCKED_OUT,
+                      (refused, locked))
+            except Exception as error:  # noqa: BLE001
+                check(CHECKS[10], False, '%s: %s' % (type(error).__name__, error))
+            finally:
+                # Leave the domain with the policy it ships with; the lockout
+                # itself lasts out its duration, which this daemon will not.
+                try:
+                    lockout_policy(options, (0, 18000000000, 18000000000))
+                except Exception:  # noqa: BLE001
+                    pass
 
     print('\n%d failure(s): %s' % (len(failures), failures))
     if skipped:

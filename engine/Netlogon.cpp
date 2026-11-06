@@ -28,6 +28,7 @@ constexpr quint32 kStatusNoSuchUser = 0xc0000064u;
 constexpr quint32 kStatusWrongPassword = 0xc000006au;
 constexpr quint32 kStatusAccountDisabled = 0xc0000072u;
 constexpr quint32 kStatusAccountRestriction = 0xc000006eu;
+constexpr quint32 kStatusAccountLockedOut = 0xc0000234u;
 constexpr quint32 kStatusInvalidWorkstation = 0xc0000070u;
 constexpr quint32 kStatusNotSupported = 0xc00000bbu;
 constexpr quint32 kStatusNoTrustSamAccount = 0xc000018bu;
@@ -1129,19 +1130,56 @@ QByteArray NetlogonServer::samLogon(const QByteArray &stub, bool withAuthenticat
         & 0x00000002u) {
         return statusOnly(kStatusAccountDisabled);
     }
+    // The domain's lockout policy sits on the domain object, in AD's own
+    // encoding: a negative 100-nanosecond interval for each duration, and a
+    // threshold of zero for "count the refusal, never lock the account".
+    quint32 lockoutThreshold = 0;
+    quint64 lockoutDuration = 0;
+    quint64 observationWindow = 0;
+    for (const DirectoryObject &object : directory()) {
+        if (object.kind != ObjectKind::Domain)
+            continue;
+        lockoutThreshold =
+            object.attributes.value(QStringLiteral("lockoutThreshold")).toUInt();
+        const qint64 duration =
+            object.attributes.value(QStringLiteral("lockoutDuration")).toLongLong();
+        const qint64 window =
+            object.attributes.value(QStringLiteral("lockoutObservationWindow")).toLongLong();
+        lockoutDuration = quint64(duration < 0 ? -duration : duration);
+        observationWindow = quint64(window < 0 ? -window : window);
+        break;
+    }
+    const quint64 now = ntTimeNow();
+    const quint64 lockedAt = account.attributes.value(QStringLiteral("lockoutTime")).toULongLong();
+    // A lockout lasts lockoutDuration; zero means until an administrator clears
+    // it. Once it expires the account is open again and the counter restarts.
+    const bool lockoutExpired =
+        lockedAt != 0 && lockoutDuration != 0 && now > lockedAt + lockoutDuration;
+    if (lockedAt != 0 && !lockoutExpired)
+        return statusOnly(kStatusAccountLockedOut);
+
     // A refused password is a counted failure: a Windows DC raises badPwdCount
-    // and stamps badPasswordTime, which is what a lockout policy and an
-    // administrator reading the account both start from. Only a well-formed
-    // response against a known account counts, so a truncated request is an
-    // error rather than a strike.
-    const auto countBadPassword = [this, &account]() {
+    // and stamps badPasswordTime, and once the count reaches the domain's
+    // threshold it stamps lockoutTime as well. A refusal older than the
+    // observation window does not carry over, so the count restarts at one.
+    // Only a well-formed response against a known account counts, so a
+    // truncated request is an error rather than a strike.
+    const auto countBadPassword = [this, &account, &lockoutThreshold, &observationWindow,
+                                   lockoutExpired, now]() {
+        quint64 count = account.attributes.value(QStringLiteral("badPwdCount")).toULongLong();
+        const quint64 lastBad =
+            account.attributes.value(QStringLiteral("badPasswordTime")).toULongLong();
+        if (lockoutExpired
+            || (observationWindow != 0 && lastBad != 0
+                && now > lastBad + observationWindow)) {
+            count = 0;
+        }
+        ++count;
         QMap<QString, QString> attributes;
-        attributes.insert(QStringLiteral("badPwdCount"),
-                          QString::number(account.attributes
-                                              .value(QStringLiteral("badPwdCount"))
-                                              .toUInt()
-                                          + 1));
-        attributes.insert(QStringLiteral("badPasswordTime"), QString::number(ntTimeNow()));
+        attributes.insert(QStringLiteral("badPwdCount"), QString::number(count));
+        attributes.insert(QStringLiteral("badPasswordTime"), QString::number(now));
+        if (lockoutThreshold != 0 && count >= lockoutThreshold)
+            attributes.insert(QStringLiteral("lockoutTime"), QString::number(now));
         if (!m_writes.updateAccount)
             return;
         QString writeError;
@@ -1196,6 +1234,9 @@ QByteArray NetlogonServer::samLogon(const QByteArray &stub, bool withAuthenticat
     // A successful logon clears the failure counter; badPasswordTime keeps the
     // last refusal, as AD keeps it.
     logonAttributes.insert(QStringLiteral("badPwdCount"), QStringLiteral("0"));
+    // A successful logon also lifts a lockout that has run its course, which is
+    // what an administrator clearing the account does by hand.
+    logonAttributes.insert(QStringLiteral("lockoutTime"), QStringLiteral("0"));
     const quint64 replicatedStamp =
         ntTimeAttribute(account, QStringLiteral("lastLogonTimestamp"));
     constexpr quint64 kFourteenDays = 14ull * 24 * 60 * 60 * 10000000ull;
