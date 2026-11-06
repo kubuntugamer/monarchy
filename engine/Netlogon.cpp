@@ -175,9 +175,9 @@ void headerString(QByteArray &fixed, QByteArray &deferred, const QString &text,
     putLe32(deferred, quint32(text.size() + (large ? 1 : 0))); // MaximumCount
     putLe32(deferred, 0);                                      // Offset
     putLe32(deferred, quint32(text.size()));                   // ActualCount
+    // NDR pushes the characters the actual count names and nothing else: the
+    // terminator the large form counts in its maximum is never on the wire.
     deferred.append(Ndr::utf16le(text));
-    if (large)
-        deferred.append(QByteArray(2, '\0'));
     alignTo(deferred, 4);
 }
 
@@ -441,7 +441,10 @@ bool parseNetworkInfo(Ndr::Reader &reader, NetworkLogon *logon)
         return fail("domain header");
     if (!reader.u32(&parameterControl))
         return fail("parameter control");
-    reader.align(8);
+    // OLD_LARGE_INTEGER is two 32-bit halves, so NDR aligns it to 4: aligning
+    // to 8 here skipped the first four bytes of the account header and every
+    // field after it on a real client's request.
+    reader.align(4);
     quint32 logonIdLow = 0;
     quint32 logonIdHigh = 0;
     if (!reader.u32(&logonIdLow) || !reader.u32(&logonIdHigh))
@@ -1074,16 +1077,22 @@ QByteArray NetlogonServer::samLogon(const QByteArray &stub, bool withAuthenticat
     if (logonLevel != 2 && logonLevel != 6)
         return statusOnly(kStatusNotSupported);
 
-    quint16 validationLevel = 0;
-    quint32 flags = 0;
+    // NetrLogonSamLogon marshals the whole logon-information parameter before
+    // validation_level: the union's arm referent, its fixed fields and every
+    // deferred string and response come first (MS-NRPC 2.2.4.1 puts
+    // validation_level after logon_information). Reading the level here used to
+    // land in the identity's first length, so only a client that deferred those
+    // strings past validation_level validated at all.
     NetworkLogon logon;
     reader.align(4);
+    if (!parseNetworkInfo(reader, &logon))
+        return statusOnly(kStatusInvalidParameter);
+
+    quint16 validationLevel = 0;
+    quint32 flags = 0;
     if (!reader.u16(&validationLevel))
         return statusOnly(kStatusInvalidParameter);
     if (withFlags && !reader.u32(&flags))
-        return statusOnly(kStatusInvalidParameter);
-    reader.align(4);
-    if (!parseNetworkInfo(reader, &logon))
         return statusOnly(kStatusInvalidParameter);
     if (!isPrintableName(logon.domain) || !isPrintableName(logon.account)
         || !isPrintableName(logon.workstation))
@@ -1229,17 +1238,18 @@ QByteArray NetlogonServer::samLogon(const QByteArray &stub, bool withAuthenticat
     putLe16(out, validationLevel); // switch_is discriminator for netr_Validation
     alignTo(out, 4);
     putLe32(out, 0x0002f200u); // NETLOGON_VALIDATION_SAM_INFO2 pointer referent
+    // The union is a single parameter, so its pointer's referent — the SAM_INFO2
+    // fixed part and every deferred string and array it carries — is
+    // marshalled before the fields that follow the union.
+    out.append(validationFixed);
+    out.append(validationDeferred);
     out.append(char(1)); // authoritative
     if (withFlags) {
         alignTo(out, 4);
-        putLe32(out, flags);
+        putLe32(out, flags); // ExtraFlags, which follows Authoritative
     }
     alignTo(out, 4);
     putLe32(out, kStatusSuccess);
-    // Pointee and its nested string/array referents are deferred until after
-    // all top-level response fields (including status) have been marshalled.
-    out.append(validationFixed);
-    out.append(validationDeferred);
     emit requestReceived(QStringLiteral("LogonSamLogon%1(%2\\%3: ok)")
                              .arg(withFlags ? QStringLiteral("WithFlags") : QString())
                              .arg(domain, logon.account));

@@ -173,19 +173,13 @@ void appendNetworkLogon(QByteArray &out, quint16 validationLevel, const QByteArr
                         quint32 extraFlags = 0,
                         const QString &workstation = QStringLiteral("CLIENT"))
 {
-    // These call-level fields precede the deferred NETLOGON_LEVEL referent.
-    appendLe16(out, validationLevel);
-    if (extraFlags != 0) {
-        while (out.size() % 4 != 0) out.append(char(0));
-        appendLe32(out, extraFlags);
-    }
     while (out.size() % 4 != 0) out.append(char(0));
 
     // NETLOGON_LOGON_IDENTITY_INFO has deferred domain, account and workstation.
     appendLe16(out, 8); appendLe16(out, 8); // domain Length and MaximumLength
     appendLe32(out, 0x00020001u); // domain buffer
     appendLe32(out, 3); // parameter_control
-    while (out.size() % 8 != 0) out.append(char(0)); // OLD_LARGE_INTEGER alignment
+    while (out.size() % 4 != 0) out.append(char(0)); // OLD_LARGE_INTEGER is 4-aligned
     appendLe64(out, 0); // Reserved
     appendLe16(out, 10); appendLe16(out, 10); appendLe32(out, 0x00020002u); // account buffer
     // The deferred array names the characters only; the header's Length agrees
@@ -217,8 +211,16 @@ void appendNetworkLogon(QByteArray &out, quint16 validationLevel, const QByteArr
     appendLe32(out, quint32(ntResponse.size()));
     out.append(ntResponse);
     while (out.size() % 4 != 0) out.append(char(0));
-    appendLe32(out, 0); // NULL LM response array
+    // The LM header above is all a NULL LM response marshals: its referent is
+    // zero, so there is no deferred array to write.
 
+    // validation_level follows the whole logon-information parameter, deferred
+    // strings and responses included; extra_flags follows it.
+    appendLe16(out, validationLevel);
+    if (extraFlags != 0) {
+        while (out.size() % 4 != 0) out.append(char(0));
+        appendLe32(out, extraFlags);
+    }
 }
 
 QByteArray uniqueString(const QString &text, quint32 referent)
@@ -492,8 +494,8 @@ void NetlogonTest::legacySamLogonAuthenticatesSecureChannel()
     appendLe16(request, 2); // LogonLevel
     appendLe16(request, 2); // NETLOGON_LEVEL's NDR32 union discriminator
     appendLe32(request, 0x00021003u); // LogonNetwork referent
-    // netr_LogonSamLogon marshals validation metadata before the deferred
-    // network-info referent; nested strings and challenge arrays follow it.
+    // netr_LogonSamLogon marshals the whole network-info referent, deferred
+    // strings and responses included, before validation_level.
     appendNetworkLogon(request, 3, ntResponse, withFlags ? 0x00000020u : 0u);
     if (qEnvironmentVariableIsSet("MONARCHY_RPC_TRACE"))
         qWarning("SamLogon stub=%s", request.toHex().constData());
@@ -504,11 +506,12 @@ void NetlogonTest::legacySamLogonAuthenticatesSecureChannel()
     QCOMPARE(reply.mid(4, 8), nextCredential(channelSeed, timestamp, sessionKey, flags, true));
     QCOMPARE(readLe32(reply, 12), timestamp);
     QCOMPARE(readLe16(reply, 16), quint16(3));
-    // Validation pointer and success status precede the deferred SAM_INFO2.
+    // The validation's referent fills the middle of the stub; the authoritative
+    // byte and the status (ExtraFlags, when asked for, between them) end it.
     QCOMPARE(readLe32(reply, 20), quint32(0x0002f200u));
-    QCOMPARE(readLe32(reply, 24), quint32(1));
-    const int statusOffset = withFlags ? 32 : 28;
-    QCOMPARE(readLe32(reply, statusOffset), quint32(0));
+    QCOMPARE(readLe32(reply, int(reply.size()) - 4), quint32(0));
+    if (withFlags)
+        QCOMPARE(readLe32(reply, int(reply.size()) - 8), quint32(0x00000020u));
     QVERIFY(reply.contains(Ndr::utf16le(QStringLiteral("alice"))));
 
     // A validated logon is recorded on the account: the DC that answered also
@@ -649,10 +652,11 @@ void NetlogonTest::allowsALogonFromAListedWorkstation()
     QVERIFY2(reply.size() > 24, qPrintable(QStringLiteral("SamLogon returned %1 bytes")
                                               .arg(reply.size())));
     QCOMPARE(readLe32(reply, 0), quint32(0x0002f210u));
-    // Validation level 3, validation pointer, success status.
+    // Validation level 3 and its pointer, then the validation, authoritative
+    // byte and status at the end.
     QCOMPARE(readLe16(reply, 16), quint16(3));
-    QCOMPARE(readLe32(reply, 24), quint32(1));
-    QCOMPARE(readLe32(reply, 28), quint32(0));
+    QCOMPARE(readLe32(reply, 20), quint32(0x0002f200u));
+    QCOMPARE(readLe32(reply, int(reply.size()) - 4), quint32(0));
     QVERIFY(reply.contains(Ndr::utf16le(QStringLiteral("alice"))));
     QVERIFY(logon.wroteBack);
 }

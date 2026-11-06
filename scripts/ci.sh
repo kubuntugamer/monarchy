@@ -16,8 +16,10 @@
 #
 # --conformance goes further than the suites: it provisions a throwaway domain
 # under a temporary directory, starts monarchy-dcd on the unprivileged dev port
-# set, and drives the running DC with scripts/drs-conformance.py and the
-# impacket half of scripts/lsad-conformance.py. Those checks marshal every call
+# set, and drives the running DC with scripts/drs-conformance.py, the impacket
+# half of scripts/lsad-conformance.py, scripts/samr-conformance.py (the account
+# lifecycle) and scripts/netlogon-conformance.py (the locator and the secure
+# channel a logon rides on, with a machine account it creates over SAMR). Those checks marshal every call
 # with impacket's own NDR, so they fail where a reply only this tree's encoder
 # understands would pass. They need impacket for python3 and are therefore
 # opt-in rather than automatic.
@@ -166,6 +168,24 @@ PY
         printf 'ci.sh: no domainSid in the provisioned secrets; LSAD conformance cannot run\n' >&2
         status=1
     fi
+
+    # SAMR and netlogon, marshalled by impacket's own NDR. The netlogon driver
+    # creates the machine account it authenticates with through SAMR, so it
+    # needs that endpoint's port as well; the port comes from the provisioned
+    # configuration because --dev-ports keeps it at 1035.
+    local samr_port
+    samr_port=$(sed -n 's/^samrPort=//p' "$dc_dir/dc.conf" | head -1)
+    : "${samr_port:=1035}"
+    printf '== SAMR conformance (impacket NDR)\n'
+    python3 "$root/scripts/samr-conformance.py" --host 127.0.0.1 --port "$samr_port" \
+        --user Administrator --password "$conformance_password" \
+        --domain "$conformance_domain" || status=1
+
+    printf '== Netlogon conformance (impacket NDR)\n'
+    python3 "$root/scripts/netlogon-conformance.py" --host 127.0.0.1 \
+        --port "$netlogon_port" --samr-port "$samr_port" \
+        --user Administrator --password "$conformance_password" \
+        --domain "$conformance_domain" || status=1
 
     if ((status != 0)); then
         printf '== daemon log (last 40 lines)\n' >&2

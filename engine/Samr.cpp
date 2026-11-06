@@ -683,11 +683,16 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
         const QByteArray handle = newHandle(Handle::Server, m_config.domainSid, 0);
         fixed.append(handle);
         if (opnum == Samr::OpConnect5) {
-            // OutVersion, then revision info (revision 1: one ULONG), then the
-            // handle, then the status.
+            // OutVersion, then the revision union switched on it — its tag and
+            // SAMPR_REVISION_INFO_V1, which is Revision and SupportedFeatures —
+            // then the handle and the status. SupportedFeatures was missing
+            // here until impacket's decoder rejected the reply as four bytes
+            // short, which is exactly what a conformance client is for.
             fixed.clear();
-            putLe32(fixed, 1u);
-            putLe32(fixed, 1u);
+            putLe32(fixed, 1u); // OutVersion
+            putLe32(fixed, 1u); // union tag (the same OutVersion)
+            putLe32(fixed, 1u); // Revision
+            putLe32(fixed, 0u); // SupportedFeatures
             fixed.append(handle);
         }
         putLe32(fixed, kStatusSuccess);
