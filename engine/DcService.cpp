@@ -619,6 +619,27 @@ bool DcService::start(const QString &dcDir)
                 emit statusMessage(tr("Replication source %1 registered.").arg(address));
             });
 
+    // DsReplicaMod edits a link in place. Only a change to the address the agent
+    // is actually pulling from retargets it; editing another link leaves the
+    // running pull alone.
+    connect(m_drsServer, &DrsServer::replicaSourceModified, this,
+            [this, parseAddress](const QString &previous, const QString &address,
+                                 const QString &) {
+                QString previousHost;
+                quint16 previousPort = 0;
+                parseAddress(previous, &previousHost, &previousPort);
+                if (!m_replicationAgent->source().startsWith(previousHost, Qt::CaseInsensitive))
+                    return;
+                QString host;
+                quint16 port = 0;
+                parseAddress(address, &host, &port);
+                m_replicationAgent->setSource(host, port);
+                if (!m_replicaTimer->isActive())
+                    m_replicaTimer->start();
+                emit statusMessage(tr("Replication source %1 changed to %2.")
+                                       .arg(previous, address));
+            });
+
     // A source retired with DsReplicaDel stops being pulled from; the agent
     // keeps its cursor, so re-adding the same partner resumes where it left off.
     connect(m_drsServer, &DrsServer::replicaSourceRemoved, this,

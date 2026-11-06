@@ -29,12 +29,16 @@
 // refused with kWerrNotSupported rather than described falsely.
 
 // A replication source registered with DsReplicaAdd: the naming context it
-// feeds and the address to pull from.
+// feeds and the address to pull from. DsReplicaMod addresses such a link by the
+// source DSA's GUID, which level 2 of Add carries and level 1 does not, and it
+// can also replace the schedule the link was registered with.
 struct ReplicaSource
 {
     QString ncDn;
     QString address;
     quint32 options = 0;
+    QUuid sourceDsa;
+    QByteArray schedule;
 };
 
 namespace Drs {
@@ -84,6 +88,8 @@ public:
 signals:
     void requestReceived(const QString &operation);
     void replicaSourceAdded(const QString &address, const QString &ncDn);
+    void replicaSourceModified(const QString &previousAddress, const QString &address,
+                               const QString &ncDn);
     void replicaSourceRemoved(const QString &address, const QString &ncDn);
 
 private:
@@ -92,6 +98,7 @@ private:
     QByteArray drsReplicaSync(const QByteArray &stub);
     QByteArray drsReplicaAdd(const QByteArray &stub);
     QByteArray drsReplicaDel(const QByteArray &stub);
+    QByteArray drsReplicaMod(const QByteArray &stub);
     QByteArray drsUpdateRefs(const QByteArray &stub);
     QByteArray drsGetNCChanges(const QByteArray &stub);
     QByteArray drsDomainControllerInfo(const QByteArray &stub);

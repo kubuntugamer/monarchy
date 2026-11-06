@@ -81,6 +81,84 @@ QByteArray replicaAddRequest(const QByteArray &handle, const QString &ncDn,
     return out;
 }
 
+// A level-2 DsReplicaAdd arm (`drsuapi_DsReplicaAddRequest2`): the handle, the
+// level, the NC, source-DSA and transport referents, the address referent, the
+// schedule and the options, then the deferred bodies. The source DSA's DSNAME
+// carries the GUID DsReplicaMod later addresses the link by.
+QByteArray replicaAddRequest2(const QByteArray &handle, const QString &ncDn,
+                              const QByteArray &sourceGuid, const QString &address)
+{
+    QByteArray out = handle;
+    appendLe32(out, 2u);          // level
+    appendLe32(out, 0x00020004u); // naming_context
+    appendLe32(out, 0x00020005u); // source_dsa_dn
+    appendLe32(out, 0u);          // transport_dn
+    appendLe32(out, 0x00020008u); // source_dsa_address
+    out.append(QByteArray(84, '\0'));
+    appendLe32(out, 0u); // options
+
+    const auto dsName = [&out](const QString &dn, const QByteArray &guid) {
+        const quint32 units = quint32(dn.size() + 1);
+        appendLe32(out, units);
+        appendLe32(out, 0u);
+        appendLe32(out, 0u);
+        out.append(guid.leftJustified(16, '\0', true).left(16));
+        out.append(QByteArray(28, '\0'));
+        appendLe32(out, units * 2);
+        out.append(Ndr::utf16le(dn + QChar(u'\0')));
+        while (out.size() % 4 != 0)
+            out.append('\0');
+    };
+    dsName(ncDn, QByteArray(16, '\0'));
+    dsName(QStringLiteral("CN=NTDS Settings,CN=CORPDC2,CN=Servers,CN=Default-First-Site-Name,"
+                          "CN=Sites,CN=Configuration,DC=corp,DC=example,DC=com"),
+           sourceGuid);
+
+    const quint32 units = quint32(address.size() + 1);
+    appendLe32(out, units);
+    out.append(Ndr::utf16le(address + QChar(u'\0')));
+    while (out.size() % 4 != 0)
+        out.append('\0');
+    return out;
+}
+
+// A DsReplicaMod level-1 request arm (`drsuapi_DsReplicaModRequest1` in the
+// reference IDL): the handle, level, the NC referent, the source DSA GUID, the
+// address referent, the 84-byte schedule, the replica flags, the modify_fields
+// mask and the call options, then the deferred DSNAME and wide address.
+QByteArray replicaModRequest(const QByteArray &handle, const QString &ncDn,
+                             const QByteArray &sourceGuid, const QString &address,
+                             const QByteArray &schedule, quint32 replicaFlags,
+                             quint32 modifyFields, quint32 options = 0)
+{
+    QByteArray out = handle;
+    appendLe32(out, 1u);          // level
+    appendLe32(out, 0x00020004u); // naming_context referent
+    out.append(sourceGuid.leftJustified(16, '\0', true).left(16));
+    appendLe32(out, 0x00020008u); // source_dsa_address referent
+    out.append(schedule.leftJustified(84, '\0', true).left(84));
+    appendLe32(out, replicaFlags);
+    appendLe32(out, modifyFields);
+    appendLe32(out, options);
+
+    const quint32 units = quint32(ncDn.size() + 1);
+    appendLe32(out, units);
+    appendLe32(out, 0u);
+    appendLe32(out, 0u);
+    out.append(QByteArray(16 + 28, '\0'));
+    appendLe32(out, units * 2);
+    out.append(Ndr::utf16le(ncDn + QChar(u'\0')));
+    while (out.size() % 4 != 0)
+        out.append('\0');
+
+    const quint32 addressUnits = quint32(address.size() + 1);
+    appendLe32(out, addressUnits);
+    out.append(Ndr::utf16le(address + QChar(u'\0')));
+    while (out.size() % 4 != 0)
+        out.append('\0');
+    return out;
+}
+
 // A DsReplicaDel level-1 request arm (MS-DRSR 4.1.20): the handle, level, the
 // two referents and the options, then the deferred DSNAME and the source
 // address, which this method carries as a UTF-8 byte string rather than the
@@ -521,6 +599,107 @@ private slots:
         QCOMPARE(readLe32(server.handleCall(6, replicaDelRequest(handle, ncDn, address, 0x8000)), 0),
                  quint32(0x57));
         QCOMPARE(readLe32(server.handleCall(6, QByteArray(20, '\x7f')), 0), quint32(0x000006f7));
+    }
+
+    // DsReplicaMod changes exactly the fields modify_fields names: the mask the
+    // vendored IDL calls drsuapi_DrsUpdate (FLAGS 0x1, ADDRESS 0x2, SCHEDULE
+    // 0x4). An unmatched link is ERROR_DS_DRA_NO_REPLICA, not success.
+    void dsReplicaModChangesOnlyTheNamedFields()
+    {
+        DrsServer server;
+        server.setConfig(config());
+        server.setObjectProvider([this]() { return fixture(); });
+
+        QStringList changed;
+        QObject::connect(&server, &DrsServer::replicaSourceModified,
+                         [&changed](const QString &previous, const QString &address,
+                                    const QString &) {
+                             changed.append(previous + QStringLiteral(" -> ") + address);
+                         });
+
+        const QByteArray handle = server.handleCall(0, bindRequest()).mid(64, 20);
+        const QString ncDn = QStringLiteral("DC=corp,DC=example,DC=com");
+        const QString oldAddress = QStringLiteral("dc02.corp.example.com");
+        const QString newAddress = QStringLiteral("dc03.corp.example.com");
+        // Level 2 carries the source DSA, which is the GUID DsReplicaMod keys
+        // the link by; a level-1 registration has none and needs the address.
+        const QByteArray guid = QByteArray::fromHex("00112233445566778899aabbccddeeff");
+        QCOMPARE(readLe32(server.handleCall(5, replicaAddRequest2(handle, ncDn, guid, oldAddress)),
+                          0),
+                 quint32(0));
+
+        QByteArray schedule(84, '\0');
+        schedule[0] = char(0xff);
+
+        const QByteArray addressAndFlags =
+            replicaModRequest(handle, ncDn, guid, newAddress, schedule, 0x00000004u, 0x1u | 0x2u);
+        QCOMPARE(readLe32(server.handleCall(7, addressAndFlags), 0), quint32(0));
+        QCOMPARE(server.replicaSources().size(), 1);
+        QCOMPARE(server.replicaSources().first().address, newAddress);
+        QCOMPARE(server.replicaSources().first().options, quint32(0x4));
+        // The schedule was not named, so it keeps what Add registered.
+        QCOMPARE(server.replicaSources().first().schedule, QByteArray(84, '\0'));
+        QCOMPARE(changed,
+                 QStringList{oldAddress + QStringLiteral(" -> ") + newAddress});
+
+        // The schedule alone: address and flags stay where the last call put them.
+        const QByteArray scheduleOnly =
+            replicaModRequest(handle, ncDn, guid, newAddress, schedule, 0x9u, 0x4u);
+        QCOMPARE(readLe32(server.handleCall(7, scheduleOnly), 0), quint32(0));
+        QCOMPARE(server.replicaSources().first().schedule, schedule);
+        QCOMPARE(server.replicaSources().first().options, quint32(0x4));
+        QCOMPARE(server.replicaSources().first().address, newAddress);
+
+        // A request with no GUID matches by address, which is all a level-1
+        // registration leaves behind.
+        QCOMPARE(readLe32(server.handleCall(7, replicaModRequest(handle, ncDn, QByteArray(16, '\0'),
+                                                                 newAddress, schedule, 0x4u, 0x4u)),
+                          0),
+                 quint32(0));
+        QCOMPARE(server.replicaSources().first().address, newAddress);
+
+        // An address nothing registered, no bit at all, a bit outside the IDL's
+        // set, another NC, call options and a forged handle are each refused.
+        // A GUID that matches nothing is NO_REPLICA even though the address is
+        // not stored either: the GUID names the link and the address is the
+        // value the call would write into it.
+        const QString missing = QStringLiteral("dc09.corp.example.com");
+        const QByteArray unknownGuid = QByteArray::fromHex("ffeeddccbbaa99887766554433221100");
+        QCOMPARE(readLe32(server.handleCall(
+                              7, replicaModRequest(handle, ncDn, unknownGuid, newAddress, schedule,
+                                                   0, 0x2u)),
+                          0),
+                 quint32(0x00002104));
+        // Without a GUID the address has to match, so an unregistered one is
+        // NO_REPLICA as well.
+        QCOMPARE(readLe32(server.handleCall(
+                              7, replicaModRequest(handle, ncDn, QByteArray(16, '\0'), missing,
+                                                   schedule, 0, 0x2u)),
+                          0),
+                 quint32(0x00002104));
+        QCOMPARE(readLe32(server.handleCall(
+                              7, replicaModRequest(handle, ncDn, guid, newAddress, schedule, 0, 0x0u)),
+                          0),
+                 quint32(0x000020f5));
+        QCOMPARE(readLe32(server.handleCall(
+                              7, replicaModRequest(handle, ncDn, guid, newAddress, schedule, 0, 0x8u)),
+                          0),
+                 quint32(0x000020f5));
+        QCOMPARE(readLe32(server.handleCall(
+                              7, replicaModRequest(handle,
+                                                   QStringLiteral("DC=other,DC=example,DC=com"),
+                                                   guid, newAddress, schedule, 0, 0x2u)),
+                          0),
+                 quint32(0x000020f8));
+        QCOMPARE(readLe32(server.handleCall(
+                              7, replicaModRequest(handle, ncDn, guid, newAddress, schedule, 0,
+                                                   0x2u, 0x1u)),
+                          0),
+                 quint32(0x57));
+        QCOMPARE(readLe32(server.handleCall(7, QByteArray(20, '\x7f')), 0), quint32(0x000006f7));
+        QCOMPARE(readLe32(server.handleCall(7, handle + QByteArray(20, '\0')), 0),
+                 quint32(0x000020f5));
+        QCOMPARE(server.replicaSources().first().address, newAddress);
     }
 
     // A deletion is not an absence: the object leaves the live store but stays

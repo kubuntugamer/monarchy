@@ -25,6 +25,13 @@ constexpr quint32 kWerrDrsNoReplica = 0x00002104u;
 // 0x8000 in this method means DRS_NO_SOURCE: expunge the whole NC replica.
 constexpr quint32 kDrsNoSourceOption = 0x00008000u;
 constexpr quint32 kReplicaDelOptions = 0x0000D191u;
+// drsuapi_DrsUpdate (reference/specs/samba-drsuapi.idl, annotated "see
+// DRS_MSG_REPMOD_V1"): the bits DsReplicaMod's modify_fields carries. These are
+// the constants that were unverified when this call was first left refused.
+constexpr quint32 kDrsUpdateFlags = 0x00000001u;
+constexpr quint32 kDrsUpdateAddress = 0x00000002u;
+constexpr quint32 kDrsUpdateSchedule = 0x00000004u;
+constexpr quint32 kDrsUpdateAll = kDrsUpdateFlags | kDrsUpdateAddress | kDrsUpdateSchedule;
 constexpr quint32 kExtRetNone = 0x00000000u;
 constexpr quint32 kExtRetSuccess = 0x00000001u;
 constexpr quint32 kExopReplObj = 0x00000006u; // EXOP_REPL_OBJ
@@ -1380,11 +1387,18 @@ QByteArray DrsServer::drsReplicaAdd(const QByteArray &stub)
     if (ncReferent != 0 && !readDsName(&reader, &ncDn, &ncGuid, &ncSid, &ncSidLen))
         return stubReply(kWerrNotSupported);
 
-    // Level 2 also defers the source DSA and transport DSNAMEs. Where a change
-    // comes from is the address, so these are walked for position only.
-    for (const quint32 referent : {sourceReferent, transportReferent}) {
-        if (referent == 0)
-            continue;
+    // Level 2 also defers the source DSA and transport DSNAMEs. The address is
+    // what the pull uses, but the source DSA's GUID is what DsReplicaMod
+    // addresses this link by, so it is kept instead of walked past.
+    QUuid sourceDsa;
+    if (sourceReferent != 0) {
+        QString ignoredDn;
+        QByteArray ignoredSid;
+        quint32 ignoredSidLen = 0;
+        if (!readDsName(&reader, &ignoredDn, &sourceDsa, &ignoredSid, &ignoredSidLen))
+            return stubReply(kWerrNotSupported);
+    }
+    if (transportReferent != 0) {
         QString ignoredDn;
         QUuid ignoredGuid;
         QByteArray ignoredSid;
@@ -1408,7 +1422,7 @@ QByteArray DrsServer::drsReplicaAdd(const QByteArray &stub)
             && known.ncDn.compare(nc, Qt::CaseInsensitive) == 0)
             return stubReply(kWerrOk);
     }
-    m_replicaSources.append(ReplicaSource{nc, address, options});
+    m_replicaSources.append(ReplicaSource{nc, address, options, sourceDsa, schedule});
     emit requestReceived(QStringLiteral("DsReplicaAdd(%1) for %2").arg(address, nc));
     emit replicaSourceAdded(address, nc);
     return stubReply(kWerrOk);
@@ -1494,6 +1508,102 @@ QByteArray DrsServer::drsReplicaDel(const QByteArray &stub)
         }
     }
     return stubReply(kWerrDrsNoReplica);
+}
+
+// DsReplicaMod (opnum 7): change one property of a registered source rather
+// than retiring and re-adding it. MS-DRSR keys the repsFrom value by the source
+// DSA's GUID and reports ERROR_DS_DRA_NO_REPLICA when nothing matches; the
+// modify_fields mask names what changes, so every field the caller did not ask
+// for keeps its stored value. A source registered at level 1 of DsReplicaAdd
+// has no GUID to match on, so an address match is accepted for it.
+//
+// DRS_UPDATE_SCHEDULE is recorded and reported; the pull cadence is still
+// replicaIntervalSeconds, which STATUS.md states rather than implying the
+// schedule already gates replication.
+QByteArray DrsServer::drsReplicaMod(const QByteArray &stub)
+{
+    Ndr::Reader reader(stub);
+    QByteArray handleBytes;
+    if (!reader.bytes(kDrsHandleSize, &handleBytes))
+        return QByteArray();
+    if (!m_handles.contains(guidFromBytes(handleBytes)))
+        return stubReply(kWerrInvalidHandle);
+
+    quint32 level = 0;
+    if (!reader.u32(&level))
+        return QByteArray();
+    if (level != 1)
+        return stubReply(kWerrDrsInvalidParameter);
+
+    quint32 ncReferent = 0;
+    QByteArray sourceGuidBytes;
+    quint32 addressReferent = 0;
+    QByteArray schedule;
+    quint32 replicaFlags = 0;
+    quint32 modifyFields = 0;
+    quint32 options = 0;
+    if (!reader.u32(&ncReferent) || !reader.bytes(16, &sourceGuidBytes)
+        || !reader.u32(&addressReferent) || !reader.bytes(84, &schedule)
+        || !reader.u32(&replicaFlags) || !reader.u32(&modifyFields)
+        || !reader.u32(&options))
+        return QByteArray();
+    if (ncReferent == 0 || addressReferent == 0)
+        return stubReply(kWerrDrsInvalidParameter);
+    if ((modifyFields & ~kDrsUpdateAll) != 0 || modifyFields == 0)
+        return stubReply(kWerrDrsInvalidParameter);
+    // The trailing DRS_OPTIONS describes how the call is performed; this server
+    // has no meaning for any bit there on this method, so it refuses rather
+    // than accepting a request whose behaviour it would not honour.
+    if (options != 0)
+        return stubReply(kWerrNotSupported);
+
+    QString ncDn;
+    QUuid ncGuid;
+    QByteArray ncSid;
+    quint32 ncSidLen = 0;
+    if (!readDsName(&reader, &ncDn, &ncGuid, &ncSid, &ncSidLen))
+        return stubReply(kWerrDrsBadNc);
+    if (ncDn.compare(baseDn(), Qt::CaseInsensitive) != 0)
+        return stubReply(kWerrDrsBadNc);
+
+    QString address;
+    if (!readDeferredString(&reader, &address))
+        return stubReply(kWerrDrsInvalidParameter);
+
+    const QUuid sourceDsa = guidFromBytes(sourceGuidBytes);
+    int index = -1;
+    for (int i = 0; i < m_replicaSources.size() && index < 0; ++i) {
+        const ReplicaSource &known = m_replicaSources.at(i);
+        if (known.ncDn.compare(ncDn, Qt::CaseInsensitive) != 0)
+            continue;
+        // A request that names a source DSA must match it: the address is the
+        // new value when DRS_UPDATE_ADDRESS is set, so it cannot identify the
+        // link. Only a request with no GUID falls back to the address, which
+        // is all a level-1 DsReplicaAdd leaves to match on.
+        if (!sourceDsa.isNull()) {
+            if (!known.sourceDsa.isNull() && known.sourceDsa == sourceDsa)
+                index = i;
+        } else if (known.address.compare(address, Qt::CaseInsensitive) == 0) {
+            index = i;
+        }
+    }
+    if (index < 0)
+        return stubReply(kWerrDrsNoReplica);
+
+    ReplicaSource &link = m_replicaSources[index];
+    const QString previousAddress = link.address;
+    if ((modifyFields & kDrsUpdateAddress) != 0)
+        link.address = address;
+    if ((modifyFields & kDrsUpdateFlags) != 0)
+        link.options = replicaFlags;
+    if ((modifyFields & kDrsUpdateSchedule) != 0)
+        link.schedule = schedule;
+
+    emit requestReceived(QStringLiteral("DsReplicaMod(%1) for %2").arg(link.address, ncDn));
+    // Both addresses travel: the daemon only retargets its pull when the link
+    // it is actually using changed, not when some other link was edited.
+    emit replicaSourceModified(previousAddress, link.address, ncDn);
+    return stubReply(kWerrOk);
 }
 
 QByteArray DrsServer::drsUpdateRefs(const QByteArray &stub)
@@ -1862,6 +1972,8 @@ QByteArray DrsServer::handleCall(quint16 opnum, const QByteArray &stub)
         return drsReplicaAdd(stub);
     case 6:
         return drsReplicaDel(stub);
+    case 7:
+        return drsReplicaMod(stub);
     default:
         // Only the calls this server implements are described; the rest are
         // refused rather than answered as if understood.
