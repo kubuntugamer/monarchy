@@ -17,7 +17,10 @@
 #include "Smb2.h"
 
 #include <QDir>
+#include <QFile>
 #include <QFileInfo>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QRegularExpression>
 #include <QSettings>
 #include <QStandardPaths>
@@ -536,10 +539,36 @@ bool DcService::start(const QString &dcDir)
     // cursor lives in the agent, so each pull asks only for what is new, and a
     // pull that fails part-way is retried from where it stopped.
     m_replicationAgent = new ReplicationAgent(this);
+    // The replica password belongs beside this domain's other secrets, not in
+    // dc.conf: the provisioner writes private/secrets.json readable only by its
+    // owner, while dc.conf is ordinary configuration. An inline value is still
+    // honoured so an existing domain keeps working, but it is reported.
+    const QString replicaSecretsPath =
+        dcConfig.value(QStringLiteral("secretsPath"),
+                       resolvedDcDir + QStringLiteral("/private/secrets.json"))
+            .toString();
+    const auto replicaPasswordFromSecrets = [](const QString &path) {
+        QFile file(path);
+        if (!file.open(QIODevice::ReadOnly))
+            return QString();
+        return QJsonDocument::fromJson(file.readAll())
+            .object()
+            .value(QStringLiteral("replicaPassword"))
+            .toString();
+    };
+    QString replicaPassword = replicaPasswordFromSecrets(replicaSecretsPath);
+    if (replicaPassword.isEmpty()) {
+        replicaPassword = dcConfig.value(QStringLiteral("replicaPassword")).toString();
+        if (!replicaPassword.isEmpty()) {
+            emit statusMessage(
+                tr("Replica credentials are being read from dc.conf; move replicaPassword "
+                   "into %1, which is readable only by its owner.")
+                    .arg(replicaSecretsPath));
+        }
+    }
     m_replicationAgent->setCredentials(
         dcConfig.value(QStringLiteral("replicaDomain"), krbRealm.netbios).toString(),
-        dcConfig.value(QStringLiteral("replicaUser")).toString(),
-        dcConfig.value(QStringLiteral("replicaPassword")).toString());
+        dcConfig.value(QStringLiteral("replicaUser")).toString(), replicaPassword);
     m_replicationAgent->setNamingContext(
         dcConfig.value(QStringLiteral("replicaNamingContext"), m_baseDn).toString());
     m_replicationAgent->setSink([this](const QList<DirectoryObject> &objects) {
