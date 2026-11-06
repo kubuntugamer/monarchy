@@ -535,38 +535,63 @@ bool DcService::start(const QString &dcDir)
     // it on its own schedule instead of waiting for an administrator to ask. The
     // cursor lives in the agent, so each pull asks only for what is new, and a
     // pull that fails part-way is retried from where it stopped.
+    m_replicationAgent = new ReplicationAgent(this);
+    m_replicationAgent->setCredentials(
+        dcConfig.value(QStringLiteral("replicaDomain"), krbRealm.netbios).toString(),
+        dcConfig.value(QStringLiteral("replicaUser")).toString(),
+        dcConfig.value(QStringLiteral("replicaPassword")).toString());
+    m_replicationAgent->setNamingContext(
+        dcConfig.value(QStringLiteral("replicaNamingContext"), m_baseDn).toString());
+    m_replicationAgent->setSink([this](const QList<DirectoryObject> &objects) {
+        return m_ldapServer->applyReplication(objects);
+    });
+    connect(m_replicationAgent, &ReplicationAgent::pulled, this,
+            [this](const QString &summary) { emit statusMessage(summary); });
+
+    const int replicaSeconds =
+        qMax(1, dcConfig.value(QStringLiteral("replicaIntervalSeconds"), 300).toInt());
+    m_replicaTimer = new QTimer(this);
+    m_replicaTimer->setInterval(replicaSeconds * 1000);
+    connect(m_replicaTimer, &QTimer::timeout, this, [this]() {
+        if (m_replicationAgent->source().isEmpty())
+            return;
+        QString error;
+        if (m_replicationAgent->pullOnce(&error) < 0) {
+            emit statusMessage(tr("Replication pull from %1 failed: %2")
+                                   .arg(m_replicationAgent->source(), error));
+        }
+    });
+
+    // DsReplicaAdd names the source the way a Windows client does: a bare host,
+    // host:port, or an ncacn_ip_tcp binding.
+    connect(m_drsServer, &DrsServer::replicaSourceAdded, this,
+            [this](const QString &address, const QString &) {
+                QString host = address;
+                quint16 port = 0;
+                if (host.startsWith(QStringLiteral("ncacn_ip_tcp:")))
+                    host.remove(0, 13);
+                const int bracket = host.indexOf(QLatin1Char('['));
+                if (bracket >= 0) {
+                    port = quint16(host.mid(bracket + 1).remove(QLatin1Char(']')).toUShort());
+                    host.truncate(bracket);
+                } else if (host.count(QLatin1Char(':')) == 1) {
+                    port = quint16(host.section(QLatin1Char(':'), 1).toUShort());
+                    host = host.section(QLatin1Char(':'), 0, 0);
+                }
+                m_replicationAgent->setSource(host, port);
+                if (!m_replicaTimer->isActive())
+                    m_replicaTimer->start();
+                emit statusMessage(tr("Replication source %1 registered.").arg(address));
+            });
+
     const QString replicaHost = dcConfig.value(QStringLiteral("replicaHost")).toString();
     if (!replicaHost.isEmpty()) {
-        m_replicationAgent = new ReplicationAgent(this);
         m_replicationAgent->setSource(
             replicaHost, quint16(dcConfig.value(QStringLiteral("replicaPort"), 0).toInt()));
-        m_replicationAgent->setCredentials(
-            dcConfig.value(QStringLiteral("replicaDomain"), krbRealm.netbios).toString(),
-            dcConfig.value(QStringLiteral("replicaUser")).toString(),
-            dcConfig.value(QStringLiteral("replicaPassword")).toString());
-        m_replicationAgent->setNamingContext(
-            dcConfig.value(QStringLiteral("replicaNamingContext"), m_baseDn).toString());
-        m_replicationAgent->setSink([this](const QList<DirectoryObject> &objects) {
-            return m_ldapServer->applyReplication(objects);
-        });
-        connect(m_replicationAgent, &ReplicationAgent::pulled, this,
-                [this](const QString &summary) { emit statusMessage(summary); });
-        const int seconds = dcConfig.value(QStringLiteral("replicaIntervalSeconds"), 300).toInt();
-        if (seconds > 0) {
-            m_replicaTimer = new QTimer(this);
-            m_replicaTimer->setInterval(seconds * 1000);
-            connect(m_replicaTimer, &QTimer::timeout, this, [this]() {
-                QString error;
-                if (m_replicationAgent->pullOnce(&error) < 0) {
-                    emit statusMessage(tr("Replication pull from %1 failed: %2")
-                                           .arg(m_replicationAgent->source(), error));
-                }
-            });
-            m_replicaTimer->start();
-        }
+        m_replicaTimer->start();
         emit statusMessage(tr("Pulling replication from %1 every %2s.")
                                .arg(m_replicationAgent->source())
-                               .arg(seconds));
+                               .arg(replicaSeconds));
     }
 
     // The endpoint mapper: the answer a client gets when it knows an interface

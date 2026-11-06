@@ -6,6 +6,7 @@
 
 #include <QByteArray>
 #include <QHash>
+#include <QList>
 #include <QHostAddress>
 #include <QObject>
 #include <QString>
@@ -26,6 +27,15 @@
 // DsReplicaSync and DsReplicaUpdateRefs are
 // answered as the lifecycle calls a replication cycle makes; other calls are
 // refused with kWerrNotSupported rather than described falsely.
+
+// A replication source registered with DsReplicaAdd: the naming context it
+// feeds and the address to pull from.
+struct ReplicaSource
+{
+    QString ncDn;
+    QString address;
+    quint32 options = 0;
+};
 
 namespace Drs {
 
@@ -67,13 +77,19 @@ public:
     // One request in, one response out (endpoint and tests).
     QByteArray handleCall(quint16 opnum, const QByteArray &stub);
 
+    // The links an administrator registered at run time, so the daemon's pull
+    // agent can start using one without a restart.
+    QList<ReplicaSource> replicaSources() const { return m_replicaSources; }
+
 signals:
     void requestReceived(const QString &operation);
+    void replicaSourceAdded(const QString &address, const QString &ncDn);
 
 private:
     QByteArray drsBind(const QByteArray &stub);
     QByteArray drsUnbind(const QByteArray &stub);
     QByteArray drsReplicaSync(const QByteArray &stub);
+    QByteArray drsReplicaAdd(const QByteArray &stub);
     QByteArray drsUpdateRefs(const QByteArray &stub);
     QByteArray drsGetNCChanges(const QByteArray &stub);
     QByteArray drsDomainControllerInfo(const QByteArray &stub);
@@ -90,6 +106,7 @@ private:
     RpcServer *m_rpc = nullptr;
     std::function<QList<DirectoryObject>()> m_provider;
     QHash<QUuid, QString> m_handles; // bind handle → principal state
+    QList<ReplicaSource> m_replicaSources;
 };
 
 #endif // DRS_H

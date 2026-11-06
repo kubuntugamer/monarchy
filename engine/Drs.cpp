@@ -1288,6 +1288,122 @@ QByteArray DrsServer::drsReplicaSync(const QByteArray &stub)
     return stubReply(kWerrOk);
 }
 
+// A deferred `[string] WCHAR *` (MS-DRSR 4.1.28 source_dsa_address): the count
+// with its terminator, then the characters. A peer marshalling it as a
+// conformant varying array puts the offset word first instead; both are read,
+// since that offset is always zero here and a real first character never is.
+bool readDeferredString(Ndr::Reader *reader, QString *text)
+{
+    quint32 count = 0;
+    if (!reader->u32(&count) || count == 0 || count > 8192)
+        return false;
+    quint32 word = 0;
+    if (!reader->u32(&word))
+        return false;
+    QByteArray chars;
+    if (word == 0) {
+        quint32 actual = 0;
+        if (!reader->u32(&actual) || actual == 0 || actual > count)
+            return false;
+        if (!reader->bytes(int(actual) * 2, &chars))
+            return false;
+    } else {
+        // The word just read is the first two characters; the reader replaces
+        // its output buffer, so it is written before the rest is appended.
+        QByteArray rest;
+        if (!reader->bytes(int(count) * 2 - 4, &rest))
+            return false;
+        putLe32(chars, word);
+        chars.append(rest);
+    }
+    reader->align(4);
+    QString value = QString::fromUtf16(reinterpret_cast<const char16_t *>(chars.constData()),
+                                       int(chars.size() / 2));
+    while (value.endsWith(QChar(u'\0')))
+        value.chop(1);
+    if (value.isEmpty())
+        return false;
+    *text = value;
+    return true;
+}
+
+// DsReplicaAdd (opnum 5): register a replication source for a naming context.
+// AD keeps the source in the NC's repsFrom and its DRA pulls from it; here the
+// link is recorded and announced, so the daemon's agent takes it up rather than
+// the call being acknowledged and forgotten.
+QByteArray DrsServer::drsReplicaAdd(const QByteArray &stub)
+{
+    Ndr::Reader reader(stub);
+    QByteArray handleBytes;
+    if (!reader.bytes(kDrsHandleSize, &handleBytes))
+        return QByteArray();
+    if (!m_handles.contains(guidFromBytes(handleBytes)))
+        return stubReply(kWerrInvalidHandle);
+
+    quint32 level = 0;
+    if (!reader.u32(&level))
+        return QByteArray();
+    if (level != 1 && level != 2)
+        return stubReply(kWerrNotSupported);
+
+    quint32 ncReferent = 0;
+    quint32 sourceReferent = 0;
+    quint32 transportReferent = 0;
+    quint32 addressReferent = 0;
+    if (!reader.u32(&ncReferent))
+        return QByteArray();
+    if (level == 2 && (!reader.u32(&sourceReferent) || !reader.u32(&transportReferent)))
+        return QByteArray();
+    if (!reader.u32(&addressReferent))
+        return QByteArray();
+    QByteArray schedule;
+    if (!reader.bytes(84, &schedule))
+        return QByteArray();
+    quint32 options = 0;
+    if (!reader.u32(&options))
+        return QByteArray();
+
+    QString ncDn;
+    QUuid ncGuid;
+    QByteArray ncSid;
+    quint32 ncSidLen = 0;
+    if (ncReferent != 0 && !readDsName(&reader, &ncDn, &ncGuid, &ncSid, &ncSidLen))
+        return stubReply(kWerrNotSupported);
+
+    // Level 2 also defers the source DSA and transport DSNAMEs. Where a change
+    // comes from is the address, so these are walked for position only.
+    for (const quint32 referent : {sourceReferent, transportReferent}) {
+        if (referent == 0)
+            continue;
+        QString ignoredDn;
+        QUuid ignoredGuid;
+        QByteArray ignoredSid;
+        quint32 ignoredSidLen = 0;
+        if (!readDsName(&reader, &ignoredDn, &ignoredGuid, &ignoredSid, &ignoredSidLen))
+            return stubReply(kWerrNotSupported);
+    }
+
+    QString address;
+    if (addressReferent != 0 && !readDeferredString(&reader, &address))
+        return stubReply(kWerrNotSupported);
+    if (address.isEmpty())
+        return stubReply(kWerrNotSupported);
+
+    const QString nc = ncDn.isEmpty() ? baseDn() : ncDn;
+    if (nc.compare(baseDn(), Qt::CaseInsensitive) != 0)
+        return stubReply(kWerrNotSupported); // only this NC is served here
+
+    for (const ReplicaSource &known : m_replicaSources) {
+        if (known.address.compare(address, Qt::CaseInsensitive) == 0
+            && known.ncDn.compare(nc, Qt::CaseInsensitive) == 0)
+            return stubReply(kWerrOk);
+    }
+    m_replicaSources.append(ReplicaSource{nc, address, options});
+    emit requestReceived(QStringLiteral("DsReplicaAdd(%1) for %2").arg(address, nc));
+    emit replicaSourceAdded(address, nc);
+    return stubReply(kWerrOk);
+}
+
 QByteArray DrsServer::drsUpdateRefs(const QByteArray &stub)
 {
     Ndr::Reader reader(stub);
@@ -1650,6 +1766,8 @@ QByteArray DrsServer::handleCall(quint16 opnum, const QByteArray &stub)
         return drsReplicaSync(stub);
     case 4:
         return drsUpdateRefs(stub);
+    case 5:
+        return drsReplicaAdd(stub);
     default:
         // Only the calls this server implements are described; the rest are
         // refused rather than answered as if understood.

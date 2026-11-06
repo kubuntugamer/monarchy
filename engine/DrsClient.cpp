@@ -4,6 +4,7 @@
 #include "DrsClient.h"
 
 #include <QDateTime>
+#include <QTimeZone>
 #include <QDeadlineTimer>
 #include <QTcpSocket>
 #include <QUuid>
@@ -193,7 +194,7 @@ QString fileTimeToIso(const QByteArray &bytes)
     if (ticks == 0)
         return QString();
     const qint64 msecs = qint64(ticks / 10000u) - Q_INT64_C(11644473600000);
-    return QDateTime::fromMSecsSinceEpoch(msecs, Qt::UTC).toString(Qt::ISODate);
+    return QDateTime::fromMSecsSinceEpoch(msecs, QTimeZone::UTC).toString(Qt::ISODate);
 }
 
 // One DSNAME as the reply defers it: the conformant character count precedes

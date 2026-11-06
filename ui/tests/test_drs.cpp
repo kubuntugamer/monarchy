@@ -45,6 +45,42 @@ quint64 readLe64(const QByteArray &data, int offset)
     return quint64(readLe32(data, offset)) | (quint64(readLe32(data, offset + 4)) << 32);
 }
 
+// A DsReplicaAdd level-1 request arm built from the reference IDL (MS-DRSR
+// 4.1.28, `drsuapi_DsReplicaAddRequest1`): the handle, the level, the two
+// referents, the 84-byte schedule and the options word, with the pointed-to
+// bodies deferred in referent order.
+QByteArray replicaAddRequest(const QByteArray &handle, const QString &ncDn,
+                             const QString &address)
+{
+    QByteArray out = handle;
+    appendLe32(out, 1u);              // level
+    appendLe32(out, 0x00020004u);     // naming_context referent
+    appendLe32(out, 0x00020008u);     // source_dsa_address referent
+    out.append(QByteArray(84, '\0')); // schedule[84]
+    appendLe32(out, 0u);              // options
+
+    // DSNAME: preCount, structLen, SidLen, GUID, the 28-byte SID slot, NameLen,
+    // then the UTF-16 characters with their terminator.
+    const quint32 units = quint32(ncDn.size() + 1);
+    appendLe32(out, units);
+    appendLe32(out, 0u);
+    appendLe32(out, 0u);
+    out.append(QByteArray(16 + 28, '\0'));
+    appendLe32(out, units * 2);
+    out.append(Ndr::utf16le(ncDn + QChar(u'\0')));
+    while (out.size() % 4 != 0)
+        out.append('\0');
+
+    // The address as a [string]: the count with its terminator, then the
+    // characters.
+    const quint32 addressUnits = quint32(address.size() + 1);
+    appendLe32(out, addressUnits);
+    out.append(Ndr::utf16le(address + QChar(u'\0')));
+    while (out.size() % 4 != 0)
+        out.append('\0');
+    return out;
+}
+
 void padTo8(QByteArray &out)
 {
     while (out.size() % 8 != 0)
@@ -358,6 +394,51 @@ private slots:
         // The numbers those methods actually own must not be answered here.
         QCOMPARE(readLe32(server.handleCall(21, handle), 0), quint32(0x57));
         QCOMPARE(readLe32(server.handleCall(22, handle), 0), quint32(0x57));
+    }
+
+    // DsReplicaAdd registers a source for this NC and announces it; a second
+    // add of the same source is a no-op, and an NC or a handle this DC does not
+    // serve is refused rather than recorded.
+    void dsReplicaAddRegistersASource()
+    {
+        DrsServer server;
+        server.setConfig(config());
+        server.setObjectProvider([this]() { return fixture(); });
+
+        QStringList announced;
+        QObject::connect(&server, &DrsServer::replicaSourceAdded,
+                         [&announced](const QString &address, const QString &) {
+                             announced.append(address);
+                         });
+
+        const QByteArray handle = server.handleCall(0, bindRequest()).mid(64, 20);
+        const QString ncDn = QStringLiteral("DC=corp,DC=example,DC=com");
+        const QString address = QStringLiteral("dc02.corp.example.com");
+        const QByteArray request = replicaAddRequest(handle, ncDn, address);
+
+        const QByteArray reply = server.handleCall(5, request);
+        QCOMPARE(reply.size(), 4);
+        QCOMPARE(readLe32(reply, 0), quint32(0));
+        QCOMPARE(server.replicaSources().size(), 1);
+        QCOMPARE(server.replicaSources().first().ncDn, ncDn);
+        QCOMPARE(server.replicaSources().first().address, address);
+        QCOMPARE(announced, QStringList{address});
+
+        // The same source twice is one link, not two.
+        QCOMPARE(readLe32(server.handleCall(5, request), 0), quint32(0));
+        QCOMPARE(server.replicaSources().size(), 1);
+        QCOMPARE(announced.size(), 1);
+
+        // A naming context this DC does not serve is refused.
+        const QString otherNc = QStringLiteral("DC=other,DC=example,DC=com");
+        QCOMPARE(readLe32(server.handleCall(5, replicaAddRequest(handle, otherNc, address)), 0),
+                 quint32(0x57));
+        QCOMPARE(server.replicaSources().size(), 1);
+
+        // A forged handle, an unknown level and a truncated arm are refused.
+        QCOMPARE(readLe32(server.handleCall(5, QByteArray(20, '\x7f')), 0), quint32(0x000006f7));
+        QCOMPARE(readLe32(server.handleCall(5, handle + QByteArray(24, '\0')), 0), quint32(0x57));
+        QCOMPARE(readLe32(server.handleCall(5, handle + QByteArray(64, '\0')), 0), quint32(0x57));
     }
 
     // A deletion is not an absence: the object leaves the live store but stays
