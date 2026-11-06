@@ -32,8 +32,11 @@ exactly as it would to a remote domain controller. Ordinary Kerberos clients
   ignored. **StartTLS** upgrades a live connection in place, presenting the
   DC certificate the provisioner created; a domain provisioned without
   `openssl` refuses StartTLS instead of pretending to encrypt. Passwords arrive as `unicodePwd`/`userPassword`,
-  are checked against policy and stored as salted verifiers plus the AD NT hash
-  (NTOWFv1) — none of which a search ever returns — and `userAccountControl` is
+  are checked against the domain policy the domain object carries under AD's own
+  attribute names (`minPwdLength`, `pwdHistoryLength`, `pwdProperties`, with
+  default 7 / 24 / complexity on) and stored as salted verifiers plus the AD NT
+  hash (NTOWFv1) — none of which a search ever returns, nor the remembered
+  hashes the policy compares against — and `userAccountControl` is
   honoured, so a disabled account cannot authenticate. Authentication itself is
   available three ways: simple bind; **NTLMv2 over LDAP SASL** (mechanism
   `NTLM`, GSS-SPNEGO tokens accepted), with CHALLENGE/AUTHENTICATE verified
@@ -514,8 +517,11 @@ LDAP SASL** verifies an NtChallengeResponse against the NT hash (HMAC-MD5,
 NTOWFv1); **Kerberos** derives AES-256/AES-128 and RC4-HMAC keys from the same
 password, so the KDC issues tickets for them and `kinit` works against the
 realm.
-Passwords must meet a minimum length plus three of the four character classes,
-and disabled accounts cannot bind by any of the three mechanisms. The sample
+Passwords must meet the domain's minimum length, use three of the four
+character classes when complexity is on, and not repeat one of the remembered
+ones; a password refused by policy leaves the account's previous credential in
+place. Disabled accounts cannot bind by any of the three mechanisms, and an
+account outside its logon week is refused. The sample
 directory has no credentials and therefore still accepts any bind, and LDAP
 traffic is plaintext — use the OpenLDAP build with LDAPS towards a remote
 server.
@@ -719,9 +725,9 @@ Protocol references used for this
 (Samba's `samr`/`lsa`/`drsuapi`/`netlogon`/`epmapper` IDLs and impacket's
 `samr`/`lsad`/`epm` clients, with
 provenance and licences) are held in `reference/specs/`. Everything else — the
-domain information classes beyond the lockout policy, writing to the read-only
-`BUILTIN` domain that holds AD's local groups, and the Netlogon trust channel to
-a partner — is not claimed to work; `DsReplicaAdd` with the multi-DC half
+domain information classes beyond the password and lockout policies, writing to
+the read-only `BUILTIN` domain that holds AD's local groups, and the Netlogon
+trust channel to a partner — is not claimed to work; `DsReplicaAdd` with the multi-DC half
 of replication is not implemented, nor is SMB 3.x, so there is no SMB
 encryption or preauth integrity. `IPC$` carries the named pipes
 `\pipe\samr`, `\pipe\lsarpc`, `\pipe\netlogon` and `\pipe\epmapper`, and

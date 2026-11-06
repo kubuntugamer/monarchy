@@ -7,6 +7,7 @@
 #include <QRandomGenerator>
 
 #include <algorithm>
+#include <limits>
 #include <QStringList>
 #include <QDebug>
 
@@ -1095,18 +1096,26 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
         };
         switch (infoClass) {
         case 1: { // DomainPasswordInformation: the policy this server enforces
+            // Read from the domain object's own attributes, so a client that
+            // sets the policy over SAMR and one that reads it over LDAP see the
+            // same values. Both ages travel as AD stores them: a delta time is
+            // a negative count of 100-nanosecond units, and the struct puts the
+            // two 8-byte members last, already aligned after the 8 bytes above.
+            const LdapServer::PasswordPolicy policy =
+                LdapServer::passwordPolicyFrom(domainObject());
             beginArm(1);
-            fixed.append(char(LdapServer::kPasswordMinLength & 0xff));
-            fixed.append(char((LdapServer::kPasswordMinLength >> 8) & 0xff));
-            // No password history and no maximum age are enforced, so reporting
-            // zero is the truth rather than a policy nobody applies.
-            fixed.append(char(0));
-            fixed.append(char(0));
-            putLe32(fixed, 1u);                 // DOMAIN_PASSWORD_COMPLEX
-            fixed.append(QByteArray(8, '\0'));  // MaxPasswordAge
-            fixed.append(QByteArray(8, '\0'));  // MinPasswordAge
+            fixed.append(char(policy.minLength & 0xff));
+            fixed.append(char((policy.minLength >> 8) & 0xff));
+            fixed.append(char(policy.historyLength & 0xff));
+            fixed.append(char((policy.historyLength >> 8) & 0xff));
+            putLe32(fixed, policy.properties);
+            putLe64(fixed, quint64(policy.maxAge));
+            putLe64(fixed, quint64(policy.minAge));
             putLe32(fixed, kStatusSuccess);
-            emit requestReceived(QStringLiteral("QueryInformationDomain(password)"));
+            emit requestReceived(QStringLiteral("QueryInformationDomain(password %1/%2/0x%3)")
+                                     .arg(policy.minLength)
+                                     .arg(policy.historyLength)
+                                     .arg(policy.properties, 0, 16));
             return fixed;
         }
         case 2: { // DomainGeneralInformation: what rpcclient's `querydominfo`
@@ -1213,6 +1222,68 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
         if (domain.dn == kBuiltinDomainSid) {
             // BUILTIN has no password or lockout policy of its own.
             putLe32(fixed, kStatusNotSupported);
+            return fixed;
+        }
+        if (infoClass == 1) {
+            // The password policy, in the shape the query answers with: two
+            // 16-bit counts, a 32-bit flag word and two delta-time ages. AD
+            // refuses a positive relative time outright (a delta time is a
+            // negative count of 100-nanosecond units) and refuses a maximum
+            // age that is shorter than the minimum, which together would make
+            // every password expire before it could be set.
+            quint16 minLength = 0;
+            quint16 historyLength = 0;
+            quint32 properties = 0;
+            quint64 maxAge = 0;
+            quint64 minAge = 0;
+            // The union carries two 8-byte members, so NDR aligns the arm that
+            // holds them to 8: the pad after the information class is part of
+            // the wire form, not an artefact of any one client.
+            reader.align(8);
+            if (!reader.u16(&minLength) || !reader.u16(&historyLength)
+                || !reader.u32(&properties))
+                return {};
+            reader.align(8);
+            if (!reader.u64(&maxAge) || !reader.u64(&minAge))
+                return {};
+            const qint64 maxDelta = qint64(maxAge);
+            const qint64 minDelta = qint64(minAge);
+            const qint64 never = std::numeric_limits<qint64>::min();
+            const auto positive = [](qint64 value) { return value > 0; };
+            const auto magnitude = [](qint64 value) {
+                return value < 0 ? quint64(-(value + 1)) + 1 : quint64(value);
+            };
+            const bool badAge = positive(maxDelta) || positive(minDelta)
+                                || (maxDelta != 0 && maxDelta != never
+                                    && magnitude(maxDelta) < magnitude(minDelta));
+            if (badAge) {
+                putLe32(fixed, kStatusInvalidParameter);
+                emit requestReceived(QStringLiteral("SetInformationDomain(password) refused"));
+                return fixed;
+            }
+            const DirectoryObject target = domainObject();
+            const QString dn = target.id.isEmpty() ? m_config.baseDn : target.id;
+            const QList<QPair<QString, QString>> changes = {
+                {QStringLiteral("minPwdLength"), QString::number(minLength)},
+                {QStringLiteral("pwdHistoryLength"), QString::number(historyLength)},
+                {QStringLiteral("pwdProperties"), QString::number(properties)},
+                {QStringLiteral("maxPwdAge"), QString::number(maxDelta)},
+                {QStringLiteral("minPwdAge"), QString::number(minDelta)},
+            };
+            bool ok = !dn.isEmpty();
+            QString error;
+            for (const auto &change : changes) {
+                if (!ok)
+                    break;
+                ok = m_writes.set && m_writes.set(dn, change.first, change.second, &error);
+            }
+            putLe32(fixed, ok ? kStatusSuccess : kStatusInvalidParameter);
+            emit requestReceived(
+                QStringLiteral("SetInformationDomain(password %1/%2/0x%3) %4")
+                    .arg(minLength)
+                    .arg(historyLength)
+                    .arg(properties, 0, 16)
+                    .arg(ok ? QStringLiteral("ok") : QStringLiteral("refused")));
             return fixed;
         }
         if (infoClass != 12) {

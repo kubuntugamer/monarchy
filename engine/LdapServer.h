@@ -144,9 +144,34 @@ public:
     // password does not meet policy, 32 noSuchObject.
     int applyModify(const QString &dn, const QList<ModifyChange> &changes);
 
-    // Minimum password length the directory enforces. SAMR reports it as the
-    // domain password policy too, so a client is told what is actually checked.
+    // AD's domain password policy, as the domain object carries it: minPwdLength,
+    // pwdHistoryLength, pwdProperties and the two ages. The ages keep AD's own
+    // encoding — a delta time is a negative count of 100-nanosecond units — so
+    // what a client reads over LDAP is what SAMR reports on the wire.
+    struct PasswordPolicy {
+        int minLength = kPasswordMinLength;
+        int historyLength = kPasswordHistoryLength;
+        quint32 properties = kPasswordComplex;
+        qint64 maxAge = kPasswordMaxAge;
+        qint64 minAge = kPasswordMinAge;
+    };
+    // What the domain object holds, falling back to AD's default domain policy
+    // for anything it does not carry. Static so SAMR reads the same values.
+    static PasswordPolicy passwordPolicyFrom(const DirectoryObject &domain);
+    PasswordPolicy passwordPolicy() const;
+
+    // pwdProperties bits this server acts on. MS-SAMR 2.2.3.5 defines the rest
+    // (anonymous-change and clear-change rules, reversible encryption, locking
+    // out the built-in Administrator), and they are reported but not enforced.
+    static constexpr quint32 kPasswordComplex = 0x1;
+
+    // AD's default domain policy, which is what a freshly promoted domain has:
+    // 7 characters, 24 remembered passwords, complexity on, a password is good
+    // for 42 days and cannot be changed again for a day.
     static constexpr int kPasswordMinLength = 7;
+    static constexpr int kPasswordHistoryLength = 24;
+    static constexpr qint64 kPasswordMaxAge = -36288000000000LL; // 42 days
+    static constexpr qint64 kPasswordMinAge = -864000000000LL;   // 1 day
 
     // Group membership is stored as distinguished names, exactly as AD stores
     // `member`, and every `memberOf` is derived from the groups' member lists.
@@ -260,6 +285,11 @@ private:
     }
     QByteArray saslFrame(ClientState *st, const QByteArray &data);
     bool saslUnframe(ClientState *st, QByteArray *out);
+    // Whether a password passes the domain policy, and whether it is one of the
+    // account's remembered passwords. `reason` says which rule refused it.
+    bool passwordMeetsPolicy(const QString &password, QString *reason) const;
+    bool passwordWasUsed(const DirectoryObject &object, const QString &password,
+                         QString *reason) const;
     // NetBIOS domain and DC host name published in the NTLM challenge.
     QString ntlmDomainName() const;
     QString ntlmServerName() const;

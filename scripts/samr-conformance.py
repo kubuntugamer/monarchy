@@ -41,6 +41,10 @@ CHECKS = [
     'SamrEnumerateDomainsInSamServer',
     'SamrLookupDomainInSamServer',
     'SamrOpenDomain',
+    'SamrQueryInformationDomain(password)',
+    'SamrSetInformationDomain(password)',
+    'SamrSetInformationDomain refuses an impossible password policy',
+    'SamrSetInformationDomain restores the default policy',
     'SamrEnumerateDomainsInSamServer lists BUILTIN',
     'SamrOpenDomain / SamrEnumerateAliasesInDomain (BUILTIN)',
     'SamrLookupNamesInDomain (BUILTIN)',
@@ -73,6 +77,10 @@ CHECKS = [
     DOMAINS,
     LOOKUP_DOMAIN,
     OPEN_DOMAIN,
+    PASSWORD_POLICY_QUERY,
+    PASSWORD_POLICY_SET,
+    PASSWORD_POLICY_REFUSED,
+    PASSWORD_POLICY_RESTORED,
     DOMAINS_BUILTIN,
     BUILTIN_ALIASES,
     BUILTIN_NAMES,
@@ -123,6 +131,36 @@ def list_field(container):
             if found is not None:
                 return found
     return None
+
+
+def delta_value(field):
+    """AD carries a relative time as a negative count of 100-nanosecond units,
+    and impacket decodes OLD_LARGE_INTEGER as a signed high half and a low
+    half."""
+    value = ((field['HighPart'] & 0xffffffff) << 32) | field['LowPart']
+    return value - (1 << 64) if value >= (1 << 63) else value
+
+
+def set_delta(field, value):
+    """The inverse: write a signed 64-bit count into the two halves."""
+    unsigned = value & 0xffffffffffffffff
+    field['LowPart'] = unsigned & 0xffffffff
+    field['HighPart'] = unsigned >> 32
+    if field['HighPart'] >= 0x80000000:
+        field['HighPart'] -= 1 << 32
+
+
+def password_policy(min_length, history, properties, max_age, min_age):
+    """The class 1 arm as MS-SAMR 2.2.3.5 declares it: two counts, the flag
+    word and the two ages."""
+    buffer = samr.SAMPR_DOMAIN_INFO_BUFFER()
+    buffer['tag'] = samr.DOMAIN_INFORMATION_CLASS.DomainPasswordInformation
+    buffer['Password']['MinPasswordLength'] = min_length
+    buffer['Password']['PasswordHistoryLength'] = history
+    buffer['Password']['PasswordProperties'] = properties
+    set_delta(buffer['Password']['MaxPasswordAge'], max_age)
+    set_delta(buffer['Password']['MinPasswordAge'], min_age)
+    return buffer
 
 
 def connect(options):
@@ -184,6 +222,58 @@ def main():
           domain_id.formatCanonical() if hasattr(domain_id, 'formatCanonical') else 'domain')
     domain = samr.hSamrOpenDomain(dce, server, MAXIMUM_ALLOWED, domain_id)['DomainHandle']
     check(OPEN_DOMAIN, True)
+
+    # The password policy is the domain object's own state under the attribute
+    # names AD uses, and SAMR reports it as MS-SAMR declares it: the two ages
+    # are delta times, meaning negative 100-nanosecond counts, which is what a
+    # client has to see if it is to trust the numbers. A freshly promoted domain
+    # has AD's default policy.
+    def read_policy():
+        info = samr.hSamrQueryInformationDomain(dce, domain, 1)['Buffer']['Password']
+        return (info['MinPasswordLength'], info['PasswordHistoryLength'],
+                info['PasswordProperties'], delta_value(info['MaxPasswordAge']),
+                delta_value(info['MinPasswordAge']))
+
+    defaults = (7, 24, 1, -36288000000000, -864000000000)
+    try:
+        values = read_policy()
+        check(PASSWORD_POLICY_QUERY, values == defaults, values)
+    except Exception as error:  # noqa: BLE001
+        check(PASSWORD_POLICY_QUERY, False, '%s: %s' % (type(error).__name__, error))
+
+    try:
+        samr.hSamrSetInformationDomain(
+            dce, domain, password_policy(12, 3, 1, -864000000000, -864000000000))
+        written = read_policy()
+        check(PASSWORD_POLICY_SET, written == (12, 3, 1, -864000000000, -864000000000),
+              written)
+    except Exception as error:  # noqa: BLE001
+        check(PASSWORD_POLICY_SET, False, '%s: %s' % (type(error).__name__, error))
+
+    # A maximum age shorter than the minimum would expire every password before
+    # it could be set, so it is refused and nothing is written: the policy the
+    # previous check set is still what the server reports.
+    try:
+        samr.hSamrSetInformationDomain(
+            dce, domain,
+            password_policy(12, 3, 1, -864000000000, -1728000000000))
+        check(PASSWORD_POLICY_REFUSED, False, 'accepted an impossible policy')
+    except Exception as error:  # noqa: BLE001
+        refused = '0xc000000d' in str(error).lower()
+        restored = read_policy() == (12, 3, 1, -864000000000, -864000000000)
+        check(PASSWORD_POLICY_REFUSED, refused and restored,
+              '%s: %s' % (type(error).__name__, error))
+
+    # Leave the domain as it was found, so the drivers that run after this one
+    # see AD's default policy.
+    try:
+        samr.hSamrSetInformationDomain(
+            dce, domain,
+            password_policy(defaults[0], defaults[1], defaults[2],
+                            defaults[3], defaults[4]))
+        check(PASSWORD_POLICY_RESTORED, read_policy() == defaults, read_policy())
+    except Exception as error:  # noqa: BLE001
+        check(PASSWORD_POLICY_RESTORED, False, '%s: %s' % (type(error).__name__, error))
 
     # Every DC reports BUILTIN next to the account domain: it is where AD keeps
     # the well-known local groups, and their SIDs are in ACLs everywhere.

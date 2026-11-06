@@ -527,37 +527,38 @@ QString decodePasswordValue(const QByteArray &raw, const QString &fallback)
     return QString::fromUtf8(bytes);
 }
 
-// Baseline of the AD complexity policy: at least three of the four character
-// classes, and the minimum length. Group Policy fine-grained policies are not
-// modelled yet.
-bool passwordMeetsPolicy(const QString &password, QString *reason)
+// The remembered passwords, as the account object carries them: the NT hashes
+// of the passwords it used to have, newest first, comma separated. AD keeps the
+// same information in its own credential store rather than as an attribute.
+QStringList rememberedHashes(const DirectoryObject &object)
 {
-    if (password.size() < LdapServer::kPasswordMinLength || password.size() > 256) {
-        if (reason)
-            *reason = QStringLiteral("password must be at least %1 characters")
-                          .arg(LdapServer::kPasswordMinLength);
-        return false;
+    return object.attributes.value(QStringLiteral("userPasswordHistory"))
+        .split(QLatin1Char(','), Qt::SkipEmptyParts);
+}
+
+// Rolls the current password into the history and keeps at most `historyLength`
+// entries. A policy of zero remembers nothing, as AD's does.
+void rememberPassword(DirectoryObject &object, int historyLength)
+{
+    QStringList history = rememberedHashes(object);
+    const QString previous = object.attributes.value(QStringLiteral("ntHash"));
+    if (!previous.isEmpty()) {
+        history.removeAll(previous);
+        history.prepend(previous);
     }
-    int classes = 0;
-    bool upper = false, lower = false, digit = false, other = false;
-    for (const QChar c : password) {
-        if (c.isUpper()) upper = true;
-        else if (c.isLower()) lower = true;
-        else if (c.isDigit()) digit = true;
-        else other = true;
-    }
-    classes = int(upper) + int(lower) + int(digit) + int(other);
-    if (classes < 3) {
-        if (reason)
-            *reason = QStringLiteral("password must use three of the four character classes");
-        return false;
-    }
-    return true;
+    while (history.size() > historyLength)
+        history.removeLast();
+    if (history.isEmpty())
+        object.attributes.remove(QStringLiteral("userPasswordHistory"));
+    else
+        object.attributes.insert(QStringLiteral("userPasswordHistory"),
+                                 history.join(QLatin1Char(',')));
 }
 
 void storePasswordVerifier(DirectoryObject &object, const QString &password,
-                           const QString &realm)
+                           const QString &realm, int historyLength)
 {
+    rememberPassword(object, historyLength);
     QByteArray salt;
     for (int i = 0; i < 2; ++i) {
         const quint64 value = QRandomGenerator::system()->generate64();
@@ -598,6 +599,7 @@ bool isSecretAttribute(const QString &type)
            || type.compare(QLatin1String("userpasswordhash"), Qt::CaseInsensitive) == 0
            || type.compare(QLatin1String("passwordscheme"), Qt::CaseInsensitive) == 0
            || type.compare(QLatin1String("nthash"), Qt::CaseInsensitive) == 0
+           || type.compare(QLatin1String("userpasswordhistory"), Qt::CaseInsensitive) == 0
            || type.compare(QLatin1String("aes128key"), Qt::CaseInsensitive) == 0
            || type.compare(QLatin1String("aes256key"), Qt::CaseInsensitive) == 0
            || type.compare(QLatin1String("kerberossalt"), Qt::CaseInsensitive) == 0;
@@ -648,6 +650,103 @@ QString rootDseNamingContext(const QList<DirectoryObject> &objects)
         if (!suffix.isEmpty()) return suffix.join(QLatin1Char(','));
     }
     return {};
+}
+
+LdapServer::PasswordPolicy LdapServer::passwordPolicyFrom(const DirectoryObject &domain)
+{
+    PasswordPolicy policy;
+    if (domain.id.isEmpty())
+        return policy;
+    const auto value = [&domain](const char *name) {
+        return domain.attributes.value(QString::fromLatin1(name));
+    };
+    bool ok = false;
+    const int minLength = value("minPwdLength").toInt(&ok);
+    if (ok)
+        policy.minLength = minLength;
+    const int history = value("pwdHistoryLength").toInt(&ok);
+    if (ok)
+        policy.historyLength = history;
+    const quint32 properties = value("pwdProperties").toUInt(&ok);
+    if (ok)
+        policy.properties = properties;
+    // AD stores a relative time as a negative count of 100-nanosecond units, and
+    // "never" as the most negative value a signed 64-bit integer can hold, which
+    // is what zero days turns into through the AD tools.
+    const qint64 maxAge = value("maxPwdAge").toLongLong(&ok);
+    if (ok)
+        policy.maxAge = maxAge;
+    const qint64 minAge = value("minPwdAge").toLongLong(&ok);
+    if (ok)
+        policy.minAge = minAge;
+    return policy;
+}
+
+LdapServer::PasswordPolicy LdapServer::passwordPolicy() const
+{
+    const QString dn = rootDseNamingContext(m_objects);
+    for (const DirectoryObject &object : m_objects) {
+        if (!dn.isEmpty() && object.id.compare(dn, Qt::CaseInsensitive) == 0)
+            return passwordPolicyFrom(object);
+    }
+    return passwordPolicyFrom(DirectoryObject());
+}
+
+// What AD's password policy checks, in the order a user meets it: the length
+// floor, the complexity rule, and the remembered passwords. Fine-grained
+// password policies (a PSO on an object or group) are not modelled, so this is
+// always the domain policy.
+bool LdapServer::passwordMeetsPolicy(const QString &password, QString *reason) const
+{
+    const PasswordPolicy policy = this->passwordPolicy();
+    if (password.size() < policy.minLength || password.size() > 256) {
+        if (reason)
+            *reason = QStringLiteral("password must be at least %1 characters")
+                          .arg(policy.minLength);
+        return false;
+    }
+    if ((policy.properties & kPasswordComplex) == 0)
+        return true;
+    // AD's rule: three of the four character classes, not counting the account
+    // name. The unaesthetic-looking count is AD's; it is why "abCD1" passes and
+    // "abcdefg" does not.
+    bool upper = false, lower = false, digit = false, other = false;
+    for (const QChar c : password) {
+        if (c.isUpper()) upper = true;
+        else if (c.isLower()) lower = true;
+        else if (c.isDigit()) digit = true;
+        else other = true;
+    }
+    const int classes = int(upper) + int(lower) + int(digit) + int(other);
+    if (classes < 3) {
+        if (reason)
+            *reason = QStringLiteral("password must use three of the four character classes");
+        return false;
+    }
+    return true;
+}
+
+bool LdapServer::passwordWasUsed(const DirectoryObject &object, const QString &password,
+                                 QString *reason) const
+{
+    const int historyLength = passwordPolicy().historyLength;
+    if (historyLength <= 0)
+        return false;
+    // The hash of the password being set, compared against the ones remembered
+    // for this account — including the current password, which a change may not
+    // repeat.
+    const QString candidate = QString::fromLatin1(Ntlm::ntowfV1(password).toHex());
+    if (object.attributes.value(QStringLiteral("ntHash")) == candidate) {
+        if (reason)
+            *reason = QStringLiteral("password was used before");
+        return true;
+    }
+    if (rememberedHashes(object).contains(candidate)) {
+        if (reason)
+            *reason = QStringLiteral("password was used before");
+        return true;
+    }
+    return false;
 }
 
 void LdapServer::ensureRootDse() {
@@ -1040,6 +1139,17 @@ bool LdapServer::setNtHash(const QString &dn, const QByteArray &ntHash, QString 
     }
 
     DirectoryObject &object = m_objects[index];
+    // The remembered-password rule applies to a hash write too: MS-SAMR 3.1.5.6.3
+    // looks for the new credential in the history before it applies it.
+    const QString candidate = QString::fromLatin1(ntHash.toHex());
+    if (passwordPolicy().historyLength > 0
+        && (object.attributes.value(QStringLiteral("ntHash")) == candidate
+            || rememberedHashes(object).contains(candidate))) {
+        if (error)
+            *error = QStringLiteral("password was used before");
+        return false;
+    }
+    rememberPassword(object, passwordPolicy().historyLength);
     // A hash is a credential of record, not an addition: the salted verifier
     // and the Kerberos keys the old password produced would otherwise keep
     // authenticating that password.
@@ -1104,12 +1214,13 @@ int LdapServer::applyModify(const QString &dn, const QList<ModifyChange> &change
             }
             const QString password = decodePasswordValue(change.rawValue, change.values.value(0));
             QString reason;
-            if (!passwordMeetsPolicy(password, &reason)) {
+            if (!passwordMeetsPolicy(password, &reason) || passwordWasUsed(object, password, &reason)) {
                 emit requestReceived(QStringLiteral("Password rejected: %1").arg(reason));
                 return 19; // constraintViolation
             }
             storePasswordVerifier(object, password,
-                                  m_kdc ? m_kdc->realm().realm : QString());
+                                  m_kdc ? m_kdc->realm().realm : QString(),
+                                  passwordPolicy().historyLength);
             continue;
         }
         if (type == QLatin1String("member")) {
@@ -2259,7 +2370,8 @@ QByteArray LdapServer::handleAdd(int msgId, const QByteArray &payload) {
                 return makeLdapResult(msgId, 0x69, 19); // constraintViolation
             }
             storePasswordVerifier(obj, password,
-                                  m_kdc ? m_kdc->realm().realm : QString());
+                                  m_kdc ? m_kdc->realm().realm : QString(),
+                                  passwordPolicy().historyLength);
             continue;
         }
         obj.attributes.insert(type, val);

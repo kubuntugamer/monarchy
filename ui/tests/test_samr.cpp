@@ -459,6 +459,7 @@ private slots:
     void ndrPrimitivesRoundTrip();
     void sidEncoding();
     void samrDirectoryCalls();
+    void samrServesTheDomainPasswordPolicy();
     void samrServesTheBuiltinDomain();
     void samrWritesAccountsAndGroups();
     void samrSetPasswordAndAccountControl();
@@ -521,6 +522,131 @@ void SamrTest::sidEncoding()
     QByteArray parsed;
     QVERIFY(Ndr::readSid(reader, &parsed));
     QCOMPARE(Ndr::sidToString(parsed), QStringLiteral("S-1-5-21-1-2-3-500"));
+}
+
+// The domain password policy lives on the domain object under the attribute
+// names AD uses, and SAMR both reports and writes it there: 7 characters, 24
+// remembered passwords, complexity on, and the two ages as negative
+// 100-nanosecond deltas. A policy that could not be honoured is refused rather
+// than accepted and dropped.
+void SamrTest::samrServesTheDomainPasswordPolicy()
+{
+    DirectoryObject domainObject;
+    domainObject.id = QStringLiteral("DC=corp,DC=example,DC=com");
+    domainObject.name = QStringLiteral("CORP");
+    domainObject.type = QStringLiteral("domainDNS");
+    domainObject.kind = ObjectKind::Domain;
+    domainObject.attributes.insert(QStringLiteral("objectSid"), QStringLiteral("S-1-5-21-1-2-3"));
+    domainObject.attributes.insert(QStringLiteral("minPwdLength"), QStringLiteral("12"));
+    domainObject.attributes.insert(QStringLiteral("pwdHistoryLength"), QStringLiteral("5"));
+    domainObject.attributes.insert(QStringLiteral("pwdProperties"), QStringLiteral("1"));
+    domainObject.attributes.insert(QStringLiteral("maxPwdAge"),
+                                   QStringLiteral("-36288000000000"));
+    domainObject.attributes.insert(QStringLiteral("minPwdAge"),
+                                   QStringLiteral("-864000000000"));
+    const QList<DirectoryObject> objects{domainObject};
+
+    SamrServer server;
+    Samr::Config config;
+    config.realm = QStringLiteral("CORP.EXAMPLE.COM");
+    config.netbios = QStringLiteral("CORP");
+    config.domainSid = QStringLiteral("S-1-5-21-1-2-3");
+    config.baseDn = QStringLiteral("DC=corp,DC=example,DC=com");
+    server.setConfig(config);
+    server.setObjectProvider([objects]() { return objects; });
+
+    QMap<QString, QString> written;
+    Samr::WriteBackend backend;
+    backend.set = [&written](const QString &dn, const QString &attribute, const QString &value,
+                             QString *) {
+        written.insert(attribute, value);
+        return dn.compare(QStringLiteral("DC=corp,DC=example,DC=com")) == 0;
+    };
+    server.setWriteBackend(backend);
+
+    const QByteArray serverHandle =
+        server.handleCall(Samr::OpConnect, kConnect).left(20);
+    const QByteArray domainHandle =
+        server.handleCall(Samr::OpOpenDomain, openDomainStub(serverHandle)).left(20);
+
+    // A set stub: the handle, the information class, then the class's arm
+    // inline (two counts, the flag word, and the two 8-byte-aligned ages).
+    const auto policyStub = [](const QByteArray &handle, quint16 minLength, quint16 history,
+                               quint32 properties, qint64 maxAge, qint64 minAge) {
+        QByteArray stub = handle;
+        stub.append(char(1));
+        stub.append(char(0));
+        while (stub.size() % 8) // the arm is 8-aligned for its two ages
+            stub.append(char(0));
+        stub.append(char(minLength & 0xff));
+        stub.append(char((minLength >> 8) & 0xff));
+        stub.append(char(history & 0xff));
+        stub.append(char((history >> 8) & 0xff));
+        for (int i = 0; i < 4; ++i)
+            stub.append(char((properties >> (8 * i)) & 0xff));
+        while (stub.size() % 8)
+            stub.append(char(0));
+        for (int i = 0; i < 8; ++i)
+            stub.append(char((quint64(maxAge) >> (8 * i)) & 0xff));
+        for (int i = 0; i < 8; ++i)
+            stub.append(char((quint64(minAge) >> (8 * i)) & 0xff));
+        return stub;
+    };
+
+    // The query reports the stored policy, with the ages as AD keeps them.
+    QByteArray request = domainHandle;
+    request.append(char(1));
+    request.append(char(0));
+    const QByteArray reply = server.handleCall(Samr::OpQueryInformationDomain, request);
+    QCOMPARE(lastWord(reply), 0u);
+    QByteArray expected;
+    expected.append(char(12));
+    expected.append(char(0));
+    expected.append(char(5));
+    expected.append(char(0));
+    expected.append(QByteArray::fromHex("01000000"));
+    for (int i = 0; i < 8; ++i)
+        expected.append(char((quint64(-36288000000000LL) >> (8 * i)) & 0xff));
+    for (int i = 0; i < 8; ++i)
+        expected.append(char((quint64(-864000000000LL) >> (8 * i)) & 0xff));
+    QVERIFY2(reply.contains(expected), qPrintable(QString::fromLatin1(reply.toHex())));
+
+    // A set writes every field it carries to the domain object.
+    QCOMPARE(lastWord(server.handleCall(
+                 Samr::OpSetInformationDomain,
+                 policyStub(domainHandle, 14, 3, 1, -864000000000LL, -864000000000LL))),
+             0u);
+    QCOMPARE(written.value(QStringLiteral("minPwdLength")), QStringLiteral("14"));
+    QCOMPARE(written.value(QStringLiteral("pwdHistoryLength")), QStringLiteral("3"));
+    QCOMPARE(written.value(QStringLiteral("pwdProperties")), QStringLiteral("1"));
+    QCOMPARE(written.value(QStringLiteral("maxPwdAge")), QStringLiteral("-864000000000"));
+    QCOMPARE(written.value(QStringLiteral("minPwdAge")), QStringLiteral("-864000000000"));
+
+    // A maximum age shorter than the minimum would expire a password before it
+    // could be set.
+    written.clear();
+    QCOMPARE(lastWord(server.handleCall(
+                 Samr::OpSetInformationDomain,
+                 policyStub(domainHandle, 14, 3, 1, -864000000000LL, -1728000000000LL))),
+             0xc000000du); // STATUS_INVALID_PARAMETER
+    QVERIFY(written.isEmpty());
+
+    // Zero is how SAMR says "never expires" (NetUserModalsGet reads it that
+    // way); AD's own attribute holds the most negative value instead. Both are
+    // accepted, and neither is rewritten behind the client's back.
+    QCOMPARE(lastWord(server.handleCall(Samr::OpSetInformationDomain,
+                                        policyStub(domainHandle, 14, 3, 1, 0, 0))),
+             0u);
+    QCOMPARE(written.value(QStringLiteral("maxPwdAge")), QStringLiteral("0"));
+
+    // Complexity off and an 8-character floor, which the directory then honours
+    // instead of the built-in rule.
+    written.clear();
+    QCOMPARE(lastWord(server.handleCall(Samr::OpSetInformationDomain,
+                                        policyStub(domainHandle, 8, 3, 0,
+                                                   -36288000000000LL, -864000000000LL))),
+             0u);
+    QCOMPARE(written.value(QStringLiteral("pwdProperties")), QStringLiteral("0"));
 }
 
 void SamrTest::samrDirectoryCalls()

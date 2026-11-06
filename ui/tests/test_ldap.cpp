@@ -36,11 +36,79 @@ class LdapTest : public QObject
     Q_OBJECT
 
 private slots:
+    void enforcesTheDomainPasswordPolicy();
     void pagesThroughSearchResults();
     void refusesUnknownCriticalControl();
     void ignoresUnknownOptionalControl();
     void rejectsCookieItDidNotIssue();
 };
+
+// The password policy is the domain object's: minPwdLength, pwdHistoryLength and
+// pwdProperties, with AD's defaults for a domain that does not carry them. A
+// password that breaks it is refused with constraintViolation and the account
+// keeps the credential it had, which is what AD does.
+void LdapTest::enforcesTheDomainPasswordPolicy()
+{
+    const QString domainDn = QStringLiteral("DC=corp,DC=example,DC=com");
+    const QString userDn = QStringLiteral("CN=alice,CN=Users,%1").arg(domainDn);
+
+    DirectoryObject domain;
+    domain.id = domainDn;
+    domain.name = QStringLiteral("CORP");
+    domain.type = QStringLiteral("domainDNS");
+    domain.kind = ObjectKind::Domain;
+    domain.attributes.insert(QStringLiteral("objectSid"), QStringLiteral("S-1-5-21-1-2-3"));
+    domain.attributes.insert(QStringLiteral("minPwdLength"), QStringLiteral("12"));
+    domain.attributes.insert(QStringLiteral("pwdHistoryLength"), QStringLiteral("2"));
+    domain.attributes.insert(QStringLiteral("pwdProperties"), QStringLiteral("1"));
+
+    DirectoryObject user;
+    user.id = userDn;
+    user.name = QStringLiteral("alice");
+    user.type = QStringLiteral("User");
+    user.kind = ObjectKind::User;
+    user.attributes.insert(QStringLiteral("sAMAccountName"), QStringLiteral("alice"));
+    user.attributes.insert(QStringLiteral("objectSid"), QStringLiteral("S-1-5-21-1-2-3-1001"));
+
+    LdapServer server;
+    server.setObjects({domain, user});
+
+    const auto setPassword = [&](const QString &password) {
+        LdapServer::ModifyChange change;
+        change.operation = 2;
+        change.type = QStringLiteral("unicodePwd");
+        change.values = QStringList{password};
+        change.rawValue = password.toUtf8();
+        return server.applyModify(userDn, {change});
+    };
+    const auto setPolicy = [&](const QString &attribute, const QString &value) {
+        LdapServer::ModifyChange change;
+        change.operation = 2;
+        change.type = attribute;
+        change.values = QStringList{value};
+        change.rawValue = value.toUtf8();
+        QCOMPARE(server.applyModify(domainDn, {change}), 0);
+    };
+
+    // Under the 12-character floor, then a password that meets both rules.
+    QCOMPARE(setPassword(QStringLiteral("Short1!")), 19);
+    QCOMPARE(setPassword(QStringLiteral("correct-horse-9")), 0);
+    // One character class only: complexity is on, so letters alone are refused.
+    QCOMPARE(setPassword(QStringLiteral("abcdefghijklm")), 19);
+    // The current password is in the history, as is the one before it.
+    QCOMPARE(setPassword(QStringLiteral("correct-horse-9")), 19);
+    QCOMPARE(setPassword(QStringLiteral("An0ther-Passphrase")), 0);
+    QCOMPARE(setPassword(QStringLiteral("correct-horse-9")), 19);
+
+    // A policy of no remembered passwords lets the old one come back, and a
+    // cleared complexity bit lets letters alone through.
+    setPolicy(QStringLiteral("pwdHistoryLength"), QStringLiteral("0"));
+    setPolicy(QStringLiteral("pwdProperties"), QStringLiteral("0"));
+    setPolicy(QStringLiteral("minPwdLength"), QStringLiteral("8"));
+    QCOMPARE(setPassword(QStringLiteral("correct-horse-9")), 0);
+    QCOMPARE(setPassword(QStringLiteral("abcdefghijklm")), 0);
+    QCOMPARE(setPassword(QStringLiteral("short")), 19);
+}
 
 // RFC 2696: a search returns one page at a time, each page announcing the total
 // and a cookie that resumes exactly where the previous page stopped.

@@ -459,6 +459,21 @@ ProvisionResult provisionDomain(const ProvisionConfig &config)
     domain.attributes.insert(QStringLiteral("lockoutDuration"), QStringLiteral("-18000000000"));
     domain.attributes.insert(QStringLiteral("lockoutObservationWindow"),
                              QStringLiteral("-18000000000"));
+    // The password policy, under the attributes AD uses for it and with AD's
+    // default domain policy: 7 characters, 24 remembered passwords, complexity
+    // on, 42 days before a password expires and one day before it may change
+    // again. The two ages are negative 100-nanosecond deltas, as AD stores
+    // them, so LDAP and SAMR report the same numbers.
+    domain.attributes.insert(QStringLiteral("minPwdLength"),
+                             QString::number(LdapServer::kPasswordMinLength));
+    domain.attributes.insert(QStringLiteral("pwdHistoryLength"),
+                             QString::number(LdapServer::kPasswordHistoryLength));
+    domain.attributes.insert(QStringLiteral("pwdProperties"),
+                             QString::number(LdapServer::kPasswordComplex));
+    domain.attributes.insert(QStringLiteral("maxPwdAge"),
+                             QString::number(LdapServer::kPasswordMaxAge));
+    domain.attributes.insert(QStringLiteral("minPwdAge"),
+                             QString::number(LdapServer::kPasswordMinAge));
     domain.attributes.insert(
         QStringLiteral("gPLink"),
         QStringLiteral("[LDAP://CN=%1,CN=Policies,CN=System,%2;0]")
