@@ -84,12 +84,14 @@ public:
 signals:
     void requestReceived(const QString &operation);
     void replicaSourceAdded(const QString &address, const QString &ncDn);
+    void replicaSourceRemoved(const QString &address, const QString &ncDn);
 
 private:
     QByteArray drsBind(const QByteArray &stub);
     QByteArray drsUnbind(const QByteArray &stub);
     QByteArray drsReplicaSync(const QByteArray &stub);
     QByteArray drsReplicaAdd(const QByteArray &stub);
+    QByteArray drsReplicaDel(const QByteArray &stub);
     QByteArray drsUpdateRefs(const QByteArray &stub);
     QByteArray drsGetNCChanges(const QByteArray &stub);
     QByteArray drsDomainControllerInfo(const QByteArray &stub);

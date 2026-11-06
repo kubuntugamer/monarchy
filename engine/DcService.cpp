@@ -562,26 +562,46 @@ bool DcService::start(const QString &dcDir)
         }
     });
 
-    // DsReplicaAdd names the source the way a Windows client does: a bare host,
-    // host:port, or an ncacn_ip_tcp binding.
+    // A DRS address is a bare host, host:port, or an ncacn_ip_tcp binding; the
+    // agent needs the host and the port separately.
+    const auto parseAddress = [](const QString &address, QString *host, quint16 *port) {
+        *host = address;
+        *port = 0;
+        if (host->startsWith(QStringLiteral("ncacn_ip_tcp:")))
+            host->remove(0, 13);
+        const int bracket = host->indexOf(QLatin1Char('['));
+        if (bracket >= 0) {
+            *port = quint16(host->mid(bracket + 1).remove(QLatin1Char(']')).toUShort());
+            host->truncate(bracket);
+        } else if (host->count(QLatin1Char(':')) == 1) {
+            *port = quint16(host->section(QLatin1Char(':'), 1).toUShort());
+            *host = host->section(QLatin1Char(':'), 0, 0);
+        }
+    };
+
     connect(m_drsServer, &DrsServer::replicaSourceAdded, this,
-            [this](const QString &address, const QString &) {
-                QString host = address;
+            [this, parseAddress](const QString &address, const QString &) {
+                QString host;
                 quint16 port = 0;
-                if (host.startsWith(QStringLiteral("ncacn_ip_tcp:")))
-                    host.remove(0, 13);
-                const int bracket = host.indexOf(QLatin1Char('['));
-                if (bracket >= 0) {
-                    port = quint16(host.mid(bracket + 1).remove(QLatin1Char(']')).toUShort());
-                    host.truncate(bracket);
-                } else if (host.count(QLatin1Char(':')) == 1) {
-                    port = quint16(host.section(QLatin1Char(':'), 1).toUShort());
-                    host = host.section(QLatin1Char(':'), 0, 0);
-                }
+                parseAddress(address, &host, &port);
                 m_replicationAgent->setSource(host, port);
                 if (!m_replicaTimer->isActive())
                     m_replicaTimer->start();
                 emit statusMessage(tr("Replication source %1 registered.").arg(address));
+            });
+
+    // A source retired with DsReplicaDel stops being pulled from; the agent
+    // keeps its cursor, so re-adding the same partner resumes where it left off.
+    connect(m_drsServer, &DrsServer::replicaSourceRemoved, this,
+            [this, parseAddress](const QString &address, const QString &) {
+                QString host;
+                quint16 port = 0;
+                parseAddress(address, &host, &port);
+                if (!m_replicationAgent->source().startsWith(host, Qt::CaseInsensitive))
+                    return;
+                m_replicationAgent->setSource(QString(), 0);
+                m_replicaTimer->stop();
+                emit statusMessage(tr("Replication source %1 retired.").arg(address));
             });
 
     const QString replicaHost = dcConfig.value(QStringLiteral("replicaHost")).toString();

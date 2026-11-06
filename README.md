@@ -651,7 +651,7 @@ this DC. Password material is deliberately not served — replication-level
 conformance, not secret export. `monarchy-drs-tests` pins a whole V6 reply
 field by field, and `scripts/drs-conformance.py` drives the DCSync-shaped
 sequence over impacket's independent NDR behind an authenticated NTLMSSP bind
-at `PKT_PRIVACY` (6 checks). The pull side lives in `engine/ReplicationAgent.cpp`: a partner named in `dc.conf` is pulled on that schedule and applied to this DC's own store. `DsReplicaAdd` now registers a source that agent consumes; the KCC and a peer DC remain.
+at `PKT_PRIVACY` (6 checks). The pull side lives in `engine/ReplicationAgent.cpp`: a partner named in `dc.conf` is pulled on that schedule and applied to this DC's own store. `DsReplicaAdd` and `DsReplicaDel` register and retire the sources that agent consumes; the KCC and a peer DC remain.
 
 **SMB2, named pipes and the domain's file shares** (`engine/Smb2.cpp`): dialect
 negotiation (2.0.2/2.1), session setup carrying SPNEGO/NTLMSSP verified by the

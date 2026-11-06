@@ -81,6 +81,39 @@ QByteArray replicaAddRequest(const QByteArray &handle, const QString &ncDn,
     return out;
 }
 
+// A DsReplicaDel level-1 request arm (MS-DRSR 4.1.20): the handle, level, the
+// two referents and the options, then the deferred DSNAME and the source
+// address, which this method carries as a UTF-8 byte string rather than the
+// wide string DsReplicaAdd takes.
+QByteArray replicaDelRequest(const QByteArray &handle, const QString &ncDn,
+                             const QString &address, quint32 options = 0)
+{
+    QByteArray out = handle;
+    appendLe32(out, 1u);              // level
+    appendLe32(out, 0x00020004u);     // naming_context referent
+    appendLe32(out, 0x00020008u);     // source_dsa_address referent
+    appendLe32(out, options);
+
+    const quint32 units = quint32(ncDn.size() + 1);
+    appendLe32(out, units);
+    appendLe32(out, 0u);
+    appendLe32(out, 0u);
+    out.append(QByteArray(16 + 28, '\0'));
+    appendLe32(out, units * 2);
+    out.append(Ndr::utf16le(ncDn + QChar(u'\0')));
+    while (out.size() % 4 != 0)
+        out.append('\0');
+
+    const QByteArray utf8 = (address + QChar(u'\0')).toUtf8();
+    appendLe32(out, quint32(utf8.size())); // max count, terminator included
+    appendLe32(out, 0u);                   // offset
+    appendLe32(out, quint32(utf8.size())); // actual count
+    out.append(utf8);
+    while (out.size() % 4 != 0)
+        out.append('\0');
+    return out;
+}
+
 void padTo8(QByteArray &out)
 {
     while (out.size() % 8 != 0)
@@ -439,6 +472,55 @@ private slots:
         QCOMPARE(readLe32(server.handleCall(5, QByteArray(20, '\x7f')), 0), quint32(0x000006f7));
         QCOMPARE(readLe32(server.handleCall(5, handle + QByteArray(24, '\0')), 0), quint32(0x57));
         QCOMPARE(readLe32(server.handleCall(5, handle + QByteArray(64, '\0')), 0), quint32(0x57));
+    }
+
+    // DsReplicaDel retires a source by address and announces it; a second
+    // delete finds nothing and says so with ERROR_DS_DRA_NO_REPLICA rather than
+    // pretending success.
+    void dsReplicaDelRetiresASource()
+    {
+        DrsServer server;
+        server.setConfig(config());
+        server.setObjectProvider([this]() { return fixture(); });
+
+        QStringList retired;
+        QObject::connect(&server, &DrsServer::replicaSourceRemoved,
+                         [&retired](const QString &address, const QString &) {
+                             retired.append(address);
+                         });
+
+        const QByteArray handle = server.handleCall(0, bindRequest()).mid(64, 20);
+        const QString ncDn = QStringLiteral("DC=corp,DC=example,DC=com");
+        const QString address = QStringLiteral("dc02.corp.example.com");
+        QCOMPARE(readLe32(server.handleCall(5, replicaAddRequest(handle, ncDn, address)), 0),
+                 quint32(0));
+
+        QCOMPARE(readLe32(server.handleCall(6, replicaDelRequest(handle, ncDn, address)), 0),
+                 quint32(0));
+        QVERIFY(server.replicaSources().isEmpty());
+        QCOMPARE(retired, QStringList{address});
+
+        // Nothing matches now.
+        QCOMPARE(readLe32(server.handleCall(6, replicaDelRequest(handle, ncDn, address)), 0),
+                 quint32(0x00002104));
+
+        // An empty address is rejected, an NC this DC does not hold is bad, and
+        // a level this method does not have is rejected before anything else.
+        QCOMPARE(readLe32(server.handleCall(6, replicaDelRequest(handle, ncDn, QString())), 0),
+                 quint32(0x000020f5));
+        QCOMPARE(readLe32(server.handleCall(
+                              6, replicaDelRequest(handle,
+                                                   QStringLiteral("DC=other,DC=example,DC=com"),
+                                                   address)),
+                          0),
+                 quint32(0x000020f8));
+        QCOMPARE(readLe32(server.handleCall(6, handle + QByteArray(20, '\0')), 0),
+                 quint32(0x000020f5));
+
+        // Expunging the whole NC (DRS_NO_SOURCE) is refused, not half-done.
+        QCOMPARE(readLe32(server.handleCall(6, replicaDelRequest(handle, ncDn, address, 0x8000)), 0),
+                 quint32(0x57));
+        QCOMPARE(readLe32(server.handleCall(6, QByteArray(20, '\x7f')), 0), quint32(0x000006f7));
     }
 
     // A deletion is not an absence: the object leaves the live store but stays

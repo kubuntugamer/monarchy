@@ -15,6 +15,16 @@ namespace {
 constexpr quint32 kWerrOk = 0x00000000u;
 constexpr quint32 kWerrInvalidHandle = 0x000006f7u; // ERROR_INVALID_HANDLE
 constexpr quint32 kWerrNotSupported = 0x00000057u; // ERROR_INVALID_PARAMETER
+// The DRS-specific errors this server returns for the topology calls
+// (MS-DRSR 5 / WinError.h): a parameter the method rejects, a naming context
+// it does not hold, and a delete that matches no source.
+constexpr quint32 kWerrDrsInvalidParameter = 0x000020F5u;
+constexpr quint32 kWerrDrsBadNc = 0x000020F8u;
+constexpr quint32 kWerrDrsNoReplica = 0x00002104u;
+// DRS_OPTIONS bits (MS-DRSR 5.41). DsReplicaDel accepts exactly these, and
+// 0x8000 in this method means DRS_NO_SOURCE: expunge the whole NC replica.
+constexpr quint32 kDrsNoSourceOption = 0x00008000u;
+constexpr quint32 kReplicaDelOptions = 0x0000D191u;
 constexpr quint32 kExtRetNone = 0x00000000u;
 constexpr quint32 kExtRetSuccess = 0x00000001u;
 constexpr quint32 kExopReplObj = 0x00000006u; // EXOP_REPL_OBJ
@@ -1404,6 +1414,88 @@ QByteArray DrsServer::drsReplicaAdd(const QByteArray &stub)
     return stubReply(kWerrOk);
 }
 
+// The deferred `[string]` octet array DsReplicaDel carries (MS-DRSR 4.1.20,
+// source_dsa_address): max count, offset, actual count, then UTF-8 bytes with
+// their terminator. It is a byte string, not the wide string DsReplicaAdd
+// takes, so it is decoded separately.
+bool readDeferredUtf8(Ndr::Reader *reader, QString *text)
+{
+    quint32 maxCount = 0;
+    quint32 offset = 0;
+    quint32 actual = 0;
+    if (!reader->u32(&maxCount) || !reader->u32(&offset) || !reader->u32(&actual))
+        return false;
+    if (maxCount == 0 || maxCount > 8192 || offset > maxCount || actual == 0 || actual > maxCount)
+        return false;
+    QByteArray bytes;
+    if (!reader->bytes(int(actual), &bytes))
+        return false;
+    reader->align(4);
+    const int end = bytes.indexOf('\0');
+    const QString value = QString::fromUtf8(end >= 0 ? bytes.left(end) : bytes);
+    if (value.isEmpty())
+        return false;
+    *text = value;
+    return true;
+}
+
+// DsReplicaDel (opnum 6): retire a replication source by its address, the
+// counterpart of DsReplicaAdd. AD matches the repsFrom value by serverAddress
+// and reports ERROR_DS_DRA_NO_REPLICA when there is none; a request to expunge
+// the whole NC (DRS_NO_SOURCE) is refused here rather than half-done, and the
+// UpdateRefs notification AD then sends to the peer is not yet made.
+QByteArray DrsServer::drsReplicaDel(const QByteArray &stub)
+{
+    Ndr::Reader reader(stub);
+    QByteArray handleBytes;
+    if (!reader.bytes(kDrsHandleSize, &handleBytes))
+        return QByteArray();
+    if (!m_handles.contains(guidFromBytes(handleBytes)))
+        return stubReply(kWerrInvalidHandle);
+
+    quint32 level = 0;
+    if (!reader.u32(&level))
+        return QByteArray();
+    if (level != 1)
+        return stubReply(kWerrDrsInvalidParameter);
+    quint32 ncReferent = 0;
+    quint32 addressReferent = 0;
+    quint32 options = 0;
+    if (!reader.u32(&ncReferent) || !reader.u32(&addressReferent) || !reader.u32(&options))
+        return QByteArray();
+    if (ncReferent == 0 || addressReferent == 0)
+        return stubReply(kWerrDrsInvalidParameter);
+    if ((options & ~kReplicaDelOptions) != 0)
+        return stubReply(kWerrDrsInvalidParameter);
+    if ((options & kDrsNoSourceOption) != 0)
+        return stubReply(kWerrNotSupported); // expunging an NC is not implemented
+
+    QString ncDn;
+    QUuid ncGuid;
+    QByteArray ncSid;
+    quint32 ncSidLen = 0;
+    if (!readDsName(&reader, &ncDn, &ncGuid, &ncSid, &ncSidLen))
+        return stubReply(kWerrDrsBadNc);
+    if (ncDn.compare(baseDn(), Qt::CaseInsensitive) != 0)
+        return stubReply(kWerrDrsBadNc);
+
+    QString address;
+    if (!readDeferredUtf8(&reader, &address))
+        return stubReply(kWerrDrsInvalidParameter);
+
+    for (int i = 0; i < m_replicaSources.size(); ++i) {
+        const ReplicaSource &known = m_replicaSources.at(i);
+        if (known.ncDn.compare(ncDn, Qt::CaseInsensitive) == 0
+            && known.address.compare(address, Qt::CaseInsensitive) == 0) {
+            m_replicaSources.removeAt(i);
+            emit requestReceived(QStringLiteral("DsReplicaDel(%1) for %2").arg(address, ncDn));
+            emit replicaSourceRemoved(address, ncDn);
+            return stubReply(kWerrOk);
+        }
+    }
+    return stubReply(kWerrDrsNoReplica);
+}
+
 QByteArray DrsServer::drsUpdateRefs(const QByteArray &stub)
 {
     Ndr::Reader reader(stub);
@@ -1768,6 +1860,8 @@ QByteArray DrsServer::handleCall(quint16 opnum, const QByteArray &stub)
         return drsUpdateRefs(stub);
     case 5:
         return drsReplicaAdd(stub);
+    case 6:
+        return drsReplicaDel(stub);
     default:
         // Only the calls this server implements are described; the rest are
         // refused rather than answered as if understood.
