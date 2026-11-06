@@ -70,11 +70,40 @@ QByteArray embeddedToken(const QByteArray &token);
 bool verifyNtlmv2(const QByteArray &ntHash, const QString &user, const QString &domain,
                   const QByteArray &serverChallenge, const QByteArray &ntResponse);
 
+// ---------- Initiator half ----------
+//
+// What an outbound client sends: the NEGOTIATE, the answer to a CHALLENGE and
+// the AUTHENTICATE that carries it. The acceptor side above verifies these,
+// from the same inputs, so both halves are pinned by one set of tests.
+struct Challenge {
+    quint32 flags = 0;
+    QByteArray serverChallenge; // 8 bytes
+    QByteArray targetInfo;      // AV_PAIR list without the EOL terminator
+};
+
+// 1 = NEGOTIATE, 2 = CHALLENGE, 3 = AUTHENTICATE.
+QByteArray negotiateToken(quint32 flags);
+bool parseChallenge(const QByteArray &token, Challenge *out);
+QByteArray authenticateToken(const QString &domain, const QString &user, quint32 flags,
+                             const QByteArray &ntResponse);
+
+// The NTLMv2 NtChallengeResponse for a CHALLENGE: proof over the blob that
+// carries a fresh timestamp, a client challenge and the peer's target info.
+// `ntProofStr` is its first 16 bytes, which is what sessionKeys() takes.
+bool ntlmv2Response(const QByteArray &ntHash, const QString &user, const QString &domain,
+                    const QByteArray &serverChallenge, const QByteArray &targetInfo,
+                    QByteArray *ntResponse, QByteArray *ntProofStr);
+
 // Negotiation flags this implementation acts on.
 constexpr quint32 kNegotiateSign = 0x00000010u;
 constexpr quint32 kNegotiateSeal = 0x00000020u;
 constexpr quint32 kNegotiate128 = 0x20000000u;
 constexpr quint32 kNegotiate56 = 0x80000000u;
+constexpr quint32 kNegotiateUnicode = 0x00000001u;
+constexpr quint32 kNegotiateNtlm = 0x00000200u;
+constexpr quint32 kNegotiateAlwaysSign = 0x00008000u;
+constexpr quint32 kNegotiateExtendedSessionSecurity = 0x00080000u;
+constexpr quint32 kNegotiateTargetInfo = 0x00800000u;
 
 // ---------- Session security (MS-NLMP §3.4) ----------
 //

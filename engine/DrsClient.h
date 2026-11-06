@@ -9,6 +9,7 @@
 #include <QObject>
 #include <QString>
 
+#include "Ntlm.h"
 #include "resultsmodel.h"
 
 class QTcpSocket;
@@ -63,6 +64,16 @@ public:
     void setPeer(const QString &host, quint16 port);
     void setTimeouts(int connectMs, int readMs);
 
+    // The security provider. With credentials the bind carries an NTLMSSP
+    // NEGOTIATE, the answer carries the CHALLENGE and an AUTH3 completes it;
+    // every call is then signed, and sealed at level 6. Without credentials the
+    // client binds unauthenticated, which a peer that enforces authentication
+    // faults rather than serving.
+    void setCredentials(const QString &domain, const QString &user, const QString &password);
+    // 1 connect, 2 integrity, 6 privacy (MS-RPCE §2.2.3.5). Default 6.
+    void setAuthLevel(quint8 level) { m_authLevel = level; }
+    bool isAuthenticated() const { return m_authenticated; }
+
     bool connectToPeer(QString *error = nullptr);
     void close();
     bool isConnected() const;
@@ -95,7 +106,10 @@ signals:
 private:
     bool writePdu(const QByteArray &pdu, QString *error);
     // Reads one whole message, joining fragments until PFC_LAST_FRAG.
-    bool readMessage(quint32 callId, quint8 *type, QByteArray *body,
+    // Reads one whole message, joining fragments until PFC_LAST_FRAG. A signed
+    // reply is verified and unsealed here; a bind_ack's token comes back in
+    // `authToken`.
+    bool readMessage(quint32 callId, quint8 *type, QByteArray *body, QByteArray *authToken,
                      quint32 *faultStatus, QString *error);
     bool callInternal(quint16 opnum, const QString &name, const QByteArray &stub,
                       QByteArray *replyStub, QString *error);
@@ -109,6 +123,20 @@ private:
     QByteArray m_handle;
     QByteArray m_buffer;
     bool m_interfaceBound = false;
+
+    // NTLMSSP session state: the keys the per-PDU signatures use and the two
+    // directions' sequence numbers, which start at zero on each side.
+    QString m_domain;
+    QString m_user;
+    QString m_password;
+    bool m_credentialsSet = false;
+    bool m_authenticated = false;
+    quint8 m_authLevel = 6;
+    Ntlm::SessionKeys m_keys;
+    Ntlm::Sealer m_sendSealer;
+    Ntlm::Sealer m_recvSealer;
+    quint32 m_sendSeq = 0;
+    quint32 m_recvSeq = 0;
 };
 
 #endif // DRSCLIENT_H

@@ -20,11 +20,16 @@ constexpr quint8 PduFault = 3;
 constexpr quint8 PduBind = 11;
 constexpr quint8 PduBindAck = 12;
 constexpr quint8 PduBindNak = 13;
+constexpr quint8 PduAuth3 = 16; // MS-RPCE PTYPE_AUTH3
 constexpr quint8 PduFlagLast = 0x02;
+
+// RPC_C_AUTHN_WINNT: NTLMSSP as the RPC security provider (MS-RPCE §2.2.3).
+constexpr quint8 AuthTypeNtlm = 10;
 
 constexpr int kHeaderSize = 16;
 constexpr int kResponseHeader = 24; // alloc_hint, context, cancel_count, reserved
 constexpr quint16 kMaxFrag = 5840;
+constexpr int kAuthTokenSize = 16; // one NTLMSSP_MESSAGE_SIGNATURE
 
 constexpr quint32 kWerrOk = 0;
 constexpr quint32 kResultAcceptance = 0;
@@ -46,6 +51,14 @@ constexpr quint32 kAttidObjectSid = 0x00090092u;
 constexpr quint32 kAttidSamAccountName = 0x000900DDu;
 constexpr quint32 kAttidUserPrincipalName = 0x00090290u;
 constexpr quint32 kAttidWhenChanged = 0x00020003u;
+
+quint32 negotiationFlags()
+{
+    return Ntlm::kNegotiateUnicode | Ntlm::kNegotiateNtlm | Ntlm::kNegotiateSign
+           | Ntlm::kNegotiateSeal | Ntlm::kNegotiateAlwaysSign
+           | Ntlm::kNegotiateExtendedSessionSecurity | Ntlm::kNegotiateTargetInfo
+           | Ntlm::kNegotiate128 | Ntlm::kNegotiate56;
+}
 
 void putLe16(QByteArray &out, quint16 value)
 {
@@ -111,8 +124,8 @@ void appendHeader(QByteArray &out, quint8 type, quint32 callId)
     out.append(char(0));
     out.append(char(0));
     out.append(char(0));
-    putLe16(out, 0); // frag_length, patched by the caller
-    putLe16(out, 0); // auth_length: this client sends no verifier
+    putLe16(out, 0); // frag_length, patched below
+    putLe16(out, 0); // auth_length, patched by appendAuthVerifier
     putLe32(out, callId);
 }
 
@@ -121,6 +134,24 @@ void patchFragmentLength(QByteArray &pdu)
     const quint16 length = quint16(pdu.size());
     pdu[8] = char(length & 0xff);
     pdu[9] = char((length >> 8) & 0xff);
+}
+
+// sec_trailer (MS-RPCE §2.2.2.11) followed by the token. The trailer's pad
+// length tells the receiver how much of the body is alignment, which is why a
+// signed stub is padded before the signature is computed.
+void appendAuthVerifier(QByteArray &pdu, quint8 authType, quint8 authLevel, quint8 padLength,
+                        quint32 contextId, const QByteArray &token)
+{
+    pdu.append(char(authType));
+    pdu.append(char(authLevel));
+    pdu.append(char(padLength));
+    pdu.append(char(0));
+    putLe32(pdu, contextId);
+    pdu.append(token);
+    const quint16 authLength = quint16(token.size());
+    pdu[10] = char(authLength & 0xff);
+    pdu[11] = char((authLength >> 8) & 0xff);
+    patchFragmentLength(pdu);
 }
 
 QByteArray guidBytes(const QUuid &guid)
@@ -403,7 +434,7 @@ DirectoryObject toDirectoryObject(const ChainEntry &entry)
 namespace DrsWire {
 
 QByteArray bindPdu(quint32 callId, const QByteArray &abstractUuid, quint16 major,
-                   quint16 minor)
+                   quint16 minor, const QByteArray &authToken, quint8 authLevel)
 {
     QByteArray pdu;
     appendHeader(pdu, PduBind, callId);
@@ -422,7 +453,10 @@ QByteArray bindPdu(quint32 callId, const QByteArray &abstractUuid, quint16 major
     pdu.append(Rpc::kNdrSyntaxUuid);
     putLe16(pdu, 2); // NDR32
     putLe16(pdu, 0);
-    patchFragmentLength(pdu);
+    if (!authToken.isEmpty())
+        appendAuthVerifier(pdu, AuthTypeNtlm, authLevel, 0, 0, authToken);
+    else
+        patchFragmentLength(pdu);
     return pdu;
 }
 
@@ -673,6 +707,15 @@ void DrsClient::setTimeouts(int connectMs, int readMs)
     m_readTimeoutMs = qMax(1, readMs);
 }
 
+void DrsClient::setCredentials(const QString &domain, const QString &user,
+                               const QString &password)
+{
+    m_domain = domain;
+    m_user = user;
+    m_password = password;
+    m_credentialsSet = !user.isEmpty() && !password.isEmpty();
+}
+
 bool DrsClient::connectToPeer(QString *error)
 {
     close();
@@ -695,8 +738,6 @@ bool DrsClient::connectToPeer(QString *error)
     m_socket->setSocketOption(QAbstractSocket::LowDelayOption, 1);
     m_buffer.clear();
     m_callId = 0;
-    m_interfaceBound = false;
-    m_handle.clear();
     return true;
 }
 
@@ -709,7 +750,10 @@ void DrsClient::close()
     }
     m_buffer.clear();
     m_interfaceBound = false;
+    m_authenticated = false;
     m_handle.clear();
+    m_sendSeq = 0;
+    m_recvSeq = 0;
 }
 
 bool DrsClient::isConnected() const
@@ -733,10 +777,12 @@ bool DrsClient::writePdu(const QByteArray &pdu, QString *error)
 }
 
 bool DrsClient::readMessage(quint32 callId, quint8 *type, QByteArray *body,
-                            quint32 *faultStatus, QString *error)
+                            QByteArray *authToken, quint32 *faultStatus, QString *error)
 {
     *faultStatus = 0;
     body->clear();
+    if (authToken)
+        authToken->clear();
     QDeadlineTimer deadline(m_readTimeoutMs);
     forever {
         while (m_buffer.size() < kHeaderSize) {
@@ -781,21 +827,60 @@ bool DrsClient::readMessage(quint32 callId, quint8 *type, QByteArray *body,
         *type = quint8(fragment.at(2));
         const quint8 flags = quint8(fragment.at(3));
         const quint16 authLength = readLe16(fragment, 10);
+        const int bodyStart = (*type == PduResponse || *type == PduFault) ? kResponseHeader
+                                                                         : kHeaderSize;
+        const int trailerPos = authLength == 0 ? fragment.size() : fragment.size() - 8
+                                                                         - int(authLength);
+        if (trailerPos < bodyStart) {
+            if (error)
+                *error = QStringLiteral("truncated auth verifier");
+            return false;
+        }
+
         if (*type == PduFault) {
-            const QByteArray tail = fragment.mid(kResponseHeader);
-            *faultStatus = readLe32(tail, 0);
+            *faultStatus = readLe32(fragment, bodyStart);
         } else if (*type == PduResponse) {
             if (authLength != 0) {
-                // Signed or sealed replies need the session key an
-                // authenticated bind would have established.
-                if (error)
-                    *error = QStringLiteral("peer signed the reply; an authenticated bind is "
-                                            "not implemented on this client yet");
-                return false;
+                if (!m_authenticated) {
+                    if (error)
+                        *error = QStringLiteral("peer signed the reply before authenticating");
+                    return false;
+                }
+                const quint8 padLength = quint8(fragment.at(trailerPos + 2));
+                QByteArray payload = fragment.mid(bodyStart, trailerPos - bodyStart);
+                const QByteArray token = fragment.mid(trailerPos + 8, authLength);
+                if (m_authLevel >= 6)
+                    payload = m_recvSealer.apply(payload);
+                // The signature covers the plaintext form: the same PDU with
+                // the sealed stub put back (MS-RPCE §2.2.3.4).
+                QByteArray signedData = fragment.left(fragment.size() - authLength);
+                signedData.replace(bodyStart, payload.size(), payload);
+                const bool signatureOk =
+                    token.size() == kAuthTokenSize && readLe32(token, 0) == 1
+                    && readLe32(token, 12) == m_recvSeq
+                    && Ntlm::secureEquals(
+                        Ntlm::mac(m_keys.serverSigningKey, m_recvSeq, signedData),
+                        token.mid(4, 8));
+                if (!signatureOk) {
+                    if (error)
+                        *error = QStringLiteral("the peer's reply signature did not verify");
+                    return false;
+                }
+                ++m_recvSeq;
+                if (int(padLength) > payload.size()) {
+                    if (error)
+                        *error = QStringLiteral("bad auth padding in the reply");
+                    return false;
+                }
+                payload.truncate(payload.size() - int(padLength));
+                body->append(payload);
+            } else {
+                body->append(fragment.mid(bodyStart, trailerPos - bodyStart));
             }
-            body->append(fragment.mid(kResponseHeader));
         } else if (*type == PduBindAck || *type == PduBindNak) {
-            body->append(fragment.mid(kHeaderSize));
+            if (authLength != 0 && authToken)
+                *authToken = fragment.mid(trailerPos + 8, authLength);
+            body->append(fragment.mid(bodyStart, trailerPos - bodyStart));
         } else {
             if (error)
                 *error = QStringLiteral("unexpected PDU type %1").arg(*type);
@@ -810,14 +895,18 @@ bool DrsClient::readMessage(quint32 callId, quint8 *type, QByteArray *body,
 bool DrsClient::bindInterface(QString *error)
 {
     const Rpc::Interface interface = Drs::interface();
+    const QByteArray negotiate =
+        m_credentialsSet ? Ntlm::negotiateToken(negotiationFlags()) : QByteArray();
     const quint32 callId = ++m_callId;
-    if (!writePdu(DrsWire::bindPdu(callId, interface.uuid, interface.major, interface.minor),
+    if (!writePdu(DrsWire::bindPdu(callId, interface.uuid, interface.major, interface.minor,
+                                  negotiate, m_authLevel),
                   error))
         return false;
     quint8 type = 0;
     quint32 faultStatus = 0;
     QByteArray body;
-    if (!readMessage(callId, &type, &body, &faultStatus, error))
+    QByteArray token;
+    if (!readMessage(callId, &type, &body, &token, &faultStatus, error))
         return false;
     if (type == PduBindNak) {
         if (error)
@@ -863,6 +952,49 @@ bool DrsClient::bindInterface(QString *error)
         return false;
     }
     m_interfaceBound = true;
+    if (!m_credentialsSet)
+        return true;
+
+    // The bind_ack carried the CHALLENGE: answer it with an NTLMv2 response in
+    // an AUTH3 PDU. A raw-NTLMSSP peer sends no reply to that, so the next call
+    // is where a wrong password shows up (as an access-denied fault).
+    Ntlm::Challenge challenge;
+    if (token.isEmpty() || !Ntlm::parseChallenge(Ntlm::embeddedToken(token), &challenge)) {
+        if (error)
+            *error = QStringLiteral("the peer did not challenge the NTLMSSP bind");
+        return false;
+    }
+    const QByteArray ntHash = Ntlm::ntowfV1(m_password);
+    QByteArray ntResponse;
+    QByteArray proof;
+    if (!Ntlm::ntlmv2Response(ntHash, m_user, m_domain, challenge.serverChallenge,
+                              challenge.targetInfo, &ntResponse, &proof)) {
+        if (error)
+            *error = QStringLiteral("could not build the NTLMv2 response");
+        return false;
+    }
+    const QByteArray authenticate =
+        Ntlm::authenticateToken(m_domain, m_user, negotiationFlags(), ntResponse);
+    QByteArray auth3;
+    appendHeader(auth3, PduAuth3, ++m_callId);
+    putLe32(auth3, 0); // alloc_hint
+    putLe16(auth3, 0); // p_cont_id
+    auth3.append(char(0)); // cancel_count
+    auth3.append(char(0)); // reserved
+    appendAuthVerifier(auth3, AuthTypeNtlm, m_authLevel, 0, 0, authenticate);
+    if (!writePdu(auth3, error))
+        return false;
+
+    if (!Ntlm::sessionKeys(ntHash, m_user, m_domain, proof, &m_keys, negotiationFlags())) {
+        if (error)
+            *error = QStringLiteral("could not derive the NTLM session keys");
+        return false;
+    }
+    m_sendSealer.reset(m_keys.clientSealingKey);
+    m_recvSealer.reset(m_keys.serverSealingKey);
+    m_sendSeq = 0;
+    m_recvSeq = 0;
+    m_authenticated = true;
     return true;
 }
 
@@ -875,11 +1007,50 @@ bool DrsClient::callInternal(quint16 opnum, const QString &name, const QByteArra
         return false;
     }
     const quint32 callId = ++m_callId;
-    if (!writePdu(DrsWire::requestPdu(callId, opnum, stub), error))
+    QByteArray pdu;
+    if (m_authenticated) {
+        // A signed call pads the stub, signs the plaintext PDU, and only then
+        // seals it; the receiver unseals and verifies against that same form.
+        const int padLength = (4 - (stub.size() % 4)) % 4;
+        QByteArray padded = stub;
+        padded.append(QByteArray(padLength, '\0'));
+        appendHeader(pdu, PduRequest, callId);
+        putLe32(pdu, quint32(stub.size())); // alloc_hint: the unpadded size
+        putLe16(pdu, 0);                    // context id
+        putLe16(pdu, opnum);
+        const int stubStart = pdu.size();
+        pdu.append(padded);
+        pdu.append(char(AuthTypeNtlm));
+        pdu.append(char(m_authLevel));
+        pdu.append(char(padLength));
+        pdu.append(char(0));
+        putLe32(pdu, 0); // auth context id: none was negotiated
+        // The signature covers the PDU as the peer will verify it, so both
+        // header length words are stamped before signing: the fragment length
+        // counts the token that is appended next.
+        const quint16 signedLength = quint16(pdu.size() + kAuthTokenSize);
+        pdu[8] = char(signedLength & 0xff);
+        pdu[9] = char((signedLength >> 8) & 0xff);
+        pdu[10] = char(kAuthTokenSize & 0xff);
+        pdu[11] = char((kAuthTokenSize >> 8) & 0xff);
+        const QByteArray signatureMac = Ntlm::mac(m_keys.clientSigningKey, m_sendSeq, pdu);
+        QByteArray signature;
+        putLe32(signature, 1);
+        signature.append(signatureMac);
+        putLe32(signature, m_sendSeq);
+        pdu.append(signature);
+        patchFragmentLength(pdu);
+        if (m_authLevel >= 6)
+            pdu.replace(stubStart, padded.size(), m_sendSealer.apply(padded));
+        ++m_sendSeq;
+    } else {
+        pdu = DrsWire::requestPdu(callId, opnum, stub);
+    }
+    if (!writePdu(pdu, error))
         return false;
     quint8 type = 0;
     quint32 faultStatus = 0;
-    if (!readMessage(callId, &type, replyStub, &faultStatus, error))
+    if (!readMessage(callId, &type, replyStub, nullptr, &faultStatus, error))
         return false;
     if (type == PduFault) {
         if (error)

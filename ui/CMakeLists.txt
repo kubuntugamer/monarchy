@@ -42,6 +42,7 @@ add_library(monarchy-ui-core STATIC
     ../engine/Provisioner.cpp
     ../engine/Ntlm.h
     ../engine/Ntlm.cpp
+    ../engine/NtlmClient.cpp
     ../engine/Aes.h
     ../engine/Aes.cpp
     ../engine/Des.h

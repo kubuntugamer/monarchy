@@ -102,21 +102,23 @@ recorded as a limitation, not accepted as sufficient.
 **What closes it:** A Windows host for the WPT harness and a real DC for bidirectional replication.
 Neither is reachable from the current development machine.
 
-## D7 — Outbound replication is unauthenticated
+## D7 — Outbound replication authenticates with NTLMSSP only
 
 **Gap:** G11 (`AD-1TO1-CONFORMANCE.md` §2.5, DRS replication)
 **Difference:** A DC pulls a cycle from a partner over an authenticated DCE/RPC bind — NTLMSSP at
 `PKT_PRIVACY`, or Kerberos — and a partner refuses `DsGetNCChanges` that carries no verifier.
 **Monarchy:** The outbound client (`engine/DrsClient.{h,cpp}`) binds the peer's DRSUAPI endpoint
-over `ncacn_ip_tcp`, runs `DsBind`/`DsGetNCChanges` and applies the decoded chain, but sends no
-security verifier; a reply that comes back signed is refused rather than read without checking.
-An endpoint with an authenticator configured — including this tree's own `DcService` — answers the
-first call with an NCA fault (`access denied`).
-**Why listed:** The transport, framing, chunking and object decoding are real and tested against
-this tree's DC; the authentication leg is missing, so the client cannot yet pull from a peer that
-enforces it.
-**What closes it:** An initiator-side NTLMSSP (or GSS-API Kerberos) bind in `DrsClient`, with the
-per-PDU signing and sealing the server already implements as the acceptor.
+over `ncacn_ip_tcp`, answers the NTLMSSP challenge with an NTLMv2 response and runs `DsBind`,
+`DsGetNCChanges` and `DsUnbind` on a session whose calls are signed and, at level 6, sealed
+(`engine/NtlmClient.cpp` is the initiator half of the exchange the acceptor in `Ntlm.cpp`
+verifies). It does not yet negotiate Kerberos, and it takes the peer's port as given instead of
+resolving it through the endpoint mapper.
+**Why listed:** The transport, authentication, framing, chunking and object decoding are real and
+tested against this tree's DC, including a wrong password that is refused at the first call. A
+peer that required Kerberos alone, or that is only reachable on a port the endpoint mapper would
+have to name, is still out of reach.
+**What closes it:** An initiator-side GSS-API Kerberos bind, and endpoint-map port discovery, both
+on top of the same signed-PDU path.
 
 ---
 

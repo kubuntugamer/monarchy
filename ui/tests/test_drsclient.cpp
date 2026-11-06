@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 // The outbound half of replication: a client that binds a peer's DRSUAPI
-// endpoint, pulls a GetNCChanges cycle and hands the decoded objects to
-// LdapServer::applyReplication. The marshal layer is exercised against replies
-// the server built with no socket at all; the convergence case runs the whole
-// thing over loopback, with the peer's server on its own thread because the
-// client blocks while it waits and a same-thread peer would never accept.
+// endpoint, authenticates with NTLMSSP, pulls a GetNCChanges cycle and hands
+// the decoded objects to LdapServer::applyReplication. The marshal layer is
+// exercised against replies the server built with no socket at all; the
+// convergence cases run the whole thing over loopback, with the peer's server
+// on its own thread because the client blocks while it waits.
 
 #include <QtTest>
 
@@ -21,16 +21,20 @@
 #include "Drs.h"
 #include "DrsClient.h"
 #include "LdapServer.h"
+#include "Ntlm.h"
 
 namespace {
 
 const QString kBaseDn = QStringLiteral("DC=corp,DC=example,DC=com");
+const QString kDomain = QStringLiteral("CORP");
+const QString kAccount = QStringLiteral("svc-repl");
+const QString kPassword = QStringLiteral("R3pl!cate-2026");
 
 Samr::Config config()
 {
     Samr::Config out;
     out.realm = QStringLiteral("CORP.EXAMPLE.COM");
-    out.netbios = QStringLiteral("CORP");
+    out.netbios = kDomain;
     out.baseDn = kBaseDn;
     out.domainSid = QStringLiteral("S-1-5-21-1-2-3");
     return out;
@@ -75,6 +79,24 @@ const DirectoryObject *liveObject(const LdapServer &store, const QString &name)
     return nullptr;
 }
 
+// The acceptor side, wired the way DcService wires it: the password's NT hash
+// verifies the NTLMv2 response and derives the keys the per-PDU signatures use.
+Rpc::Authenticator passwordAuthenticator(const QString &domain, const QString &user,
+                                         const QString &password)
+{
+    const QByteArray ntHash = Ntlm::ntowfV1(password);
+    return [domain, user, ntHash](const Rpc::AuthRequest &request, Ntlm::SessionKeys *keys) {
+        if (request.user.compare(user, Qt::CaseInsensitive) != 0
+            || request.domain.compare(domain, Qt::CaseInsensitive) != 0)
+            return false;
+        if (!Ntlm::verifyNtlmv2(ntHash, request.user, request.domain, request.challenge,
+                                request.ntResponse))
+            return false;
+        return Ntlm::sessionKeys(ntHash, request.user, request.domain,
+                                 request.ntResponse.left(16), keys, request.flags);
+    };
+}
+
 // The store the peer serves, guarded because the peer reads it on its own
 // thread while the test rewrites it between cycles.
 struct SharedObjects {
@@ -99,11 +121,19 @@ class DrsServerThread : public QThread
 {
 public:
     DrsServerThread(std::function<QList<DirectoryObject>()> provider, Samr::Config config,
-                    bool rejectAuthentication = false)
+                    Rpc::Authenticator authenticator = {})
         : m_provider(std::move(provider))
         , m_config(std::move(config))
-        , m_rejectAuthentication(rejectAuthentication)
+        , m_authenticator(std::move(authenticator))
     {
+    }
+
+    ~DrsServerThread() override
+    {
+        // A test that fails before it quits the peer must not turn into an
+        // abort: destroy the thread only once its event loop has stopped.
+        quit();
+        wait(5000);
     }
 
     void waitUntilListening()
@@ -119,11 +149,14 @@ protected:
         DrsServer server;
         server.setConfig(m_config);
         server.setObjectProvider(m_provider);
-        if (m_rejectAuthentication) {
-            server.setAuthenticator([](const Rpc::AuthRequest &, Ntlm::SessionKeys *) {
-                return false;
-            });
+        if (m_authenticator) {
+            server.setDomainNames(kDomain, QStringLiteral("DC01"),
+                                  QStringLiteral("corp.example.com"));
+            server.setAuthenticator(m_authenticator);
         }
+        QObject::connect(&server, &DrsServer::requestReceived, [](const QString &line) {
+            qWarning("DRS: %s", qPrintable(line));
+        });
         const bool listening = server.listen(0);
         m_port = listening ? server.serverPort() : 0;
         m_ready.release();
@@ -134,7 +167,7 @@ protected:
 private:
     std::function<QList<DirectoryObject>()> m_provider;
     Samr::Config m_config;
-    bool m_rejectAuthentication = false;
+    Rpc::Authenticator m_authenticator;
     quint16 m_port = 0;
     QSemaphore m_ready;
 };
@@ -222,10 +255,10 @@ private slots:
         QCOMPARE(delivered.size(), 2);
     }
 
-    // The whole path over a socket: bind, DsBind, GetNCChanges, apply. The
-    // second store must end up holding what the first one serves, and must
-    // follow a later deletion instead of keeping a stale copy.
-    void secondDcConvergesOverTheRpcWire()
+    // The whole path over a socket, authenticated: bind, NTLMSSP, DsBind,
+    // signed and sealed GetNCChanges, apply. The second store must end up
+    // holding what the first one serves, and must follow a later deletion.
+    void anAuthenticatedPeerAnswersASealedSession()
     {
         LdapServer source;
         source.addObject(domainObject());
@@ -234,16 +267,19 @@ private slots:
         SharedObjects shared;
         shared.set(source.objects() + source.tombstones());
 
-        DrsServerThread peer([&shared]() { return shared.snapshot(); }, config());
+        DrsServerThread peer([&shared]() { return shared.snapshot(); }, config(),
+                             passwordAuthenticator(kDomain, kAccount, kPassword));
         peer.start();
         peer.waitUntilListening();
         QVERIFY(peer.port() != 0);
 
         DrsClient client;
         client.setPeer(QStringLiteral("127.0.0.1"), peer.port());
+        client.setCredentials(kDomain, kAccount, kPassword);
         QString error;
         QVERIFY2(client.connectToPeer(&error), qPrintable(error));
         QVERIFY2(client.bindInterface(&error), qPrintable(error));
+        QVERIFY(client.isAuthenticated());
         QVERIFY2(client.dsBind(&error), qPrintable(error));
 
         LdapServer target;
@@ -270,8 +306,7 @@ private slots:
         QCOMPARE(aliceOnTarget->attributes.value(QStringLiteral("objectGUID")).toLower(),
                  QStringLiteral("{33333333-3333-3333-3333-333333333333}"));
 
-        // The deletion travels the same way: the source keeps a tombstone and
-        // the target turns its live copy into one.
+        // The deletion travels the same signed session.
         QVERIFY(source.removeObject(alice().id));
         shared.set(source.objects() + source.tombstones());
         QList<DirectoryObject> deletion;
@@ -289,12 +324,40 @@ private slots:
         QVERIFY(peer.wait(5000));
     }
 
-    // The authentication leg is not implemented on this client, and it says so
-    // rather than pretending: an endpoint that requires authentication accepts
-    // the transport bind and faults the call.
-    void anAuthenticatedPeerRefusesTheCallNotTheBind()
+    // A wrong password completes the transport bind and the challenge, then the
+    // first call is refused: the client never pretends to have a session.
+    void aWrongPasswordIsRefused()
     {
-        DrsServerThread peer([]() { return fixture(); }, config(), true);
+        DrsServerThread peer([]() { return fixture(); }, config(),
+                             passwordAuthenticator(kDomain, kAccount, kPassword));
+        peer.start();
+        peer.waitUntilListening();
+        QVERIFY(peer.port() != 0);
+
+        DrsClient client;
+        client.setPeer(QStringLiteral("127.0.0.1"), peer.port());
+        client.setCredentials(kDomain, kAccount, QStringLiteral("not-the-password"));
+        QString error;
+        QVERIFY2(client.connectToPeer(&error), qPrintable(error));
+        QVERIFY2(client.bindInterface(&error), qPrintable(error));
+        QVERIFY(!client.dsBind(&error));
+        // A rejected AUTHENTICATE ends the session: the peer either faults the
+        // next call or, as this tree's server does, hangs up so no call can be
+        // served without a completed authentication.
+        QVERIFY2(error.contains(QStringLiteral("faulted"))
+                     || error.contains(QStringLiteral("closed")),
+                 qPrintable(error));
+        client.close();
+        peer.quit();
+        QVERIFY(peer.wait(5000));
+    }
+
+    // With no credentials the client sends no verifier, and a peer that
+    // enforces authentication refuses the call rather than serving it.
+    void anAuthenticatedPeerRefusesAnUnboundCall()
+    {
+        DrsServerThread peer([]() { return fixture(); }, config(),
+                             [](const Rpc::AuthRequest &, Ntlm::SessionKeys *) { return false; });
         peer.start();
         peer.waitUntilListening();
         QVERIFY(peer.port() != 0);
@@ -304,6 +367,7 @@ private slots:
         QString error;
         QVERIFY2(client.connectToPeer(&error), qPrintable(error));
         QVERIFY2(client.bindInterface(&error), qPrintable(error));
+        QVERIFY(!client.isAuthenticated());
         QVERIFY(!client.dsBind(&error));
         QVERIFY2(error.contains(QStringLiteral("faulted")), qPrintable(error));
         client.close();
