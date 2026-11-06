@@ -75,6 +75,85 @@ QList<DirectoryObject> fixture()
     return QList<DirectoryObject>{domainObject(), alice()};
 }
 
+// UTF-16LE with a terminator, for the request builders below; the suite pins
+// the bytes by hand instead of borrowing the marshal layer it is testing.
+QByteArray wideString(const QString &text)
+{
+    QByteArray out;
+    out.reserve((text.size() + 1) * 2);
+    for (const QChar ch : text + QChar(u'\0')) {
+        out.append(char(ch.unicode() & 0xff));
+        out.append(char((ch.unicode() >> 8) & 0xff));
+    }
+    while (out.size() % 4 != 0)
+        out.append('\0');
+    return out;
+}
+
+void appendU32(QByteArray &out, quint32 value)
+{
+    for (int i = 0; i < 4; ++i)
+        out.append(char((value >> (8 * i)) & 0xff));
+}
+
+quint32 readU32(const QByteArray &bytes)
+{
+    quint32 value = 0;
+    for (int i = 0; i < 4 && i < bytes.size(); ++i)
+        value |= quint32(quint8(bytes.at(i))) << (8 * i);
+    return value;
+}
+
+// One deferred DSNAME as the server reads it: counts, the empty GUID and SID
+// slots, then the characters.
+void appendDsName(QByteArray &out, const QString &dn)
+{
+    const quint32 units = quint32(dn.size() + 1);
+    appendU32(out, units);
+    appendU32(out, 0);
+    appendU32(out, 0);
+    out.append(QByteArray(16 + 28, '\0'));
+    appendU32(out, units * 2);
+    out.append(wideString(dn));
+}
+
+// DsReplicaAdd level 1 (MS-DRSR 4.1.19): handle, level, the two referents, the
+// 84-byte schedule and the options, then the deferred bodies.
+QByteArray replicaAddStub(const QByteArray &handle, const QString &ncDn, const QString &address)
+{
+    QByteArray out = handle;
+    appendU32(out, 1u);
+    appendU32(out, 0x00020004u);
+    appendU32(out, 0x00020008u);
+    out.append(QByteArray(84, '\0'));
+    appendU32(out, 0u);
+    appendDsName(out, ncDn);
+    const QByteArray wide = wideString(address);
+    appendU32(out, quint32(wide.size() / 2));
+    out.append(wide);
+    return out;
+}
+
+// DsReplicaDel level 1 (MS-DRSR 4.1.20): the same shape, but the address is a
+// UTF-8 byte string with max count, offset and actual count.
+QByteArray replicaDelStub(const QByteArray &handle, const QString &ncDn, const QString &address)
+{
+    QByteArray out = handle;
+    appendU32(out, 1u);
+    appendU32(out, 0x00020004u);
+    appendU32(out, 0x00020008u);
+    appendU32(out, 0u);
+    appendDsName(out, ncDn);
+    const QByteArray utf8 = (address + QChar(u'\0')).toUtf8();
+    appendU32(out, quint32(utf8.size()));
+    appendU32(out, 0u);
+    appendU32(out, quint32(utf8.size()));
+    out.append(utf8);
+    while (out.size() % 4 != 0)
+        out.append('\0');
+    return out;
+}
+
 const DirectoryObject *liveObject(const LdapServer &store, const QString &name)
 {
     for (const DirectoryObject &object : store.objects()) {
@@ -282,10 +361,50 @@ public:
     quint16 port() const { return m_port; }
     quint16 epmPort() const { return m_epmPort; }
 
+    // One stub call on the peer's own thread. The topology calls read and write
+    // the server's handle table, which the event loop also touches, so they are
+    // serialised onto that thread instead of called straight from the test.
+    QByteArray handleCall(quint16 opnum, const QByteArray &stub)
+    {
+        DrsServer *server = nullptr;
+        {
+            QMutexLocker lock(&m_serverMutex);
+            server = m_server;
+        }
+        if (!server || !isRunning())
+            return QByteArray();
+        QByteArray reply;
+        QMetaObject::invokeMethod(
+            server, [server, opnum, stub, &reply]() { reply = server->handleCall(opnum, stub); },
+            Qt::BlockingQueuedConnection);
+        return reply;
+    }
+
+    int replicaSourceCount()
+    {
+        DrsServer *server = nullptr;
+        {
+            QMutexLocker lock(&m_serverMutex);
+            server = m_server;
+        }
+        if (!server || !isRunning())
+            return 0;
+        int count = 0;
+        QMetaObject::invokeMethod(
+            server,
+            [server, &count]() { count = server->replicaSources().size(); },
+            Qt::BlockingQueuedConnection);
+        return count;
+    }
+
 protected:
     void run() override
     {
         DrsServer server;
+        {
+            QMutexLocker lock(&m_serverMutex);
+            m_server = &server;
+        }
         server.setConfig(m_config);
         server.setObjectProvider(m_provider);
         if (m_authenticator) {
@@ -311,6 +430,8 @@ private:
     Rpc::Authenticator m_authenticator;
     quint16 m_port = 0;
     quint16 m_epmPort = 0;
+    QMutex m_serverMutex;
+    DrsServer *m_server = nullptr;
     QSemaphore m_ready;
 };
 
@@ -567,6 +688,64 @@ private slots:
                                 .arg(error)));
         QVERIFY(liveObject(target, QStringLiteral("alice")) == nullptr);
         QCOMPARE(target.tombstones().size(), 1);
+
+        peer.quit();
+        QVERIFY(peer.wait(5000));
+    }
+
+    // The whole path an administrator walks: register a link through the
+    // topology call, pull changes over loopback TCP, see a deletion converge on
+    // the second store, then retire the link through the wire again.
+    void aRegisteredLinkIsPulledAndRetired()
+    {
+        LdapServer source;
+        source.addObject(domainObject());
+        source.addObject(alice());
+
+        SharedObjects shared;
+        shared.set(source.objects() + source.tombstones());
+
+        DrsServerThread peer([&shared]() { return shared.snapshot(); }, config());
+        peer.start();
+        peer.waitUntilListening();
+        QVERIFY(peer.port() != 0);
+
+        // Bind first: the topology calls take the context handle DsBind returns.
+        QByteArray handle;
+        quint32 werr = 1;
+        QVERIFY(DrsWire::parseDsBindReply(peer.handleCall(0, DrsWire::dsBindRequest()), &handle,
+                                          &werr));
+        QCOMPARE(werr, quint32(0));
+
+        const QString address = QStringLiteral("127.0.0.1:%1").arg(peer.port());
+        QCOMPARE(readU32(peer.handleCall(5, replicaAddStub(handle, kBaseDn, address))), quint32(0));
+        QCOMPARE(peer.replicaSourceCount(), 1);
+
+        LdapServer target;
+        ReplicationAgent agent;
+        agent.setSource(QStringLiteral("127.0.0.1"), peer.port());
+        agent.setNamingContext(kBaseDn);
+        agent.setSink([&target](const QList<DirectoryObject> &objects) {
+            return target.applyReplication(objects);
+        });
+
+        QString error;
+        QVERIFY2(agent.pullOnce(&error) >= 0, qPrintable(error));
+        QVERIFY(liveObject(target, QStringLiteral("alice")) != nullptr);
+
+        // A deletion on the source reaches the second store on the next cycle.
+        QVERIFY(source.removeObject(alice().id));
+        shared.set(source.objects() + source.tombstones());
+        QVERIFY2(agent.pullOnce(&error) >= 1, qPrintable(error));
+        QVERIFY(liveObject(target, QStringLiteral("alice")) == nullptr);
+        QCOMPARE(target.tombstones().size(), 1);
+
+        // Retiring the link removes it, and a second delete reports that there
+        // is no such source rather than succeeding twice.
+        QCOMPARE(readU32(peer.handleCall(6, replicaDelStub(handle, kBaseDn, address))), quint32(0));
+        QCOMPARE(peer.replicaSourceCount(), 0);
+        QCOMPARE(readU32(peer.handleCall(6, replicaDelStub(handle, kBaseDn, address))),
+                 quint32(0x00002104));
 
         peer.quit();
         QVERIFY(peer.wait(5000));
