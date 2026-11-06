@@ -31,5 +31,14 @@ jobs:
           version: '6.8.*'
           cache: true
 
+      # The conformance stage marshals every call with impacket's NDR rather
+      # than this tree's, so it needs a client implementation GitHub ships.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install impacket
+        run: python3 -m pip install --upgrade pip impacket
+
       - name: Build and test
-        run: scripts/ci.sh
+        run: scripts/ci.sh --conformance

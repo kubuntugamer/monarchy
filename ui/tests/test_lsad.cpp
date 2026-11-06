@@ -279,6 +279,7 @@ private slots:
     void alignsThePolicyArmsApparentlyTrivialLevelsHide();
     void answersThePrivilegeDisplayName();
     void refusesUnknownHandlesAndClasses();
+    void enumeratesEveryAccountAndPagesOnLength();
     void createsQueriesEnumeratesAndDeletesATrust();
     void refusesDuplicateAndUnknownTrusts();
 };
@@ -675,6 +676,72 @@ void LsadTest::refusesDuplicateAndUnknownTrusts()
     const QByteArray refused = server.handleCall(Lsad::OpQueryTrustedDomainInfo, query);
     QCOMPARE(lastWord(refused), 0xc0000003u); // STATUS_INVALID_INFO_CLASS
     QCOMPARE(readLe32At(refused, 0), 0u);
+}
+
+// LsarEnumerateAccounts lists the domain's accounts, not only the SIDs that
+// happen to carry a userRight. Answering from the rights table made a freshly
+// provisioned domain report an empty list to impacket's own NDR client while
+// every other LSAD call answered normally.
+void LsadTest::enumeratesEveryAccountAndPagesOnLength()
+{
+    LsadServer server;
+    server.setConfig(testConfig());
+
+    const auto account = [](const QString &dn, const QString &sid, const QString &classes) {
+        DirectoryObject object;
+        object.id = dn;
+        object.type = QStringLiteral("user");
+        object.attributes.insert(QStringLiteral("distinguishedName"), dn);
+        object.attributes.insert(QStringLiteral("objectSid"), sid);
+        object.attributes.insert(QStringLiteral("objectClass"), classes);
+        return object;
+    };
+    const QString user = QStringLiteral("top;person;organizationalPerson;user");
+    const QString adminSid = QStringLiteral("S-1-5-21-1-2-3-500");
+    const QString aliceSid = QStringLiteral("S-1-5-21-1-2-3-1104");
+    const QString groupSid = QStringLiteral("S-1-5-21-1-2-3-513");
+
+    QList<DirectoryObject> store;
+    DirectoryObject administrator = account(
+        QStringLiteral("CN=Administrator,CN=Users,DC=corp,DC=example,DC=com"), adminSid, user);
+    administrator.attributes.insert(QStringLiteral("userRight"),
+                                    QStringLiteral("SeBackupPrivilege"));
+    store.append(administrator);
+    // No userRight: still an account, and the case that used to be missing.
+    store.append(account(QStringLiteral("CN=alice,CN=Users,DC=corp,DC=example,DC=com"),
+                         aliceSid, user));
+    // A group is an alias in the policy database, not an account.
+    store.append(account(QStringLiteral("CN=Domain Users,CN=Users,DC=corp,DC=example,DC=com"),
+                         groupSid, QStringLiteral("top;group")));
+    server.setObjectProvider([&store]() { return store; });
+
+    const QByteArray handle =
+        server.handleCall(Lsad::OpOpenPolicy2, openPolicyStub()).left(20);
+    const auto enumerate = [&](quint32 context, quint32 maximumLength) {
+        QByteArray stub = handle;
+        appendLe32(stub, context);
+        appendLe32(stub, maximumLength);
+        return server.handleCall(Lsad::OpEnumAccounts, stub);
+    };
+
+    const QByteArray all = enumerate(0, 0x1000);
+    QCOMPARE(lastWord(all), 0u);
+    QCOMPARE(readLe32At(all, 0), 2u); // the context both accounts consumed
+    QCOMPARE(readLe32At(all, 4), 2u); // EntriesRead
+    QVERIFY(all.contains(wireSid(adminSid)));
+    QVERIFY(all.contains(wireSid(aliceSid)));
+    QVERIFY(!all.contains(wireSid(groupSid)));
+
+    // PreferedMaximumLength bounds the page: one SID and its pointer is 36
+    // bytes here, so a 36-byte budget carries one entry and defers the other.
+    const QByteArray page = enumerate(0, 36);
+    QCOMPARE(lastWord(page), 0x00000105u); // STATUS_MORE_ENTRIES
+    QCOMPARE(readLe32At(page, 0), 1u);     // resume here
+    QCOMPARE(readLe32At(page, 4), 1u);     // EntriesRead
+    const QByteArray rest = enumerate(readLe32At(page, 0), 36);
+    QCOMPARE(lastWord(rest), 0u);
+    QCOMPARE(readLe32At(rest, 0), 2u);
+    QCOMPARE(readLe32At(rest, 4), 1u);
 }
 
 QTEST_MAIN(LsadTest)

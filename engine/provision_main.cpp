@@ -47,6 +47,12 @@ int main(int argc, char *argv[])
     QCommandLineOption kdcPortOption(QStringLiteral("kdc-port"),
                                 QStringLiteral("Port the KDC serves (default: native 88)."),
                                 QStringLiteral("port"));
+    QCommandLineOption netlogonPortOption(QStringLiteral("netlogon-port"),
+                                QStringLiteral("Port Netlogon serves (default: 1037)."),
+                                QStringLiteral("port"));
+    QCommandLineOption drsPortOption(QStringLiteral("drs-port"),
+                                QStringLiteral("Port DRSUAPI serves (default: 1038)."),
+                                QStringLiteral("port"));
     QCommandLineOption devPortsOption(QStringLiteral("dev-ports"),
                                 QStringLiteral("Provision the unprivileged port set "
                                                "(1389/1053/8888/1035/1036) a rootless "
@@ -65,6 +71,8 @@ int main(int argc, char *argv[])
     parser.addOption(ipOption);
     parser.addOption(hostOption);
     parser.addOption(kdcPortOption);
+    parser.addOption(netlogonPortOption);
+    parser.addOption(drsPortOption);
     parser.addOption(devPortsOption);
     parser.addOption(forwarderOption);
     parser.addOption(forceOption);
@@ -87,6 +95,12 @@ int main(int argc, char *argv[])
     config.kdcPort = parser.isSet(kdcPortOption)
         ? quint16(parser.value(kdcPortOption).toUInt())
         : config.kdcPort; // default: native 88 with the rest of the well-known set
+    config.netlogonPort = parser.isSet(netlogonPortOption)
+        ? quint16(parser.value(netlogonPortOption).toUInt())
+        : config.netlogonPort;
+    config.drsPort = parser.isSet(drsPortOption)
+        ? quint16(parser.value(drsPortOption).toUInt())
+        : config.drsPort;
     config.devPorts = parser.isSet(devPortsOption);
     if (config.devPorts && !parser.isSet(kdcPortOption))
         config.kdcPort = 8888; // rootless development binding

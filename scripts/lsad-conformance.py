@@ -34,6 +34,9 @@ Options:
                      Interpreter with impacket installed. Default: the
                      interpreter running this script
   --list             Only list the checks that would run.
+  --skip-samba       Run only the impacket half. Use this where Samba's Python
+                     bindings are absent (CI images); the Samba half stays the
+                     reference check on a machine that has them.
 
 Exit status is 0 when every check passes, 1 otherwise.
 """
@@ -335,6 +338,9 @@ def main():
     parser.add_argument('--samba-python', default='/usr/bin/python3')
     parser.add_argument('--impacket-python', default=sys.executable)
     parser.add_argument('--list', action='store_true')
+    parser.add_argument('--skip-samba', action='store_true',
+                        help="Run only the impacket half, for a host without "
+                             "Samba's Python bindings.")
     options = parser.parse_args()
 
     domain_sid = options.domain_sid or os.environ.get('MONARCHY_DOMAIN_SID')
@@ -352,8 +358,9 @@ def main():
     arguments = [options.host, options.port, options.user, options.password,
                  options.domain, domain_sid]
     failures = 0
-    print('--- Samba dcerpc (reference NDR)')
-    failures += run(options.samba_python, SAMBA_CHECKS, arguments)
+    if not options.skip_samba:
+        print('--- Samba dcerpc (reference NDR)')
+        failures += run(options.samba_python, SAMBA_CHECKS, arguments)
     print('\n--- impacket (MS-LSAD from the specification)')
     failures += run(options.impacket_python, IMPACKET_CHECKS, arguments)
     return 0 if failures == 0 else 1

@@ -31,6 +31,12 @@ struct ProvisionConfig {
     quint16 lsadPort = 49153;
     quint16 epmPort = 135;
     quint16 smbPort = 445;
+    // Netlogon and DRSUAPI have no privileged variant, so they keep the same
+    // number in both port sets. A host that already runs a DC still needs to
+    // move them for a second instance, which is what the daemon reads back out
+    // of dc.conf.
+    quint16 netlogonPort = 1037;
+    quint16 drsPort = 1038;
     bool devPorts = false;
     // Upstream resolvers for out-of-zone DNS (address or address:port). Empty
     // leaves detection to the host's resolv.conf at runtime.

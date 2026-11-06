@@ -1372,15 +1372,46 @@ QByteArray LsadServer::handleCall(quint16 opnum, const QByteArray &stub,
             return result(kStatusInvalidHandle);
         if (!reader.u32(&context) || !reader.u32(&maximumLength))
             return {};
-        Q_UNUSED(maximumLength)
 
-        const QStringList sids = accountsWithRights();
+        // MS-LSAD 3.1.4.4.3 enumerates every account in the policy's domain.
+        // Groups are aliases, not accounts, but an account that carries no
+        // userRight is still an account; answering from the rights table made
+        // a freshly provisioned domain report an empty list to a real client.
+        QStringList sids;
+        for (const DirectoryObject &object : directory()) {
+            const QString sid = object.attributes.value(QStringLiteral("objectSid"));
+            if (sid.isEmpty() || sids.contains(sid))
+                continue;
+            const QString classes = object.attributes.value(QStringLiteral("objectClass"));
+            if (!classes.contains(QLatin1String("user"), Qt::CaseInsensitive)
+                && !classes.contains(QLatin1String("computer"), Qt::CaseInsensitive))
+                continue;
+            sids.append(sid);
+        }
+        std::sort(sids.begin(), sids.end());
+
+        // PreferedMaximumLength bounds the reply, and a client that gets
+        // STATUS_MORE_ENTRIES comes back with the context this reply returns.
+        // One entry is always included so a length below a single SID cannot
+        // leave the client in a loop that never advances.
         const int start = int(qMin<qsizetype>(context, sids.size()));
         QStringList page;
-        for (int i = start; i < sids.size(); ++i)
+        int used = 0;
+        for (int i = start; i < sids.size(); ++i) {
+            QByteArray encoded;
+            appendSid(encoded, sids.at(i));
+            const int cost = 4 + encoded.size(); // SID pointer and the SID
+            if (!page.isEmpty() && maximumLength != 0 && used + cost > int(maximumLength))
+                break;
             page.append(sids.at(i));
+            used += cost;
+        }
+        const quint32 resume = quint32(start + page.size());
 
-        putLe32(fixed, 0); // resume
+        // LsarEnumerateAccountsResponse: the context first, then the buffer's
+        // EntriesRead, its array referent, the maximum count, the SID pointers
+        // and the deferred SIDs, which is the order impacket's NDR reads.
+        putLe32(fixed, resume);
         putLe32(fixed, quint32(page.size()));
         putLe32(fixed, 0x00030100u); // array pointer
         putLe32(fixed, quint32(page.size())); // array maximum count
@@ -1388,8 +1419,10 @@ QByteArray LsadServer::handleCall(quint16 opnum, const QByteArray &stub,
             putLe32(fixed, 0x00030110u + quint32(i)); // SID pointers
         for (const QString &sid : page)
             appendSid(fixed, sid);
-        emit requestReceived(QStringLiteral("EnumAccounts (%1)").arg(page.size()));
-        return result(kStatusSuccess);
+        emit requestReceived(QStringLiteral("EnumAccounts (%1 of %2)")
+                                 .arg(page.size())
+                                 .arg(sids.size()));
+        return result(start + page.size() < sids.size() ? kStatusMoreEntries : kStatusSuccess);
     }
     case Lsad::OpEnumTrustDom:
     case Lsad::OpEnumTrustedDomainsEx: {

@@ -210,6 +210,11 @@ the offscreen platform set so the console-linked suites work headless, as
 `scripts/ci.sh` — which is what `.github/workflows/ci.yml` runs on every push
 and pull request. `scripts/ci.sh --build-dir DIR` keeps an existing directory
 instead of starting clean, and `--with-ldap` builds the OpenLDAP backend.
+`scripts/ci.sh --conformance` adds the wire check: it provisions a throwaway
+domain, starts `monarchy-dcd` on free ports (a host that already runs a DC keeps
+1037/1038, so the ports are chosen per run) and drives it with
+`scripts/drs-conformance.py` and the impacket half of
+`scripts/lsad-conformance.py`. It needs `impacket` for the `python3` on `PATH`.
 
 ## Run
 

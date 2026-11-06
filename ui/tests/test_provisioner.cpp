@@ -93,6 +93,9 @@ void ProvisionerTest::buildsDomainFromScratch()
     QCOMPARE(conf.value(QStringLiteral("lsadPort")).toInt(), 49153);
     QCOMPARE(conf.value(QStringLiteral("gcPort")).toInt(), 3268);
     QCOMPARE(conf.value(QStringLiteral("netlogonPort")).toInt(), 1037);
+    // DRSUAPI is written too, so a host that already runs a DC can move the
+    // second instance instead of colliding on the default.
+    QCOMPARE(conf.value(QStringLiteral("drsPort")).toInt(), 1038);
     QCOMPARE(conf.value(QStringLiteral("forwarders")).toString(),
              QStringLiteral("192.0.2.53, 192.0.2.54:5353"));
 
