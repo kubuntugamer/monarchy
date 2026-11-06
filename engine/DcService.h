@@ -16,6 +16,8 @@ class NetlogonServer;
 class DrsServer;
 class EpmServer;
 class Smb2Server;
+class ReplicationAgent;
+class QTimer;
 
 // The domain controller as a standalone unit: loads the provisioned domain's
 // dc.conf, owns every service endpoint (LDAP, KDC, DNS, SAMR, LSAD, Netlogon,
@@ -63,6 +65,8 @@ private:
     DrsServer *m_drsServer = nullptr;
     EpmServer *m_epmServer = nullptr;
     Smb2Server *m_smbServer = nullptr;
+    ReplicationAgent *m_replicationAgent = nullptr;
+    QTimer *m_replicaTimer = nullptr;
 
     bool m_started = false;
     // Store and zone locations resolved from dc.conf at start-up.

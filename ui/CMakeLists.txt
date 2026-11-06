@@ -43,6 +43,8 @@ add_library(monarchy-ui-core STATIC
     ../engine/Ntlm.h
     ../engine/Ntlm.cpp
     ../engine/NtlmClient.cpp
+    ../engine/ReplicationAgent.h
+    ../engine/ReplicationAgent.cpp
     ../engine/Aes.h
     ../engine/Aes.cpp
     ../engine/Des.h

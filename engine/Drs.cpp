@@ -1047,6 +1047,22 @@ QByteArray DrsServer::drsGetNCChanges(const QByteArray &stub)
 
     const QList<DirectoryObject> all = directory();
 
+    // The configuration and schema partitions are naming contexts of their own
+    // in AD. Their objects hang off the same root DN, so a suffix test alone
+    // would sweep them into the domain NC and replicate them as domain data.
+    QStringList foreignNcs;
+    for (const DirectoryObject &object : all) {
+        if (!object.id.isEmpty())
+            continue;
+        for (const QString &key : {QStringLiteral("configurationNamingContext"),
+                                   QStringLiteral("schemaNamingContext")}) {
+            const QString root = object.attributes.value(key);
+            if (!root.isEmpty() && root.compare(ncDn, Qt::CaseInsensitive) != 0
+                && !foreignNcs.contains(root, Qt::CaseInsensitive))
+                foreignNcs.append(root);
+        }
+    }
+
     // Target resolution: GUID first, then SID, then DN. An empty pNC or a
     // bare-NC DSNAME means the whole domain NC.
     const bool targeted = extendedOp == kExopReplObj
@@ -1073,6 +1089,16 @@ QByteArray DrsServer::drsGetNCChanges(const QByteArray &stub)
             if (!ncDn.isEmpty() && object.id != ncDn
                 && !object.id.endsWith(QLatin1Char(',') + ncDn, Qt::CaseInsensitive))
                 continue;
+            bool foreign = false;
+            for (const QString &root : foreignNcs) {
+                if (object.id.compare(root, Qt::CaseInsensitive) == 0
+                    || object.id.endsWith(QLatin1Char(',') + root, Qt::CaseInsensitive)) {
+                    foreign = true;
+                    break;
+                }
+            }
+            if (foreign)
+                continue;
             const quint64 usn = storeUsn(object);
             if (usn > fromUsn[0])
                 changed.append(qMakePair(usn, object));
@@ -1096,6 +1122,9 @@ QByteArray DrsServer::drsGetNCChanges(const QByteArray &stub)
     QList<DirectoryObject> batch;
     for (const QPair<quint64, DirectoryObject> &entry : changed)
         batch.append(entry.second);
+    // storeUsn() keeps an object with no real uSNChanged below the store's own
+    // USN space (writing starts at 1001), so the highest value in the batch is
+    // always a safe cursor: it can never sit above a change written later.
     const quint64 deliveredUsn =
         batch.isEmpty() ? fromUsn[0] : changed[batchCount - 1].first;
 
@@ -1589,15 +1618,17 @@ QList<DirectoryObject> DrsServer::directory() const
 quint64 DrsServer::storeUsn(const DirectoryObject &object) const
 {
     // The store stamps uSNChanged on every write, which is what a replication
-    // cursor has to follow — a tombstone is ordered by the USN its deletion
-    // was stamped with. A hand-built fixture without the attribute keeps the
-    // stable derived value the earlier suites pin.
+    // cursor has to follow — a tombstone is ordered by the USN its deletion was
+    // stamped with. An object that arrives without the attribute gets a stable
+    // value below the store's own USN space (writing starts at 1001), so it is
+    // still delivered but can never push a partner's cursor past a change the
+    // store writes later.
     bool ok = false;
     const quint64 stored =
         object.attributes.value(QStringLiteral("uSNChanged")).toULongLong(&ok);
     if (ok && stored != 0)
         return stored;
-    return 10000u + quint64(qHash(object.id)) % 900000u;
+    return 1u + quint64(qHash(object.id)) % 999u;
 }
 
 QByteArray DrsServer::handleCall(quint16 opnum, const QByteArray &stub)

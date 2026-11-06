@@ -26,6 +26,7 @@
 #include "DrsClient.h"
 #include "LdapServer.h"
 #include "Ntlm.h"
+#include "ReplicationAgent.h"
 
 namespace {
 
@@ -492,6 +493,81 @@ private slots:
         QCOMPARE(objects.size(), 2);
 
         client.close();
+        peer.quit();
+        QVERIFY(peer.wait(5000));
+    }
+
+    // The agent is the DRA half: a partner named once, pulled when asked,
+    // applying into a real store with a cursor that survives between pulls.
+    void aPullAgentConvergesTwoStores()
+    {
+        SharedObjects shared;
+        shared.set(fixture());
+
+        DrsServerThread peer([&shared]() { return shared.snapshot(); }, config());
+        peer.start();
+        peer.waitUntilListening();
+
+        LdapServer target;
+        ReplicationAgent agent;
+        agent.setSource(QStringLiteral("127.0.0.1"), peer.port());
+        agent.setNamingContext(kBaseDn);
+        agent.setSink([&target](const QList<DirectoryObject> &objects) {
+            return target.applyReplication(objects);
+        });
+
+        QString error;
+        const int first = agent.pullOnce(&error);
+        QVERIFY2(first >= 0, qPrintable(error));
+        QCOMPARE(first, 2);
+        QVERIFY(liveObject(target, QStringLiteral("alice")) != nullptr);
+        QVERIFY(agent.lastUsn() > 0);
+
+        // The cursor is the point: a second pull takes nothing new.
+        QCOMPARE(agent.pullOnce(&error), 0);
+
+        peer.quit();
+        QVERIFY(peer.wait(5000));
+    }
+
+    // A deletion reaches the other store through the same agent, and the store
+    // keeps it as a tombstone rather than forgetting the object ever existed.
+    void aPullAgentCarriesDeletions()
+    {
+        LdapServer source;
+        source.addObject(domainObject());
+        source.addObject(alice());
+
+        SharedObjects shared;
+        shared.set(source.objects() + source.tombstones());
+
+        DrsServerThread peer([&shared]() { return shared.snapshot(); }, config());
+        peer.start();
+        peer.waitUntilListening();
+
+        LdapServer target;
+        ReplicationAgent agent;
+        agent.setSource(QStringLiteral("127.0.0.1"), peer.port());
+        agent.setNamingContext(kBaseDn);
+        agent.setSink([&target](const QList<DirectoryObject> &objects) {
+            return target.applyReplication(objects);
+        });
+
+        QString error;
+        QVERIFY2(agent.pullOnce(&error) >= 0, qPrintable(error));
+        QVERIFY(liveObject(target, QStringLiteral("alice")) != nullptr);
+
+        QVERIFY(source.removeObject(alice().id));
+        shared.set(source.objects() + source.tombstones());
+        const int second = agent.pullOnce(&error);
+        QVERIFY2(second >= 1,
+                 qPrintable(QStringLiteral("applied=%1 cursor=%2 error=%3")
+                                .arg(second)
+                                .arg(agent.lastUsn())
+                                .arg(error)));
+        QVERIFY(liveObject(target, QStringLiteral("alice")) == nullptr);
+        QCOMPARE(target.tombstones().size(), 1);
+
         peer.quit();
         QVERIFY(peer.wait(5000));
     }

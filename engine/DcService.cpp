@@ -22,6 +22,11 @@
 #include <QSettings>
 #include <QStandardPaths>
 
+#include <QTimer>
+
+#include "ReplicationAgent.h"
+#include "resultsmodel.h"
+
 DcService::DcService(QObject *parent)
     : QObject(parent)
 {
@@ -524,6 +529,44 @@ bool DcService::start(const QString &dcDir)
     } else {
         emit statusMessage(
             tr("DRSR served on 127.0.0.1:%1.").arg(m_drsServer->serverPort()));
+    }
+
+    // Pull replication: when dc.conf names a partner, this DC takes changes from
+    // it on its own schedule instead of waiting for an administrator to ask. The
+    // cursor lives in the agent, so each pull asks only for what is new, and a
+    // pull that fails part-way is retried from where it stopped.
+    const QString replicaHost = dcConfig.value(QStringLiteral("replicaHost")).toString();
+    if (!replicaHost.isEmpty()) {
+        m_replicationAgent = new ReplicationAgent(this);
+        m_replicationAgent->setSource(
+            replicaHost, quint16(dcConfig.value(QStringLiteral("replicaPort"), 0).toInt()));
+        m_replicationAgent->setCredentials(
+            dcConfig.value(QStringLiteral("replicaDomain"), krbRealm.netbios).toString(),
+            dcConfig.value(QStringLiteral("replicaUser")).toString(),
+            dcConfig.value(QStringLiteral("replicaPassword")).toString());
+        m_replicationAgent->setNamingContext(
+            dcConfig.value(QStringLiteral("replicaNamingContext"), m_baseDn).toString());
+        m_replicationAgent->setSink([this](const QList<DirectoryObject> &objects) {
+            return m_ldapServer->applyReplication(objects);
+        });
+        connect(m_replicationAgent, &ReplicationAgent::pulled, this,
+                [this](const QString &summary) { emit statusMessage(summary); });
+        const int seconds = dcConfig.value(QStringLiteral("replicaIntervalSeconds"), 300).toInt();
+        if (seconds > 0) {
+            m_replicaTimer = new QTimer(this);
+            m_replicaTimer->setInterval(seconds * 1000);
+            connect(m_replicaTimer, &QTimer::timeout, this, [this]() {
+                QString error;
+                if (m_replicationAgent->pullOnce(&error) < 0) {
+                    emit statusMessage(tr("Replication pull from %1 failed: %2")
+                                           .arg(m_replicationAgent->source(), error));
+                }
+            });
+            m_replicaTimer->start();
+        }
+        emit statusMessage(tr("Pulling replication from %1 every %2s.")
+                               .arg(m_replicationAgent->source())
+                               .arg(seconds));
     }
 
     // The endpoint mapper: the answer a client gets when it knows an interface
