@@ -85,8 +85,12 @@ failure) |
   password policy is reported but not settable over RPC); `SamrSetInformationGroup`
   classes 1–3 (renaming a group and setting its SE_GROUP_* attribute set have no
   directory attribute behind them, so they are refused rather than accepted and
-  dropped); and the bad-password and logon counters, which are always reported
-  as zero because nothing counts them.
+  dropped); and a lockout policy: `SamLogon` raises `badPwdCount` and stamps
+  `badPasswordTime` on a refused password, clears the counter and bumps
+  `logonCount` and `lastLogon` on a success, and
+  `SamrQueryInformationUser2` class 21 reports all of it, but `lockoutTime` is
+  never set and class 12 reports a zero threshold, so a wrong password is
+  counted rather than locking the account.
 - **LSAD trusted domains beyond the object and its secret**: the trust, its
   SID, direction, names and the inter-realm keys derived from its clear secret
   are stored, reported and rewritable, but a trust still is not a working

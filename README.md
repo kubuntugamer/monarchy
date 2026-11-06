@@ -216,7 +216,8 @@ domain, starts `monarchy-dcd` on free ports (a host that already runs a DC keeps
 `scripts/drs-conformance.py`, the impacket half of `scripts/lsad-conformance.py`,
 `scripts/samr-conformance.py` (the account lifecycle) and
 `scripts/netlogon-conformance.py` (the locator, a machine account created over
-SAMR, the secure channel and a validated NTLMv2 logon). It needs `impacket` for
+SAMR, the secure channel, a validated NTLMv2 logon, a refused password and the
+`badPwdCount`/`logonCount` it leaves on the account). It needs `impacket` for
 the `python3` on `PATH`.
 
 ## Run

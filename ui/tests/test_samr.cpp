@@ -479,6 +479,12 @@ void SamrTest::samrDirectoryCalls()
     addUser(QStringLiteral("Administrator"), QStringLiteral("Administrator"),
             QStringLiteral("S-1-5-21-1-2-3-500"));
     addUser(QStringLiteral("alice"), QStringLiteral("alice"), QStringLiteral("S-1-5-21-1-2-3-1001"));
+    // The logon statistics SamLogon keeps on the account, so the aggregate read
+    // reports what a domain administrator sees on the account tab.
+    objects.last().attributes.insert(QStringLiteral("lastLogon"),
+                                     QStringLiteral("1234605616436508552"));
+    objects.last().attributes.insert(QStringLiteral("logonCount"), QStringLiteral("7"));
+    objects.last().attributes.insert(QStringLiteral("badPwdCount"), QStringLiteral("3"));
 
     SamrServer server;
     Samr::Config config;
@@ -559,6 +565,10 @@ void SamrTest::samrDirectoryCalls()
     QVERIFY(utf16Text(allReply).contains(QStringLiteral("alice")));
     QVERIFY(allReply.contains(QByteArray::fromHex("e9030000"))); // RID 1001
     QVERIFY(allReply.contains(QByteArray::fromHex("ffe7ff09"))); // fields present
+    // LastLogon, badPwdCount and logonCount are the stored values: the arm is
+    // the 196-byte aggregate that starts after the referent and tag.
+    QVERIFY(allReply.contains(QByteArray::fromHex("8877665544332211"))); // lastLogon
+    QCOMPARE(allReply.mid(8 + 184, 4), QByteArray::fromHex("03000700"));
     // The logon-hours pointer is [size_is(1260), length_is(168/8)]: maximum
     // count 1260, offset 0, twenty-one octets of "every hour allowed".
     QByteArray hours;

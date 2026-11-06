@@ -117,6 +117,9 @@ struct DomainBuilder {
                                QStringLiteral("%1@%2").arg(account, dnsDomain));
         user.attributes.insert(QStringLiteral("description"), description);
         user.attributes.insert(QStringLiteral("badPwdCount"), QStringLiteral("0"));
+        user.attributes.insert(QStringLiteral("badPasswordTime"), QStringLiteral("0"));
+        user.attributes.insert(QStringLiteral("logonCount"), QStringLiteral("0"));
+        user.attributes.insert(QStringLiteral("lastLogon"), QStringLiteral("0"));
         user.attributes.insert(QStringLiteral("pwdLastSet"), QStringLiteral("0"));
         return user;
     }

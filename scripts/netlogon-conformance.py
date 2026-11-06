@@ -17,6 +17,10 @@ status and the account the validation names.
 A machine account the directory does not hold must be refused with
 STATUS_NO_TRUST_SAM_ACCOUNT, so that path is checked with a name nothing serves.
 
+A wrong password has to be refused with STATUS_WRONG_PASSWORD *and* counted:
+the account's badPwdCount goes up, the good logon clears it, and SAMR reports
+both counters back, so the last two checks read the account over SAMR.
+
 Usage:
   scripts/netlogon-conformance.py [options]
 
@@ -57,6 +61,7 @@ STATUS_SUCCESS = 0x00000000
 STATUS_NO_SUCH_USER = 0xC0000064
 STATUS_NO_TRUST_SAM_ACCOUNT = 0xC000018B
 STATUS_USER_EXISTS = 0xC0000063
+STATUS_WRONG_PASSWORD = 0xC000006A
 NETLOGON_NEG_STRONG_KEYS = 0x00004000
 
 failures = []
@@ -70,6 +75,8 @@ CHECKS = [
     'machine account created over SAMR',
     'NetrServerReqChallenge / NetrServerAuthenticate3 establish a channel',
     'NetrLogonSamLogon validates the account (NTLMv2)',
+    'a refused password is counted on the account',
+    'SAMR reports the account logon statistics',
 ]
 
 
@@ -147,6 +154,42 @@ def machine_account(options):
     samr.hSamrCloseHandle(dce, domain)
     samr.hSamrCloseHandle(dce, server)
     return (account, password, rid), None
+
+
+def logon_statistics(options):
+    """badPwdCount and logonCount as SAMR reports them for the account the
+    logon calls validate: the counters a DC keeps are what a lockout policy and
+    an administrator both read."""
+    dce = samr_bind(options)
+    server = samr.hSamrConnect5(dce, '\\\\%s\x00' % options.host,
+                                MAXIMUM_ALLOWED, 1, 3)['ServerHandle']
+    domain_id = samr.hSamrLookupDomainInSamServer(dce, server, options.domain)['DomainId']
+    domain = samr.hSamrOpenDomain(dce, server, MAXIMUM_ALLOWED, domain_id)['DomainHandle']
+    names = samr.hSamrLookupNamesInDomain(dce, domain, (options.user,))
+    # SAMPR_ULONG_ARRAY is a count plus a pointer to the values, and each value
+    # may still be the NDR object rather than the integer it carries.
+    entries = names['RelativeIds']['Element']
+    rid = entries[0]
+    rid = int(rid['Data']) if hasattr(rid, 'fields') else int(rid)
+    user = samr.hSamrOpenUser(dce, domain, MAXIMUM_ALLOWED, rid)['UserHandle']
+    response = samr.hSamrQueryInformationUser2(dce, user, 21)  # SamrUserAllInformation
+    # The union's arm for class 21 is SAMPR_USER_ALL_INFORMATION; the union
+    # key is what names it, and a release that keys by name is handled too.
+    buffer = response['Buffer']
+    arm_name = samr.SAMPR_USER_INFO_BUFFER.union[21][0]
+    arm = buffer[arm_name] if arm_name in buffer.fields else None
+    if arm is None:
+        for value in buffer.fields.values():
+            if hasattr(value, 'fields') and 'BadPasswordCount' in value.fields:
+                arm = value
+                break
+    bad = int(arm['BadPasswordCount'])
+    logons = int(arm['LogonCount'])
+    samr.hSamrCloseHandle(dce, user)
+    samr.hSamrCloseHandle(dce, domain)
+    samr.hSamrCloseHandle(dce, server)
+    dce.disconnect()
+    return (bad == 0 and logons >= 1), (bad, logons)
 
 
 def ntlmv2_response(nt_hash, user, domain, challenge):
@@ -304,6 +347,59 @@ def main():
         request['NegotiateFlags'] = NETLOGON_NEG_STRONG_KEYS
         return dce.request(request), session_key
 
+    def samlogon(server_credential, session_key, user, password):
+        """One NetrLogonSamLogon over an established channel."""
+        nt_hash = ntlm.compute_nthash(password)
+        challenge = b'ConfChlg'
+        nt_response = ntlmv2_response(nt_hash, user, options.domain, challenge)
+        request = nrpc.NetrLogonSamLogon()
+        request['LogonServer'] = NULL
+        request['ComputerName'] = computer
+        # This helper returns a whole NETLOGON_AUTHENTICATOR, not the 8-byte
+        # credential: its Timestamp is the one the credential was computed for,
+        # and the server derives its answer from that timestamp.
+        authenticator = nrpc.ComputeNetlogonAuthenticator(server_credential, session_key)
+        set_credential(request['Authenticator'], 'Credential', authenticator['Credential'])
+        request['Authenticator']['Timestamp'] = authenticator['Timestamp']
+        request['ReturnAuthenticator']['Timestamp'] = 0
+        set_credential(request['ReturnAuthenticator'], 'Credential', b'\x00' * 8)
+        # NetlogonNetworkInformation (MS-NRPC 2.2.1.4.16) is 2, not 3: 3 is
+        # NetlogonServiceInformation, whose arm carries interactive OWFs and no
+        # challenge. The union arm is selected by its own tag, which the IDL
+        # requires to equal LogonLevel.
+        request['LogonLevel'] = 2
+        request['LogonInformation']['tag'] = 2
+        request['ValidationLevel'] = 3  # NETLOGON_VALIDATION_SAM_INFO2
+        network = request['LogonInformation']['LogonNetwork']
+        network['Identity']['LogonDomainName'] = options.domain
+        network['Identity']['ParameterControl'] = 3
+        network['Identity']['UserName'] = user
+        network['Identity']['Workstation'] = computer
+        # LM_CHALLENGE is a fixed 8-byte array, so the whole field is assigned;
+        # its Data member reads back as bytes.
+        network['LmChallenge'] = challenge
+        # The responses are counted binary strings whose only member is Data, so
+        # impacket exposes the arm as the value itself and the whole field is
+        # assigned. Both are sent: impacket writes no counted array at all for
+        # an empty one, which no client would put on the wire. A client that
+        # answers only with NTLMv2 sends a zeroed 24-byte LMv2.
+        network['NtChallengeResponse'] = nt_response
+        network['LmChallengeResponse'] = b'\x00' * 24
+        return dce.request(request)
+
+    def open_channel(account, password):
+        """A fresh challenge and handshake, so a call that spends the channel
+        (a refused logon steps it before the password is looked at) leaves the
+        next check a clean one."""
+        nonlocal server_challenge
+        request = nrpc.NetrServerReqChallenge()
+        request['PrimaryName'] = NULL
+        request['ComputerName'] = computer
+        request['ClientChallenge'] = client_challenge
+        server_challenge = eight(dce.request(request)['ServerChallenge'])
+        response, session_key = authenticate(account, password)
+        return session_key, eight(response['ServerCredential']), response['ErrorCode']
+
     if server_challenge:
         try:
             response, _ = authenticate('NOSUCH%s$' % uuid.uuid4().hex[:4].upper(),
@@ -329,9 +425,27 @@ def main():
             skip(CHECKS[4], reason)
             skip(CHECKS[5], 'no machine account to authenticate with')
             skip(CHECKS[6], 'no secure channel to log on over')
+            skip(CHECKS[7], 'no secure channel to refuse a password on')
+            skip(CHECKS[8], 'no account logon to read back')
         else:
             account, password, rid = machine
             check(CHECKS[4], True, '%s rid %d' % (account, rid))
+
+            # A refused password raises badPwdCount. This has to run on its own
+            # channel: the server steps the credential before it looks at the
+            # password, so the refusal spends this one and the good logon below
+            # opens a fresh one.
+            try:
+                refused_key, refused_seed, refused_code = open_channel(account, password)
+                if refused_code != STATUS_SUCCESS:
+                    raise RuntimeError('channel refused: 0x%08x' % refused_code)
+                samlogon(refused_seed, refused_key, options.user,
+                         'Wr0ng-' + uuid.uuid4().hex)
+                check(CHECKS[7], False, 'the wrong password was accepted')
+            except Exception as error:  # noqa: BLE001
+                code = getattr(error, 'error_code', None)
+                check(CHECKS[7], code == STATUS_WRONG_PASSWORD,
+                      '%s: %s' % (type(error).__name__, error))
 
             # A fresh challenge per channel: the first one was spent above.
             request = nrpc.NetrServerReqChallenge()
@@ -358,50 +472,8 @@ def main():
                 skip(CHECKS[6], 'no secure channel')
             else:
                 try:
-                    nt_hash = ntlm.compute_nthash(options.password)
-                    challenge = b'ConfChlg'
-                    nt_response = ntlmv2_response(nt_hash, options.user,
-                                                  options.domain, challenge)
-                    request = nrpc.NetrLogonSamLogon()
-                    request['LogonServer'] = NULL
-                    request['ComputerName'] = computer
-                    # This helper returns a whole NETLOGON_AUTHENTICATOR, not
-                    # the 8-byte credential: its Timestamp is the one the
-                    # credential was computed for, and the server derives its
-                    # answer from that timestamp.
-                    authenticator = nrpc.ComputeNetlogonAuthenticator(
-                        server_credential, session_key)
-                    set_credential(request['Authenticator'], 'Credential',
-                                   authenticator['Credential'])
-                    request['Authenticator']['Timestamp'] = authenticator['Timestamp']
-                    request['ReturnAuthenticator']['Timestamp'] = 0
-                    set_credential(request['ReturnAuthenticator'], 'Credential',
-                                   b'\x00' * 8)
-                    # NetlogonNetworkInformation (MS-NRPC 2.2.1.4.16) is 2, not
-                    # 3: 3 is NetlogonServiceInformation, whose arm carries
-                    # interactive OWFs and no challenge. The union arm is
-                    # selected by its own tag, which the IDL requires to equal
-                    # LogonLevel.
-                    request['LogonLevel'] = 2
-                    request['LogonInformation']['tag'] = 2
-                    request['ValidationLevel'] = 3  # NETLOGON_VALIDATION_SAM_INFO2
-                    network = request['LogonInformation']['LogonNetwork']
-                    network['Identity']['LogonDomainName'] = options.domain
-                    network['Identity']['ParameterControl'] = 3
-                    network['Identity']['UserName'] = options.user
-                    network['Identity']['Workstation'] = computer
-                    # LM_CHALLENGE is a fixed 8-byte array, so the whole field
-                    # is assigned; its Data member reads back as bytes.
-                    network['LmChallenge'] = challenge
-                    # The responses are counted binary strings whose only
-                    # member is Data, so impacket exposes the arm as the value
-                    # itself and the whole field is assigned. Both are sent:
-                    # impacket writes no counted array at all for an empty one,
-                    # which no client would put on the wire. A client that
-                    # answers only with NTLMv2 sends a zeroed 24-byte LMv2.
-                    network['NtChallengeResponse'] = nt_response
-                    network['LmChallengeResponse'] = b'\x00' * 24
-                    response = dce.request(request)
+                    response = samlogon(server_credential, session_key, options.user,
+                                        options.password)
                     # The validated account is the SamInfo2 arm's EffectiveName.
                     name = validation_field(
                         response['ValidationInformation']['ValidationSam2'],
@@ -413,6 +485,14 @@ def main():
                 except Exception as error:  # noqa: BLE001
                     traceback.print_exc()
                     check(CHECKS[6], False, '%s: %s' % (type(error).__name__, error))
+
+                # The good logon cleared the counter the refusal raised, and
+                # raised the logon count, on the account itself.
+                try:
+                    ok, counters = logon_statistics(options)
+                    check(CHECKS[8], ok, counters)
+                except Exception as error:  # noqa: BLE001
+                    check(CHECKS[8], False, '%s: %s' % (type(error).__name__, error))
 
     print('\n%d failure(s): %s' % (len(failures), failures))
     if skipped:

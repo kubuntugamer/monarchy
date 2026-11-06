@@ -1314,6 +1314,16 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
                     info.primaryGroupId = 513; // Domain Users
                 info.accountControl =
                     object.attributes.value(QStringLiteral("userAccountControl")).toUInt();
+                // The logon statistics a DC keeps on the account: when it last
+                // logged on and how many times, and how many passwords were
+                // refused. SamLogon writes them, so this reads the same values
+                // a domain administrator would see on the account tab.
+                info.lastLogon =
+                    object.attributes.value(QStringLiteral("lastLogon")).toULongLong();
+                info.logonCount = quint16(
+                    object.attributes.value(QStringLiteral("logonCount")).toUInt());
+                info.badPasswordCount = quint16(
+                    object.attributes.value(QStringLiteral("badPwdCount")).toUInt());
                 info.accountExpires =
                     object.attributes.value(QStringLiteral("accountExpires")).toULongLong();
                 const quint64 pwdLastSet =

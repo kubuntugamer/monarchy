@@ -1129,14 +1129,41 @@ QByteArray NetlogonServer::samLogon(const QByteArray &stub, bool withAuthenticat
         & 0x00000002u) {
         return statusOnly(kStatusAccountDisabled);
     }
+    // A refused password is a counted failure: a Windows DC raises badPwdCount
+    // and stamps badPasswordTime, which is what a lockout policy and an
+    // administrator reading the account both start from. Only a well-formed
+    // response against a known account counts, so a truncated request is an
+    // error rather than a strike.
+    const auto countBadPassword = [this, &account]() {
+        QMap<QString, QString> attributes;
+        attributes.insert(QStringLiteral("badPwdCount"),
+                          QString::number(account.attributes
+                                              .value(QStringLiteral("badPwdCount"))
+                                              .toUInt()
+                                          + 1));
+        attributes.insert(QStringLiteral("badPasswordTime"), QString::number(ntTimeNow()));
+        if (!m_writes.updateAccount)
+            return;
+        QString writeError;
+        if (!m_writes.updateAccount(account.id, attributes, &writeError)
+            && !qEnvironmentVariableIsEmpty("MONARCHY_RPC_TRACE")) {
+            qWarning("Netlogon: bad-password write for %s failed: %s", qPrintable(account.id),
+                     qPrintable(writeError));
+        }
+    };
+
     QByteArray ntHash = QByteArray::fromHex(
         account.attributes.value(QStringLiteral("ntHash")).toLatin1());
-    if (ntHash.size() != 16)
+    if (ntHash.size() != 16) {
+        countBadPassword();
         return statusOnly(kStatusWrongPassword);
+    }
     if (logon.challenge.size() != 8 || logon.ntResponse.size() < 24)
         return statusOnly(kStatusWrongPassword);
-    if (!Ntlm::verifyNtlmv2(ntHash, logon.account, domain, logon.challenge, logon.ntResponse))
+    if (!Ntlm::verifyNtlmv2(ntHash, logon.account, domain, logon.challenge, logon.ntResponse)) {
+        countBadPassword();
         return statusOnly(kStatusWrongPassword);
+    }
 
     // A correct password outside the account's logonHours is refused the way a
     // Windows DC refuses it, and no last-logon stamp is written for a logon
@@ -1166,6 +1193,9 @@ QByteArray NetlogonServer::samLogon(const QByteArray &stub, bool withAuthenticat
         account.attributes.value(QStringLiteral("logonCount")).toULongLong();
     logonAttributes.insert(QStringLiteral("logonCount"),
                            QString::number(previousLogonCount + 1));
+    // A successful logon clears the failure counter; badPasswordTime keeps the
+    // last refusal, as AD keeps it.
+    logonAttributes.insert(QStringLiteral("badPwdCount"), QStringLiteral("0"));
     const quint64 replicatedStamp =
         ntTimeAttribute(account, QStringLiteral("lastLogonTimestamp"));
     constexpr quint64 kFourteenDays = 14ull * 24 * 60 * 60 * 10000000ull;
@@ -1196,6 +1226,10 @@ QByteArray NetlogonServer::samLogon(const QByteArray &stub, bool withAuthenticat
         answer.primaryGid = 513;
     answer.acctFlags = account.attributes.value(QStringLiteral("userAccountControl")).toUInt();
     answer.logonTime = ntTimeNow();
+    answer.logonCount = quint16(previousLogonCount + 1);
+    // This logon cleared the failure counter, so the account it leaves behind
+    // has none, whatever the copy read before the write.
+    answer.badPasswordCount = 0;
     answer.lastPasswordChange = ntTimeAttribute(account, QStringLiteral("pwdLastSet"));
     answer.forcePasswordChange = kNeverNtTime;
     answer.lastSuccessfulLogon = ntTimeAttribute(account, QStringLiteral("lastLogon"));
