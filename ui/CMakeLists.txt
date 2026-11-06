@@ -81,6 +81,8 @@ add_library(monarchy-ui-core STATIC
     ../engine/Smb2.cpp
     ../engine/Drs.h
     ../engine/Drs.cpp
+    ../engine/DrsClient.h
+    ../engine/DrsClient.cpp
 )
 
 target_include_directories(monarchy-ui-core PUBLIC
@@ -424,6 +426,23 @@ if(BUILD_TESTING)
 
     add_test(NAME monarchy-replication-tests COMMAND monarchy-replication-tests)
     set_tests_properties(monarchy-replication-tests PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+    )
+
+    # The outbound DRS client: the marshal layer against server-built replies,
+    # and a whole cycle over loopback into a second store.
+    add_executable(monarchy-drsclient-tests
+        tests/test_drsclient.cpp
+    )
+
+    target_link_libraries(monarchy-drsclient-tests PRIVATE
+        monarchy-ui-core
+        Qt6::Test
+        Qt6::Core
+    )
+
+    add_test(NAME monarchy-drsclient-tests COMMAND monarchy-drsclient-tests)
+    set_tests_properties(monarchy-drsclient-tests PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
     )
 

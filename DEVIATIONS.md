@@ -95,12 +95,28 @@ this tree.
 Protocol Test Suites (`ADFamily`, `Kerberos`, `MS-XCA`) plus bidirectional DRS against a real
 Windows DC.
 **Monarchy:** Everything proven so far is L1 wire interop against independent clients — impacket,
-Samba's NDR clients and `smbclient`, MIT krb5, `dig`/`nsupdate`, OpenSSL — and the 19-suite `ctest`
-run on 2026-11-04.
+Samba's NDR clients and `smbclient`, MIT krb5, `dig`/`nsupdate`, OpenSSL — and the 20-suite `ctest`
+run on 2026-11-05.
 **Why listed:** Without this entry, a reader could mistake an unrun suite for a passing one. It is
 recorded as a limitation, not accepted as sufficient.
 **What closes it:** A Windows host for the WPT harness and a real DC for bidirectional replication.
 Neither is reachable from the current development machine.
+
+## D7 — Outbound replication is unauthenticated
+
+**Gap:** G11 (`AD-1TO1-CONFORMANCE.md` §2.5, DRS replication)
+**Difference:** A DC pulls a cycle from a partner over an authenticated DCE/RPC bind — NTLMSSP at
+`PKT_PRIVACY`, or Kerberos — and a partner refuses `DsGetNCChanges` that carries no verifier.
+**Monarchy:** The outbound client (`engine/DrsClient.{h,cpp}`) binds the peer's DRSUAPI endpoint
+over `ncacn_ip_tcp`, runs `DsBind`/`DsGetNCChanges` and applies the decoded chain, but sends no
+security verifier; a reply that comes back signed is refused rather than read without checking.
+An endpoint with an authenticator configured — including this tree's own `DcService` — answers the
+first call with an NCA fault (`access denied`).
+**Why listed:** The transport, framing, chunking and object decoding are real and tested against
+this tree's DC; the authentication leg is missing, so the client cannot yet pull from a peer that
+enforces it.
+**What closes it:** An initiator-side NTLMSSP (or GSS-API Kerberos) bind in `DrsClient`, with the
+per-PDU signing and sealing the server already implements as the acceptor.
 
 ---
 
