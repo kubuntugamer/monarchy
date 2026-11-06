@@ -107,6 +107,95 @@ bool isAlias(const DirectoryObject &object)
     return numeric && (type & 0x4) != 0;
 }
 
+// The BUILTIN domain (S-1-5-32) is the second domain every DC reports. Its
+// aliases are the well-known local groups Windows seeds at install, and their
+// SIDs appear in ACLs on every machine. AD keeps them in a naming context of
+// their own, so this server synthesises them from the same table Lsad.cpp
+// resolves instead of storing them in the account NC, and refuses writes to
+// them: there is nowhere to persist one, and accepting it would lose it.
+const QString kBuiltinDomainSid = QStringLiteral("S-1-5-32");
+
+struct BuiltinAlias {
+    const char *name;
+    quint32 rid;
+};
+
+const QList<BuiltinAlias> &builtinAliasTable()
+{
+    static const QList<BuiltinAlias> table = {
+        {"Administrators", 544},                {"Users", 545},
+        {"Guests", 546},                        {"Power Users", 547},
+        {"Account Operators", 548},             {"Server Operators", 549},
+        {"Print Operators", 550},               {"Backup Operators", 551},
+        {"Replicator", 552},                    {"Remote Desktop Users", 555},
+        {"Network Configuration Operators", 556}, {"Performance Monitor Users", 558},
+        {"Performance Log Users", 559},         {"IIS_IUSRS", 568},
+        {"Event Log Readers", 573},             {"Certificate Service DCOM Access", 574},
+    };
+    return table;
+}
+
+// The aliases in the shape the enumeration and the lookups already take, so the
+// BUILTIN domain needs no second code path through them. groupType carries
+// GROUP_TYPE_RESOURCE_GROUP, which is what makes them aliases and not groups.
+QList<DirectoryObject> builtinAliasObjects()
+{
+    QList<DirectoryObject> result;
+    for (const BuiltinAlias &entry : builtinAliasTable()) {
+        DirectoryObject object;
+        object.id = QStringLiteral("%1-%2").arg(kBuiltinDomainSid).arg(entry.rid);
+        object.name = QString::fromLatin1(entry.name);
+        object.type = QStringLiteral("Group");
+        object.kind = ObjectKind::Group;
+        object.attributes.insert(QStringLiteral("objectSid"), object.id);
+        object.attributes.insert(QStringLiteral("sAMAccountName"), object.name);
+        object.attributes.insert(QStringLiteral("groupType"), QStringLiteral("4"));
+        result.append(object);
+    }
+    return result;
+}
+
+bool isBuiltinAlias(const QString &dn)
+{
+    return dn.startsWith(kBuiltinDomainSid + QLatin1Char('-'));
+}
+
+// What AD seeds each BUILTIN alias with when a domain is created: its own
+// groups, plus the two runtime identities Windows puts in Users. A group is
+// listed only when the directory holds it, so a directory without Domain Admins
+// reports an empty Administrators rather than a member nobody has.
+QList<QByteArray> builtinMemberSids(quint32 rid, const QString &domainSid,
+                                    const QList<DirectoryObject> &objects)
+{
+    QList<QByteArray> sids;
+    QList<quint32> seeded;
+    if (rid == 544)
+        seeded.append(512); // Administrators <- Domain Admins
+    else if (rid == 545)
+        seeded.append(513); // Users <- Domain Users
+    else if (rid == 546)
+        seeded.append(514); // Guests <- Domain Guests
+    for (quint32 seededRid : seeded) {
+        const QString text = QStringLiteral("%1-%2").arg(domainSid).arg(seededRid);
+        for (const DirectoryObject &object : objects) {
+            if (object.attributes.value(QStringLiteral("objectSid")) != text)
+                continue;
+            const QByteArray sid = Ndr::sidFromString(text);
+            if (!sid.isEmpty())
+                sids.append(sid);
+            break;
+        }
+    }
+    if (rid == 545) {
+        for (const char *text : {"S-1-5-11", "S-1-5-4"}) {
+            const QByteArray sid = Ndr::sidFromString(QString::fromLatin1(text));
+            if (!sid.isEmpty())
+                sids.append(sid);
+        }
+    }
+    return sids;
+}
+
 // RPC_SID as MS-RPCE carries it: the sub-authority count is a conformant array
 // length, so it comes before the fixed header, then the header and the
 // sub-authorities. Ndr::writeSid omits that count, which is the shape LSAD's
@@ -851,15 +940,18 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
             }
         }
 
-        if (!m_config.netbios.isEmpty()
-            && name.compare(m_config.netbios, Qt::CaseInsensitive) != 0
-            && name.compare(m_config.realm, Qt::CaseInsensitive) != 0) {
+        QString sidText = m_config.domainSid;
+        if (name.compare(QStringLiteral("Builtin"), Qt::CaseInsensitive) == 0) {
+            sidText = kBuiltinDomainSid;
+        } else if (!m_config.netbios.isEmpty()
+                   && name.compare(m_config.netbios, Qt::CaseInsensitive) != 0
+                   && name.compare(m_config.realm, Qt::CaseInsensitive) != 0) {
             fixed.append(char(0));
             putLe32(fixed, kStatusNoSuchDomain);
             return fixed;
         }
 
-        const QByteArray sid = Ndr::sidFromString(m_config.domainSid);
+        const QByteArray sid = Ndr::sidFromString(sidText);
         if (sid.isEmpty()) {
             // Without a domain SID there is nothing to hand out: answer with a
             // NULL SID rather than a malformed one.
@@ -892,17 +984,20 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
             return fixed;
         }
 
-        const bool more = context == 0;
-        const int entries = more ? 1 : 0;
+        // Every DC reports two domains, and AD lists BUILTIN first.
+        QStringList names;
+        if (context == 0) {
+            names.append(QStringLiteral("Builtin"));
+            names.append(m_config.netbios);
+        }
         putLe32(fixed, 0);            // EnumerationContext: nothing follows
         putLe32(fixed, 0x0002d4c6u);  // Buffer referent
-        putLe32(fixed, quint32(entries));
+        putLe32(fixed, quint32(names.size()));
         putLe32(fixed, 0x0002d4c7u);  // entry array referent
-        putLe32(fixed, quint32(entries));
+        putLe32(fixed, quint32(names.size()));
         QList<QByteArray> strings;
-        if (more) {
-            putLe32(fixed, 0); // RelativeId: the domain entry has none
-            const QString name = m_config.netbios;
+        for (const QString &name : names) {
+            putLe32(fixed, 0); // RelativeId: a domain entry has none
             const QByteArray utf16 = Ndr::utf16le(name);
             fixed.append(char(utf16.size() & 0xff));
             fixed.append(char((utf16.size() >> 8) & 0xff));
@@ -915,8 +1010,8 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
         }
         for (const QByteArray &bytes : strings)
             fixed.append(bytes);
-        putLe32(fixed, quint32(entries)); // CountReturned
-        putLe32(fixed, more ? kStatusSuccess : kStatusSuccess);
+        putLe32(fixed, quint32(names.size())); // CountReturned
+        putLe32(fixed, kStatusSuccess);
         emit requestReceived(QStringLiteral("EnumerateDomains"));
         return fixed;
     }
@@ -951,12 +1046,20 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
             putLe32(fixed, kStatusInvalidHandle);
             return fixed;
         }
-        if (!sid.isEmpty() && Ndr::sidToString(sid) != m_config.domainSid) {
-            fixed.append(QByteArray(kHandleSize, '\0'));
-            putLe32(fixed, kStatusNoSuchDomain);
-            return fixed;
+        // Two domains are openable: the account NC and BUILTIN, whose handle is
+        // tagged by its SID so the calls below know which space they are in.
+        QString sidText = m_config.domainSid;
+        if (!sid.isEmpty()) {
+            const QString requested = Ndr::sidToString(sid);
+            if (requested == kBuiltinDomainSid)
+                sidText = kBuiltinDomainSid;
+            else if (requested != m_config.domainSid) {
+                fixed.append(QByteArray(kHandleSize, '\0'));
+                putLe32(fixed, kStatusNoSuchDomain);
+                return fixed;
+            }
         }
-        fixed.append(newHandle(Handle::Domain, m_config.domainSid, 0));
+        fixed.append(newHandle(Handle::Domain, sidText, 0));
         putLe32(fixed, kStatusSuccess);
         emit requestReceived(QStringLiteral("OpenDomain"));
         return fixed;
@@ -975,6 +1078,12 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
         if (!lookupHandle(handle, Handle::Domain, &domain)) {
             putLe32(fixed, 0); // NULL union referent
             putLe32(fixed, kStatusInvalidHandle);
+            return fixed;
+        }
+        if (domain.dn == kBuiltinDomainSid) {
+            // BUILTIN reports no password policy, logon hours or role of its own.
+            putLe32(fixed, 0); // NULL union referent
+            putLe32(fixed, kStatusNotSupported);
             return fixed;
         }
         auto beginArm = [&fixed](quint16 tag) {
@@ -1101,6 +1210,11 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
             putLe32(fixed, kStatusInvalidHandle);
             return fixed;
         }
+        if (domain.dn == kBuiltinDomainSid) {
+            // BUILTIN has no password or lockout policy of its own.
+            putLe32(fixed, kStatusNotSupported);
+            return fixed;
+        }
         if (infoClass != 12) {
             putLe32(fixed, kStatusInvalidInfoClass);
             emit requestReceived(QStringLiteral("SetInformationDomain class %1 unsupported")
@@ -1200,7 +1314,9 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
             return fixed;
         }
 
-        const QList<DirectoryObject> all = users();
+        // Degenerate but legal: BUILTIN holds no accounts.
+        const QList<DirectoryObject> all =
+            domain.dn == kBuiltinDomainSid ? QList<DirectoryObject>() : users();
         const int start = int(context);
         QList<DirectoryObject> page;
         for (int i = start; i < all.size(); ++i)
@@ -1261,7 +1377,8 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
             return fixed;
         }
 
-        const QList<DirectoryObject> all = groups();
+        const QList<DirectoryObject> all =
+            domain.dn == kBuiltinDomainSid ? QList<DirectoryObject>() : groups();
         const int start = int(context);
         QList<DirectoryObject> page;
         for (int i = start; i < all.size(); ++i)
@@ -1318,7 +1435,8 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
             return fixed;
         }
 
-        const QList<DirectoryObject> all = aliases();
+        const QList<DirectoryObject> all =
+            domain.dn == kBuiltinDomainSid ? builtinAliasObjects() : aliases();
         QList<DirectoryObject> page;
         for (int i = int(context); i < all.size(); ++i)
             page.append(all.at(i));
@@ -1342,7 +1460,9 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
             putLe32(fixed, kStatusInvalidHandle);
             return fixed;
         }
-        for (const DirectoryObject &alias : aliases()) {
+        const QList<DirectoryObject> pool =
+            domain.dn == kBuiltinDomainSid ? builtinAliasObjects() : aliases();
+        for (const DirectoryObject &alias : pool) {
             if (ridOf(alias) != rid)
                 continue;
             fixed.append(newHandle(Handle::Alias, alias.id, rid));
@@ -1368,6 +1488,12 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
         Handle alias;
         if (!lookupHandle(handle, Handle::Alias, &alias)) {
             putLe32(fixed, kStatusInvalidHandle);
+            return fixed;
+        }
+        if (isBuiltinAlias(alias.dn)) {
+            putLe32(fixed, kStatusNotSupported);
+            emit requestReceived(QStringLiteral("%1 BUILTIN alias member: not stored")
+                                     .arg(adding ? QStringLiteral("Add") : QStringLiteral("Remove")));
             return fixed;
         }
         // The member must be in this domain: same identifier authority and the
@@ -1423,24 +1549,28 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
             putLe32(fixed, kStatusInvalidHandle);
             return fixed;
         }
-        QStringList members;
-        for (const DirectoryObject &object : aliases()) {
-            if (object.id.compare(alias.dn, Qt::CaseInsensitive) == 0) {
-                members = object.members;
-                break;
-            }
-        }
-        const QList<DirectoryObject> all = directory();
         QList<QByteArray> sids;
-        for (const QString &member : members) {
-            for (const DirectoryObject &candidate : all) {
-                if (candidate.id.compare(member, Qt::CaseInsensitive) != 0)
-                    continue;
-                const QByteArray sid = Ndr::sidFromString(
-                    candidate.attributes.value(QStringLiteral("objectSid")));
-                if (!sid.isEmpty())
-                    sids.append(sid);
-                break;
+        if (isBuiltinAlias(alias.dn)) {
+            sids = builtinMemberSids(alias.rid, m_config.domainSid, directory());
+        } else {
+            QStringList members;
+            for (const DirectoryObject &object : aliases()) {
+                if (object.id.compare(alias.dn, Qt::CaseInsensitive) == 0) {
+                    members = object.members;
+                    break;
+                }
+            }
+            const QList<DirectoryObject> all = directory();
+            for (const QString &member : members) {
+                for (const DirectoryObject &candidate : all) {
+                    if (candidate.id.compare(member, Qt::CaseInsensitive) != 0)
+                        continue;
+                    const QByteArray sid = Ndr::sidFromString(
+                        candidate.attributes.value(QStringLiteral("objectSid")));
+                    if (!sid.isEmpty())
+                        sids.append(sid);
+                    break;
+                }
             }
         }
         putLe32(fixed, quint32(sids.size()));
@@ -1471,6 +1601,11 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
         if (!lookupHandle(handle, Handle::Domain, &domain)) {
             fixed.append(QByteArray(kHandleSize, '\0'));
             putLe32(fixed, kStatusInvalidHandle);
+            return fixed;
+        }
+        if (domain.dn == kBuiltinDomainSid) {
+            fixed.append(QByteArray(kHandleSize, '\0'));
+            putLe32(fixed, kStatusNoSuchUser);
             return fixed;
         }
         for (const DirectoryObject &user : users()) {
@@ -1756,7 +1891,10 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
             return fixed;
         }
 
-        const QList<DirectoryObject> all = directory();
+        // BUILTIN holds only its aliases, so its own name and RID tables are the
+        // alias table rather than the account NC.
+        const QList<DirectoryObject> all =
+            domain.dn == kBuiltinDomainSid ? builtinAliasObjects() : directory();
         QList<quint32> rids;
         QList<quint32> types;
         int mapped = 0;
@@ -1842,7 +1980,8 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
             return fixed;
         }
 
-        const QList<DirectoryObject> all = directory();
+        const QList<DirectoryObject> all =
+            domain.dn == kBuiltinDomainSid ? builtinAliasObjects() : directory();
         QStringList names;
         QList<quint32> types;
         QList<bool> resolved;
@@ -1960,6 +2099,20 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
 
         Handle domain;
         const bool handleOk = lookupHandle(handle, Handle::Domain, &domain);
+        if (handleOk && domain.dn == kBuiltinDomainSid) {
+            // BUILTIN's aliases are fixed by Windows; there is nowhere to store
+            // a new one, so the create is refused rather than lost.
+            fixed.append(QByteArray(kHandleSize, '\0'));
+            if (!creatingGroup)
+                putLe32(fixed, 0);
+            putLe32(fixed, 0);
+            putLe32(fixed, kStatusNotSupported);
+            emit requestReceived(QStringLiteral("Create %1 in BUILTIN refused")
+                                     .arg(creatingAlias ? QStringLiteral("alias")
+                                          : (creatingGroup ? QStringLiteral("group")
+                                                           : QStringLiteral("user"))));
+            return fixed;
+        }
         if (!handleOk || account.isEmpty() || !m_writes.create) {
             fixed.append(QByteArray(kHandleSize, '\0'));
             if (!creatingGroup)
@@ -2038,6 +2191,13 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
             putLe32(fixed, kStatusInvalidHandle);
             return fixed;
         }
+        if (deletingAlias && isBuiltinAlias(object.dn)) {
+            fixed.append(QByteArray(kHandleSize, '\0'));
+            putLe32(fixed, kStatusNotSupported);
+            emit requestReceived(QStringLiteral("DeleteAlias(%1): BUILTIN is read-only")
+                                     .arg(object.dn));
+            return fixed;
+        }
         QString error;
         if (!m_writes.remove || !m_writes.remove(object.dn, &error)) {
             fixed.append(QByteArray(kHandleSize, '\0'));
@@ -2067,6 +2227,13 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
         if (!lookupHandle(handle, Handle::Domain, &domain)) {
             fixed.append(QByteArray(kHandleSize, '\0'));
             putLe32(fixed, kStatusInvalidHandle);
+            return fixed;
+        }
+        if (domain.dn == kBuiltinDomainSid) {
+            // The BUILTIN aliases are opened with SamrOpenAlias; there are no
+            // groups of the other kind in that domain.
+            fixed.append(QByteArray(kHandleSize, '\0'));
+            putLe32(fixed, kStatusNoSuchGroup);
             return fixed;
         }
         for (const DirectoryObject &object : directory()) {
@@ -2288,9 +2455,11 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
             putLe32(fixed, kStatusInvalidHandle);
             return fixed;
         }
+        const QList<DirectoryObject> pool =
+            isBuiltinAlias(alias.dn) ? builtinAliasObjects() : aliases();
         DirectoryObject found;
         bool foundObject = false;
-        for (const DirectoryObject &object : aliases()) {
+        for (const DirectoryObject &object : pool) {
             if (object.id.compare(alias.dn, Qt::CaseInsensitive) == 0) {
                 found = object;
                 foundObject = true;
@@ -2329,7 +2498,11 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
         case 1: { // AliasGeneralInformation
             beginArm(1);
             putUnicode(name, 0x0002e710u);
-            putLe32(fixed, quint32(found.members.size()));
+            putLe32(fixed, quint32(isBuiltinAlias(alias.dn)
+                                       ? builtinMemberSids(alias.rid, m_config.domainSid,
+                                                          directory())
+                                             .size()
+                                       : found.members.size()));
             putUnicode(comment, 0x0002e720u);
             fixed.append(deferred);
             putLe32(fixed, kStatusSuccess);
@@ -2375,6 +2548,12 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
         Handle alias;
         if (!lookupHandle(handle, Handle::Alias, &alias)) {
             putLe32(fixed, kStatusInvalidHandle);
+            return fixed;
+        }
+        if (isBuiltinAlias(alias.dn)) {
+            putLe32(fixed, kStatusNotSupported);
+            emit requestReceived(QStringLiteral("SetInformationAlias(%1): BUILTIN is read-only")
+                                     .arg(alias.dn));
             return fixed;
         }
         if (infoClass != 3) {

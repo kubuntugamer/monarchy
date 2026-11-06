@@ -152,6 +152,65 @@ QByteArray createStub(const QByteArray &domainHandle, const QString &name, bool 
     return stub;
 }
 
+// The two server-level calls for the BUILTIN domain, which every DC reports
+// next to the account NC.
+QByteArray lookupDomainStubFor(const QByteArray &serverHandle, const QString &name)
+{
+    const QByteArray utf16 = Ndr::utf16le(name);
+    QByteArray stub = serverHandle;
+    stub.append(char(utf16.size() & 0xff));
+    stub.append(char((utf16.size() >> 8) & 0xff));
+    stub.append(char(utf16.size() & 0xff));
+    stub.append(char((utf16.size() >> 8) & 0xff));
+    appendLe32(stub, 0x00006f69u); // name buffer referent
+    appendLe32(stub, quint32(name.size()));
+    appendLe32(stub, 0);
+    appendLe32(stub, quint32(name.size()));
+    stub.append(utf16);
+    while (stub.size() % 4 != 0)
+        stub.append('\0');
+    return stub;
+}
+
+QByteArray openDomainStubFor(const QByteArray &serverHandle, const QString &sidText)
+{
+    QByteArray stub = serverHandle;
+    appendLe32(stub, 0x00000002u); // DesiredAccess
+    appendLe32(stub, 0);           // alignment before the inline SID count
+    const QByteArray sid = Ndr::sidFromString(sidText);
+    appendLe32(stub, quint32((sid.size() - 8) / 4));
+    stub.append(sid);
+    return stub;
+}
+
+// SamrEnumerateAliasesInDomain: no access mask, just the window.
+QByteArray enumAliasesStub(const QByteArray &domainHandle)
+{
+    QByteArray stub = domainHandle;
+    appendLe32(stub, 0);
+    appendLe32(stub, 0x10000);
+    return stub;
+}
+
+// SamrQueryInformationAlias: the class is a USHORT behind the handle.
+QByteArray queryAliasStub(const QByteArray &aliasHandle, quint16 infoClass)
+{
+    QByteArray stub = aliasHandle;
+    stub.append(char(infoClass & 0xff));
+    stub.append(char((infoClass >> 8) & 0xff));
+    return stub;
+}
+
+// SamrAddMemberToAlias: the member is an RPC_SID, whose sub-authority count is
+// a conformant array length in front of the header.
+QByteArray aliasMemberStub(const QByteArray &aliasHandle, const QByteArray &sid)
+{
+    QByteArray stub = aliasHandle;
+    appendLe32(stub, quint32((sid.size() - 8) / 4));
+    stub.append(sid);
+    return stub;
+}
+
 // SamrSetInformationUser2, captured from impacket for a control-information
 // write: info class 16, union tag 16, then the ULONG arm.
 QByteArray controlStub(const QByteArray &userHandle)
@@ -400,6 +459,7 @@ private slots:
     void ndrPrimitivesRoundTrip();
     void sidEncoding();
     void samrDirectoryCalls();
+    void samrServesTheBuiltinDomain();
     void samrWritesAccountsAndGroups();
     void samrSetPasswordAndAccountControl();
     void desPrimitivesAndHashEncoding();
@@ -667,6 +727,126 @@ void SamrTest::samrDirectoryCalls()
     const QByteArray stale = server.handleCall(Samr::OpEnumerateUsersInDomain,
                                                enumUsersStub(QByteArray(20, '\x7f')));
     QCOMPARE(lastWord(stale), 0xc0000008u); // STATUS_INVALID_HANDLE
+}
+
+// BUILTIN (S-1-5-32) is the second domain a DC reports: its well-known aliases
+// are not in the account NC, so SAMR derives them, and every write to them is
+// refused rather than accepted and dropped.
+void SamrTest::samrServesTheBuiltinDomain()
+{
+    QList<DirectoryObject> objects;
+    DirectoryObject admins;
+    admins.id = QStringLiteral("CN=Domain Admins,CN=Users,DC=corp,DC=example,DC=com");
+    admins.name = QStringLiteral("Domain Admins");
+    admins.type = QStringLiteral("Group");
+    admins.kind = ObjectKind::Group;
+    admins.attributes.insert(QStringLiteral("sAMAccountName"), QStringLiteral("Domain Admins"));
+    admins.attributes.insert(QStringLiteral("objectSid"), QStringLiteral("S-1-5-21-1-2-3-512"));
+    admins.attributes.insert(QStringLiteral("groupType"), QStringLiteral("-2147483646"));
+    objects.append(admins);
+
+    DirectoryObject domainObject;
+    domainObject.id = QStringLiteral("DC=corp,DC=example,DC=com");
+    domainObject.name = QStringLiteral("CORP");
+    domainObject.type = QStringLiteral("domainDNS");
+    domainObject.kind = ObjectKind::Domain;
+    domainObject.attributes.insert(QStringLiteral("objectSid"), QStringLiteral("S-1-5-21-1-2-3"));
+    objects.append(domainObject);
+
+    SamrServer server;
+    Samr::Config config;
+    config.realm = QStringLiteral("CORP.EXAMPLE.COM");
+    config.netbios = QStringLiteral("CORP");
+    config.domainSid = QStringLiteral("S-1-5-21-1-2-3");
+    server.setConfig(config);
+    server.setObjectProvider([objects]() { return objects; });
+
+    const QByteArray serverHandle = server.handleCall(Samr::OpConnect, kConnect).left(20);
+
+    // Both domains come back in one page, BUILTIN first as AD lists it.
+    const QByteArray domains =
+        server.handleCall(Samr::OpEnumerateDomainsInSamServer, enumDomainsStub(serverHandle));
+    QCOMPARE(lastWord(domains), 0u);
+    QCOMPARE(readLe32At(domains, 8), 2u); // CountReturned
+    const QString domainText = utf16Text(domains);
+    QVERIFY(domainText.contains(QStringLiteral("Builtin")));
+    QVERIFY(domainText.contains(QStringLiteral("CORP")));
+
+    // Its SID is the well-known one, and that SID opens it by name or directly.
+    const QByteArray builtinSid = Ndr::sidFromString(QStringLiteral("S-1-5-32"));
+    const QByteArray lookup = server.handleCall(
+        Samr::OpLookupDomainInSamServer,
+        lookupDomainStubFor(serverHandle, QStringLiteral("Builtin")));
+    QCOMPARE(lastWord(lookup), 0u);
+    QVERIFY(lookup.contains(builtinSid));
+    const QByteArray open = server.handleCall(
+        Samr::OpOpenDomain, openDomainStubFor(serverHandle, QStringLiteral("S-1-5-32")));
+    QCOMPARE(open.size(), 24);
+    QCOMPARE(lastWord(open), 0u);
+    const QByteArray builtinHandle = open.left(20);
+
+    // The alias table, and none of the account domain's groups or accounts.
+    const QByteArray aliases =
+        server.handleCall(Samr::OpEnumerateAliasesInDomain, enumAliasesStub(builtinHandle));
+    QCOMPARE(lastWord(aliases), 0u);
+    QCOMPARE(readLe32At(aliases, 8), 16u); // CountReturned
+    QVERIFY(utf16Text(aliases).contains(QStringLiteral("Administrators")));
+    QCOMPARE(readLe32At(server.handleCall(Samr::OpEnumerateGroupsInDomain,
+                                          enumUsersStub(builtinHandle)),
+                        8),
+             0u);
+    QCOMPARE(readLe32At(server.handleCall(Samr::OpEnumerateUsersInDomain,
+                                          enumUsersStub(builtinHandle)),
+                        8),
+             0u);
+
+    // Names and RIDs round-trip inside BUILTIN, with SidTypeAlias.
+    const QByteArray namesReply = server.handleCall(
+        Samr::OpLookupNamesInDomain,
+        lookupNamesStub(builtinHandle, {QStringLiteral("Administrators")}));
+    QCOMPARE(lastWord(namesReply), 0u);
+    int pos = 0;
+    QList<quint32> rids;
+    QList<quint32> types;
+    QVERIFY(readIdArray(namesReply, &pos, &rids));
+    QVERIFY(readIdArray(namesReply, &pos, &types));
+    QCOMPARE(rids, (QList<quint32>{544}));
+    QCOMPARE(types, (QList<quint32>{4})); // SidTypeAlias
+    const QByteArray idsReply =
+        server.handleCall(Samr::OpLookupIdsInDomain, lookupIdsStub(builtinHandle, {545}));
+    QCOMPARE(lastWord(idsReply), 0u);
+    QVERIFY(utf16Text(idsReply).contains(QStringLiteral("Users")));
+
+    // OpenAlias, the general information and the membership AD seeds: the
+    // Administrators alias holds the domain's Domain Admins group.
+    const QByteArray aliasReply =
+        server.handleCall(Samr::OpOpenAlias, openUserStub(builtinHandle, 544));
+    QCOMPARE(aliasReply.size(), 24);
+    QCOMPARE(lastWord(aliasReply), 0u);
+    const QByteArray aliasHandle = aliasReply.left(20);
+    const QByteArray general =
+        server.handleCall(Samr::OpQueryInformationAlias, queryAliasStub(aliasHandle, 1));
+    QCOMPARE(lastWord(general), 0u);
+    QVERIFY(utf16Text(general).contains(QStringLiteral("Administrators")));
+    const QByteArray members = server.handleCall(Samr::OpGetMembersInAlias, aliasHandle);
+    QCOMPARE(lastWord(members), 0u);
+    QCOMPARE(readLe32At(members, 0), 1u);
+    QVERIFY(members.contains(Ndr::sidFromString(QStringLiteral("S-1-5-21-1-2-3-512"))));
+
+    // Everything that would write is refused: there is nowhere to persist a
+    // BUILTIN write, so accepting it would lose the change.
+    const QByteArray memberSid = Ndr::sidFromString(QStringLiteral("S-1-5-21-1-2-3-1001"));
+    QCOMPARE(lastWord(server.handleCall(Samr::OpAddMemberToAlias,
+                                        aliasMemberStub(aliasHandle, memberSid))),
+             0xc00000bbu); // STATUS_NOT_SUPPORTED
+    QCOMPARE(lastWord(server.handleCall(Samr::OpSetInformationAlias,
+                                        aliasHandle + QByteArray::fromHex("03000300"))),
+             0xc00000bbu);
+    QCOMPARE(lastWord(server.handleCall(Samr::OpDeleteAlias, aliasHandle)), 0xc00000bbu);
+    QCOMPARE(lastWord(server.handleCall(
+                 Samr::OpCreateAliasInDomain,
+                 createStub(builtinHandle, QStringLiteral("not-here"), false))),
+             0xc00000bbu);
 }
 
 void SamrTest::samrWritesAccountsAndGroups()

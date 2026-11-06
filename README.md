@@ -214,7 +214,8 @@ instead of starting clean, and `--with-ldap` builds the OpenLDAP backend.
 domain, starts `monarchy-dcd` on free ports (a host that already runs a DC keeps
 1037/1038, so the ports are chosen per run) and drives it with
 `scripts/drs-conformance.py`, the impacket half of `scripts/lsad-conformance.py`,
-`scripts/samr-conformance.py` (the account lifecycle) and
+`scripts/samr-conformance.py` (the account lifecycle, the alias lifecycle and
+the read-only `BUILTIN` domain) and
 `scripts/netlogon-conformance.py` (the locator, a machine account created over
 SAMR, the secure channel, a validated NTLMv2 logon, a refused password and the
 `badPwdCount`/`logonCount` it leaves on the account, the lockout policy set and
@@ -718,9 +719,9 @@ Protocol references used for this
 (Samba's `samr`/`lsa`/`drsuapi`/`netlogon`/`epmapper` IDLs and impacket's
 `samr`/`lsad`/`epm` clients, with
 provenance and licences) are held in `reference/specs/`. Everything else — the
-domain information classes beyond the lockout policy, the `BUILTIN` domain that
-holds AD's local groups, and the Netlogon trust channel to a partner — is not
-claimed to work; `DsReplicaAdd` with the multi-DC half
+domain information classes beyond the lockout policy, writing to the read-only
+`BUILTIN` domain that holds AD's local groups, and the Netlogon trust channel to
+a partner — is not claimed to work; `DsReplicaAdd` with the multi-DC half
 of replication is not implemented, nor is SMB 3.x, so there is no SMB
 encryption or preauth integrity. `IPC$` carries the named pipes
 `\pipe\samr`, `\pipe\lsarpc`, `\pipe\netlogon` and `\pipe\epmapper`, and
