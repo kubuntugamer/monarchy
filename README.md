@@ -205,6 +205,12 @@ ctest --test-dir build-ldap --output-on-failure
 
 Either `cmake -S .` or the historical `cmake -S ui -B ui/build` layout works.
 
+Those three steps run together, on a freshly removed build directory and with
+the offscreen platform set so the console-linked suites work headless, as
+`scripts/ci.sh` — which is what `.github/workflows/ci.yml` runs on every push
+and pull request. `scripts/ci.sh --build-dir DIR` keeps an existing directory
+instead of starting clean, and `--with-ldap` builds the OpenLDAP backend.
+
 ## Run
 
 ```sh

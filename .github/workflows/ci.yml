@@ -1,0 +1,35 @@
+# SPDX-FileCopyrightText: 2026 Monarchy contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# The same check a contributor runs locally: scripts/ci.sh configures a fresh
+# build directory, builds it and runs every suite. Qt comes from the installer
+# action rather than the distribution, because the suites use Qt 6 APIs newer
+# than the runner image's package.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build openssl libgl1
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.*'
+          cache: true
+
+      - name: Build and test
+        run: scripts/ci.sh

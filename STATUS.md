@@ -4,8 +4,8 @@ This file is the release contract for 0.1.0. It lists what the build actually
 does, how each capability is proven, and what is deliberately **not** claimed.
 Anything not listed under "Implemented and verified" is absent, not partial.
 
-Verified on this tree with: `cmake --build build` (clean, no warnings) and
-`ctest --output-on-failure` in `build/` → **20/20 suites pass**.
+Verified on this tree with `scripts/ci.sh` — a fresh configure, a build that
+emits no warnings, and every suite → **20/20 suites pass**.
 
 ---
 
@@ -183,7 +183,8 @@ After those: GPO/SYSVOL over SMB, FSMO, sites and the KCC, interdomain trust
 replication, WINS-era name resolution if 2000 parity is taken literally, and the
 schema/LDF import path. Each block is landed the way SAMR was: against the
 IDL in `reference/specs/`, driven by an independent client, with the CI suite
-extended in the same change.
+(`scripts/ci.sh`, which `.github/workflows/ci.yml` runs) extended in the same
+change.
 
 ## 4. Security posture
 
