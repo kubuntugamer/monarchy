@@ -1391,11 +1391,11 @@ QByteArray DrsServer::drsReplicaAdd(const QByteArray &stub)
     // what the pull uses, but the source DSA's GUID is what DsReplicaMod
     // addresses this link by, so it is kept instead of walked past.
     QUuid sourceDsa;
+    QString sourceDsaDn;
     if (sourceReferent != 0) {
-        QString ignoredDn;
         QByteArray ignoredSid;
         quint32 ignoredSidLen = 0;
-        if (!readDsName(&reader, &ignoredDn, &sourceDsa, &ignoredSid, &ignoredSidLen))
+        if (!readDsName(&reader, &sourceDsaDn, &sourceDsa, &ignoredSid, &ignoredSidLen))
             return stubReply(kWerrNotSupported);
     }
     if (transportReferent != 0) {
@@ -1422,7 +1422,8 @@ QByteArray DrsServer::drsReplicaAdd(const QByteArray &stub)
             && known.ncDn.compare(nc, Qt::CaseInsensitive) == 0)
             return stubReply(kWerrOk);
     }
-    m_replicaSources.append(ReplicaSource{nc, address, options, sourceDsa, schedule});
+    m_replicaSources.append(
+        ReplicaSource{nc, address, options, sourceDsa, sourceDsaDn, schedule});
     emit requestReceived(QStringLiteral("DsReplicaAdd(%1) for %2").arg(address, nc));
     emit replicaSourceAdded(address, nc);
     return stubReply(kWerrOk);
@@ -1604,6 +1605,134 @@ QByteArray DrsServer::drsReplicaMod(const QByteArray &stub)
     // it is actually using changed, not when some other link was edited.
     emit replicaSourceModified(previousAddress, link.address, ncDn);
     return stubReply(kWerrOk);
+}
+
+// DsReplicaGetInfo (opnum 19): the read side of the topology calls. MS-DRSR
+// answers NEIGHBORS out of drsuapi_DsReplicaNeighbourCtr, whose members are the
+// naming context, the source DSA's DN and GUID, the address and the replica
+// flags. That structure has no schedule member, so the schedule this server
+// records is not part of this reply. No per-link sync history is kept either,
+// which is why the USNs, timestamps and failure counters are zero: a zero here
+// means unmeasured, not a successful sync at the epoch.
+QByteArray DrsServer::drsReplicaGetInfo(const QByteArray &stub)
+{
+    Ndr::Reader reader(stub);
+    QByteArray handleBytes;
+    if (!reader.bytes(kDrsHandleSize, &handleBytes))
+        return QByteArray();
+    if (!m_handles.contains(guidFromBytes(handleBytes)))
+        return stubReply(kWerrInvalidHandle);
+
+    quint32 level = 0;
+    if (!reader.u32(&level))
+        return QByteArray();
+    if (level != 1 && level != 2)
+        return stubReply(kWerrDrsInvalidParameter);
+
+    quint32 requestReferent = 0;
+    if (!reader.u32(&requestReferent) || requestReferent == 0)
+        return stubReply(kWerrDrsInvalidParameter);
+
+    quint32 infoType = 0;
+    quint32 objectDnReferent = 0;
+    QByteArray sourceGuidBytes;
+    if (!reader.u32(&infoType) || !reader.u32(&objectDnReferent)
+        || !reader.bytes(16, &sourceGuidBytes))
+        return QByteArray();
+
+    // Level 2 adds the metadata filters. They select nothing for NEIGHBORS, but
+    // their bodies still sit on the wire after the fixed part.
+    quint32 attributeReferent = 0;
+    quint32 valueReferent = 0;
+    if (level == 2) {
+        quint32 flags = 0;
+        quint32 enumerationContext = 0;
+        if (!reader.u32(&flags) || !reader.u32(&attributeReferent)
+            || !reader.u32(&valueReferent) || !reader.u32(&enumerationContext))
+            return QByteArray();
+    }
+
+    QString objectDn;
+    if (objectDnReferent != 0 && !readDeferredString(&reader, &objectDn))
+        return stubReply(kWerrDrsInvalidParameter);
+    for (const quint32 referent : {attributeReferent, valueReferent}) {
+        if (referent == 0)
+            continue;
+        QString ignored;
+        if (!readDeferredString(&reader, &ignored))
+            return stubReply(kWerrDrsInvalidParameter);
+    }
+
+    // DRSUAPI_DS_REPLICA_INFO_NEIGHBORS is the only view this server holds; the
+    // cursor, metadata and failure views are not tracked.
+    if (infoType != 0u)
+        return stubReply(kWerrNotSupported);
+    if (!objectDn.isEmpty() && objectDn.compare(baseDn(), Qt::CaseInsensitive) != 0)
+        return stubReply(kWerrDrsBadNc);
+
+    const QUuid filter = guidFromBytes(sourceGuidBytes);
+    QList<ReplicaSource> matches;
+    for (const ReplicaSource &link : m_replicaSources) {
+        if (link.ncDn.compare(baseDn(), Qt::CaseInsensitive) != 0)
+            continue;
+        if (!filter.isNull() && link.sourceDsa != filter)
+            continue;
+        matches.append(link);
+    }
+
+    // The naming context's own GUID is the store's when the object has one, the
+    // same identity every other reply uses for that DN.
+    QUuid ncGuid = objectGuidFor(baseDn());
+    for (const DirectoryObject &object : directory()) {
+        if (object.id.compare(baseDn(), Qt::CaseInsensitive) == 0) {
+            ncGuid = objectWireGuid(object);
+            break;
+        }
+    }
+
+    Referents refs;
+    Node ctr;
+    ctr.spine.append(u32Piece(quint32(matches.size()))); // count
+    ctr.spine.append(u32Piece(0u));                      // reserved
+    ctr.spine.append(u32Piece(quint32(matches.size()))); // conformant max_count
+    for (const ReplicaSource &link : matches) {
+        const quint32 ncReferent = refs.take();
+        const quint32 sourceDnReferent = link.sourceDsaDn.isEmpty() ? 0u : refs.take();
+        const quint32 addressReferent = refs.take();
+        ctr.spine.append(u32Piece(ncReferent));
+        ctr.spine.append(u32Piece(sourceDnReferent));
+        ctr.spine.append(u32Piece(addressReferent));
+        ctr.spine.append(u32Piece(0u)); // transport_obj_dn: not tracked
+        ctr.spine.append(u32Piece(link.options));
+        ctr.spine.append(u32Piece(0u)); // reserved
+        ctr.spine.append(guidPiece(ncGuid));
+        ctr.spine.append(guidPiece(link.sourceDsa));
+        ctr.spine.append(guidPiece(QUuid())); // source_dsa_invocation_id
+        ctr.spine.append(guidPiece(QUuid())); // transport_obj_guid
+        for (int i = 0; i < 4; ++i)
+            ctr.spine.append(u64Piece(0u)); // two USNs and the two times
+        ctr.spine.append(u32Piece(0u));     // result_last_attempt
+        ctr.spine.append(u32Piece(0u));     // consecutive_sync_failures
+
+        ctr.children.append(lpwstrNode(baseDn()));
+        if (sourceDnReferent != 0)
+            ctr.children.append(lpwstrNode(link.sourceDsaDn));
+        ctr.children.append(lpwstrNode(link.address));
+    }
+
+    // The reply: the out info_type, then the union — its discriminant and the
+    // counter pointer — and the deferred counter body, then the ErrorCode.
+    Node arm;
+    arm.spine.append(u32Piece(infoType));
+    arm.spine.append(u32Piece(refs.take()));
+    arm.children.append(ctr);
+    QByteArray armBytes;
+    flatten(arm, armBytes, 0);
+    Ndr::Writer writer;
+    writer.u32(infoType);
+    writer.bytes(armBytes);
+    writer.u32(kWerrOk);
+    return writer.take();
 }
 
 QByteArray DrsServer::drsUpdateRefs(const QByteArray &stub)
@@ -1974,6 +2103,8 @@ QByteArray DrsServer::handleCall(quint16 opnum, const QByteArray &stub)
         return drsReplicaDel(stub);
     case 7:
         return drsReplicaMod(stub);
+    case 19:
+        return drsReplicaGetInfo(stub);
     default:
         // Only the calls this server implements are described; the rest are
         // refused rather than answered as if understood.

@@ -106,7 +106,7 @@ Status is what the code does, not what the specs allow. **Absent** means no code
 | G8 | absent | DRSR serves uncompressed `DsGetNCChanges` only; no compression path exists to gate | `engine/Drs.cpp` |
 | G9 | absent | SYSVOL is served from the filesystem over SMB2/SMB1; no FRS or DFS-R | `engine/Smb2.cpp`, `engine/Smb1.cpp`, `engine/LdapServer.cpp:708` |
 | G10 | absent | No read-only DC; DC info reports `fIsRodc` = 0 | `engine/Drs.cpp:1322` |
-| G11 | partial | `DsBind`, `DsGetNCChanges` (V6), `DsCrackNames`, `DsGetDomainControllerInfo`, `DsReplicaSync`, `DsUpdateRefs` for one naming context, with deletion tombstones exported and objects ordered by the store's `uSNChanged`; `DsReplicaAdd`/`DsReplicaMod`/`DsReplicaDel` register, change and retire a source the pull agent consumes; no linked-value hysteresis | `engine/Drs.cpp` |
+| G11 | partial | `DsBind`, `DsGetNCChanges` (V6), `DsCrackNames`, `DsGetDomainControllerInfo`, `DsReplicaSync`, `DsUpdateRefs` for one naming context, with deletion tombstones exported and objects ordered by the store's `uSNChanged`; `DsReplicaAdd`/`DsReplicaMod`/`DsReplicaDel` register, change and retire a source the pull agent consumes, and `DsReplicaGetInfo` reads one back; no linked-value hysteresis | `engine/Drs.cpp` |
 | G12 | partial | Global Catalog is the same store on 3268; deletions are kept as tombstones (`isDeleted`, `whenChanged`, a `<rdn>\0ADEL:<guid>` RDN) and exported over DRS, but there is no tombstone lifetime or garbage collection | `engine/LdapServer.cpp`, `engine/Drs.cpp` |
 | G13 | absent | No MS-KKDCP `/KdcProxy` | — |
 | G14 | absent | No Kerberos claims or compound identity | — |

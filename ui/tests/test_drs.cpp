@@ -81,6 +81,30 @@ QByteArray replicaAddRequest(const QByteArray &handle, const QString &ncDn,
     return out;
 }
 
+// A DsReplicaGetInfo level-1 request (`drsuapi_DsReplicaGetInfoRequest1`): the
+// handle, the level, the request referent, the info type, the object DN
+// referent and the source DSA GUID, then the deferred DN string.
+QByteArray replicaGetInfoRequest(const QByteArray &handle, quint32 infoType,
+                                 const QString &objectDn, const QByteArray &sourceGuid)
+{
+    QByteArray out = handle;
+    appendLe32(out, 1u);          // level
+    appendLe32(out, 0x00020010u); // req referent
+    appendLe32(out, infoType);
+    appendLe32(out, objectDn.isEmpty() ? 0u : 0x00020011u);
+    out.append(sourceGuid.leftJustified(16, '\0', true).left(16));
+    if (!objectDn.isEmpty()) {
+        const quint32 units = quint32(objectDn.size() + 1);
+        appendLe32(out, units);
+        appendLe32(out, 0u);
+        appendLe32(out, units);
+        out.append(Ndr::utf16le(objectDn + QChar(u'\0')));
+        while (out.size() % 4 != 0)
+            out.append('\0');
+    }
+    return out;
+}
+
 // A level-2 DsReplicaAdd arm (`drsuapi_DsReplicaAddRequest2`): the handle, the
 // level, the NC, source-DSA and transport referents, the address referent, the
 // schedule and the options, then the deferred bodies. The source DSA's DSNAME
@@ -700,6 +724,66 @@ private slots:
         QCOMPARE(readLe32(server.handleCall(7, handle + QByteArray(20, '\0')), 0),
                  quint32(0x000020f5));
         QCOMPARE(server.replicaSources().first().address, newAddress);
+    }
+
+    // DsReplicaGetInfo reports the link DsReplicaAdd registered, in the
+    // neighbour structure MS-DRSR defines: the naming context, the source DSA's
+    // DN and GUID, the address and the replica flags. The structure has no
+    // schedule member, so the recorded schedule stays internal.
+    void dsReplicaGetInfoReturnsTheRegisteredLink()
+    {
+        DrsServer server;
+        server.setConfig(config());
+        server.setObjectProvider([this]() { return fixture(); });
+
+        const QByteArray handle = server.handleCall(0, bindRequest()).mid(64, 20);
+        const QString ncDn = QStringLiteral("DC=corp,DC=example,DC=com");
+        const QByteArray guid = QByteArray::fromHex("00112233445566778899aabbccddeeff");
+        const QString address = QStringLiteral("dc02.corp.example.com");
+        QCOMPARE(readLe32(server.handleCall(5, replicaAddRequest2(handle, ncDn, guid, address)),
+                          0),
+                 quint32(0));
+
+        const QByteArray reply = server.handleCall(
+            19, replicaGetInfoRequest(handle, 0u, ncDn, QByteArray(16, '\0')));
+        QCOMPARE(readLe32(reply, 0), quint32(0));  // info_type echoed
+        QCOMPARE(readLe32(reply, 4), quint32(0));  // union discriminant
+        QVERIFY(readLe32(reply, 8) != 0u);         // counter referent
+        QCOMPARE(readLe32(reply, 12), quint32(1)); // count
+        QCOMPARE(readLe32(reply, 16), quint32(0)); // reserved
+        QCOMPARE(readLe32(reply, 20), quint32(1)); // conformant max_count
+        // The element opens on the 4-byte boundary after the counter head.
+        QVERIFY(readLe32(reply, 24) != 0u);        // naming_context_dn
+        QVERIFY(readLe32(reply, 28) != 0u);        // source_dsa_obj_dn
+        QVERIFY(readLe32(reply, 32) != 0u);        // source_dsa_address
+        QCOMPARE(readLe32(reply, 36), quint32(0)); // transport_obj_dn
+        QCOMPARE(readLe32(reply, 40), quint32(0)); // replica_flags as registered
+        QCOMPARE(reply.mid(64, 16), guid);         // source_dsa_obj_guid
+        QCOMPARE(readLe32(reply, reply.size() - 4), quint32(0)); // ErrorCode
+
+        // A GUID that matches no link is an empty counter, not an error.
+        const QByteArray other =
+            server.handleCall(19, replicaGetInfoRequest(
+                                      handle, 0u, ncDn,
+                                      QByteArray::fromHex("ffeeddccbbaa99887766554433221100")));
+        QCOMPARE(readLe32(other, 12), quint32(0));
+        QCOMPARE(readLe32(other, other.size() - 4), quint32(0));
+
+        // Another naming context, a view this server does not hold, a bad level
+        // and a forged handle are refused.
+        QCOMPARE(readLe32(server.handleCall(
+                              19, replicaGetInfoRequest(handle, 0u,
+                                                        QStringLiteral("DC=other,DC=example,DC=com"),
+                                                        QByteArray(16, '\0'))),
+                          0),
+                 quint32(0x000020f8));
+        QCOMPARE(readLe32(server.handleCall(19, replicaGetInfoRequest(
+                                                             handle, 1u, ncDn, QByteArray(16, '\0'))),
+                          0),
+                 quint32(0x57));
+        QCOMPARE(readLe32(server.handleCall(19, handle + QByteArray(8, '\0')), 0),
+                 quint32(0x000020f5));
+        QCOMPARE(readLe32(server.handleCall(19, QByteArray(20, '\x7f')), 0), quint32(0x000006f7));
     }
 
     // A deletion is not an absence: the object leaves the live store but stays

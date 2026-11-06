@@ -38,6 +38,7 @@ struct ReplicaSource
     QString address;
     quint32 options = 0;
     QUuid sourceDsa;
+    QString sourceDsaDn;
     QByteArray schedule;
 };
 
@@ -99,6 +100,7 @@ private:
     QByteArray drsReplicaAdd(const QByteArray &stub);
     QByteArray drsReplicaDel(const QByteArray &stub);
     QByteArray drsReplicaMod(const QByteArray &stub);
+    QByteArray drsReplicaGetInfo(const QByteArray &stub);
     QByteArray drsUpdateRefs(const QByteArray &stub);
     QByteArray drsGetNCChanges(const QByteArray &stub);
     QByteArray drsDomainControllerInfo(const QByteArray &stub);
