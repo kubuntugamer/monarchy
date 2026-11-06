@@ -11,6 +11,8 @@
 #include "LdapServer.h"
 #include "ReplicationAgent.h"
 
+#include <QTimeZone>
+
 namespace {
 
 DirectoryObject domainObject()
@@ -124,27 +126,27 @@ private slots:
         const int slot = 96 + 13;
         schedule[slot / 8] = char(0x80u >> (slot % 8));
 
-        const QDateTime monday315(QDate(2026, 11, 9), QTime(3, 15), Qt::UTC);
+        const QDateTime monday315(QDate(2026, 11, 9), QTime(3, 15), QTimeZone::utc());
         QVERIFY(ReplicationAgent::slotAllowed(schedule, monday315));
         QVERIFY(!ReplicationAgent::slotAllowed(
-            schedule, QDateTime(QDate(2026, 11, 9), QTime(3, 30), Qt::UTC)));
+            schedule, QDateTime(QDate(2026, 11, 9), QTime(3, 30), QTimeZone::utc())));
         QCOMPARE(ReplicationAgent::nextSlotStart(schedule, monday315.addSecs(-900)),
                  monday315);
         // From Tuesday the next allowed slot is the following Monday.
         QCOMPARE(ReplicationAgent::nextSlotStart(
-                     schedule, QDateTime(QDate(2026, 11, 10), QTime(9, 0), Qt::UTC)),
-                 QDateTime(QDate(2026, 11, 16), QTime(3, 15), Qt::UTC));
+                     schedule, QDateTime(QDate(2026, 11, 10), QTime(9, 0), QTimeZone::utc())),
+                 QDateTime(QDate(2026, 11, 16), QTime(3, 15), QTimeZone::utc()));
     }
 
     void theWeekWrapsAfterSevenDays()
     {
         QByteArray schedule(ReplicationAgent::kScheduleBytes, '\0');
         schedule[0] = char(0x80); // Sunday 00:00
-        const QDateTime sunday(QDate(2026, 11, 8), QTime(0, 0), Qt::UTC);
+        const QDateTime sunday(QDate(2026, 11, 8), QTime(0, 0), QTimeZone::utc());
         QVERIFY(ReplicationAgent::slotAllowed(schedule, sunday));
         // The slot ends a second later, and the next one is a week away.
         QCOMPARE(ReplicationAgent::nextSlotStart(schedule, sunday.addSecs(1)),
-                 QDateTime(QDate(2026, 11, 15), QTime(0, 0), Qt::UTC));
+                 QDateTime(QDate(2026, 11, 15), QTime(0, 0), QTimeZone::utc()));
     }
 
     void theDelayFollowsTheScheduleOnlyWhenPeriodicSyncIsRequested()
@@ -152,7 +154,7 @@ private slots:
         QByteArray schedule(ReplicationAgent::kScheduleBytes, '\0');
         const int slot = 96 + 13;
         schedule[slot / 8] = char(0x80u >> (slot % 8));
-        const QDateTime now(QDate(2026, 11, 9), QTime(3, 0), Qt::UTC);
+        const QDateTime now(QDate(2026, 11, 9), QTime(3, 0), QTimeZone::utc());
 
         // DRS_PER_SYNC set: the next cycle waits for the slot.
         QCOMPARE(ReplicationAgent::nextCycleDelayMs(schedule, ReplicationAgent::kDrsPerSync,
