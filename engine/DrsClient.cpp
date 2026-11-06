@@ -429,6 +429,173 @@ DirectoryObject toDirectoryObject(const ChainEntry &entry)
     return object;
 }
 
+// The endpoint mapper (MS-RPCE §6.2): the fixed-port service a host registers
+// its dynamic endpoints with. AD puts DRSUAPI on an arbitrary port, so a client
+// told only "this host" asks here first instead of guessing.
+const QUuid kEpmInterface =
+    QUuid::fromString(QStringLiteral("{e1af8308-5d1f-11c9-91a4-08002b14a0fa}"));
+const QUuid kTcpProtocol =
+    QUuid::fromString(QStringLiteral("{045d888a-eb1c-c911-9fe8-08002b104860}"));
+
+bool sendPdu(QTcpSocket *socket, const QByteArray &pdu)
+{
+    return socket->write(pdu) == pdu.size() && socket->waitForBytesWritten(3000);
+}
+
+bool readPdu(QTcpSocket *socket, QByteArray *buffer, QByteArray *pdu)
+{
+    QDeadlineTimer deadline(3000);
+    auto fillTo = [&](int target) {
+        while (buffer->size() < target) {
+            const qint64 remaining = deadline.remainingTime();
+            if (remaining <= 0)
+                return false;
+            if (!socket->waitForReadyRead(int(remaining))) {
+                buffer->append(socket->readAll());
+                return buffer->size() >= target;
+            }
+            buffer->append(socket->readAll());
+        }
+        return true;
+    };
+    if (!fillTo(kHeaderSize))
+        return false;
+    const quint16 length = readLe16(*buffer, 8);
+    if (length < kHeaderSize || !fillTo(length))
+        return false;
+    *pdu = buffer->left(length);
+    buffer->remove(0, length);
+    return true;
+}
+
+bool bindAccepted(const QByteArray &pdu)
+{
+    if (pdu.size() < kHeaderSize + 14 || quint8(pdu.at(2)) != PduBindAck)
+        return false;
+    const QByteArray body = pdu.mid(kHeaderSize);
+    const int secAddrLength = readLe16(body, 8);
+    int pos = 10 + secAddrLength;
+    pos += (4 - (pos % 4)) % 4;
+    if (pos + 4 > body.size())
+        return false;
+    const int results = quint8(body.at(pos));
+    for (int i = 0; i < results; ++i) {
+        const int offset = pos + 4 + i * 24;
+        if (offset + 24 > body.size())
+            break;
+        if (readLe16(body, offset) == kResultAcceptance)
+            return true;
+    }
+    return false;
+}
+
+// A tower is a list of floors; a transport floor names its protocol in the
+// left-hand side and carries the address in the right. The TCP address opens
+// with the port in network order (MS-RPCE §6.2.1.2).
+bool parseTowerPort(const QByteArray &tower, quint16 *port)
+{
+    int pos = 0;
+    const quint16 floors = readLe16(tower, pos);
+    pos += 2;
+    for (int i = 0; i < floors; ++i) {
+        const quint16 lhsLength = readLe16(tower, pos);
+        pos += 2;
+        if (pos + int(lhsLength) + 2 > tower.size())
+            return false;
+        const QByteArray lhs = tower.mid(pos, lhsLength);
+        pos += lhsLength;
+        const quint16 rhsLength = readLe16(tower, pos);
+        pos += 2;
+        if (pos + int(rhsLength) > tower.size())
+            return false;
+        if (lhsLength == 16 && guidFromBytes(lhs) == kTcpProtocol && rhsLength >= 2) {
+            const quint16 found = quint16((quint8(tower.at(pos)) << 8)
+                                          | quint8(tower.at(pos + 1)));
+            if (found != 0) {
+                *port = found;
+                return true;
+            }
+        }
+        pos += rhsLength;
+    }
+    return false;
+}
+
+bool lookupEndpoint(const QString &host, quint16 epmPort, const QByteArray &ifaceUuid,
+                    quint16 major, quint16 minor, quint16 *port, QString *error)
+{
+    QTcpSocket socket;
+    socket.connectToHost(host, epmPort);
+    if (!socket.waitForConnected(3000)) {
+        if (error)
+            *error = QStringLiteral("the endpoint mapper at %1:%2 is unreachable: %3")
+                         .arg(host)
+                         .arg(epmPort)
+                         .arg(socket.errorString());
+        return false;
+    }
+    QByteArray buffer;
+    if (!sendPdu(&socket,
+                 DrsWire::bindPdu(1, guidBytes(kEpmInterface), 3, 0, QByteArray(), 0))) {
+        if (error)
+            *error = QStringLiteral("could not send the endpoint mapper bind");
+        return false;
+    }
+    QByteArray pdu;
+    if (!readPdu(&socket, &buffer, &pdu) || !bindAccepted(pdu)) {
+        if (error)
+            *error = QStringLiteral("the endpoint mapper refused the bind");
+        return false;
+    }
+
+    QByteArray stub;
+    putLe32(stub, 0); // inquiry_type: ept_tower
+    putLe32(stub, 0); // object: null referent
+    stub.append(ifaceUuid);
+    putLe16(stub, major);
+    putLe16(stub, minor);
+    putLe32(stub, 1);                   // vers_option: major version only
+    stub.append(QByteArray(20, '\0')); // ept_lookup_handle
+    putLe32(stub, 4);                   // max_ents
+    if (!sendPdu(&socket, DrsWire::requestPdu(2, 2, stub))) {
+        if (error)
+            *error = QStringLiteral("could not send the endpoint query");
+        return false;
+    }
+    if (!readPdu(&socket, &buffer, &pdu) || quint8(pdu.at(2)) != PduResponse) {
+        if (error)
+            *error = QStringLiteral("the endpoint mapper did not answer the query");
+        return false;
+    }
+
+    const QByteArray replyStub = pdu.mid(kResponseHeader);
+    Ndr::Reader reader(replyStub);
+    quint32 numEnts = 0;
+    if (!reader.skip(20) || !reader.u32(&numEnts)) {
+        if (error)
+            *error = QStringLiteral("the endpoint reply could not be parsed");
+        return false;
+    }
+    for (quint32 i = 0; i < numEnts && i < 32; ++i) {
+        quint32 status = 0;
+        quint32 towerLength = 0;
+        quint32 towerOffset = 0;
+        if (!reader.u32(&status) || !reader.u32(&towerLength) || !reader.u32(&towerOffset))
+            break;
+        QByteArray tower;
+        if (!reader.bytes(int(towerLength), &tower))
+            break;
+        reader.align(4);
+        if (status != 0)
+            continue;
+        if (parseTowerPort(tower, port))
+            return true;
+    }
+    if (error)
+        *error = QStringLiteral("%1 does not register DRSUAPI on a TCP port").arg(host);
+    return false;
+}
+
 } // namespace
 
 namespace DrsWire {
@@ -716,14 +883,34 @@ void DrsClient::setCredentials(const QString &domain, const QString &user,
     m_credentialsSet = !user.isEmpty() && !password.isEmpty();
 }
 
-bool DrsClient::connectToPeer(QString *error)
+bool DrsClient::resolvePeer(QString *error)
 {
-    close();
-    if (m_host.isEmpty() || m_port == 0) {
+    if (m_port != 0)
+        return true;
+    if (m_host.isEmpty()) {
         if (error)
             *error = QStringLiteral("no peer configured");
         return false;
     }
+    const Rpc::Interface interface = Drs::interface();
+    quint16 port = 0;
+    if (!lookupEndpoint(m_host, m_epmPort, interface.uuid, interface.major, interface.minor,
+                        &port, error))
+        return false;
+    m_port = port;
+    return true;
+}
+
+bool DrsClient::connectToPeer(QString *error)
+{
+    close();
+    if (m_host.isEmpty()) {
+        if (error)
+            *error = QStringLiteral("no peer configured");
+        return false;
+    }
+    if (m_port == 0 && !resolvePeer(error))
+        return false;
     m_socket = new QTcpSocket(this);
     m_socket->connectToHost(m_host, m_port);
     if (!m_socket->waitForConnected(m_connectTimeoutMs)) {

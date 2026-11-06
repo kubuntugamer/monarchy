@@ -10,9 +10,13 @@
 
 #include <QtTest>
 
+#include <QHash>
+#include <QHostAddress>
 #include <QMutex>
 #include <QMutexLocker>
 #include <QSemaphore>
+#include <QTcpServer>
+#include <QTcpSocket>
 #include <QThread>
 
 #include <functional>
@@ -115,8 +119,141 @@ struct SharedObjects {
     }
 };
 
+// A stand-in for a host's endpoint mapper: it answers the DCE bind and then an
+// ept_lookup with a tower naming the port the peer actually serves on. Windows
+// registers DRSUAPI the same way, on a port nobody configured by hand.
+class EpmStubServer : public QObject
+{
+public:
+    explicit EpmStubServer(quint16 dynamicPort) : m_dynamicPort(dynamicPort)
+    {
+        m_server.listen(QHostAddress::LocalHost, 0);
+        connect(&m_server, &QTcpServer::newConnection, this, [this]() {
+            while (QTcpSocket *socket = m_server.nextPendingConnection()) {
+                connect(socket, &QTcpSocket::readyRead, this,
+                        [this, socket]() { onData(socket); });
+                connect(socket, &QObject::destroyed, this,
+                        [this, socket]() { m_buffers.remove(socket); });
+                connect(socket, &QTcpSocket::disconnected, socket, &QObject::deleteLater);
+            }
+        });
+    }
+
+    quint16 port() const { return m_server.serverPort(); }
+
+private:
+    void onData(QTcpSocket *socket)
+    {
+        QByteArray &buffer = m_buffers[socket];
+        buffer.append(socket->readAll());
+        while (buffer.size() >= 16) {
+            const quint16 length = quint16(quint8(buffer.at(8)) | (quint8(buffer.at(9)) << 8));
+            if (length < 16 || buffer.size() < length)
+                break;
+            const QByteArray pdu = buffer.left(length);
+            buffer.remove(0, length);
+            answer(socket, pdu);
+        }
+    }
+
+    void answer(QTcpSocket *socket, const QByteArray &pdu)
+    {
+        const quint8 type = quint8(pdu.at(2));
+        const quint32 callId = quint32(quint8(pdu.at(12)))
+                               | (quint32(quint8(pdu.at(13))) << 8)
+                               | (quint32(quint8(pdu.at(14))) << 16)
+                               | (quint32(quint8(pdu.at(15))) << 24);
+        if (type == 11)
+            socket->write(bindAck(callId));
+        else if (type == 0)
+            socket->write(lookupReply(callId));
+    }
+
+    static void appendLe16(QByteArray &out, quint16 value)
+    {
+        out.append(char(value & 0xff));
+        out.append(char((value >> 8) & 0xff));
+    }
+    static void appendLe32(QByteArray &out, quint32 value)
+    {
+        appendLe16(out, quint16(value & 0xffff));
+        appendLe16(out, quint16(value >> 16));
+    }
+    static QByteArray responsePdu(quint8 type, quint32 callId, const QByteArray &body)
+    {
+        const int overhead = type == 2 ? 24 : 16; // a response echoes the call header
+        const quint16 total = quint16(overhead + body.size());
+        QByteArray out;
+        out.append(char(5));    // rpc_vers
+        out.append(char(0));    // rpc_vers_minor
+        out.append(char(type)); // PTYPE
+        out.append(char(0x03)); // first | last fragment
+        out.append(char(0x10)); // little-endian
+        out.append(QByteArray(3, '\0'));
+        appendLe16(out, total);
+        out.append(QByteArray(2, '\0')); // auth_length
+        appendLe32(out, callId);
+        if (type == 2)
+            out.append(QByteArray(8, '\0')); // alloc_hint, context, cancel, reserved
+        out.append(body);
+        return out;
+    }
+
+    QByteArray bindAck(quint32 callId) const
+    {
+        QByteArray body;
+        appendLe16(body, 5840);   // max_xmit_frag
+        appendLe16(body, 5840);   // max_recv_frag
+        appendLe32(body, 0x1001); // assoc_group
+        appendLe16(body, 0);      // secondary address length
+        appendLe16(body, 0);
+        body.append(char(1)); // one presented context
+        body.append(QByteArray(3, '\0'));
+        appendLe16(body, 0); // acceptance
+        appendLe16(body, 0); // reason
+        body.append(Rpc::kNdrSyntaxUuid);
+        appendLe32(body, 2); // NDR32
+        return responsePdu(12, callId, body);
+    }
+
+    QByteArray lookupReply(quint32 callId) const
+    {
+        // Floors name their protocol in the left-hand side; the transport floor
+        // carries the port in network order.
+        QByteArray tower;
+        appendLe16(tower, 2); // two floors
+        appendLe16(tower, 16);
+        tower.append(Rpc::kNdrSyntaxUuid); // the interface's own floor
+        appendLe16(tower, 4);
+        appendLe16(tower, 3);
+        appendLe16(tower, 0);
+        appendLe16(tower, 16);
+        tower.append(QByteArray::fromHex("8a885d041ceb11c99fe808002b104860")); // TCP
+        appendLe16(tower, 4);
+        tower.append(char((m_dynamicPort >> 8) & 0xff));
+        tower.append(char(m_dynamicPort & 0xff));
+        appendLe16(tower, 0);
+        appendLe16(tower, 0); // a tower closes with the first floor's length
+
+        QByteArray stub;
+        stub.append(QByteArray(20, '\0')); // ept_lookup_handle
+        appendLe32(stub, 1);               // one entry
+        appendLe32(stub, 0);               // entry status
+        appendLe32(stub, quint32(tower.size()));
+        appendLe32(stub, 0); // octet-string offset
+        stub.append(tower);
+        while (stub.size() % 4 != 0)
+            stub.append('\0');
+        return responsePdu(2, callId, stub);
+    }
+
+    QTcpServer m_server;
+    quint16 m_dynamicPort;
+    QHash<QTcpSocket *, QByteArray> m_buffers;
+};
+
 // A DrsServer with its own event loop, so a blocking client on the test thread
-// can talk to it.
+// can talk to it. It stands behind an endpoint mapper, as a DC does.
 class DrsServerThread : public QThread
 {
 public:
@@ -142,6 +279,7 @@ public:
     }
 
     quint16 port() const { return m_port; }
+    quint16 epmPort() const { return m_epmPort; }
 
 protected:
     void run() override
@@ -159,6 +297,8 @@ protected:
         });
         const bool listening = server.listen(0);
         m_port = listening ? server.serverPort() : 0;
+        EpmStubServer epm(m_port);
+        m_epmPort = epm.port();
         m_ready.release();
         if (listening)
             exec();
@@ -169,6 +309,7 @@ private:
     Samr::Config m_config;
     Rpc::Authenticator m_authenticator;
     quint16 m_port = 0;
+    quint16 m_epmPort = 0;
     QSemaphore m_ready;
 };
 
@@ -324,8 +465,39 @@ private slots:
         QVERIFY(peer.wait(5000));
     }
 
+    // A host without a port is enough: the endpoint mapper names the DRSUAPI
+    // port, and the session then runs exactly as it does with a known port.
+    void aDynamicPeerPortIsFoundThroughTheEndpointMapper()
+    {
+        DrsServerThread peer([]() { return fixture(); }, config());
+        peer.start();
+        peer.waitUntilListening();
+        QVERIFY(peer.port() != 0);
+        QVERIFY(peer.epmPort() != 0);
+
+        DrsClient client;
+        client.setPeer(QStringLiteral("127.0.0.1"), 0);
+        client.setEpmPort(peer.epmPort());
+        QString error;
+        QVERIFY2(client.connectToPeer(&error), qPrintable(error));
+        QCOMPARE(client.peerPort(), peer.port());
+        QVERIFY2(client.bindInterface(&error), qPrintable(error));
+        QVERIFY2(client.dsBind(&error), qPrintable(error));
+
+        QList<DirectoryObject> objects;
+        quint64 usnHigh = 0;
+        bool moreData = false;
+        QVERIFY2(client.getNCChanges(kBaseDn, 0, &objects, &usnHigh, &moreData, &error),
+                 qPrintable(error));
+        QCOMPARE(objects.size(), 2);
+
+        client.close();
+        peer.quit();
+        QVERIFY(peer.wait(5000));
+    }
+
     // A wrong password completes the transport bind and the challenge, then the
-    // first call is refused: the client never pretends to have a session.
+    // first call is refused: the client never gets a usable session.
     void aWrongPasswordIsRefused()
     {
         DrsServerThread peer([]() { return fixture(); }, config(),

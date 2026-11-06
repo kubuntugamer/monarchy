@@ -23,9 +23,11 @@ namespace DrsWire {
 // The DRS_HANDLE a DsBind reply carries: a 16-byte GUID plus a 4-byte pad.
 constexpr int kHandleSize = 20;
 
-// One DCE/RPC bind for the DRSUAPI interface, offering NDR32 only.
+// One DCE/RPC bind for the DRSUAPI interface, offering NDR32 only. An NTLMSSP
+// NEGOTIATE rides in `authToken` when the caller has credentials.
 QByteArray bindPdu(quint32 callId, const QByteArray &abstractUuid, quint16 major,
-                   quint16 minor);
+                   quint16 minor, const QByteArray &authToken = QByteArray(),
+                   quint8 authLevel = 6);
 
 // One DCE/RPC request PDU for `opnum` with this stub.
 QByteArray requestPdu(quint32 callId, quint16 opnum, const QByteArray &stub);
@@ -59,9 +61,12 @@ public:
     explicit DrsClient(QObject *parent = nullptr);
     ~DrsClient() override;
 
-    // ncacn_ip_tcp to a DRS endpoint. A DC publishes DRS on a dynamic port
-    // discovered through EPM; this client takes the port it is given.
+    // ncacn_ip_tcp to a DRS endpoint. A DC publishes DRS on a dynamic port, so
+    // a peer can be named by host alone (port 0) and the port looked up through
+    // its endpoint mapper first, the way Windows does it.
     void setPeer(const QString &host, quint16 port);
+    void setEpmPort(quint16 port) { m_epmPort = port; }
+    quint16 peerPort() const { return m_port; }
     void setTimeouts(int connectMs, int readMs);
 
     // The security provider. With credentials the bind carries an NTLMSSP
@@ -74,6 +79,8 @@ public:
     void setAuthLevel(quint8 level) { m_authLevel = level; }
     bool isAuthenticated() const { return m_authenticated; }
 
+    // Resolves the port when only a host was given; connectToPeer() calls it.
+    bool resolvePeer(QString *error = nullptr);
     bool connectToPeer(QString *error = nullptr);
     void close();
     bool isConnected() const;
@@ -105,7 +112,6 @@ signals:
 
 private:
     bool writePdu(const QByteArray &pdu, QString *error);
-    // Reads one whole message, joining fragments until PFC_LAST_FRAG.
     // Reads one whole message, joining fragments until PFC_LAST_FRAG. A signed
     // reply is verified and unsealed here; a bind_ack's token comes back in
     // `authToken`.
@@ -117,6 +123,7 @@ private:
     QTcpSocket *m_socket = nullptr;
     QString m_host;
     quint16 m_port = 0;
+    quint16 m_epmPort = 135;
     int m_connectTimeoutMs = 5000;
     int m_readTimeoutMs = 30000;
     quint32 m_callId = 0;

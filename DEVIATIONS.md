@@ -111,14 +111,12 @@ Neither is reachable from the current development machine.
 over `ncacn_ip_tcp`, answers the NTLMSSP challenge with an NTLMv2 response and runs `DsBind`,
 `DsGetNCChanges` and `DsUnbind` on a session whose calls are signed and, at level 6, sealed
 (`engine/NtlmClient.cpp` is the initiator half of the exchange the acceptor in `Ntlm.cpp`
-verifies). It does not yet negotiate Kerberos, and it takes the peer's port as given instead of
-resolving it through the endpoint mapper.
-**Why listed:** The transport, authentication, framing, chunking and object decoding are real and
-tested against this tree's DC, including a wrong password that is refused at the first call. A
-peer that required Kerberos alone, or that is only reachable on a port the endpoint mapper would
-have to name, is still out of reach.
-**What closes it:** An initiator-side GSS-API Kerberos bind, and endpoint-map port discovery, both
-on top of the same signed-PDU path.
+verifies). When it is given a host but no port, it asks that host's endpoint mapper for the
+DRSUAPI endpoint, the way a Windows client does.
+**Why listed:** The transport, authentication, endpoint discovery, framing, chunking and object
+decoding are real and tested against this tree's DC, including a wrong password that is refused at
+the first call. A peer that required Kerberos alone is still out of reach.
+**What closes it:** An initiator-side GSS-API Kerberos bind on the same signed-PDU path.
 
 ---
 
