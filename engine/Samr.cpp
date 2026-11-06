@@ -35,6 +35,11 @@ constexpr quint32 kStatusNotSupported = 0xc00000bbu;
 constexpr quint32 kStatusMoreEntries = 0x00000105u;
 constexpr quint32 kStatusSomeNotMapped = 0x00000107u;
 constexpr quint32 kStatusNoneMapped = 0xc0000073u;
+constexpr quint32 kStatusAliasExists = 0xc0000155u;
+constexpr quint32 kStatusNoSuchAlias = 0xc0000156u;
+constexpr quint32 kStatusMemberInAlias = 0xc0000157u;
+constexpr quint32 kStatusMemberNotInAlias = 0xc0000158u;
+constexpr quint32 kStatusInvalidMember = 0xc0000178u;
 
 // A SAMPR_HANDLE is a 20-byte context handle: a 16-byte id and a 4-byte
 // server-side pointer that clients must not interpret.
@@ -72,10 +77,12 @@ void appendVaryingString(QByteArray &out, const QString &text)
 }
 
 // SID_NAME_USE as MS-SAMR reports it for a relative identifier.
+bool isAlias(const DirectoryObject &object);
+
 quint32 nameTypeFor(const DirectoryObject &object)
 {
     if (object.kind == ObjectKind::Group)
-        return 2; // SidTypeGroup
+        return isAlias(object) ? 4 : 2; // SidTypeAlias : SidTypeGroup
     if (object.kind == ObjectKind::Computer)
         return 8; // SidTypeComputer
     return 1;     // SidTypeUser
@@ -86,6 +93,81 @@ quint32 ridOf(const DirectoryObject &object)
     const QStringList parts =
         object.attributes.value(QStringLiteral("objectSid")).split(QLatin1Char('-'));
     return parts.isEmpty() ? 0 : parts.last().toUInt();
+}
+
+// AD stores the two SAMR name spaces as one: a group whose groupType has
+// GROUP_TYPE_RESOURCE_GROUP (0x4) is a domain-local group, which SAMR calls an
+// alias; the global and universal groups are the ones SAMR calls groups.
+bool isAlias(const DirectoryObject &object)
+{
+    if (object.kind != ObjectKind::Group)
+        return false;
+    bool numeric = false;
+    const qint64 type = object.attributes.value(QStringLiteral("groupType")).toLongLong(&numeric);
+    return numeric && (type & 0x4) != 0;
+}
+
+// RPC_SID as MS-RPCE carries it: the sub-authority count is a conformant array
+// length, so it comes before the fixed header, then the header and the
+// sub-authorities. Ndr::writeSid omits that count, which is the shape LSAD's
+// inline SIDs use, so the alias calls marshal their own.
+void putWireSid(QByteArray &out, const QByteArray &sid)
+{
+    const quint8 count = sid.size() >= 8 ? quint8(sid.at(1)) : 0;
+    putLe32(out, quint32(count));
+    out.append(sid.left(8));
+    out.append(sid.mid(8, count * 4));
+}
+
+bool readWireSid(Ndr::Reader &reader, QByteArray *sid)
+{
+    quint32 maximum = 0;
+    QByteArray header;
+    if (!reader.u32(&maximum) || !reader.bytes(8, &header))
+        return false;
+    const quint8 count = quint8(header.at(1));
+    if (maximum < count)
+        return false;
+    QByteArray out = header;
+    for (quint8 i = 0; i < count; ++i) {
+        QByteArray sub;
+        if (!reader.bytes(4, &sub))
+            return false;
+        out.append(sub);
+    }
+    if (sid)
+        *sid = out;
+    return true;
+}
+
+// SAMPR_ENUMERATION_BUFFER: context, buffer pointer, entries read, the array's
+// pointer and maximum count, one {RelativeId; RPC_UNICODE_STRING} per entry and
+// then the name buffers, in that order.
+void appendEnumeration(QByteArray &out, const QList<DirectoryObject> &page, quint32 context,
+                       quint32 referent)
+{
+    putLe32(out, context);
+    putLe32(out, referent);
+    putLe32(out, quint32(page.size()));
+    putLe32(out, referent + 1);
+    putLe32(out, quint32(page.size()));
+    QByteArray names;
+    for (int i = 0; i < page.size(); ++i) {
+        const DirectoryObject &object = page.at(i);
+        putLe32(out, ridOf(object));
+        QString name = object.attributes.value(QStringLiteral("sAMAccountName"));
+        if (name.isEmpty())
+            name = object.name;
+        const QByteArray utf16 = Ndr::utf16le(name);
+        out.append(char(utf16.size() & 0xff));
+        out.append(char((utf16.size() >> 8) & 0xff));
+        out.append(char(utf16.size() & 0xff));
+        out.append(char((utf16.size() >> 8) & 0xff));
+        putLe32(out, referent + 2 + quint32(i));
+        appendVaryingString(names, name);
+    }
+    out.append(names);
+    putLe32(out, quint32(page.size())); // CountReturned
 }
 
 // MS-SAMR 2.2.11.1: a samr_CryptPassword holds the UTF-16LE password padded to
@@ -618,6 +700,21 @@ QList<DirectoryObject> SamrServer::groups() const
     QList<DirectoryObject> result;
     for (const DirectoryObject &object : directory()) {
         if (object.id.isEmpty() || object.kind != ObjectKind::Group)
+            continue;
+        if (object.attributes.value(QStringLiteral("objectSid")).isEmpty())
+            continue;
+        if (isAlias(object))
+            continue;
+        result.append(object);
+    }
+    return result;
+}
+
+QList<DirectoryObject> SamrServer::aliases() const
+{
+    QList<DirectoryObject> result;
+    for (const DirectoryObject &object : directory()) {
+        if (object.id.isEmpty() || !isAlias(object))
             continue;
         if (object.attributes.value(QStringLiteral("objectSid")).isEmpty())
             continue;
@@ -1198,6 +1295,169 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
         emit requestReceived(QStringLiteral("EnumerateGroups (%1)").arg(page.size()));
         return fixed;
     }
+    // SamrEnumerateAliasesInDomain (opnum 15): the group enumeration buffer
+    // again, over the domain-local groups, and with no access mask in the
+    // request (MS-SAMR 3.1.5.10.2).
+    case Samr::OpEnumerateAliasesInDomain: {
+        QByteArray handle;
+        if (!reader.bytes(kHandleSize, &handle))
+            return {};
+        quint32 context = 0;
+        quint32 maximum = 0;
+        reader.u32(&context);
+        reader.u32(&maximum);
+        Q_UNUSED(maximum)
+        Handle domain;
+        if (!lookupHandle(handle, Handle::Domain, &domain)) {
+            putLe32(fixed, context);
+            fixed.append(char(0));
+            putLe32(fixed, 0);
+            putLe32(fixed, 0);
+            putLe32(fixed, 0);
+            putLe32(fixed, kStatusInvalidHandle);
+            return fixed;
+        }
+
+        const QList<DirectoryObject> all = aliases();
+        QList<DirectoryObject> page;
+        for (int i = int(context); i < all.size(); ++i)
+            page.append(all.at(i));
+        appendEnumeration(fixed, page, 0, 0x0002d510u);
+        putLe32(fixed, kStatusSuccess);
+        emit requestReceived(QStringLiteral("EnumerateAliases (%1)").arg(page.size()));
+        return fixed;
+    }
+    case Samr::OpOpenAlias: {
+        QByteArray handle;
+        if (!reader.bytes(kHandleSize, &handle))
+            return {};
+        quint32 desired = 0;
+        quint32 rid = 0;
+        reader.u32(&desired);
+        reader.u32(&rid);
+        Q_UNUSED(desired)
+        Handle domain;
+        if (!lookupHandle(handle, Handle::Domain, &domain)) {
+            fixed.append(QByteArray(kHandleSize, '\0'));
+            putLe32(fixed, kStatusInvalidHandle);
+            return fixed;
+        }
+        for (const DirectoryObject &alias : aliases()) {
+            if (ridOf(alias) != rid)
+                continue;
+            fixed.append(newHandle(Handle::Alias, alias.id, rid));
+            putLe32(fixed, kStatusSuccess);
+            emit requestReceived(QStringLiteral("OpenAlias(%1)").arg(alias.name));
+            return fixed;
+        }
+        fixed.append(QByteArray(kHandleSize, '\0'));
+        putLe32(fixed, kStatusNoSuchAlias);
+        return fixed;
+    }
+    // SamrAddMemberToAlias / SamrRemoveMemberFromAlias (opnum 31/32): the member
+    // arrives as a SID rather than the RID the group calls take.
+    case Samr::OpAddMemberToAlias:
+    case Samr::OpRemoveMemberFromAlias: {
+        const bool adding = opnum == Samr::OpAddMemberToAlias;
+        QByteArray handle;
+        if (!reader.bytes(kHandleSize, &handle))
+            return {};
+        QByteArray memberSid;
+        if (!readWireSid(reader, &memberSid))
+            return {};
+        Handle alias;
+        if (!lookupHandle(handle, Handle::Alias, &alias)) {
+            putLe32(fixed, kStatusInvalidHandle);
+            return fixed;
+        }
+        // The member must be in this domain: same identifier authority and the
+        // same sub-authorities up to the one that carries the relative id.
+        const QByteArray domainSid = Ndr::sidFromString(m_config.domainSid);
+        const bool inDomain = domainSid.size() >= 12 && memberSid.size() > domainSid.size()
+                              && memberSid.size() >= 8 && memberSid.mid(2, 6) == domainSid.mid(2, 6)
+                              && memberSid.mid(8, domainSid.size() - 12)
+                                     == domainSid.mid(8, domainSid.size() - 12);
+        quint32 rid = 0;
+        if (inDomain)
+            rid = quint32(quint8(memberSid.at(memberSid.size() - 4)))
+                  | (quint32(quint8(memberSid.at(memberSid.size() - 3))) << 8)
+                  | (quint32(quint8(memberSid.at(memberSid.size() - 2))) << 16)
+                  | (quint32(quint8(memberSid.at(memberSid.size() - 1))) << 24);
+        QString memberDn;
+        if (rid != 0) {
+            for (const DirectoryObject &object : directory()) {
+                if (object.id.isEmpty() || ridOf(object) != rid)
+                    continue;
+                memberDn = object.id;
+                break;
+            }
+        }
+        if (memberDn.isEmpty()) {
+            putLe32(fixed, kStatusInvalidMember);
+            emit requestReceived(QStringLiteral("%1 alias member refused: no account for that SID")
+                                     .arg(adding ? QStringLiteral("Add") : QStringLiteral("Remove")));
+            return fixed;
+        }
+        QString error;
+        const bool ok = adding ? (m_writes.addMember && m_writes.addMember(alias.dn, memberDn, &error))
+                               : (m_writes.removeMember
+                                  && m_writes.removeMember(alias.dn, memberDn, &error));
+        putLe32(fixed, ok ? kStatusSuccess
+                          : (adding ? kStatusMemberInAlias : kStatusMemberNotInAlias));
+        emit requestReceived(QStringLiteral("%1AliasMember(%2) %3")
+                                 .arg(adding ? QStringLiteral("Add") : QStringLiteral("Remove"),
+                                      memberDn, ok ? QStringLiteral("ok") : error));
+        return fixed;
+    }
+    // SamrGetMembersInAlias (opnum 33): SAMPR_PSID_ARRAY, a count and a pointer
+    // to an array of SIDs. Each element is a pointer to an RPC_SID, so the
+    // referents follow the array, in order.
+    case Samr::OpGetMembersInAlias: {
+        QByteArray handle;
+        if (!reader.bytes(kHandleSize, &handle))
+            return {};
+        Handle alias;
+        if (!lookupHandle(handle, Handle::Alias, &alias)) {
+            putLe32(fixed, 0); // Count
+            putLe32(fixed, 0); // NULL array
+            putLe32(fixed, kStatusInvalidHandle);
+            return fixed;
+        }
+        QStringList members;
+        for (const DirectoryObject &object : aliases()) {
+            if (object.id.compare(alias.dn, Qt::CaseInsensitive) == 0) {
+                members = object.members;
+                break;
+            }
+        }
+        const QList<DirectoryObject> all = directory();
+        QList<QByteArray> sids;
+        for (const QString &member : members) {
+            for (const DirectoryObject &candidate : all) {
+                if (candidate.id.compare(member, Qt::CaseInsensitive) != 0)
+                    continue;
+                const QByteArray sid = Ndr::sidFromString(
+                    candidate.attributes.value(QStringLiteral("objectSid")));
+                if (!sid.isEmpty())
+                    sids.append(sid);
+                break;
+            }
+        }
+        putLe32(fixed, quint32(sids.size()));
+        if (sids.isEmpty()) {
+            putLe32(fixed, 0);
+        } else {
+            putLe32(fixed, 0x0002e300u);        // array referent
+            putLe32(fixed, quint32(sids.size())); // maximum count
+            for (int i = 0; i < sids.size(); ++i)
+                putLe32(fixed, 0x0002e310u + quint32(i));
+            for (const QByteArray &sid : sids)
+                putWireSid(fixed, sid);
+        }
+        putLe32(fixed, kStatusSuccess);
+        emit requestReceived(QStringLiteral("GetAliasMembers(%1)").arg(sids.size()));
+        return fixed;
+    }
     case Samr::OpOpenUser: {
         QByteArray handle;
         if (!reader.bytes(kHandleSize, &handle))
@@ -1648,9 +1908,15 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
         return fixed;
     }
     case Samr::OpCreateUser2:
-    case Samr::OpCreateGroupInDomain: {
+    case Samr::OpCreateGroupInDomain:
+    case Samr::OpCreateAliasInDomain: {
+        const bool creatingAlias = opnum == Samr::OpCreateAliasInDomain;
         const bool creatingGroup = opnum == Samr::OpCreateGroupInDomain;
-        const quint32 existsStatus = creatingGroup ? kStatusGroupExists : kStatusUserExists;
+        // Aliases and groups are both group objects, and their create calls
+        // carry the same arguments, so one arm serves both.
+        const bool creatingContainer = creatingAlias || creatingGroup;
+        const quint32 existsStatus = creatingAlias ? kStatusAliasExists
+                                   : (creatingGroup ? kStatusGroupExists : kStatusUserExists);
         QByteArray handle;
         if (!reader.bytes(kHandleSize, &handle))
             return {};
@@ -1681,10 +1947,10 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
             reader.align(4);
         }
         // CreateUser2 carries an AccountType before the access mask; the group
-        // call has only the mask.
+        // and alias calls have only the mask.
         quint32 accountFlags = 0;
         quint32 accessMask = 0;
-        if (creatingGroup) {
+        if (creatingContainer) {
             if (!reader.u32(&accessMask))
                 return {};
         } else if (!reader.u32(&accountFlags) || !reader.u32(&accessMask)) {
@@ -1705,15 +1971,21 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
 
         DirectoryObject object;
         object.name = account;
-        object.kind = creatingGroup ? ObjectKind::Group : ObjectKind::User;
-        object.type = creatingGroup ? QStringLiteral("Security Group") : QStringLiteral("User");
+        object.kind = creatingContainer ? ObjectKind::Group : ObjectKind::User;
+        object.type = creatingContainer ? QStringLiteral("Security Group") : QStringLiteral("User");
         object.container = QStringLiteral("CN=Users,%1").arg(m_config.baseDn);
         object.id = QStringLiteral("CN=%1,%2").arg(account, object.container);
         object.attributes.insert(QStringLiteral("cn"), account);
         object.attributes.insert(QStringLiteral("sAMAccountName"), account);
         object.attributes.insert(QStringLiteral("objectClass"),
-                                 creatingGroup ? QStringLiteral("group") : QStringLiteral("user"));
-        if (creatingGroup) {
+                                 creatingContainer ? QStringLiteral("group")
+                                                   : QStringLiteral("user"));
+        if (creatingAlias) {
+            // GROUP_TYPE_RESOURCE_GROUP | SECURITY_ENABLED: the domain-local
+            // group AD presents to SAMR as an alias.
+            object.attributes.insert(QStringLiteral("groupType"), QStringLiteral("-2147483644"));
+            object.attributes.insert(QStringLiteral("description"), QString());
+        } else if (creatingGroup) {
             object.attributes.insert(QStringLiteral("groupType"), QStringLiteral("Security"));
         } else {
             // SamrCreateUser2's AccountType is a SAMR_ACCT_FLAGS set, which is
@@ -1724,41 +1996,44 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
             object.attributes.insert(QStringLiteral("pwdLastSet"), QStringLiteral("0"));
         }
 
+        const QString kindName = creatingAlias ? QStringLiteral("Alias")
+                                 : (creatingGroup ? QStringLiteral("Group")
+                                                  : QStringLiteral("User"));
         QString error;
         if (!m_writes.create(&object, &error)) {
             fixed.append(QByteArray(kHandleSize, '\0'));
-            if (!creatingGroup)
+            if (!creatingContainer)
                 putLe32(fixed, 0);
             putLe32(fixed, 0);
             putLe32(fixed, existsStatus);
             emit requestReceived(QStringLiteral("Create%1(%2) refused: %3")
-                                     .arg(creatingGroup ? QStringLiteral("Group")
-                                                        : QStringLiteral("User"),
-                                          account, error));
+                                     .arg(kindName, account, error));
             return fixed;
         }
 
         const quint32 rid = ridOf(object);
-        fixed.append(newHandle(creatingGroup ? Handle::Group : Handle::User, object.id, rid));
-        if (!creatingGroup)
+        fixed.append(newHandle(creatingAlias ? Handle::Alias
+                                             : (creatingGroup ? Handle::Group : Handle::User),
+                               object.id, rid));
+        if (!creatingContainer)
             putLe32(fixed, accessMask);
         putLe32(fixed, rid);
         putLe32(fixed, kStatusSuccess);
-        emit requestReceived(QStringLiteral("Create%1(%2) rid %3")
-                                 .arg(creatingGroup ? QStringLiteral("Group")
-                                                    : QStringLiteral("User"))
-                                 .arg(account)
-                                 .arg(rid));
+        emit requestReceived(QStringLiteral("Create%1(%2) rid %3").arg(kindName, account).arg(rid));
         return fixed;
     }
     case Samr::OpDeleteUser:
-    case Samr::OpDeleteGroup: {
+    case Samr::OpDeleteGroup:
+    case Samr::OpDeleteAlias: {
         const bool deletingGroup = opnum == Samr::OpDeleteGroup;
+        const bool deletingAlias = opnum == Samr::OpDeleteAlias;
+        const Handle::Kind kind = deletingAlias ? Handle::Alias
+                                 : (deletingGroup ? Handle::Group : Handle::User);
         QByteArray handle;
         if (!reader.bytes(kHandleSize, &handle))
             return {};
         Handle object;
-        if (!lookupHandle(handle, deletingGroup ? Handle::Group : Handle::User, &object)) {
+        if (!lookupHandle(handle, kind, &object)) {
             fixed.append(QByteArray(kHandleSize, '\0'));
             putLe32(fixed, kStatusInvalidHandle);
             return fixed;
@@ -1773,8 +2048,9 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
         fixed.append(QByteArray(kHandleSize, '\0'));
         putLe32(fixed, kStatusSuccess);
         emit requestReceived(QStringLiteral("Delete%1(%2)")
-                                 .arg(deletingGroup ? QStringLiteral("Group")
-                                                    : QStringLiteral("User"),
+                                 .arg(deletingAlias ? QStringLiteral("Alias")
+                                      : (deletingGroup ? QStringLiteral("Group")
+                                                       : QStringLiteral("User")),
                                       object.dn));
         return fixed;
     }
@@ -1995,6 +2271,147 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
                                      .arg(infoClass));
             return fixed;
         }
+    }
+    // SamrQueryInformationAlias (opnum 28): the alias's name, member count and
+    // administrative comment. Unlike the group and domain queries the union is
+    // behind a pointer here, so it starts with a referent.
+    case Samr::OpQueryInformationAlias: {
+        QByteArray handle;
+        if (!reader.bytes(kHandleSize, &handle))
+            return {};
+        quint16 infoClass = 0;
+        if (!reader.u16(&infoClass))
+            return {};
+        Handle alias;
+        if (!lookupHandle(handle, Handle::Alias, &alias)) {
+            putLe32(fixed, 0);
+            putLe32(fixed, kStatusInvalidHandle);
+            return fixed;
+        }
+        DirectoryObject found;
+        bool foundObject = false;
+        for (const DirectoryObject &object : aliases()) {
+            if (object.id.compare(alias.dn, Qt::CaseInsensitive) == 0) {
+                found = object;
+                foundObject = true;
+                break;
+            }
+        }
+        if (!foundObject) {
+            putLe32(fixed, 0);
+            putLe32(fixed, kStatusNoSuchAlias);
+            return fixed;
+        }
+        QString name = found.attributes.value(QStringLiteral("sAMAccountName"));
+        if (name.isEmpty())
+            name = found.name;
+        const QString comment = found.attributes.value(QStringLiteral("description"));
+
+        QByteArray deferred;
+        auto beginArm = [&fixed](quint16 tag) {
+            putLe32(fixed, 0x0002e700u + tag); // union referent
+            fixed.append(char(tag & 0xff));
+            fixed.append(char((tag >> 8) & 0xff));
+            fixed.append(char(0));
+            fixed.append(char(0));
+        };
+        auto putUnicode = [&fixed, &deferred](const QString &text, quint32 referent) {
+            const QByteArray utf16 = Ndr::utf16le(text);
+            fixed.append(char(utf16.size() & 0xff));
+            fixed.append(char((utf16.size() >> 8) & 0xff));
+            fixed.append(char(utf16.size() & 0xff));
+            fixed.append(char((utf16.size() >> 8) & 0xff));
+            putLe32(fixed, utf16.isEmpty() ? 0u : referent);
+            if (!utf16.isEmpty())
+                appendVaryingString(deferred, text);
+        };
+        switch (infoClass) {
+        case 1: { // AliasGeneralInformation
+            beginArm(1);
+            putUnicode(name, 0x0002e710u);
+            putLe32(fixed, quint32(found.members.size()));
+            putUnicode(comment, 0x0002e720u);
+            fixed.append(deferred);
+            putLe32(fixed, kStatusSuccess);
+            emit requestReceived(QStringLiteral("QueryInformationAlias(%1, general)").arg(name));
+            return fixed;
+        }
+        case 2: { // AliasNameInformation
+            beginArm(2);
+            putUnicode(name, 0x0002e730u);
+            fixed.append(deferred);
+            putLe32(fixed, kStatusSuccess);
+            emit requestReceived(QStringLiteral("QueryInformationAlias(%1, name)").arg(name));
+            return fixed;
+        }
+        case 3: { // AliasAdminCommentInformation
+            beginArm(3);
+            putUnicode(comment, 0x0002e740u);
+            fixed.append(deferred);
+            putLe32(fixed, kStatusSuccess);
+            emit requestReceived(QStringLiteral("QueryInformationAlias(%1, comment)").arg(name));
+            return fixed;
+        }
+        default:
+            putLe32(fixed, 0);
+            putLe32(fixed, kStatusInvalidInfoClass);
+            emit requestReceived(QStringLiteral("QueryInformationAlias class %1 unsupported")
+                                     .arg(infoClass));
+            return fixed;
+        }
+    }
+    // SamrSetInformationAlias (opnum 29): the comment is a directory attribute;
+    // renaming needs a rename the write backend does not offer, so the name
+    // class is refused rather than accepted and dropped.
+    case Samr::OpSetInformationAlias: {
+        QByteArray handle;
+        if (!reader.bytes(kHandleSize, &handle))
+            return {};
+        quint16 infoClass = 0;
+        quint16 tag = 0;
+        if (!reader.u16(&infoClass) || !reader.u16(&tag))
+            return {};
+        Q_UNUSED(tag)
+        Handle alias;
+        if (!lookupHandle(handle, Handle::Alias, &alias)) {
+            putLe32(fixed, kStatusInvalidHandle);
+            return fixed;
+        }
+        if (infoClass != 3) {
+            putLe32(fixed, infoClass == 2 ? kStatusNotSupported : kStatusInvalidInfoClass);
+            emit requestReceived(QStringLiteral("SetInformationAlias class %1 unsupported")
+                                     .arg(infoClass));
+            return fixed;
+        }
+        quint16 length = 0;
+        quint16 maximum = 0;
+        quint32 referent = 0;
+        if (!reader.u16(&length) || !reader.u16(&maximum) || !reader.u32(&referent))
+            return {};
+        Q_UNUSED(maximum)
+        QString text;
+        if (referent != 0 && length > 0) {
+            quint32 count = 0;
+            quint32 offset = 0;
+            quint32 actual = 0;
+            if (!reader.u32(&count) || !reader.u32(&offset) || !reader.u32(&actual))
+                return {};
+            Q_UNUSED(count)
+            Q_UNUSED(offset)
+            QByteArray chars;
+            if (!reader.bytes(int(actual) * 2, &chars))
+                return {};
+            text = QString::fromUtf16(reinterpret_cast<const char16_t *>(chars.constData()),
+                                      qsizetype(chars.size() / 2));
+        }
+        QString error;
+        const bool ok = m_writes.set
+                        && m_writes.set(alias.dn, QStringLiteral("description"), text, &error);
+        putLe32(fixed, ok ? kStatusSuccess
+                          : (m_writes.set ? kStatusAccessDenied : kStatusNotSupported));
+        emit requestReceived(QStringLiteral("SetInformationAlias(%1) description: %2")
+                                 .arg(alias.dn, ok ? QStringLiteral("ok") : error));
+        return fixed;
     }
     // SamrSetInformationGroup (opnum 14). The description is a directory
     // attribute; the name and the SE_GROUP_* attribute set are not, so those

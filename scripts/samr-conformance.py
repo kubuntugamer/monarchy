@@ -30,7 +30,7 @@ import argparse
 import sys
 import uuid
 
-from impacket.dcerpc.v5 import rpcrt, samr, transport
+from impacket.dcerpc.v5 import dtypes, rpcrt, samr, transport
 
 MAXIMUM_ALLOWED = 0x02000000
 
@@ -48,6 +48,13 @@ CHECKS = [
     'SamrCreateGroupInDomain',
     'SamrAddMemberToGroup / SamrGetMembersInGroup',
     'SamrEnumerateUsersInDomain',
+    'SamrCreateAliasInDomain',
+    'SamrEnumerateAliasesInDomain',
+    'SamrEnumerateGroupsInDomain omits the alias',
+    'SamrAddMemberToAlias / SamrGetMembersInAlias',
+    'SamrQueryInformationAlias',
+    'SamrSetInformationAlias / SamrRemoveMemberFromAlias',
+    'SamrDeleteAlias',
     'SamrDeleteUser',
     'SamrDeleteGroup',
     'SamrCloseHandle',
@@ -204,23 +211,87 @@ def main():
     except Exception as error:  # noqa: BLE001
         check(CHECKS[12], False, '%s: %s' % (type(error).__name__, error))
 
+    # An alias is the domain-local group SAMR keeps apart from the groups: it is
+    # created, enumerated and read through its own calls, and its members are
+    # named by SID rather than by RID.
+    alias = None
+    alias_name = 'conf-alias-%s' % uuid.uuid4().hex[:6]
+    alias_rid = 0
     try:
-        samr.hSamrDeleteUser(dce, user)
-        check(CHECKS[13], True)
+        alias_created = samr.hSamrCreateAliasInDomain(
+            dce, domain, alias_name, MAXIMUM_ALLOWED)
+        alias = alias_created['AliasHandle']
+        alias_rid = alias_created['RelativeId']
+        check(CHECKS[13], alias_rid > 0, (alias_name, alias_rid))
     except Exception as error:  # noqa: BLE001
         check(CHECKS[13], False, '%s: %s' % (type(error).__name__, error))
+
+    if alias is not None:
+        try:
+            page = samr.hSamrEnumerateAliasesInDomain(dce, domain, 0, 0x10000)
+            listed = [(entry['Name'], entry['RelativeId']) for entry in page['Buffer']['Buffer']]
+            check(CHECKS[14], (alias_name, alias_rid) in listed, listed)
+        except Exception as error:  # noqa: BLE001
+            check(CHECKS[14], False, '%s: %s' % (type(error).__name__, error))
+        try:
+            page = samr.hSamrEnumerateGroupsInDomain(dce, domain, 0, 0x10000)
+            names = [entry['Name'] for entry in page['Buffer']['Buffer']]
+            check(CHECKS[15], alias_name not in names, names)
+        except Exception as error:  # noqa: BLE001
+            check(CHECKS[15], False, '%s: %s' % (type(error).__name__, error))
+
+        member_sid = dtypes.RPC_SID()
+        member_sid.fromCanonical('%s-%d' % (domain_id.formatCanonical(), rid))
+        try:
+            samr.hSamrAddMemberToAlias(dce, alias, member_sid)
+            members = [entry['Data']['SidPointer'].formatCanonical()
+                       for entry in samr.hSamrGetMembersInAlias(dce, alias)['Members']['Sids']]
+            check(CHECKS[16], members == [member_sid.formatCanonical()], members)
+        except Exception as error:  # noqa: BLE001
+            check(CHECKS[16], False, '%s: %s' % (type(error).__name__, error))
+        try:
+            general = samr.hSamrQueryInformationAlias(dce, alias, 1)['Buffer']['General']
+            check(CHECKS[17],
+                  general['Name'] == alias_name and general['MemberCount'] == 1,
+                  (general['Name'], general['MemberCount']))
+        except Exception as error:  # noqa: BLE001
+            check(CHECKS[17], False, '%s: %s' % (type(error).__name__, error))
+        try:
+            comment = 'engineers-%s' % uuid.uuid4().hex[:6]
+            buffer = samr.SAMPR_ALIAS_INFO_BUFFER()
+            buffer['tag'] = 3
+            buffer['AdminComment']['AdminComment'] = comment
+            samr.hSamrSetInformationAlias(dce, alias, buffer)
+            general = samr.hSamrQueryInformationAlias(dce, alias, 1)['Buffer']['General']
+            samr.hSamrRemoveMemberFromAlias(dce, alias, member_sid)
+            remaining = samr.hSamrGetMembersInAlias(dce, alias)['Members']['Count']
+            check(CHECKS[18], general['AdminComment'] == comment and remaining == 0,
+                  (general['AdminComment'], remaining))
+        except Exception as error:  # noqa: BLE001
+            check(CHECKS[18], False, '%s: %s' % (type(error).__name__, error))
+        try:
+            samr.hSamrDeleteAlias(dce, alias)
+            check(CHECKS[19], True)
+        except Exception as error:  # noqa: BLE001
+            check(CHECKS[19], False, '%s: %s' % (type(error).__name__, error))
+
+    try:
+        samr.hSamrDeleteUser(dce, user)
+        check(CHECKS[20], True)
+    except Exception as error:  # noqa: BLE001
+        check(CHECKS[20], False, '%s: %s' % (type(error).__name__, error))
     if group is not None:
         try:
             samr.hSamrDeleteGroup(dce, group)
-            check(CHECKS[14], True)
+            check(CHECKS[21], True)
         except Exception as error:  # noqa: BLE001
-            check(CHECKS[14], False, '%s: %s' % (type(error).__name__, error))
+            check(CHECKS[21], False, '%s: %s' % (type(error).__name__, error))
     try:
         samr.hSamrCloseHandle(dce, domain)
         samr.hSamrCloseHandle(dce, server)
-        check(CHECKS[15], True)
+        check(CHECKS[22], True)
     except Exception as error:  # noqa: BLE001
-        check(CHECKS[15], False, '%s: %s' % (type(error).__name__, error))
+        check(CHECKS[22], False, '%s: %s' % (type(error).__name__, error))
 
     print('\n%d failure(s): %s' % (len(failures), failures))
     return 0 if not failures else 1

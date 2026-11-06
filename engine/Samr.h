@@ -61,6 +61,11 @@ enum Opnum : quint16 {
     OpSetInformationDomain = 9,
     OpCreateGroupInDomain = 10,
     OpEnumerateGroupsInDomain = 11,
+    // SamrCreateAliasInDomain (14) and SamrEnumerateAliasesInDomain (15): an
+    // alias is AD's domain-local group, so both work over the same objects as
+    // the group calls and are told apart by the group's groupType.
+    OpCreateAliasInDomain = 14,
+    OpEnumerateAliasesInDomain = 15,
     OpEnumerateUsersInDomain = 13,
     // MS-SAMR function 0x14/0x15, after OpenGroup (0x13).
     OpQueryInformationGroup = 20,
@@ -72,6 +77,13 @@ enum Opnum : quint16 {
     OpDeleteGroup = 23,
     OpRemoveMemberFromGroup = 24,
     OpGetMembersInGroup = 25,
+    OpOpenAlias = 27,
+    OpQueryInformationAlias = 28,
+    OpSetInformationAlias = 29,
+    OpDeleteAlias = 30,
+    OpAddMemberToAlias = 31,
+    OpRemoveMemberFromAlias = 32,
+    OpGetMembersInAlias = 33,
     OpOpenUser = 34,
     OpGetGroupsForUser = 39,
     OpDeleteUser = 35,
@@ -138,7 +150,7 @@ signals:
 
 private:
     struct Handle {
-        enum Kind { None, Server, Domain, User, Group } kind = None;
+        enum Kind { None, Server, Domain, User, Group, Alias } kind = None;
         QString dn;   // domain or user object
         quint32 rid = 0;
     };
@@ -149,6 +161,7 @@ private:
     DirectoryObject domainObject() const;
     QList<DirectoryObject> users() const;
     QList<DirectoryObject> groups() const;
+    QList<DirectoryObject> aliases() const;
     QByteArray newHandle(Handle::Kind kind, const QString &dn, quint32 rid);
     bool lookupHandle(const QByteArray &handle, Handle::Kind kind, Handle *out) const;
 

@@ -723,6 +723,16 @@ void SamrTest::samrWritesAccountsAndGroups()
         }
         return false;
     };
+    backend.set = [&store](const QString &dn, const QString &attribute, const QString &value,
+                           QString *) {
+        for (DirectoryObject &object : store) {
+            if (object.id.compare(dn, Qt::CaseInsensitive) == 0) {
+                object.attributes.insert(attribute, value);
+                return true;
+            }
+        }
+        return false;
+    };
     backend.removeMember = [&store](const QString &groupDn, const QString &memberDn, QString *) {
         for (DirectoryObject &object : store) {
             if (object.id.compare(groupDn, Qt::CaseInsensitive) == 0) {
@@ -784,6 +794,88 @@ void SamrTest::samrWritesAccountsAndGroups()
     QCOMPARE(lastWord(members), 0u);
     QCOMPARE(readLe32At(members, 4), 1u);          // MemberCount
     QCOMPARE(readLe32At(members, 20), 1001u);      // the member's RID
+
+    // An alias is a domain-local group: the same object kind, told apart by
+    // groupType, and it takes its members as SIDs rather than RIDs.
+    const QByteArray aliasReply = server.handleCall(Samr::OpCreateAliasInDomain,
+                                                    createStub(domainHandle,
+                                                               QStringLiteral("engineers"), false));
+    QCOMPARE(aliasReply.size(), 28);
+    QCOMPARE(lastWord(aliasReply), 0u);
+    const quint32 aliasRid = readLe32At(aliasReply, 20);
+    QCOMPARE(aliasRid, 1003u);
+    QCOMPARE(store.size(), 3);
+    QCOMPARE(store.last().attributes.value(QStringLiteral("groupType")),
+             QStringLiteral("-2147483644"));
+
+    // The two enumerations each see their own objects: the alias is in one and
+    // not the other, and the group still is a group.
+    const QByteArray aliasPage =
+        server.handleCall(Samr::OpEnumerateAliasesInDomain,
+                          domainHandle + QByteArray::fromHex("00000000ffffffff"));
+    QCOMPARE(lastWord(aliasPage), 0u);
+    QCOMPARE(readLe32At(aliasPage, 8), 1u); // EntriesRead
+    QVERIFY(aliasPage.contains(Ndr::utf16le(QStringLiteral("engineers"))));
+    const QByteArray groupPage =
+        server.handleCall(Samr::OpEnumerateGroupsInDomain,
+                          domainHandle + QByteArray::fromHex("0000000000000000ffffffff"));
+    QCOMPARE(lastWord(groupPage), 0u);
+    QVERIFY(!groupPage.contains(Ndr::utf16le(QStringLiteral("engineers"))));
+    QVERIFY(groupPage.contains(Ndr::utf16le(QStringLiteral("staff"))));
+
+    QByteArray openAlias = domainHandle;
+    appendLe32(openAlias, 0x000f001fu);
+    appendLe32(openAlias, aliasRid);
+    const QByteArray aliasHandleReply = server.handleCall(Samr::OpOpenAlias, openAlias);
+    QCOMPARE(lastWord(aliasHandleReply), 0u);
+    const QByteArray aliasHandle = aliasHandleReply.left(20);
+
+    // The member SID on this wire: the sub-authority count is a conformant
+    // array length and comes before the header.
+    QByteArray aliasMemberSid;
+    appendLe32(aliasMemberSid, 5);
+    aliasMemberSid.append(QByteArray::fromHex("0105000000000005"));
+    for (quint32 sub : {21u, 1u, 2u, 3u, 1001u})
+        appendLe32(aliasMemberSid, sub);
+
+    QCOMPARE(lastWord(server.handleCall(Samr::OpAddMemberToAlias,
+                                        aliasHandle + aliasMemberSid)),
+             0u);
+
+    const QByteArray aliasMembers = server.handleCall(Samr::OpGetMembersInAlias, aliasHandle);
+    QCOMPARE(lastWord(aliasMembers), 0u);
+    QCOMPARE(readLe32At(aliasMembers, 0), 1u); // Count
+    QVERIFY(aliasMembers.contains(QByteArray::fromHex("e9030000"))); // rid 1001
+
+    // The general arm carries the name, the member count and the comment; the
+    // union is behind a pointer, so a referent comes first.
+    const QByteArray aliasGeneral =
+        server.handleCall(Samr::OpQueryInformationAlias,
+                          aliasHandle + QByteArray::fromHex("0100"));
+    QCOMPARE(lastWord(aliasGeneral), 0u);
+    QCOMPARE(readLe32At(aliasGeneral, 16), 1u); // MemberCount
+
+    // The administrative comment is a directory attribute.
+    QByteArray setAlias = aliasHandle;
+    setAlias.append(QByteArray::fromHex("03000300"));
+    const QByteArray comment = Ndr::utf16le(QStringLiteral("Domain engineers"));
+    setAlias.append(char(comment.size() & 0xff));
+    setAlias.append(char((comment.size() >> 8) & 0xff));
+    setAlias.append(char(comment.size() & 0xff));
+    setAlias.append(char((comment.size() >> 8) & 0xff));
+    appendLe32(setAlias, 0x00027000u);
+    appendVaryingString(setAlias, QStringLiteral("Domain engineers"));
+    QCOMPARE(lastWord(server.handleCall(Samr::OpSetInformationAlias, setAlias)), 0u);
+    QCOMPARE(store.last().attributes.value(QStringLiteral("description")),
+             QStringLiteral("Domain engineers"));
+
+    // Membership comes back off again, and the alias is deleted like a group.
+    QCOMPARE(lastWord(server.handleCall(Samr::OpRemoveMemberFromAlias,
+                                        aliasHandle + aliasMemberSid)),
+             0u);
+    QCOMPARE(readLe32At(server.handleCall(Samr::OpGetMembersInAlias, aliasHandle), 0), 0u);
+    QCOMPARE(lastWord(server.handleCall(Samr::OpDeleteAlias, aliasHandle)), 0u);
+    QCOMPARE(store.size(), 2);
 
     // Deleting the account removes it from the store, and its handle dies.
     QCOMPARE(lastWord(server.handleCall(Samr::OpDeleteUser, userHandle)), 0u);

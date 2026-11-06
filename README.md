@@ -718,8 +718,9 @@ Protocol references used for this
 (Samba's `samr`/`lsa`/`drsuapi`/`netlogon`/`epmapper` IDLs and impacket's
 `samr`/`lsad`/`epm` clients, with
 provenance and licences) are held in `reference/specs/`. Everything else — the
-bad-password and logon counters, the domain information *set* calls, and aliases
-— is absent and is not claimed to work; `DsReplicaAdd` with the multi-DC half
+domain information classes beyond the lockout policy, the `BUILTIN` domain that
+holds AD's local groups, and the Netlogon trust channel to a partner — is not
+claimed to work; `DsReplicaAdd` with the multi-DC half
 of replication is not implemented, nor is SMB 3.x, so there is no SMB
 encryption or preauth integrity. `IPC$` carries the named pipes
 `\pipe\samr`, `\pipe\lsarpc`, `\pipe\netlogon` and `\pipe\epmapper`, and
