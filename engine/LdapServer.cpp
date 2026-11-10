@@ -105,13 +105,16 @@ QString readString(const QByteArray &d, int &pos) {
 
 int readInt(const QByteArray &d, int &pos) {
     int tag; QByteArray v = readTLV(d, pos, tag);
-    int r = 0;
+    // Accumulate unsigned: a BER INTEGER is signed, but shifting a signed int
+    // left is undefined once a bit reaches the sign position, and any four-byte
+    // value with the top bit set (a legal sizeLimit included) does that.
+    quint32 r = 0;
     for (char c : v) r = (r << 8) | (unsigned char)c;
     // sign extend
     if (!v.isEmpty() && (v[0] & 0x80)) {
-        for (int i = v.size(); i < (int)sizeof(int); i++) r |= (0xFF << (i*8));
+        for (int i = v.size(); i < (int)sizeof(int); i++) r |= (0xFFu << (i*8));
     }
-    return r;
+    return (int)r;
 }
 
 // ---------- BER writers ----------
