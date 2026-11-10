@@ -76,6 +76,10 @@ inline QByteArray searchRequest(int id, const QByteArray &base,
 {
     QByteArray inner = tlv(0x04, base);
     inner += tlv(char(0x0a), QByteArray(1, char(2))); // scope: wholeSubtree
+    inner += tlv(char(0x0a), QByteArray(1, char(0))); // derefAliases: never
+    inner += tlv(char(0x02), QByteArray(1, char(0))); // sizeLimit: no limit
+    inner += tlv(char(0x02), QByteArray(1, char(0))); // timeLimit: no limit
+    inner += tlv(char(0x01), QByteArray(1, char(0))); // typesOnly: FALSE
     inner += tlv(char(0x87), QByteArray("objectClass")); // present filter
     inner += tlv(char(0x30), QByteArray());
     return ldapMessage(id, char(0x63), inner, controls);

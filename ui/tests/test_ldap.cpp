@@ -35,6 +35,10 @@ QByteArray scopedSearch(int id, const QByteArray &base, int scope)
 {
     QByteArray inner = tlv(0x04, base);
     inner += tlv(char(0x0a), QByteArray(1, char(scope)));
+    inner += tlv(char(0x0a), QByteArray(1, char(0))); // derefAliases: never
+    inner += tlv(char(0x02), QByteArray(1, char(0))); // sizeLimit: no limit
+    inner += tlv(char(0x02), QByteArray(1, char(0))); // timeLimit: no limit
+    inner += tlv(char(0x01), QByteArray(1, char(0))); // typesOnly: FALSE
     inner += tlv(char(0x87), QByteArray("objectClass")); // present filter
     inner += tlv(char(0x30), QByteArray());
     return ldapMessage(id, char(0x63), inner);
@@ -87,6 +91,7 @@ private slots:
     void searchOnMissingBaseIsNoSuchObject();
     void anonymousSearchesOnlyTheRootDse();
     void simpleBindRecordsTheConnectionIdentity();
+    void searchMissingRequiredFieldsIsProtocolError();
 };
 
 // The password policy is the domain object's: minPwdLength, pwdHistoryLength and
@@ -582,6 +587,34 @@ void LdapTest::simpleBindRecordsTheConnectionIdentity()
     reply = runSearch(client, reader, 13, domainDn.toUtf8(), 2);
     QCOMPARE(reply.size(), 1);
     QCOMPARE(resultCode(reply.first()), 50);
+}
+
+// A SearchRequest that carries only the base, the scope and the filter is not a
+// request the server may answer: RFC 4511 §4.5.1.1 requires derefAliases,
+// sizeLimit, timeLimit and typesOnly between the scope and the filter. Before
+// the parser checked tags, the presence filter's "objectClass" value was read
+// as derefAliases, the remaining fields were filled with zeros from whatever
+// followed, and the search succeeded on a malformed request.
+void LdapTest::searchMissingRequiredFieldsIsProtocolError()
+{
+    LdapServer server;
+    QVERIFY(server.listen(0));
+
+    QTcpSocket client;
+    client.connectToHost(QHostAddress::LocalHost, server.serverPort());
+    QVERIFY(client.waitForConnected(3000));
+    Reader reader(&client);
+
+    QByteArray inner = tlv(0x04, QByteArray()); // root DSE
+    inner += tlv(char(0x0a), QByteArray(1, char(0))); // scope: baseObject
+    inner += tlv(char(0x87), QByteArray("objectClass")); // present filter
+    inner += tlv(char(0x30), QByteArray());
+    client.write(ldapMessage(1, char(0x63), inner));
+
+    const QByteArray reply = reader.next();
+    QVERIFY(!reply.isEmpty());
+    QCOMPARE(operationTag(reply), 0x65); // searchResDone
+    QCOMPARE(resultCode(reply), 2); // protocolError
 }
 
 QTEST_MAIN(LdapTest)

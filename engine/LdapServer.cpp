@@ -103,8 +103,7 @@ QString readString(const QByteArray &d, int &pos) {
     return QString::fromUtf8(v);
 }
 
-int readInt(const QByteArray &d, int &pos) {
-    int tag; QByteArray v = readTLV(d, pos, tag);
+int decodeInt(const QByteArray &v) {
     // Accumulate unsigned: a BER INTEGER is signed, but shifting a signed int
     // left is undefined once a bit reaches the sign position, and any four-byte
     // value with the top bit set (a legal sizeLimit included) does that.
@@ -115,6 +114,22 @@ int readInt(const QByteArray &d, int &pos) {
         for (int i = v.size(); i < (int)sizeof(int); i++) r |= (0xFFu << (i*8));
     }
     return (int)r;
+}
+
+int readInt(const QByteArray &d, int &pos) {
+    int tag; QByteArray v = readTLV(d, pos, tag);
+    return decodeInt(v);
+}
+
+// Reads one INTEGER/ENUMERATED/BOOLEAN field and requires its tag, so a field
+// that is absent cannot be filled in from the next element's bytes.
+bool readIntField(const QByteArray &d, int &pos, int expectedTag, int *value) {
+    int tag = 0;
+    const int start = pos;
+    const QByteArray v = readTLV(d, pos, tag);
+    if (tag != expectedTag || pos <= start) return false;
+    *value = decodeInt(v);
+    return true;
 }
 
 // ---------- BER writers ----------
@@ -2192,33 +2207,63 @@ QByteArray LdapServer::pagedResultsControl(int total, const QByteArray &cookie) 
 QByteArray LdapServer::handleSearch(ClientState *st, int msgId, const QByteArray &payload,
                                     const QList<Control> &controls) {
     int pos = 0;
-    QString base = readString(payload, pos);
-    int scope = readInt(payload, pos);
-    int deref = readInt(payload, pos);
-    Q_UNUSED(deref)
-    int sizeLimit = readInt(payload, pos);
-    Q_UNUSED(sizeLimit)
-    int timeLimit = readInt(payload, pos);
-    Q_UNUSED(timeLimit)
-    // typesOnly BOOLEAN
-    int ttag = readTag(payload, pos);
-    int tlen = readLength(payload, pos);
-    Q_UNUSED(ttag); Q_UNUSED(tlen);
-    if (tlen > 0) pos += tlen;
+    int baseTag = 0;
+    const QByteArray baseValue = readTLV(payload, pos, baseTag);
+    int scope = 0;
+    int deref = 0;
+    int sizeLimit = 0;
+    int timeLimit = 0;
+    // RFC 4511 §4.5.1.1: baseObject, scope, derefAliases, sizeLimit, timeLimit,
+    // typesOnly and filter are all required, and in that order. Reading them
+    // positionally without checking tags let a request that omitted four of
+    // them pass the filter's presence value to the integer reader and still
+    // "recover" — the sort of accidental success /TESTING.md exists to name.
+    bool fieldsOk = baseTag == 0x04
+                    && readIntField(payload, pos, 0x0A, &scope)
+                    && readIntField(payload, pos, 0x0A, &deref)
+                    && readIntField(payload, pos, 0x02, &sizeLimit)
+                    && readIntField(payload, pos, 0x02, &timeLimit);
+    int typesTag = 0;
+    const QByteArray typesValue = readTLV(payload, pos, typesTag);
+    fieldsOk = fieldsOk && typesTag == 0x01 && typesValue.size() == 1;
+    if (!fieldsOk || scope < 0 || scope > 2 || deref < 0 || deref > 3
+        || (typesValue.at(0) & 0xFE) != 0)
+        return makeSearchDone(msgId, 2); // protocolError
 
-    // filter
+    const QString base = QString::fromUtf8(baseValue);
+    Q_UNUSED(deref)
+    Q_UNUSED(sizeLimit)
+    Q_UNUSED(timeLimit)
+
+    // filter: [0] and/ [1] or / [2] not / [3] equalityMatch / [4] substrings /
+    // [5] greaterOrEqual / [6] lessOrEqual / [7] present / [8] approxMatch /
+    // [9] extensibleMatch.
+    int filterTag = 0;
+    int filterStart = pos;
+    readTLV(payload, filterStart, filterTag);
+    const bool filterOk = (filterTag == 0x87 || (filterTag >= 0xA0 && filterTag <= 0xA9))
+                          && filterStart > pos;
+    if (!filterOk)
+        return makeSearchDone(msgId, 2);
     Pred pred = parseFilter(payload, pos);
 
     // attributes SEQUENCE OF OCTET STRING
-    int stag = readTag(payload, pos);
-    int slen = readLength(payload, pos);
-    Q_UNUSED(stag); Q_UNUSED(slen);
-    int send = pos + slen;
+    int stag = 0;
+    const QByteArray attrBytes = readTLV(payload, pos, stag);
+    if (stag != 0x30)
+        return makeSearchDone(msgId, 2);
+    int apos = 0;
     QStringList attrs;
-    while (pos < send) {
-        attrs.append(readString(payload, pos));
+    while (apos < attrBytes.size()) {
+        int atag = 0;
+        const int before = apos;
+        const QByteArray name = readTLV(attrBytes, apos, atag);
+        if (atag != 0x04 || apos <= before)
+            return makeSearchDone(msgId, 2);
+        attrs.append(QString::fromUtf8(name));
     }
-    pos = send;
+    if (pos != payload.size())
+        return makeSearchDone(msgId, 2);
 
     emit requestReceived(QStringLiteral("Search: %1").arg(base));
 
