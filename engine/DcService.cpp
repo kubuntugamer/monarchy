@@ -124,6 +124,7 @@ bool DcService::start(const QString &dcDir)
     const QString dnsDomain = dcConfig.value(QStringLiteral("dnsDomain"),
                                              QStringLiteral("MONARCHY.EXAMPLE.COM")).toString();
     const int ldapPort = dcConfig.value(QStringLiteral("ldapPort"), 1389).toInt();
+
     const QString dcHost = dcConfig.value(QStringLiteral("dcHost"),
                                           QStringLiteral("dc1.") + dnsDomain).toString();
     const QString dcIp = dcConfig.value(QStringLiteral("dcIp"),
@@ -175,12 +176,17 @@ bool DcService::start(const QString &dcDir)
     identity.siteName = siteName;
     m_ldapServer->setIdentity(identity);
     const int kdcPort = dcConfig.value(QStringLiteral("kdcPort"), 8888).toInt();
+    // The port the socket actually bound, or 0 when it did not. What the zone
+    // advertises is derived from these, never from the configuration alone: a
+    // listener that failed would otherwise publish a locator nothing answers.
+    quint16 boundKdcPort = 0;
     if (!m_kdc->listen(quint16(kdcPort))) {
         emit statusMessage(tr("Kerberos KDC failed to listen on port %1.").arg(kdcPort));
     } else {
+        boundKdcPort = m_kdc->serverPort();
         emit statusMessage(tr("Kerberos realm %1 served on port %2.")
                                .arg(m_kdc->realm().realm)
-                               .arg(m_kdc->serverPort()));
+                               .arg(boundKdcPort));
     }
 
     // Serve the store over LDAP.
@@ -193,17 +199,19 @@ bool DcService::start(const QString &dcDir)
         // The directory is the one thing a DC cannot do without.
         return false;
     }
+    const quint16 boundLdapPort = m_ldapServer->serverPort();
 
     // Global Catalog: the same store on 3268, which is what the `_gc._tcp`
     // locator record has always pointed at. The root DSE reports
     // isGlobalCatalogReady from whether this listener actually came up, so a
     // port that is taken is visible to the client instead of assumed away.
     const int gcPort = dcConfig.value(QStringLiteral("gcPort"), 3268).toInt();
+    quint16 boundGcPort = 0;
     if (!m_ldapServer->listenGc(quint16(gcPort))) {
         emit statusMessage(tr("Global Catalog failed to listen on port %1.").arg(gcPort));
     } else {
-        emit statusMessage(
-            tr("Global Catalog served on port %1.").arg(m_ldapServer->gcServerPort()));
+        boundGcPort = m_ldapServer->gcServerPort();
+        emit statusMessage(tr("Global Catalog served on port %1.").arg(boundGcPort));
     }
 
     // A domain provisioned before kpasswd existed has no kadmin/changepw
@@ -277,11 +285,13 @@ bool DcService::start(const QString &dcDir)
     connect(m_kpasswdServer, &KpasswdServer::requestReceived, this,
             &DcService::statusMessage);
     const int kpasswdPort = dcConfig.value(QStringLiteral("kpasswdPort"), 464).toInt();
+    quint16 boundKpasswdPort = 0;
     if (!m_kpasswdServer->listen(quint16(kpasswdPort))) {
         emit statusMessage(tr("kpasswd failed to listen on port %1.").arg(kpasswdPort));
     } else {
-        emit statusMessage(tr("Kerberos password change served on port %1.")
-                               .arg(m_kpasswdServer->serverPort()));
+        boundKpasswdPort = m_kpasswdServer->serverPort();
+        emit statusMessage(
+            tr("Kerberos password change served on port %1.").arg(boundKpasswdPort));
     }
 
     // Remote management: the SAMR interface over DCE/RPC, backed by the same
@@ -888,14 +898,20 @@ bool DcService::start(const QString &dcDir)
     m_dnsServer->setForwarders(forwarders);
     m_dnsServer->setForwardingEnabled(dcConfig.value(QStringLiteral("forwarding"), true).toBool());
     if (!m_dnsServer->loadZone(m_zonePath)) {
-        m_dnsServer->loadAdZone(dnsDomain, dcHost, dcIp, quint16(ldapPort), quint16(gcPort),
-                                siteName, quint16(kpasswdPort), quint16(kdcPort));
+        m_dnsServer->loadAdZone(dnsDomain, dcHost, dcIp, boundLdapPort, boundGcPort, siteName,
+                                boundKpasswdPort, boundKdcPort);
     }
     // A zone loaded from disk may predate a service this build serves — the
-    // kpasswd locators, for one — so the DC holds its own zone to what it
-    // actually answers before it serves it.
-    if (m_dnsServer->repairAdZoneLocators(dcHost, quint16(ldapPort), quint16(gcPort), siteName,
-                                          quint16(kpasswdPort), quint16(kdcPort))) {
+    // kpasswd locators, for one — or name an address this machine no longer
+    // holds, so the DC holds its own zone to what it actually answers and where
+    // it actually is before it serves it. The ports are the ones that bound,
+    // not the ones configured: a listener that failed leaves no locator behind
+    // pointing at a port nothing answers, and dcIp is the authority for the
+    // address records rather than whatever the zone was written with.
+    const bool addressRepaired = m_dnsServer->repairAdZoneAddresses(dcHost, dcIp);
+    const bool locatorsRepaired = m_dnsServer->repairAdZoneLocators(
+        dcHost, boundLdapPort, boundGcPort, siteName, boundKpasswdPort, boundKdcPort);
+    if (addressRepaired || locatorsRepaired) {
         QString zoneError;
         if (!m_zonePath.isEmpty() && !m_dnsServer->saveZone(m_zonePath, &zoneError))
             emit statusMessage(tr("Could not persist the repaired zone: %1").arg(zoneError));

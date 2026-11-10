@@ -281,6 +281,8 @@ class DnsTest : public QObject
 private slots:
     void publishesAdServiceRecords();
     void repairsAdZoneLocators();
+    void withdrawsLocatorsForUnboundServices();
+    void followsConfiguredAddressOnDiskZone();
     void answersQueriesOverUdp();
     void refusesOutOfZoneQueries();
     void answersQueriesOverTcp();
@@ -406,6 +408,65 @@ void DnsTest::repairsAdZoneLocators()
     // A zone that already matches is not rewritten, so a start does not bump
     // the serial for nothing.
     QVERIFY(!server.repairAdZoneLocators(host, 389, 3268, site, 464, 8888));
+}
+
+void DnsTest::withdrawsLocatorsForUnboundServices()
+{
+    const QString zone = QStringLiteral("monarchy.example.com");
+    const QString host = QStringLiteral("monarchydc1.monarchy.example.com");
+    const QString site = QStringLiteral("Default-First-Site-Name");
+
+    DnsServer server;
+    // A KDC and a kpasswd service that did not bind, so their ports are 0.
+    server.loadAdZone(zone, host, QStringLiteral("10.0.0.10"), 1389, 3268, site, 0, 0);
+
+    QCOMPARE(server.records(QStringLiteral("_ldap._tcp.") + zone, DnsServer::TypeSrv).size(), 1);
+    QCOMPARE(server.records(QStringLiteral("_gc._tcp.") + zone, DnsServer::TypeSrv).size(), 1);
+    // Nothing advertises a service this DC does not answer.
+    for (const QString &owner : {QStringLiteral("_kerberos._tcp."),
+                                 QStringLiteral("_kerberos._udp."),
+                                 QStringLiteral("_kpasswd._tcp."),
+                                 QStringLiteral("_kpasswd._udp.")})
+        QVERIFY(server.records(owner + zone, DnsServer::TypeSrv).isEmpty());
+
+    // A zone from disk that still names those services loses the records when
+    // the DC is held to what it answers, so an older zone cannot outlive the
+    // service that used to answer it.
+    DnsServer restored;
+    restored.loadAdZone(zone, host, QStringLiteral("10.0.0.10"), 1389, 3268, site, 464, 8888);
+    QCOMPARE(restored.records(QStringLiteral("_kpasswd._tcp.") + zone, DnsServer::TypeSrv).size(),
+             1);
+    QVERIFY(restored.repairAdZoneLocators(host, 1389, 3268, site, 0, 8888));
+    for (const QString &owner : {QStringLiteral("_kpasswd._tcp."),
+                                 QStringLiteral("_kpasswd._udp.")})
+        QVERIFY(restored.records(owner + zone, DnsServer::TypeSrv).isEmpty());
+    // The services that are served are untouched, so a start is not a rewrite.
+    QVERIFY(!restored.repairAdZoneLocators(host, 1389, 3268, site, 0, 8888));
+}
+
+void DnsTest::followsConfiguredAddressOnDiskZone()
+{
+    const QString zone = QStringLiteral("monarchy.example.com");
+    const QString host = QStringLiteral("monarchydc1.monarchy.example.com");
+
+    DnsServer server;
+    // Written when this DC was 10.0.0.10, started where dcIp is now something
+    // else: the address records follow the configuration, or a client resolves
+    // the DC to a machine that no longer holds that address.
+    server.loadAdZone(zone, host, QStringLiteral("10.0.0.10"), 1389, 3268,
+                      QStringLiteral("Default-First-Site-Name"));
+    QCOMPARE(server.records(host, DnsServer::TypeA).first().rdata,
+             QByteArray::fromHex("0a00000a"));
+
+    QVERIFY(server.repairAdZoneAddresses(host, QStringLiteral("10.0.0.99")));
+    for (const QString &owner : {host, QStringLiteral("ns1.") + zone, zone}) {
+        const QList<DnsServer::Record> records = server.records(owner, DnsServer::TypeA);
+        QCOMPARE(records.size(), 1);
+        QCOMPARE(records.first().rdata, QByteArray::fromHex("0a000063"));
+    }
+    // Already correct: nothing is rewritten, so the serial does not move on
+    // every start.
+    QVERIFY(!server.repairAdZoneAddresses(host, QStringLiteral("10.0.0.99")));
 }
 
 void DnsTest::answersQueriesOverUdp()

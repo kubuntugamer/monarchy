@@ -533,6 +533,27 @@ QByteArray DnsServer::srvRdata(quint16 port, const QString &target) const {
 
 namespace {
 
+// The A record rdata for an address: four bytes, or empty when the configured
+// value is not an IPv4 address. loadAdZone() and repairAdZoneAddresses() encode
+// it here so a repaired record compares equal to a freshly built one.
+QByteArray ipv4Rdata(const QString &ip)
+{
+    const QHostAddress parsed(ip);
+    if (parsed.isNull() || parsed.protocol() != QAbstractSocket::IPv4Protocol)
+        return {};
+    const quint32 v4 = parsed.toIPv4Address();
+    QByteArray rdata;
+    rdata.append(char((v4 >> 24) & 0xff));
+    rdata.append(char((v4 >> 16) & 0xff));
+    rdata.append(char((v4 >> 8) & 0xff));
+    rdata.append(char(v4 & 0xff));
+    return rdata;
+}
+
+} // namespace
+
+namespace {
+
 struct AdSrvSpec {
     QString owner;
     quint16 port;
@@ -599,20 +620,7 @@ void DnsServer::loadAdZone(const QString &zone, const QString &host, const QStri
     addRecord(zoneName, TypeNs, 3600, encodeName(QStringLiteral("ns1.") + zoneName));
 
     // Addresses.
-    QByteArray address;
-    const QHostAddress parsed(ip);
-    const QList<QHostAddress> candidates = parsed.isNull()
-                                               ? QList<QHostAddress>{QHostAddress(QStringLiteral("127.0.0.1"))}
-                                               : QList<QHostAddress>{parsed};
-    for (const QHostAddress &addr : candidates) {
-        if (addr.protocol() == QAbstractSocket::IPv4Protocol) {
-            const quint32 v4 = addr.toIPv4Address();
-            address.append(char((v4 >> 24) & 0xff));
-            address.append(char((v4 >> 16) & 0xff));
-            address.append(char((v4 >> 8) & 0xff));
-            address.append(char(v4 & 0xff));
-        }
-    }
+    QByteArray address = ipv4Rdata(ip);
     if (address.isEmpty())
         address = QByteArray::fromHex("7f000001");
 
@@ -624,8 +632,13 @@ void DnsServer::loadAdZone(const QString &zone, const QString &host, const QStri
         addRecord(zoneName, TypeA, 600, address);
 
     for (const AdSrvSpec &spec :
-         adSrvSpecs(zoneName, siteName, ldapPort, gcPort, kpasswdPort, kdcPort))
+         adSrvSpecs(zoneName, siteName, ldapPort, gcPort, kpasswdPort, kdcPort)) {
+        // A port of 0 means the service did not bind. No locator is published
+        // for it, so a client is never sent to a port nothing answers.
+        if (spec.port == 0)
+            continue;
         addRecord(spec.owner, TypeSrv, 600, srvRdata(spec.port, hostName));
+    }
 }
 
 bool DnsServer::repairAdZoneLocators(const QString &host, quint16 ldapPort, quint16 gcPort,
@@ -638,8 +651,19 @@ bool DnsServer::repairAdZoneLocators(const QString &host, quint16 ldapPort, quin
     bool changed = false;
     for (const AdSrvSpec &spec :
          adSrvSpecs(m_zone, siteName, ldapPort, gcPort, kpasswdPort, kdcPort)) {
-        const QByteArray wanted = srvRdata(spec.port, hostName);
         const QList<Record> existing = records(spec.owner, TypeSrv);
+        // A port of 0 is a service this DC is not serving. Its locator is
+        // withdrawn rather than repointed: advertising a dead port is the
+        // defect being repaired, and a client that finds nothing falls over to
+        // another DC instead of timing out against this one.
+        if (spec.port == 0) {
+            if (!existing.isEmpty()) {
+                removeRecord(spec.owner, TypeSrv);
+                changed = true;
+            }
+            continue;
+        }
+        const QByteArray wanted = srvRdata(spec.port, hostName);
         // Exactly the record a client should find: leave it alone, so a zone
         // that is already correct is not rewritten on every start.
         if (existing.size() == 1 && existing.first().rdata == wanted)
@@ -647,6 +671,47 @@ bool DnsServer::repairAdZoneLocators(const QString &host, quint16 ldapPort, quin
         if (!existing.isEmpty())
             removeRecord(spec.owner, TypeSrv);
         addRecord(spec.owner, TypeSrv, 600, wanted);
+        changed = true;
+    }
+    if (changed)
+        bumpSerial();
+    return changed;
+}
+
+bool DnsServer::repairAdZoneAddresses(const QString &host, const QString &ip)
+{
+    if (m_zone.isEmpty())
+        return false;
+    const QByteArray wanted = ipv4Rdata(ip);
+    if (wanted.isEmpty())
+        return false;
+
+    // The same three owners loadAdZone() gives an A record, at the same TTLs.
+    struct AddressSpec {
+        QString owner;
+        quint32 ttl;
+    };
+    const QString hostName = host.toLower();
+    QList<AddressSpec> specs{{
+        hostName,
+        1200,
+    }, {
+        QStringLiteral("ns1.") + m_zone,
+        3600,
+    }};
+    if (hostName != m_zone)
+        specs.append({m_zone, 600});
+
+    bool changed = false;
+    for (const AddressSpec &spec : specs) {
+        const QList<Record> existing = records(spec.owner, TypeA);
+        // Already the configured address and nothing else: leave it, so a start
+        // does not rewrite a correct zone.
+        if (existing.size() == 1 && existing.first().rdata == wanted)
+            continue;
+        if (!existing.isEmpty())
+            removeRecord(spec.owner, TypeA);
+        addRecord(spec.owner, TypeA, spec.ttl, wanted);
         changed = true;
     }
     if (changed)

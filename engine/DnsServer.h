@@ -95,6 +95,13 @@ public:
                              const QString &site, quint16 kpasswdPort = 464,
                              quint16 kdcPort = 88);
 
+    // Holds the DC's own A records (host, ns1 and the zone apex) to the address
+    // it is configured with. A zone loaded from disk can carry the address of a
+    // machine that has since moved, and dcIp is the authority on where this DC
+    // answers; records that already match are left untouched. Returns true when
+    // the zone changed.
+    bool repairAdZoneAddresses(const QString &host, const QString &ip);
+
     void addRecord(const QString &name, quint16 type, quint32 ttl, const QByteArray &rdata);
     void removeRecord(const QString &name, quint16 type);
     QList<Record> records(const QString &name, quint16 type) const;
