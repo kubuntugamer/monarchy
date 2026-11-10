@@ -1601,6 +1601,12 @@ QByteArray LdapServer::handleBind(ClientState *st, int msgId, const QByteArray &
 
     emit requestReceived(QStringLiteral("Bind"));
 
+    // A bind replaces the connection's identity even when it fails: RFC 4513
+    // §5.1.1 leaves a connection anonymous after a failed or anonymous bind, so
+    // a session that authenticated and then re-binds must not keep its right to
+    // read. Clear before verification and record the DN only on success.
+    st->authenticatedDn.clear();
+
     // Without any stored secret every bind succeeds (the console's sample
     // directory). Once a password exists — on the object itself or in the
     // provisioned secrets — simple binds are verified against its verifier.
@@ -1670,6 +1676,8 @@ QByteArray LdapServer::handleBind(ClientState *st, int msgId, const QByteArray &
                    != PasswordAge::State::Valid)
             return makeBindResponse(msgId, 49);
     }
+    if (!name.isEmpty())
+        st->authenticatedDn = name;
     return makeBindResponse(msgId, 0); // success
 }
 
@@ -2202,6 +2210,23 @@ QByteArray LdapServer::handleSearch(ClientState *st, int msgId, const QByteArray
 
     emit requestReceived(QStringLiteral("Search: %1").arg(base));
 
+    const QString searchBase = base.trimmed();
+
+    // Anonymous sessions may read the root DSE and nothing else. A connection
+    // that never bound — or whose bind was reset by StartTLS or replaced by a
+    // failed re-bind — has no identity, and a non-empty base is a directory
+    // read. Answer 50 insufficientAccessRights rather than an empty success, so
+    // "you may not see it" is distinguishable from "it has no children".
+    //
+    // This check sits before the base-existence guard on purpose: an
+    // unauthenticated caller that got 32 for a missing DN and 50 for an
+    // existing one could use search to enumerate the directory, which is the
+    // exposure this closes. The empty base is the root DSE (RFC 4512 §5.1) and
+    // stays answerable, which is how a client discovers the naming context
+    // before it has credentials.
+    if (!searchBase.isEmpty() && st->authenticatedDn.isEmpty())
+        return makeSearchDone(msgId, 50); // insufficientAccessRights
+
     // RFC 4511 §4.5.1: a base that names no entry is noSuchObject, not an empty
     // success. Without this, "you may not see it", "it is not there" and "it has
     // no children" are all the same answer, and a client validating a DN — a
@@ -2213,7 +2238,6 @@ QByteArray LdapServer::handleSearch(ClientState *st, int msgId, const QByteArray
     // it is never missing. The comparison is trimmed and case-insensitive
     // because that is how inScope() below matches it: a client that varies the
     // case or pads a valid DN must still find the entry.
-    const QString searchBase = base.trimmed();
     if (!searchBase.isEmpty()) {
         const QString lowerBase = searchBase.toLower();
         const QString childSuffix = QLatin1Char(',') + lowerBase;

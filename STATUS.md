@@ -213,7 +213,10 @@ change.
 
 Development directory service, not a hardened DC. LDAP is plaintext unless the
 client asks for StartTLS (there is no dedicated LDAPS port, and no client
-certificate is requested), DNS updates have no TSIG or ACL, and RPC has no
+certificate is requested), and an unbound session may read only the root DSE:
+a search with a non-empty base answers `insufficientAccessRights(50)`, a failed
+bind leaves the connection anonymous, and StartTLS resets it (RFC 4511 §4.14.1).
+DNS updates have no TSIG or ACL, and RPC has no
 authorization model beyond "the bind authenticated": any account that
 authenticates can administer. The RPC endpoints therefore bind `127.0.0.1`
 only (`samrPort` 1035, `lsadPort` 1036 and `drsPort` 1038 by default). Do not

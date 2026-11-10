@@ -13,6 +13,28 @@
 #include "LdapServer.h"
 #include "SampleData.h"
 
+namespace {
+
+const char kAdministratorDn[] = "CN=Administrator,CN=Users,DC=corp,DC=example,DC=com";
+const char kAdministratorPassword[] = "Str0ng-Pass!";
+
+// The sample store ships no credential, and a bind to an account without a
+// verifier succeeds. That stops being true as soon as any account gets one —
+// every later bind is checked against the stored verifiers — so a test that
+// creates password-protected objects gives its own connection a real verifier
+// first, instead of relying on the credential-less store.
+bool giveAdministratorAVerifier(LdapServer &server)
+{
+    LdapServer::ModifyChange change;
+    change.operation = 2; // replace
+    change.type = QStringLiteral("unicodePwd");
+    change.values = QStringList{QString::fromLatin1(kAdministratorPassword)};
+    change.rawValue = kAdministratorPassword;
+    return server.applyModify(QString::fromLatin1(kAdministratorDn), {change}) == 0;
+}
+
+} // namespace
+
 class BackendTest : public QObject
 {
     Q_OBJECT
@@ -42,12 +64,15 @@ void BackendTest::servesSampleData()
     LdapServer server;
     QVERIFY(server.listen(0));
     server.setObjects(sampleObjects());
+    QVERIFY(giveAdministratorAVerifier(server));
 
     ConnectionService connection;
     ConnectionProfile profile;
     profile.server = QStringLiteral("127.0.0.1");
     profile.port = server.serverPort();
     profile.baseDn = QStringLiteral("DC=corp,DC=example,DC=com");
+    profile.bindDn = QString::fromLatin1(kAdministratorDn);
+    profile.password = QString::fromLatin1(kAdministratorPassword);
 
     auto connectFuture = connection.connect(profile);
     QTRY_VERIFY_WITH_TIMEOUT(connectFuture.isFinished(), 5000);
@@ -101,12 +126,15 @@ void BackendTest::writesRoundTrip()
     LdapServer server;
     QVERIFY(server.listen(0));
     server.setObjects(sampleObjects());
+    QVERIFY(giveAdministratorAVerifier(server));
 
     ConnectionService connection;
     ConnectionProfile profile;
     profile.server = QStringLiteral("127.0.0.1");
     profile.port = server.serverPort();
     profile.baseDn = QStringLiteral("DC=corp,DC=example,DC=com");
+    profile.bindDn = QString::fromLatin1(kAdministratorDn);
+    profile.password = QString::fromLatin1(kAdministratorPassword);
 
     auto connectFuture = connection.connect(profile);
     QTRY_VERIFY_WITH_TIMEOUT(connectFuture.isFinished(), 5000);
@@ -217,12 +245,15 @@ void BackendTest::groupMembershipRoundTrip()
     LdapServer server;
     QVERIFY(server.listen(0));
     server.setObjects(sampleObjects());
+    QVERIFY(giveAdministratorAVerifier(server));
 
     ConnectionService connection;
     ConnectionProfile profile;
     profile.server = QStringLiteral("127.0.0.1");
     profile.port = server.serverPort();
     profile.baseDn = QStringLiteral("DC=corp,DC=example,DC=com");
+    profile.bindDn = QString::fromLatin1(kAdministratorDn);
+    profile.password = QString::fromLatin1(kAdministratorPassword);
 
     auto connectFuture = connection.connect(profile);
     QTRY_VERIFY_WITH_TIMEOUT(connectFuture.isFinished(), 5000);
@@ -307,12 +338,15 @@ void BackendTest::passwordSetAndBind()
     LdapServer server;
     QVERIFY(server.listen(0));
     server.setObjects(sampleObjects());
+    QVERIFY(giveAdministratorAVerifier(server));
 
     ConnectionService connection;
     ConnectionProfile profile;
     profile.server = QStringLiteral("127.0.0.1");
     profile.port = server.serverPort();
     profile.baseDn = QStringLiteral("DC=corp,DC=example,DC=com");
+    profile.bindDn = QString::fromLatin1(kAdministratorDn);
+    profile.password = QString::fromLatin1(kAdministratorPassword);
 
     auto connectFuture = connection.connect(profile);
     QTRY_VERIFY_WITH_TIMEOUT(connectFuture.isFinished(), 5000);
@@ -402,12 +436,15 @@ void BackendTest::evaluatesCompositeFilters()
     LdapServer server;
     QVERIFY(server.listen(0));
     server.setObjects(sampleObjects());
+    QVERIFY(giveAdministratorAVerifier(server));
 
     ConnectionService connection;
     ConnectionProfile profile;
     profile.server = QStringLiteral("127.0.0.1");
     profile.port = server.serverPort();
     profile.baseDn = QStringLiteral("DC=corp,DC=example,DC=com");
+    profile.bindDn = QString::fromLatin1(kAdministratorDn);
+    profile.password = QString::fromLatin1(kAdministratorPassword);
 
     auto connectFuture = connection.connect(profile);
     QTRY_VERIFY_WITH_TIMEOUT(connectFuture.isFinished(), 5000);

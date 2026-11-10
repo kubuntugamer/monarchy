@@ -40,6 +40,37 @@ QByteArray scopedSearch(int id, const QByteArray &base, int scope)
     return ldapMessage(id, char(0x63), inner);
 }
 
+// Sends one search and collects its reply up to and including the done message.
+QList<QByteArray> runSearch(QTcpSocket &client, Reader &reader, int id,
+                            const QByteArray &base, int scope)
+{
+    client.write(scopedSearch(id, base, scope));
+    QList<QByteArray> messages;
+    while (true) {
+        const QByteArray message = reader.next();
+        if (message.isEmpty())
+            break;
+        messages.append(message);
+        if (operationTag(message) == 0x65)
+            break;
+    }
+    return messages;
+}
+
+// A bind with a non-empty DN is what turns a connection from anonymous into
+// authenticated. The sample store carries no verifier, so any account name
+// authenticates there; a provisioned store verifies the password instead.
+void authenticate(QTcpSocket &client, Reader &reader, const QByteArray &dn, int id = 1)
+{
+    client.write(bindRequest(id, dn, QByteArray("secret")));
+    const QByteArray reply = reader.next();
+    QVERIFY(!reply.isEmpty());
+    QCOMPARE(operationTag(reply), 0x61); // bindResponse
+    QCOMPARE(resultCode(reply), 0);
+}
+
+const char kSampleUserDn[] = "CN=Alice Chen,CN=Users,DC=corp,DC=example,DC=com";
+
 } // namespace
 
 class LdapTest : public QObject
@@ -54,6 +85,8 @@ private slots:
     void ignoresUnknownOptionalControl();
     void rejectsCookieItDidNotIssue();
     void searchOnMissingBaseIsNoSuchObject();
+    void anonymousSearchesOnlyTheRootDse();
+    void simpleBindRecordsTheConnectionIdentity();
 };
 
 // The password policy is the domain object's: minPwdLength, pwdHistoryLength and
@@ -213,6 +246,7 @@ void LdapTest::pagesThroughSearchResults()
     client.connectToHost(QHostAddress::LocalHost, server.serverPort());
     QVERIFY(client.waitForConnected(3000));
     Reader reader(&client);
+    authenticate(client, reader, kSampleUserDn);
 
     const QByteArray base("DC=corp,DC=example,DC=com");
     QSet<QString> dns;
@@ -271,6 +305,7 @@ void LdapTest::refusesUnknownCriticalControl()
     client.connectToHost(QHostAddress::LocalHost, server.serverPort());
     QVERIFY(client.waitForConnected(3000));
     Reader reader(&client);
+    authenticate(client, reader, kSampleUserDn);
 
     const QByteArray controls =
         controlsField({control("1.2.840.113556.1.4.999", QByteArray(), true)});
@@ -292,6 +327,7 @@ void LdapTest::ignoresUnknownOptionalControl()
     client.connectToHost(QHostAddress::LocalHost, server.serverPort());
     QVERIFY(client.waitForConnected(3000));
     Reader reader(&client);
+    authenticate(client, reader, kSampleUserDn);
 
     const QByteArray controls =
         controlsField({control("1.2.840.113556.1.4.999", QByteArray(), false)});
@@ -324,6 +360,7 @@ void LdapTest::rejectsCookieItDidNotIssue()
     client.connectToHost(QHostAddress::LocalHost, server.serverPort());
     QVERIFY(client.waitForConnected(3000));
     Reader reader(&client);
+    authenticate(client, reader, kSampleUserDn);
 
     const QByteArray forged("ABCDEFGHIJKL"); // 12 bytes: id + offset, but never issued
     const QByteArray controls =
@@ -378,19 +415,10 @@ void LdapTest::searchOnMissingBaseIsNoSuchObject()
     client.connectToHost(QHostAddress::LocalHost, server.serverPort());
     QVERIFY(client.waitForConnected(3000));
     Reader reader(&client);
+    authenticate(client, reader, alice.id.toUtf8());
 
     const auto search = [&](int id, const QByteArray &base, int scope) {
-        client.write(scopedSearch(id, base, scope));
-        QList<QByteArray> messages;
-        while (true) {
-            const QByteArray message = reader.next();
-            if (message.isEmpty())
-                break;
-            messages.append(message);
-            if (operationTag(message) == 0x65)
-                break;
-        }
-        return messages;
+        return runSearch(client, reader, id, base, scope);
     };
 
     // Missing entry inside a naming context the server holds: every scope is
@@ -450,6 +478,110 @@ void LdapTest::searchOnMissingBaseIsNoSuchObject()
         QCOMPARE(operationTag(reply.first()), 0x64);
         QCOMPARE(resultCode(reply.last()), 0);
     }
+}
+
+// Anonymous may read the root DSE and nothing else: every non-empty base, at
+// every scope, is an explicit refusal rather than an empty success, and zero
+// entries precede the done message. AD has behaved this way since Server 2003,
+// and an empty success let a stranger count the directory.
+void LdapTest::anonymousSearchesOnlyTheRootDse()
+{
+    LdapServer server;
+    server.setObjects(sampleObjects());
+    QVERIFY(server.listen(0));
+
+    QTcpSocket client;
+    client.connectToHost(QHostAddress::LocalHost, server.serverPort());
+    QVERIFY(client.waitForConnected(3000));
+    Reader reader(&client);
+
+    for (int scope = 0; scope <= 2; ++scope) {
+        const QList<QByteArray> reply =
+            runSearch(client, reader, 10 + scope, "DC=corp,DC=example,DC=com", scope);
+        QCOMPARE(reply.size(), 1);
+        QCOMPARE(operationTag(reply.first()), 0x65);
+        QCOMPARE(resultCode(reply.first()), 50); // insufficientAccessRights
+    }
+
+    // The root DSE is synthesized and answers on the empty base, which is how a
+    // client learns the naming context before it has credentials. Requiring a
+    // bind here would break that discovery step.
+    const QList<QByteArray> rootDse = runSearch(client, reader, 20, QByteArray(), 0);
+    QCOMPARE(rootDse.size(), 2);
+    QCOMPARE(operationTag(rootDse.first()), 0x64);
+    QVERIFY(entryDn(rootDse.first()).isEmpty());
+    QCOMPARE(resultCode(rootDse.last()), 0);
+}
+
+// A simple bind has to record the connection's identity, or gating reads on it
+// would refuse every simple-bind client — the common case and most LDAP tooling.
+// A refused or anonymous bind must clear it, because the connection's rights are
+// those of its latest bind, not of the one that once succeeded.
+void LdapTest::simpleBindRecordsTheConnectionIdentity()
+{
+    const QString domainDn = QStringLiteral("DC=corp,DC=example,DC=com");
+    const QString aliceDn = QStringLiteral("CN=alice,CN=Users,%1").arg(domainDn);
+    const QString password = QStringLiteral("Alice!Password123");
+
+    DirectoryObject domain;
+    domain.id = domainDn;
+    domain.name = QStringLiteral("CORP");
+    domain.type = QStringLiteral("domainDNS");
+    domain.kind = ObjectKind::Domain;
+
+    DirectoryObject alice;
+    alice.id = aliceDn;
+    alice.name = QStringLiteral("alice");
+    alice.type = QStringLiteral("User");
+    alice.kind = ObjectKind::User;
+    alice.attributes.insert(QStringLiteral("sAMAccountName"), QStringLiteral("alice"));
+    alice.attributes.insert(QStringLiteral("ntHash"),
+                            QString::fromLatin1(Ntlm::ntowfV1(password).toHex()));
+    alice.attributes.insert(QStringLiteral("userAccountControl"), QStringLiteral("512"));
+    alice.attributes.insert(QStringLiteral("pwdLastSet"),
+                            QString::number(QDateTime::currentSecsSinceEpoch()));
+
+    LdapServer server;
+    server.setObjects({domain, alice});
+    QVERIFY(server.listen(0));
+
+    QTcpSocket client;
+    client.connectToHost(QHostAddress::LocalHost, server.serverPort());
+    QVERIFY(client.waitForConnected(3000));
+    Reader reader(&client);
+
+    // Before any bind the base is unreadable.
+    QList<QByteArray> reply = runSearch(client, reader, 10, domainDn.toUtf8(), 2);
+    QCOMPARE(reply.size(), 1);
+    QCOMPARE(resultCode(reply.first()), 50);
+
+    // A wrong password is refused, and the failed bind leaves the connection
+    // anonymous rather than authenticated as the account it named.
+    client.write(bindRequest(2, aliceDn.toUtf8(), QByteArray("wrong-password")));
+    QCOMPARE(resultCode(reader.next()), 49);
+    reply = runSearch(client, reader, 11, domainDn.toUtf8(), 2);
+    QCOMPARE(reply.size(), 1);
+    QCOMPARE(resultCode(reply.first()), 50);
+
+    // The right password authenticates, and the same search runs unchanged.
+    client.write(bindRequest(3, aliceDn.toUtf8(), password.toUtf8()));
+    QCOMPARE(resultCode(reader.next()), 0);
+    reply = runSearch(client, reader, 12, domainDn.toUtf8(), 2);
+    QCOMPARE(reply.size(), 3);
+    QSet<QString> returned;
+    for (const QByteArray &message : reply) {
+        if (operationTag(message) == 0x64)
+            returned.insert(entryDn(message));
+    }
+    QVERIFY((returned == QSet<QString>{domainDn, aliceDn}));
+    QCOMPARE(resultCode(reply.last()), 0);
+
+    // An anonymous bind replaces the identity, so the read is refused again.
+    client.write(bindRequest(4, QByteArray(), QByteArray()));
+    QCOMPARE(resultCode(reader.next()), 0);
+    reply = runSearch(client, reader, 13, domainDn.toUtf8(), 2);
+    QCOMPARE(reply.size(), 1);
+    QCOMPARE(resultCode(reply.first()), 50);
 }
 
 QTEST_MAIN(LdapTest)

@@ -213,6 +213,7 @@ class TlsTest : public QObject
 private slots:
     void refusesStartTlsWithoutCertificate();
     void upgradesAndServesLdapOverTls();
+    void startTlsDropsTheReadPermission();
     void abortsWhenPlaintextFollowsStartTls();
     void independentClientVerifiesProvisionedCertificate();
 };
@@ -314,6 +315,85 @@ void TlsTest::upgradesAndServesLdapOverTls()
     const QByteArray entry = reader.next(5000);
     QVERIFY(!entry.isEmpty());
     QCOMPARE(operationTag(entry), 0x64); // SearchResultEntry
+}
+
+// RFC 4511 §4.14.1 resets the session to anonymous on StartTLS. Since anonymous
+// may read only the root DSE, that reset is observable: a connection that bound
+// and read before the upgrade is refused on the same base afterwards, and works
+// again once it re-binds inside TLS.
+void TlsTest::startTlsDropsTheReadPermission()
+{
+    if (!QSslSocket::supportsSsl())
+        QSKIP("Qt has no TLS backend (OpenSSL) available");
+
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    ProvisionResult provisioned;
+    QVERIFY2(provision(dir, &provisioned), qPrintable(provisioned.error));
+    QVERIFY2(provisioned.tlsEnabled, qPrintable(provisioned.tlsError));
+
+    LdapServer server;
+    QVERIFY(server.loadFromFile(provisioned.storePath));
+    QVERIFY(server.loadSecretsFromFile(provisioned.secretsPath));
+    QVERIFY(server.loadTlsCredentials(provisioned.tlsCertPath, provisioned.tlsKeyPath));
+    QVERIFY(server.listen(0));
+
+    QSslSocket client;
+    QSslConfiguration config = client.sslConfiguration();
+    config.setPeerVerifyMode(QSslSocket::VerifyPeer);
+    config.setCaCertificates(QSslCertificate::fromPath(provisioned.tlsCertPath));
+    client.setSslConfiguration(config);
+    client.connectToHost(QHostAddress::LocalHost, server.serverPort());
+    QVERIFY(client.waitForConnected(3000));
+    Reader reader(&client);
+
+    const QByteArray adminDn =
+        QStringLiteral("CN=Administrator,CN=Users,%1").arg(provisioned.baseDn).toUtf8();
+    client.write(bindRequest(1, adminDn, "P@ssw0rd123!"));
+    QCOMPARE(resultCode(reader.next(5000)), 0);
+
+    // Reads a whole search reply, so the stream is empty for the next request.
+    const auto drainSearch = [&](int *entries) {
+        *entries = 0;
+        while (true) {
+            const QByteArray message = reader.next(5000);
+            if (message.isEmpty())
+                return -1;
+            const int tag = operationTag(message);
+            if (tag == 0x64) {
+                ++(*entries);
+                continue;
+            }
+            if (tag == 0x65)
+                return resultCode(message);
+        }
+    };
+
+    // Authenticated, so the naming context reads.
+    int entries = 0;
+    client.write(searchRequest(2, provisioned.baseDn.toUtf8()));
+    QCOMPARE(drainSearch(&entries), 0);
+    QVERIFY(entries > 0);
+
+    client.write(startTlsRequest(3));
+    QCOMPARE(resultCode(reader.next(5000)), 0);
+    client.startClientEncryption();
+    QTRY_VERIFY_WITH_TIMEOUT(client.isEncrypted()
+                                 || client.state() == QAbstractSocket::UnconnectedState,
+                             10000);
+    QVERIFY2(client.isEncrypted(), qPrintable(client.errorString()));
+
+    // Same socket, same base: the upgrade discarded the identity.
+    client.write(searchRequest(4, provisioned.baseDn.toUtf8()));
+    QCOMPARE(drainSearch(&entries), 50); // insufficientAccessRights
+    QCOMPARE(entries, 0);
+
+    // Binding again inside TLS restores the read.
+    client.write(bindRequest(5, adminDn, "P@ssw0rd123!"));
+    QCOMPARE(resultCode(reader.next(5000)), 0);
+    client.write(searchRequest(6, provisioned.baseDn.toUtf8()));
+    QCOMPARE(drainSearch(&entries), 0);
+    QVERIFY(entries > 0);
 }
 
 // After the upgrade the stream is TLS: bytes that are not TLS records are not
