@@ -161,6 +161,8 @@ QFuture<QList<DirectoryObject>> DirectoryService::search(const QString &baseDn, 
                                       filterUtf8.constData(), nullptr, 0, nullptr, nullptr,
                                       nullptr, pageSize, &res);
             if (rc != LDAP_SUCCESS && rc != LDAP_SIZELIMIT_EXCEEDED) {
+                if (rc == LDAP_INSUFFICIENT_ACCESS)
+                    emit authorizationRequired();
                 return result;
             }
 
@@ -215,8 +217,14 @@ QFuture<QList<DirectoryObject>> DirectoryService::search(const QString &baseDn, 
         }
         const QString base = baseDn.isEmpty() ? m_connection->baseDn() : baseDn;
         const auto entries = client.search(base, 2 /*subtree*/, filter, attributes, &err);
-        if (!err.isEmpty())
+        if (client.lastResultCode() == 50) {
+            // Distinguish a refusal from an empty container: the caller offers a
+            // bind, and the raw "search failed with result 50" is not shown as a
+            // directory error on top of that prompt.
+            emit authorizationRequired();
+        } else if (!err.isEmpty()) {
             emit error(err);
+        }
         for (const LdapClient::Entry &e : entries) {
             if (e.dn.isEmpty()) // root DSE is not a console object
                 continue;

@@ -4,6 +4,7 @@
 #include <QtTest>
 
 #include <QFuture>
+#include <QSignalSpy>
 #include <QTemporaryDir>
 
 #include "AdminService.h"
@@ -45,6 +46,7 @@ private slots:
     void persistsStore();
     void groupMembershipRoundTrip();
     void passwordSetAndBind();
+    void asksForCredentialsWhenAReadIsRefused();
     void evaluatesCompositeFilters();
     void dnsZoneLoaded();
 
@@ -429,6 +431,52 @@ void BackendTest::passwordSetAndBind()
     auto enableFuture = directory.modifyObject(erinDn, enable);
     QTRY_VERIFY_WITH_TIMEOUT(enableFuture.isFinished(), 5000);
     QVERIFY(bindAs(QStringLiteral("N3w-Passw0rd!")));
+}
+
+// An anonymous session may read only the root DSE. A refused read is not an
+// empty container: the service has to say so, because that signal is what the
+// console turns into a sign-in prompt.
+void BackendTest::asksForCredentialsWhenAReadIsRefused()
+{
+    LdapServer server;
+    QVERIFY(server.listen(0));
+    server.setObjects(sampleObjects());
+    QVERIFY(giveAdministratorAVerifier(server));
+
+    ConnectionService connection;
+    ConnectionProfile profile;
+    profile.server = QStringLiteral("127.0.0.1");
+    profile.port = server.serverPort();
+    profile.baseDn = QStringLiteral("DC=corp,DC=example,DC=com");
+
+    // No bind DN: the connection is anonymous.
+    auto connectFuture = connection.connect(profile);
+    QTRY_VERIFY_WITH_TIMEOUT(connectFuture.isFinished(), 5000);
+    QVERIFY(connectFuture.result());
+
+    DirectoryService directory(&connection);
+    QSignalSpy refused(&directory, &DirectoryService::authorizationRequired);
+    auto searchFuture = directory.search(profile.baseDn, QStringLiteral("(objectClass=*)"),
+                                         QStringList(), 1000);
+    QTRY_VERIFY_WITH_TIMEOUT(searchFuture.isFinished(), 5000);
+    QVERIFY(searchFuture.result().isEmpty());
+    QTRY_COMPARE(refused.count(), 1);
+
+    // The same read succeeds once the session is signed in, and no further
+    // refusal is reported.
+    connection.disconnect();
+    profile.bindDn = QString::fromLatin1(kAdministratorDn);
+    profile.password = QString::fromLatin1(kAdministratorPassword);
+    auto reconnectFuture = connection.connect(profile);
+    QTRY_VERIFY_WITH_TIMEOUT(reconnectFuture.isFinished(), 5000);
+    QVERIFY(reconnectFuture.result());
+
+    auto authenticated = directory.search(profile.baseDn, QStringLiteral("(objectClass=*)"),
+                                          QStringList(), 1000);
+    QTRY_VERIFY_WITH_TIMEOUT(authenticated.isFinished(), 5000);
+    QCOMPARE(authenticated.result().size(), 12);
+    QTest::qWait(50); // let any queued signal arrive before counting
+    QCOMPARE(refused.count(), 1);
 }
 
 void BackendTest::evaluatesCompositeFilters()

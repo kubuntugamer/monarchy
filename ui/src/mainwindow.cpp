@@ -638,6 +638,8 @@ void MainWindow::createCentralWidget()
     connect(m_directoryService, &DirectoryService::error, this, [this](const QString &message) {
         statusBar()->showMessage(tr("Directory error: %1").arg(message), 8000);
     });
+    connect(m_directoryService, &DirectoryService::authorizationRequired,
+            this, &MainWindow::onAuthorizationRequired);
     connect(m_adminService, &AdminService::error, this, [this](const QString &message) {
         statusBar()->showMessage(tr("Administration error: %1").arg(message), 8000);
     });
@@ -795,6 +797,9 @@ void MainWindow::onDelete()
 
 void MainWindow::onRefresh()
 {
+    // A manual refresh is a new attempt: if the session still may not read, ask
+    // for credentials again instead of staying silent after a cancelled prompt.
+    m_credentialsDeclined = false;
     if (m_consoleView)
         m_consoleView->refresh();
 }
@@ -1402,6 +1407,7 @@ void MainWindow::onConnectToDirectory()
     profile.useKerberos = kerberosCheck->isChecked();
     profile.useTls = tlsCheck->isChecked();
 
+    m_credentialsDeclined = false;
     m_connectionService->disconnect();
     m_connectionService->connect(profile);
     statusBar()->showMessage(tr("Connecting to %1:%2...")
@@ -1409,8 +1415,82 @@ void MainWindow::onConnectToDirectory()
                              4000);
 }
 
+// An anonymous session may read only the root DSE, so the console's own
+// auto-connect is enough to establish a connection and not enough to browse.
+// When a read comes back insufficientAccessRights, ask for a bind in place
+// rather than leaving an empty results pane and a status-bar line.
+void MainWindow::onAuthorizationRequired()
+{
+    if (m_credentialsPromptOpen || m_credentialsDeclined || !m_connectionService)
+        return;
+    m_credentialsPromptOpen = true;
+
+    QDialog dialog(this);
+    dialog.setWindowTitle(tr("Sign in to the Directory"));
+    auto *layout = new QVBoxLayout(&dialog);
+
+    auto *message = new QLabel(
+        tr("The directory refused the read because this session is not signed in.\n\n"
+           "An anonymous session may read only the root DSE. Sign in to browse %1.")
+            .arg(namingContext()),
+        &dialog);
+    message->setWordWrap(true);
+    layout->addWidget(message);
+
+    auto *form = new QFormLayout;
+    QLineEdit *bindDnEdit = new QLineEdit(&dialog);
+    const QString boundDn = m_connectionService->bindDn();
+    bindDnEdit->setText(boundDn.isEmpty()
+                            ? QStringLiteral("CN=Administrator,CN=Users,%1").arg(namingContext())
+                            : boundDn);
+    form->addRow(tr("Bind DN:"), bindDnEdit);
+
+    QLineEdit *passwordEdit = new QLineEdit(&dialog);
+    passwordEdit->setEchoMode(QLineEdit::Password);
+    form->addRow(tr("Password:"), passwordEdit);
+    layout->addLayout(form);
+
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    layout->addWidget(buttons);
+
+    const bool accepted = dialog.exec() == QDialog::Accepted;
+    m_credentialsPromptOpen = false;
+    const QString bindDn = bindDnEdit->text().trimmed();
+
+    if (!accepted || bindDn.isEmpty()) {
+        // Do not re-open on every timer tick or navigation; Refresh and
+        // Connect to Directory are the explicit ways to ask again.
+        m_credentialsDeclined = true;
+        statusBar()->showMessage(bindDn.isEmpty()
+                                     ? tr("A bind DN is required to sign in.")
+                                     : tr("Not signed in; the directory stays unreadable."),
+                                 6000);
+        return;
+    }
+
+    ConnectionProfile profile;
+    profile.server = m_connectionService->server();
+    profile.port = m_connectionService->port();
+    profile.baseDn = m_connectionService->baseDn();
+    profile.bindDn = bindDn;
+    profile.password = passwordEdit->text();
+    // A password prompt is a simple bind, so Kerberos is off for this profile —
+    // otherwise the DN typed here would be ignored. TLS is transport and stays.
+    profile.useKerberos = false;
+    profile.useTls = QSettings().value(QStringLiteral("connection/tls"), false).toBool();
+
+    QSettings().setValue(QStringLiteral("connection/bindDn"), bindDn);
+    m_credentialsDeclined = false;
+    m_connectionService->disconnect();
+    m_connectionService->connect(profile);
+    statusBar()->showMessage(tr("Signing in as %1...").arg(bindDn), 4000);
+}
+
 void MainWindow::onDisconnect()
 {
+    m_credentialsDeclined = false;
     if (m_connectionService)
         m_connectionService->disconnect();
     statusBar()->showMessage(tr("Disconnected. Showing the offline sample directory."), 5000);

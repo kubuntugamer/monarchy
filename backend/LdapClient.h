@@ -38,6 +38,9 @@ public:
     void close(); // unbind + disconnect
 
     bool isOpen() const { return m_socket.state() == QAbstractSocket::ConnectedState; }
+    // Result code of the last search's SearchResultDone (0 on success), so a
+    // caller can tell "nothing matched" from "refused" without parsing text.
+    int lastResultCode() const { return m_lastResultCode; }
 
 private:
     bool sendMessage(const QByteArray &message);
@@ -47,6 +50,7 @@ private:
     QTcpSocket m_socket;
     QByteArray m_buffer;
     int m_nextId = 1;
+    int m_lastResultCode = 0;
 };
 
 #endif // LDAPCLIENT_H

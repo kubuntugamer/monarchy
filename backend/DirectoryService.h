@@ -39,6 +39,10 @@ public:
 
 signals:
     void error(const QString &message);
+    // A read was refused with insufficientAccessRights (50): the session is
+    // anonymous or lacks the right. The console answers this with a sign-in
+    // prompt instead of an empty container.
+    void authorizationRequired();
 
 private:
     ConnectionService *m_connection = nullptr;

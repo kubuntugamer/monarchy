@@ -302,6 +302,7 @@ QList<LdapClient::Entry> LdapClient::search(const QString &base, int scope, cons
                                             const QStringList &attributes, QString *error)
 {
     QList<Entry> result;
+    m_lastResultCode = 0;
 
     QByteArray inner;
     writeTLV(inner, 0x04, base.toUtf8());
@@ -366,6 +367,19 @@ QList<LdapClient::Entry> LdapClient::search(const QString &base, int scope, cons
         if (!readTLV(frame, &pos, &opTag, &opLen))
             break;
         if (opTag == 0x65) { // SearchResultDone
+            // LDAPResult: ENUM resultCode first. A refusal is not an empty
+            // result set, and the caller has to be able to tell them apart —
+            // the console turns 50 into a sign-in prompt.
+            quint8 rt = 0;
+            int rl = 0;
+            if (readTLV(frame, &pos, &rt, &rl)) {
+                int code = 0;
+                for (int i = 0; i < rl; i++)
+                    code = (code << 8) | quint8(frame[pos + i]);
+                m_lastResultCode = code;
+                if (code != 0 && error)
+                    *error = QStringLiteral("search failed with result %1").arg(code);
+            }
             break;
         }
         if (opTag != 0x64) {

@@ -56,6 +56,7 @@ private slots:
     void applyAutoRefreshSettings();
     void onConnectToDirectory();
     void onDisconnect();
+    void onAuthorizationRequired();
     void onToggleFullScreen();
     void onInvertSelection();
     void onCascadeWindows();
@@ -98,6 +99,10 @@ private:
     QMenuBar *m_menuBar = nullptr;
     QMenu *m_recentFilesMenu = nullptr;
     QActionGroup *m_viewGroup = nullptr;
+    // One sign-in prompt at a time; a cancelled prompt is not repeated by the
+    // auto-refresh timer or by navigating to another container.
+    bool m_credentialsPromptOpen = false;
+    bool m_credentialsDeclined = false;
 
     QAction *m_actBack = nullptr;
     QAction *m_actForward = nullptr;

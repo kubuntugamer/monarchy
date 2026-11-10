@@ -320,10 +320,10 @@ on **3268**, the KDC on
 `epmPort` and SMB2 on `smbPort`. The console is a pure client: it reads the
 provisioned domain's `dc.conf` (or `MONARCHY_DCDIR`) for the port, asks the
 server's root DSE for the naming context when none is configured, and connects
-automatically. An unbound session may read only the root DSE, so browsing the
-directory needs a bind DN and password in **Connect to Directory…**; an
-anonymous connection answers `insufficientAccessRights` for anything else. Use
-the same dialog to point the console at a remote LDAP server. **File → Disconnect** clears the console; no sample objects are
+automatically. An unbound session may read only the root DSE, so when a read is
+refused with `insufficientAccessRights` the console asks for a bind DN and
+password in place; the same credential fields are in **Connect to Directory…**,
+which also points the console at a remote LDAP server. **File → Disconnect** clears the console; no sample objects are
 invented in their place. Outbound LDAPS and Kerberos/GSSAPI binds to a *remote* server require
 the `MONARCHY_WITH_LDAP=ON` build; the default build reports an error instead of
 silently falling back to plaintext. The engine's own KDC needs no external
