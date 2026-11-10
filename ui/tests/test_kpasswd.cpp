@@ -312,6 +312,7 @@ struct Fixture {
                && server->applyModify(guestDn, {change}) == 0;
     }
 
+#ifdef MONARCHY_WITH_KRB5
     // Runs the MIT client to completion while the event loop serves the realm.
     static bool run(PasswordClient &client)
     {
@@ -325,6 +326,7 @@ struct Fixture {
         client.wait(1000);
         return client.isFinished();
     }
+#endif // MONARCHY_WITH_KRB5
 };
 
 } // namespace
