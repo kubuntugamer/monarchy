@@ -161,6 +161,17 @@ must pass `--adminpass`. Without `--realm` the script provisions
 `MONARCHY.EXAMPLE.COM`. Re-running refreshes the binaries and unit and leaves
 an existing domain alone — `--force` replaces it.
 
+To build and install the binaries that are already in this tree without the
+wizard, use the shorter entry point:
+
+```sh
+sudo scripts/build-and-install.sh --service
+```
+
+It configures, builds, tests and installs the three shipped binaries, and with
+`--service` provisions a domain and starts/enables `monarchy-dcd`. `--help`
+lists the flags; `scripts/install-monarchy.sh` above remains the guided path.
+
 Run the same script as a normal user for a self-contained install under
 `~/.local` with development ports and no systemd changes:
 
