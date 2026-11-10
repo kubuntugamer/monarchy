@@ -497,6 +497,68 @@ bool parseNetworkInfo(Ndr::Reader &reader, NetworkLogon *logon)
     return true;
 }
 
+// netr_PasswordInfo (MS-NRPC 2.2.4.1.3): the identity a network logon also
+// carries, followed by the password's own one-way functions instead of a
+// challenge and its responses. The interactive (1) and service (3) classes
+// marshal this arm.
+struct PasswordLogon {
+    QString domain;
+    QString account;
+    QString workstation;
+    quint32 parameterControl = 0;
+    quint64 logonId = 0;
+    QByteArray lmOwf; // 16 bytes; never trusted, because no LM hash is stored
+    QByteArray ntOwf; // 16 bytes
+};
+
+bool parsePasswordInfo(Ndr::Reader &reader, PasswordLogon *logon)
+{
+    auto fail = [&reader](const char *field) {
+        if (!qEnvironmentVariableIsEmpty("MONARCHY_RPC_TRACE"))
+            qWarning("Netlogon: malformed password info at %d reading %s", reader.position(),
+                     field);
+        return false;
+    };
+    StringHeader domainHeader;
+    StringHeader accountHeader;
+    StringHeader workstationHeader;
+    quint32 parameterControl = 0;
+    quint64 logonId = 0;
+    // The identity is laid out exactly as netr_NetworkInfo's, including the
+    // 4-aligned OLD_LARGE_INTEGER the logon id is read as.
+    if (!readStringHeader(reader, &domainHeader))
+        return fail("domain header");
+    if (!reader.u32(&parameterControl))
+        return fail("parameter control");
+    reader.align(4);
+    quint32 logonIdLow = 0;
+    quint32 logonIdHigh = 0;
+    if (!reader.u32(&logonIdLow) || !reader.u32(&logonIdHigh))
+        return fail("logon id");
+    logonId = quint64(logonIdLow) | (quint64(logonIdHigh) << 32);
+    if (!readStringHeader(reader, &accountHeader) || !readStringHeader(reader, &workstationHeader))
+        return fail("account/workstation header");
+
+    PasswordLogon parsed;
+    parsed.parameterControl = parameterControl;
+    parsed.logonId = logonId;
+    // samr_Password is 16 inline bytes, so both one-way functions are part of
+    // the fixed structure and the identity's strings are deferred past them.
+    if (!reader.bytes(16, &parsed.lmOwf) || !reader.bytes(16, &parsed.ntOwf))
+        return fail("one-way functions");
+    if (domainHeader.referent != 0
+        && !readDeferredString(reader, domainHeader, &parsed.domain))
+        return fail("deferred domain");
+    if (accountHeader.referent != 0
+        && !readDeferredString(reader, accountHeader, &parsed.account))
+        return fail("deferred account");
+    if (workstationHeader.referent != 0
+        && !readDeferredString(reader, workstationHeader, &parsed.workstation))
+        return fail("deferred workstation");
+    *logon = parsed;
+    return true;
+}
+
 // ---------- writing netr_SamInfo2/3/6 ----------
 
 struct SamAnswer {
@@ -1078,7 +1140,12 @@ QByteArray NetlogonServer::samLogon(const QByteArray &stub, bool withAuthenticat
             || !reader.referent(&logonPresent) || !logonPresent)
             return statusOnly(kStatusInvalidParameter);
     }
-    if (logonLevel != 2 && logonLevel != 6)
+    // The interactive (1) and service (3) classes carry netr_PasswordInfo: the
+    // password's own one-way functions rather than a challenge and its
+    // responses. The generic (4), ticket (8) and transitive (5/6/7) classes are
+    // still refused.
+    const bool passwordLogon = logonLevel == 1 || logonLevel == 3;
+    if (!passwordLogon && logonLevel != 2 && logonLevel != 6)
         return statusOnly(kStatusNotSupported);
 
     // NetrLogonSamLogon marshals the whole logon-information parameter before
@@ -1088,9 +1155,17 @@ QByteArray NetlogonServer::samLogon(const QByteArray &stub, bool withAuthenticat
     // land in the identity's first length, so only a client that deferred those
     // strings past validation_level validated at all.
     NetworkLogon logon;
+    PasswordLogon password;
     reader.align(4);
-    if (!parseNetworkInfo(reader, &logon))
+    if (passwordLogon) {
+        if (!parsePasswordInfo(reader, &password))
+            return statusOnly(kStatusInvalidParameter);
+    } else if (!parseNetworkInfo(reader, &logon)) {
         return statusOnly(kStatusInvalidParameter);
+    }
+    const QString logonDomain = passwordLogon ? password.domain : logon.domain;
+    const QString logonAccount = passwordLogon ? password.account : logon.account;
+    const QString logonWorkstation = passwordLogon ? password.workstation : logon.workstation;
 
     quint16 validationLevel = 0;
     quint32 flags = 0;
@@ -1098,12 +1173,13 @@ QByteArray NetlogonServer::samLogon(const QByteArray &stub, bool withAuthenticat
         return statusOnly(kStatusInvalidParameter);
     if (withFlags && !reader.u32(&flags))
         return statusOnly(kStatusInvalidParameter);
-    if (!isPrintableName(logon.domain) || !isPrintableName(logon.account)
-        || !isPrintableName(logon.workstation))
+    if (!isPrintableName(logonDomain) || !isPrintableName(logonAccount)
+        || !isPrintableName(logonWorkstation))
         return statusOnly(kStatusInvalidParameter);
     if (!qEnvironmentVariableIsEmpty("MONARCHY_RPC_TRACE"))
-        qWarning("Netlogon: samlogon info at %d level=%u domain=%s account=%s", reader.position(),
-                 validationLevel, qPrintable(logon.domain), qPrintable(logon.account));
+        qWarning("Netlogon: samlogon info at %d class=%u level=%u domain=%s account=%s",
+                 reader.position(), logonLevel, validationLevel, qPrintable(logonDomain),
+                 qPrintable(logonAccount));
 
     auto channel = m_channels.find(computerName.toLower());
     if (channel == m_channels.end())
@@ -1117,7 +1193,7 @@ QByteArray NetlogonServer::samLogon(const QByteArray &stub, bool withAuthenticat
             return statusOnly(kStatusAccessDenied);
     }
 
-    QString domain = logon.domain;
+    QString domain = logonDomain;
     if (domain.isEmpty())
         domain = m_config.netbios;
     if (domain.compare(m_config.netbios, Qt::CaseInsensitive) != 0
@@ -1126,7 +1202,7 @@ QByteArray NetlogonServer::samLogon(const QByteArray &stub, bool withAuthenticat
         return statusOnly(kStatusNoSuchUser);
     }
 
-    const DirectoryObject account = findAccount(logon.account);
+    const DirectoryObject account = findAccount(logonAccount);
     if (account.id.isEmpty())
         return statusOnly(kStatusNoSuchUser);
     if (account.attributes.value(QStringLiteral("userAccountControl")).toUInt()
@@ -1199,11 +1275,25 @@ QByteArray NetlogonServer::samLogon(const QByteArray &stub, bool withAuthenticat
         countBadPassword();
         return statusOnly(kStatusWrongPassword);
     }
-    if (logon.challenge.size() != 8 || logon.ntResponse.size() < 24)
-        return statusOnly(kStatusWrongPassword);
-    if (!Ntlm::verifyNtlmv2(ntHash, logon.account, domain, logon.challenge, logon.ntResponse)) {
-        countBadPassword();
-        return statusOnly(kStatusWrongPassword);
+    if (passwordLogon) {
+        // A password class proves the password by sending its own NT one-way
+        // function, which is compared to the stored hash in constant time. The
+        // LM function beside it is ignored rather than trusted: this store has
+        // no LM hash to check it against, and a caller that sends only that
+        // half is refused.
+        if (password.ntOwf.size() != 16
+            || !constantTimeEquals(ntHash, password.ntOwf)) {
+            countBadPassword();
+            return statusOnly(kStatusWrongPassword);
+        }
+    } else {
+        if (logon.challenge.size() != 8 || logon.ntResponse.size() < 24)
+            return statusOnly(kStatusWrongPassword);
+        if (!Ntlm::verifyNtlmv2(ntHash, logonAccount, domain, logon.challenge,
+                                logon.ntResponse)) {
+            countBadPassword();
+            return statusOnly(kStatusWrongPassword);
+        }
     }
 
     // A correct password that has aged out is refused next, with the two codes
@@ -1233,7 +1323,7 @@ QByteArray NetlogonServer::samLogon(const QByteArray &stub, bool withAuthenticat
     // it sits after the password, so a wrong password is still answered as a
     // wrong password for a restricted account.
     if (!WorkstationRestriction::allows(
-            account.attributes.value(QStringLiteral("userWorkstations")), logon.workstation))
+            account.attributes.value(QStringLiteral("userWorkstations")), logonWorkstation))
         return statusOnly(kStatusInvalidWorkstation);
 
     // Record the logon the way a DC does. lastLogon is per-DC and always
@@ -1343,7 +1433,7 @@ QByteArray NetlogonServer::samLogon(const QByteArray &stub, bool withAuthenticat
     putLe32(out, kStatusSuccess);
     emit requestReceived(QStringLiteral("LogonSamLogon%1(%2\\%3: ok)")
                              .arg(withFlags ? QStringLiteral("WithFlags") : QString())
-                             .arg(domain, logon.account));
+                             .arg(domain, logonAccount));
     return out;
 }
 

@@ -9,10 +9,13 @@ MS-NRPC has two halves and this script exercises both:
     this domain and this DC;
   * the secure channel, which is what every logon call rides on. A machine
     account is created over SAMR, given a password, and then used for
-    NetrServerReqChallenge andNetrServerAuthenticate3. If the channel is
-established, NetrLogonSamLogon is asked for a network logon (level 2) and
-validated at NETLOGON_VALIDATION_SAM_INFO2; this script checks the returned
-status and the account the validation names.
+    NetrServerReqChallenge and NetrServerAuthenticate3. If the channel is
+    established, NetrLogonSamLogon is asked for a network logon (class 2) and
+    validated at NETLOGON_VALIDATION_SAM_INFO2; this script checks the returned
+    status and the account the validation names. The interactive (1) and
+    service (3) classes are driven too: they carry the password's own one-way
+    functions instead of a challenge and its responses, so the same account
+    proves itself without NTLMv2, and a wrong one-way function is refused.
 
 A machine account the directory does not hold must be refused with
 STATUS_NO_TRUST_SAM_ACCOUNT, so that path is checked with a name nothing serves.
@@ -67,6 +70,7 @@ STATUS_PASSWORD_EXPIRED = 0xC0000071
 STATUS_PASSWORD_MUST_CHANGE = 0xC0000224
 STATUS_INVALID_PARAMETER = 0xC000000D
 NETLOGON_NEG_STRONG_KEYS = 0x00004000
+VALIDATION_SAM_INFO2 = 3
 
 failures = []
 skipped = []
@@ -85,6 +89,9 @@ CHECKS = [
     'a locked account is refused with STATUS_ACCOUNT_LOCKED_OUT',
     'an aged-out password is refused with STATUS_PASSWORD_EXPIRED',
     'a password that must change is refused with STATUS_PASSWORD_MUST_CHANGE',
+    'NetrLogonSamLogon answers an interactive logon (class 1)',
+    'NetrLogonSamLogon answers a service logon (class 3)',
+    'a wrong one-way function is refused with STATUS_WRONG_PASSWORD',
 ]
 
 
@@ -331,6 +338,18 @@ def raw_credential(credential):
     return bytes(credential.getData())
 
 
+def set_owf(target, field, value):
+    """A samr_Password is a fixed 16-byte array of two CYPHER_BLOCKs, so the
+    whole field is assigned the way set_credential does an 8-byte one."""
+    if len(value) != 16:
+        raise ValueError('a samr_Password is 16 bytes, got %d' % len(value))
+    data = bytearray(value)
+    try:
+        target[field] = data
+    except TypeError:
+        target[field] = bytes(data)
+
+
 def set_credential(target, field, credential):
     """A NETLOGON_CREDENTIAL is a fixed 8-byte array, so the whole field is
     assigned; setting its Data member instead goes through a string path and
@@ -478,6 +497,34 @@ def main():
         network['LmChallengeResponse'] = b'\x00' * 24
         return dce.request(request)
 
+    def password_logon(server_credential, session_key, user, password, logon_class):
+        """One NetrLogonSamLogon carrying netr_PasswordInfo: the interactive (1)
+        and service (3) classes send the password's own one-way functions rather
+        than a challenge and its responses, so no NTLMv2 is computed."""
+        request = nrpc.NetrLogonSamLogon()
+        request['LogonServer'] = NULL
+        request['ComputerName'] = computer
+        authenticator = nrpc.ComputeNetlogonAuthenticator(server_credential, session_key)
+        set_credential(request['Authenticator'], 'Credential', authenticator['Credential'])
+        request['Authenticator']['Timestamp'] = authenticator['Timestamp']
+        request['ReturnAuthenticator']['Timestamp'] = 0
+        set_credential(request['ReturnAuthenticator'], 'Credential', b'\x00' * 8)
+        # The class and the union arm's own tag agree, as the IDL requires.
+        request['LogonLevel'] = logon_class
+        request['LogonInformation']['tag'] = logon_class
+        request['ValidationLevel'] = VALIDATION_SAM_INFO2
+        arm = request['LogonInformation'][
+            'LogonInteractive' if logon_class == 1 else 'LogonService']
+        arm['Identity']['LogonDomainName'] = options.domain
+        arm['Identity']['ParameterControl'] = 3
+        arm['Identity']['UserName'] = user
+        arm['Identity']['Workstation'] = computer
+        # The server stores no LM hash and ignores this half rather than
+        # trusting it; the NT half is what it compares to the account's hash.
+        set_owf(arm, 'LmOwfPassword', b'\x00' * 16)
+        set_owf(arm, 'NtOwfPassword', ntlm.compute_nthash(password))
+        return dce.request(request)
+
     def open_channel(account, password):
         """A fresh challenge and handshake, so a call that spends the channel
         (a refused logon steps it before the password is looked at) leaves the
@@ -520,6 +567,9 @@ def main():
             skip(CHECKS[8], 'no account logon to read back')
             skip(CHECKS[9], 'no machine account to open a secure channel with')
             skip(CHECKS[10], 'no machine account to open a secure channel with')
+            skip(CHECKS[13], 'no machine account to open a secure channel with')
+            skip(CHECKS[14], 'no machine account to open a secure channel with')
+            skip(CHECKS[15], 'no machine account to open a secure channel with')
         else:
             account, password, rid = machine
             check(CHECKS[4], True, '%s rid %d' % (account, rid))
@@ -633,6 +683,40 @@ def main():
                           '%s: %s' % (type(error).__name__, error))
             except Exception as error:  # noqa: BLE001
                 check(CHECKS[12], False, '%s: %s' % (type(error).__name__, error))
+
+            # The interactive and service classes prove the password by
+            # sending its own NT one-way function, with no challenge in play.
+            # The wrong function is refused first, because the refusal is a
+            # counted failure and the good logons below clear the counter the
+            # lockout checks further down depend on being empty. Each logon
+            # spends its channel, so each gets a fresh handshake.
+            try:
+                key, seed, code = open_channel(account, password)
+                if code != STATUS_SUCCESS:
+                    raise RuntimeError('channel refused: 0x%08x' % code)
+                password_logon(seed, key, options.user, 'Wr0ng-' + uuid.uuid4().hex, 1)
+                check(CHECKS[15], False, 'the wrong one-way function was accepted')
+            except Exception as error:  # noqa: BLE001
+                check(CHECKS[15],
+                      getattr(error, 'error_code', None) == STATUS_WRONG_PASSWORD,
+                      '%s: %s' % (type(error).__name__, error))
+
+            for index, logon_class in ((13, 1), (14, 3)):
+                try:
+                    key, seed, code = open_channel(account, password)
+                    if code != STATUS_SUCCESS:
+                        raise RuntimeError('channel refused: 0x%08x' % code)
+                    response = password_logon(seed, key, options.user, options.password,
+                                              logon_class)
+                    name = validation_field(
+                        response['ValidationInformation']['ValidationSam2'],
+                        'EffectiveName')
+                    check(CHECKS[index],
+                          response['ErrorCode'] == STATUS_SUCCESS
+                          and name == options.user,
+                          (hex(response['ErrorCode']), name))
+                except Exception as error:  # noqa: BLE001
+                    check(CHECKS[index], False, '%s: %s' % (type(error).__name__, error))
 
             # The domain's lockout policy is what turns a counted refusal into
             # a lockout, and a domain administrator sets it over SAMR.

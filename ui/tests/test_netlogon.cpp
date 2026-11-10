@@ -169,6 +169,19 @@ QByteArray authenticatorRequest(const QByteArray &credential, quint32 timestamp)
     return out;
 }
 
+// The characters a deferred lsa_String points at: a conformant array of its own
+// counts and then the UTF-16 payload. `align` is the alignment of whatever
+// follows it, which NDR pads to: 4 for the next header or byte array, 2 for a
+// uint16 such as validation_level.
+void appendDeferredString(QByteArray &out, const QString &value, int align = 4)
+{
+    while (out.size() % 4 != 0) out.append(char(0));
+    const quint32 count = quint32(value.size());
+    appendLe32(out, count); appendLe32(out, 0); appendLe32(out, count);
+    out.append(Ndr::utf16le(value));
+    while (out.size() % align != 0) out.append(char(0));
+}
+
 void appendNetworkLogon(QByteArray &out, quint16 validationLevel, const QByteArray &ntResponse,
                         quint32 extraFlags = 0,
                         const QString &workstation = QStringLiteral("CLIENT"))
@@ -195,17 +208,9 @@ void appendNetworkLogon(QByteArray &out, quint16 validationLevel, const QByteArr
 
     // Deferred unique-pointer referents are carried separately from the
     // conformant string payloads; the NDR pointer IDs were in the fixed struct.
-    auto appendDeferredString = [&out](const QString &value, quint32 referent) {
-        Q_UNUSED(referent)
-        while (out.size() % 4 != 0) out.append(char(0));
-        const quint32 count = quint32(value.size());
-        appendLe32(out, count); appendLe32(out, 0); appendLe32(out, count);
-        out.append(Ndr::utf16le(value));
-        while (out.size() % 4 != 0) out.append(char(0));
-    };
-    appendDeferredString(QStringLiteral("CORP"), 0x00020001u);
-    appendDeferredString(QStringLiteral("alice"), 0x00020002u);
-    appendDeferredString(workstation, 0x00020003u);
+    appendDeferredString(out, QStringLiteral("CORP"));
+    appendDeferredString(out, QStringLiteral("alice"));
+    appendDeferredString(out, workstation);
     while (out.size() % 4 != 0) out.append(char(0));
     appendLe32(out, quint32(ntResponse.size())); appendLe32(out, 0);
     appendLe32(out, quint32(ntResponse.size()));
@@ -221,6 +226,36 @@ void appendNetworkLogon(QByteArray &out, quint16 validationLevel, const QByteArr
         while (out.size() % 4 != 0) out.append(char(0));
         appendLe32(out, extraFlags);
     }
+}
+
+// netr_PasswordInfo: the identity a network logon also carries, then the two
+// 16-byte one-way functions of the password itself, in place, so this arm ends
+// where netr_NetworkInfo's challenge and response headers begin. The interactive
+// (1) and service (3) classes marshal it.
+void appendPasswordLogon(QByteArray &out, quint16 validationLevel, const QByteArray &ntOwf,
+                         const QString &workstation = QStringLiteral("CLIENT1"))
+{
+    while (out.size() % 4 != 0) out.append(char(0));
+
+    appendLe16(out, 8); appendLe16(out, 8); appendLe32(out, 0x00020001u); // domain "CORP"
+    appendLe32(out, 3); // parameter_control
+    while (out.size() % 4 != 0) out.append(char(0)); // OLD_LARGE_INTEGER is 4-aligned
+    appendLe64(out, 0); // Reserved
+    appendLe16(out, 10); appendLe16(out, 10); appendLe32(out, 0x00020002u); // "alice"
+    // An odd-length workstation pins the rule validation_level depends on: the
+    // level is 2-aligned and comes straight after these UTF-16 characters.
+    const quint16 workstationBytes = quint16(workstation.size() * 2);
+    appendLe16(out, workstationBytes); appendLe16(out, workstationBytes);
+    appendLe32(out, 0x00020003u);
+
+    out.append(QByteArray(16, '\0')); // lmpassword: ignored, no LM hash is stored
+    out.append(ntOwf);
+
+    appendDeferredString(out, QStringLiteral("CORP"));
+    appendDeferredString(out, QStringLiteral("alice"));
+    appendDeferredString(out, workstation, 2);
+
+    appendLe16(out, validationLevel);
 }
 
 QByteArray uniqueString(const QString &text, quint32 referent)
@@ -328,6 +363,8 @@ struct WorkstationLogon {
     ChannelFixture channel;
     QByteArray userHash;
     bool wroteBack = false;
+    QString writtenDn;
+    QMap<QString, QString> writtenAttributes;
 };
 
 void prepareWorkstationLogon(WorkstationLogon *fixture, const QString &workstations,
@@ -376,8 +413,11 @@ void prepareWorkstationLogon(WorkstationLogon *fixture, const QString &workstati
     });
 
     Netlogon::WriteBackend writes;
-    writes.updateAccount = [fixture](const QString &, const QMap<QString, QString> &, QString *) {
+    writes.updateAccount = [fixture](const QString &dn, const QMap<QString, QString> &attributes,
+                                     QString *) {
         fixture->wroteBack = true;
+        fixture->writtenDn = dn;
+        fixture->writtenAttributes = attributes;
         return true;
     };
     fixture->server.setWriteBackend(writes);
@@ -416,6 +456,8 @@ private slots:
     void refusesAnExpiredPassword();
     void refusesAPasswordThatMustChange();
     void allowsAnAgedPasswordThatNeverExpires();
+    void interactiveAndServiceLogonClasses_data();
+    void interactiveAndServiceLogonClasses();
     void passwordSet2WritesTheMachineHash();
     void rejectsAChannelCredentialFromTheWrongPassword();
     void dcLocatorNamesThisDc();
@@ -940,6 +982,71 @@ void NetlogonTest::allowsAnAgedPasswordThatNeverExpires()
     QCOMPARE(readLe32(reply, 0), quint32(0x0002f210u));
     QCOMPARE(readLe32(reply, int(reply.size()) - 4), quint32(0));
     QVERIFY(logon.wroteBack);
+}
+
+// The interactive (1) and service (3) classes send netr_PasswordInfo: the
+// password's own NT one-way function instead of a challenge and its response.
+// It is compared to the stored hash, so a wrong one is a wrong password rather
+// than a malformed request, and the workstation the class names is the one the
+// account's restriction is checked against.
+void NetlogonTest::interactiveAndServiceLogonClasses_data()
+{
+    QTest::addColumn<quint16>("logonLevel");
+    QTest::addColumn<bool>("correctPassword");
+    QTest::newRow("interactive") << quint16(1) << true;
+    QTest::newRow("service") << quint16(3) << true;
+    QTest::newRow("interactive-wrong-hash") << quint16(1) << false;
+}
+
+void NetlogonTest::interactiveAndServiceLogonClasses()
+{
+    QFETCH(quint16, logonLevel);
+    QFETCH(bool, correctPassword);
+
+    WorkstationLogon logon;
+    prepareWorkstationLogon(&logon, QStringLiteral("WS1,WS2"));
+    QVERIFY(logon.channel.ok);
+
+    const quint32 timestamp = 61;
+    const QByteArray credential = nextCredential(logon.channel.seed, timestamp,
+                                                 logon.channel.sessionKey, logon.channel.flags, false);
+    QByteArray owf = logon.userHash;
+    if (!correctPassword)
+        owf[0] = char(quint8(owf.at(0)) ^ 0x5a);
+
+    QByteArray request;
+    appendLe32(request, 0); // NULL LogonServer pointer
+    appendPointerString(request, QStringLiteral("DC1"), 0x00021000u); // ComputerName
+    appendLe32(request, 0x00021001u); // Authenticator pointer
+    request.append(authenticatorRequest(credential, timestamp));
+    appendLe32(request, 0x00021002u); // ReturnAuthenticator pointer
+    request.append(QByteArray(12, '\0'));
+    appendLe16(request, logonLevel); // LogonLevel: the class, not the validation
+    appendLe16(request, logonLevel); // NETLOGON_LEVEL's NDR32 union discriminator
+    appendLe32(request, 0x00021003u); // LogonInteractive/Service referent
+    appendPasswordLogon(request, 3, owf, QStringLiteral("WS1"));
+
+    const QByteArray reply = logon.server.handleCall(Netlogon::OpLogonSamLogon, request);
+    if (!correctPassword) {
+        QCOMPARE(reply.size(), 4);
+        QCOMPARE(readLe32(reply, 0), quint32(0xc000006au)); // STATUS_WRONG_PASSWORD
+        // A refused password is a counted failure, but not a logon.
+        QCOMPARE(logon.writtenAttributes.value(QStringLiteral("badPwdCount")), QStringLiteral("1"));
+        QVERIFY(!logon.writtenAttributes.contains(QStringLiteral("logonCount")));
+        return;
+    }
+
+    QVERIFY2(reply.size() > 24, qPrintable(QStringLiteral("SamLogon returned %1 bytes: %2")
+                                               .arg(reply.size())
+                                               .arg(readLe32(reply, 0), 8, 16, QLatin1Char('0'))));
+    QCOMPARE(readLe32(reply, 0), quint32(0x0002f210u));
+    QCOMPARE(readLe32(reply, 12), timestamp);
+    QCOMPARE(readLe16(reply, 16), quint16(3)); // the validation level asked for
+    QCOMPARE(readLe32(reply, int(reply.size()) - 4), quint32(0));
+    QVERIFY(reply.contains(Ndr::utf16le(QStringLiteral("alice"))));
+    // A validated password logon is recorded on the account like a network one.
+    QCOMPARE(logon.writtenDn, QStringLiteral("CN=alice,CN=Users,DC=corp,DC=example,DC=com"));
+    QCOMPARE(logon.writtenAttributes.value(QStringLiteral("logonCount")), QStringLiteral("1"));
 }
 
 void NetlogonTest::secureChannelNegotiatesCrypto()
