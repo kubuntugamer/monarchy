@@ -42,3 +42,27 @@ jobs:
 
       - name: Build and test
         run: scripts/ci.sh --conformance
+
+  # MONARCHY_WITH_LDAP=ON changes which sources are compiled, and no job passed
+  # the flag, so a change that only broke that configuration looked green. It
+  # needs the Qt install for the same reason the job above does: it runs the
+  # same suites, not a subset.
+  openldap-backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build openssl libgl1 libldap2-dev
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.*'
+          cache: true
+
+      - name: Build and test against OpenLDAP
+        run: scripts/ci.sh --with-ldap
