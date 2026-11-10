@@ -127,7 +127,9 @@ bool readIntField(const QByteArray &d, int &pos, int expectedTag, int *value) {
     int tag = 0;
     const int start = pos;
     const QByteArray v = readTLV(d, pos, tag);
-    if (tag != expectedTag || pos <= start) return false;
+    // A field this reader cannot represent is an error, not a guess: anything
+    // wider than four bytes would wrap silently in decodeInt's quint32.
+    if (tag != expectedTag || pos <= start || v.size() > 4) return false;
     *value = decodeInt(v);
     return true;
 }

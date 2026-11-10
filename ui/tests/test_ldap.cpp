@@ -92,6 +92,7 @@ private slots:
     void anonymousSearchesOnlyTheRootDse();
     void simpleBindRecordsTheConnectionIdentity();
     void searchMissingRequiredFieldsIsProtocolError();
+    void searchOversizeIntegerIsProtocolError();
 };
 
 // The password policy is the domain object's: minPwdLength, pwdHistoryLength and
@@ -607,6 +608,34 @@ void LdapTest::searchMissingRequiredFieldsIsProtocolError()
 
     QByteArray inner = tlv(0x04, QByteArray()); // root DSE
     inner += tlv(char(0x0a), QByteArray(1, char(0))); // scope: baseObject
+    inner += tlv(char(0x87), QByteArray("objectClass")); // present filter
+    inner += tlv(char(0x30), QByteArray());
+    client.write(ldapMessage(1, char(0x63), inner));
+
+    const QByteArray reply = reader.next();
+    QVERIFY(!reply.isEmpty());
+    QCOMPARE(operationTag(reply), 0x65); // searchResDone
+    QCOMPARE(resultCode(reply), 2); // protocolError
+}
+
+// Every field present and correctly ordered, but sizeLimit is five bytes: wider
+// than the four decodeInt can hold, so it would otherwise truncate silently.
+void LdapTest::searchOversizeIntegerIsProtocolError()
+{
+    LdapServer server;
+    QVERIFY(server.listen(0));
+
+    QTcpSocket client;
+    client.connectToHost(QHostAddress::LocalHost, server.serverPort());
+    QVERIFY(client.waitForConnected(3000));
+    Reader reader(&client);
+
+    QByteArray inner = tlv(0x04, QByteArray()); // root DSE
+    inner += tlv(char(0x0a), QByteArray(1, char(0))); // scope: baseObject
+    inner += tlv(char(0x0a), QByteArray(1, char(0))); // derefAliases: never
+    inner += tlv(char(0x02), QByteArray(5, char(0x7f))); // sizeLimit: 5 bytes
+    inner += tlv(char(0x02), QByteArray(1, char(0))); // timeLimit
+    inner += tlv(char(0x01), QByteArray(1, char(0))); // typesOnly
     inner += tlv(char(0x87), QByteArray("objectClass")); // present filter
     inner += tlv(char(0x30), QByteArray());
     client.write(ldapMessage(1, char(0x63), inner));
