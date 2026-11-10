@@ -20,6 +20,7 @@ class ConsoleView;
 class AdminService;
 class ConnectionService;
 class DirectoryService;
+struct ConnectionProfile;
 
 class MainWindow : public QMainWindow
 {
@@ -27,6 +28,9 @@ class MainWindow : public QMainWindow
 
 public:
     explicit MainWindow(QWidget *parent = nullptr);
+    // A harness — or any caller that already resolved where to connect — can
+    // hand the console its profile instead of having it read the saved one.
+    explicit MainWindow(const ConnectionProfile &profile, QWidget *parent = nullptr);
     ~MainWindow() override;
 
 protected:
@@ -75,7 +79,8 @@ private:
     void createMenus();
     void createToolbar();
     void createStatusBar();
-    void createCentralWidget();
+    void createCentralWidget(const ConnectionProfile *startupProfile);
+    void initialize(const ConnectionProfile *startupProfile);
     // Naming context of the directory the console is connected to.
     QString namingContext() const;
     QString connectedDnsZone() const;

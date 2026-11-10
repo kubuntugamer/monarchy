@@ -99,6 +99,17 @@ DomainDefaults domainDefaults()
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
 {
+    initialize(nullptr);
+}
+
+MainWindow::MainWindow(const ConnectionProfile &profile, QWidget *parent)
+    : QMainWindow(parent)
+{
+    initialize(&profile);
+}
+
+void MainWindow::initialize(const ConnectionProfile *startupProfile)
+{
     setWindowTitle(tr("Monarchy Management Console"));
     setWindowIcon(objectIcon(ObjectKind::Domain));
     setMinimumSize(800, 600);
@@ -107,7 +118,7 @@ MainWindow::MainWindow(QWidget *parent)
     createMenus();
     createToolbar();
     createStatusBar();
-    createCentralWidget();
+    createCentralWidget(startupProfile);
     loadSettings();
     applyAutoRefreshSettings();
 
@@ -605,7 +616,7 @@ void MainWindow::createStatusBar()
     m_statusBar->addPermanentWidget(m_statusCountLabel);
 }
 
-void MainWindow::createCentralWidget()
+void MainWindow::createCentralWidget(const ConnectionProfile *startupProfile)
 {
     m_consoleView = new ConsoleView(this);
     setCentralWidget(m_consoleView);
@@ -620,16 +631,21 @@ void MainWindow::createCentralWidget()
     m_consoleView->setDirectoryService(m_directoryService);
     m_consoleView->setAdminService(m_adminService);
 
-    // Auto-connect using the saved profile, which defaults to the domain
-    // provisioned on this machine (talks real LDAP to the local DC).
-    const DomainDefaults domain = domainDefaults();
+    // Auto-connect. A profile handed in by a caller wins; otherwise the saved
+    // one applies, defaulting to the domain provisioned on this machine (real
+    // LDAP to the local DC).
     ConnectionProfile profile;
-    profile.server = QSettings().value(QStringLiteral("connection/server"), QStringLiteral("localhost")).toString();
-    profile.port = QSettings().value(QStringLiteral("connection/port"), domain.ldapPort).toInt();
-    profile.baseDn = QSettings().value(QStringLiteral("connection/baseDn"), domain.baseDn).toString();
-    profile.bindDn = QSettings().value(QStringLiteral("connection/bindDn"), QString()).toString();
-    profile.useKerberos = QSettings().value(QStringLiteral("connection/kerberos"), false).toBool();
-    profile.useTls = QSettings().value(QStringLiteral("connection/tls"), false).toBool();
+    if (startupProfile) {
+        profile = *startupProfile;
+    } else {
+        const DomainDefaults domain = domainDefaults();
+        profile.server = QSettings().value(QStringLiteral("connection/server"), QStringLiteral("localhost")).toString();
+        profile.port = QSettings().value(QStringLiteral("connection/port"), domain.ldapPort).toInt();
+        profile.baseDn = QSettings().value(QStringLiteral("connection/baseDn"), domain.baseDn).toString();
+        profile.bindDn = QSettings().value(QStringLiteral("connection/bindDn"), QString()).toString();
+        profile.useKerberos = QSettings().value(QStringLiteral("connection/kerberos"), false).toBool();
+        profile.useTls = QSettings().value(QStringLiteral("connection/tls"), false).toBool();
+    }
     m_connectionService->connect(profile);
 
     connect(m_connectionService, &ConnectionService::error, this, [this](const QString &message) {
@@ -1426,6 +1442,9 @@ void MainWindow::onAuthorizationRequired()
     m_credentialsPromptOpen = true;
 
     QDialog dialog(this);
+    // Names so a harness can find the prompt and its fields without matching
+    // labels; they are also what the UI tests drive.
+    dialog.setObjectName(QStringLiteral("credentialPrompt"));
     dialog.setWindowTitle(tr("Sign in to the Directory"));
     auto *layout = new QVBoxLayout(&dialog);
 
@@ -1439,6 +1458,7 @@ void MainWindow::onAuthorizationRequired()
 
     auto *form = new QFormLayout;
     QLineEdit *bindDnEdit = new QLineEdit(&dialog);
+    bindDnEdit->setObjectName(QStringLiteral("credentialBindDn"));
     const QString boundDn = m_connectionService->bindDn();
     bindDnEdit->setText(boundDn.isEmpty()
                             ? QStringLiteral("CN=Administrator,CN=Users,%1").arg(namingContext())
@@ -1446,6 +1466,7 @@ void MainWindow::onAuthorizationRequired()
     form->addRow(tr("Bind DN:"), bindDnEdit);
 
     QLineEdit *passwordEdit = new QLineEdit(&dialog);
+    passwordEdit->setObjectName(QStringLiteral("credentialPassword"));
     passwordEdit->setEchoMode(QLineEdit::Password);
     form->addRow(tr("Password:"), passwordEdit);
     layout->addLayout(form);

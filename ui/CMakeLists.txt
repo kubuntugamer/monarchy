@@ -203,6 +203,27 @@ if(BUILD_TESTING)
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
     )
 
+    # The console window itself. mainwindow.cpp is part of the shipped
+    # executable rather than the core library, so the harness compiles it again
+    # and drives the window through the constructor that takes a connection
+    # profile — no saved settings, no developer's DC.
+    add_executable(monarchy-mainwindow-tests
+        tests/test_mainwindow.cpp
+        src/mainwindow.h
+        src/mainwindow.cpp
+    )
+
+    target_link_libraries(monarchy-mainwindow-tests PRIVATE
+        monarchy-ui-core
+        monarchy-test-fixtures
+        Qt6::Test
+    )
+
+    add_test(NAME monarchy-mainwindow-tests COMMAND monarchy-mainwindow-tests)
+    set_tests_properties(monarchy-mainwindow-tests PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+    )
+
     add_executable(monarchy-dns-tests
         tests/test_dns.cpp
     )
