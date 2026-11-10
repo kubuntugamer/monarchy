@@ -34,11 +34,14 @@ endpoint mapper (135) and SMB (445) stay native under `--dev-ports`.
 | Endpoint mapper (C706) | 135 / 135 (loopback) | `monarchy-epm-tests` | **impacket** `hept_lookup` / `hept_map`, C706 appendix L towers | `hept_lookup` returns a port that accepts a connection |
 | SMB2 + named pipes | 445 / 445 | `monarchy-smb-tests` | **impacket** over `ncacn_np` (live only) | binary walk of `\pipe\samr`, `\\dc\SYSVOL` |
 | SMB1 (NT LM 0.12) | 445 / 445 | `monarchy-smb1-tests` | **Samba** `smbclient -m NT1` (live only) | fetch `GPT.INI` byte for byte, anonymous refused |
+| The endpoint set as a whole | every port `dc.conf` declares | `monarchy-dcservice-tests` | a TCP connection to each declared port, made by the kernel | `scripts/check-dc-health.sh` |
 | RPC auth (NTLMSSP + SPNEGO + Kerberos) | all RPC | `monarchy-samr-tests`, `monarchy-kerberos-tests` | **impacket** and **Samba** with credentials | every conformance script binds at `PKT_PRIVACY` |
 
 `scripts/ci.sh --conformance` is the row-for-row proof of the RPC half: it
 provisions a throwaway domain, starts the daemon on free ports, and drives DRSR,
-LSAD, SAMR and Netlogon with impacket's own NDR. CI runs it on every push.
+LSAD, SAMR and Netlogon with impacket's own NDR. CI runs it on every push, and a second job builds the tree with
+`MONARCHY_WITH_LDAP=ON` so the OpenLDAP configuration is compiled and its suites
+run rather than assumed to work.
 
 ## 2. What to run when you touch this
 
@@ -60,7 +63,7 @@ when you want the narrow loop first.
 | `DnsServer.cpp` | `monarchy-dns-tests` | `scripts/check-dc-health.sh` |
 | `Smb1.cpp`, `Smb2.cpp` | `monarchy-smb-tests` `monarchy-smb1-tests` | `smbclient -m NT1` |
 | `Provisioner.cpp` | `monarchy-provision-tests` | **full** `ci.sh --conformance`: it seeds the tree every other suite starts from |
-| `DcService.cpp` | full `ci.sh --conformance` | `check-dc-health.sh` — port composition has no suite (gap G3) |
+| `DcService.cpp` | `monarchy-dcservice-tests`, full `ci.sh --conformance` | `check-dc-health.sh` |
 | `ui/src/mainwindow.cpp`, `mainwindow.h` | `monarchy-mainwindow-tests` `monarchy-ui-tests` `monarchy-backend-tests` | full `ci.sh` — it is what listens on every port |
 | `CMakeLists.txt`, `ui/CMakeLists.txt` | — | `ci.sh --with-ldap` as well |
 
@@ -93,13 +96,9 @@ DC believes it started.
 These are places where a change can pass everything and still be wrong. They are
 recorded, not hidden:
 
-- **G1 — no sanitizer build.** No configuration in the tree enables ASan or
-  UBSan, and these parsers read attacker-controlled DCE/RPC. Tracked on #7.
-- **G2 — `MONARCHY_WITH_LDAP=ON` is never built in CI.** `scripts/ci.sh
-  --with-ldap` exists and nothing passes it. Tracked on #7.
-- **G3 — port composition is untested.** Nothing asserts that the daemon binds
-  every port it advertises; `check-dc-health.sh` does it only against a live
-  install, so CI cannot see it.
+- **G1 — no sanitizer build in CI.** No configuration in the tree enables ASan
+  or UBSan, and these parsers read attacker-controlled DCE/RPC. A local build
+  with the flags finds real defects (#8–#10), which is the argument for a job.
 - **G4 — SMB has no independent client in CI.** The suites are self-contained;
   `smbclient` and impacket over `ncacn_np` are live-only, so a byte that only
   this tree's SMB encoder accepts would pass.
@@ -110,6 +109,17 @@ recorded, not hidden:
   development convenience on one box, not a stage in `ci.sh`.
 - **G7 — `check-dc-health.sh` needs an install,** so CI runs the suites and the
   conformance scripts but never the health check.
+
+Two of the original seven are closed; their entries stay here so a reference in
+#7 still resolves:
+
+- **G2 — closed.** `MONARCHY_WITH_LDAP=ON` is the `openldap-backend` CI job,
+  which installs `libldap2-dev` and runs `scripts/ci.sh --with-ldap`; the
+  configure check now names the package instead of a library that is present.
+- **G3 — closed.** `monarchy-dcservice-tests` provisions a domain, moves only the
+  ports another process already holds, and asserts that a TCP connection to every
+  port `dc.conf` still declares is accepted. A port the daemon cannot take must
+  be reported, so a locator is never derived from a listener that failed.
 
 ## 5. Parity between two working copies
 
