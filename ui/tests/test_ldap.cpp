@@ -30,6 +30,16 @@ int pagedTotal(const QByteArray &value)
     return total;
 }
 
+// A search with an explicit scope; the header's searchRequest() is subtree only.
+QByteArray scopedSearch(int id, const QByteArray &base, int scope)
+{
+    QByteArray inner = tlv(0x04, base);
+    inner += tlv(char(0x0a), QByteArray(1, char(scope)));
+    inner += tlv(char(0x87), QByteArray("objectClass")); // present filter
+    inner += tlv(char(0x30), QByteArray());
+    return ldapMessage(id, char(0x63), inner);
+}
+
 } // namespace
 
 class LdapTest : public QObject
@@ -43,6 +53,7 @@ private slots:
     void refusesUnknownCriticalControl();
     void ignoresUnknownOptionalControl();
     void rejectsCookieItDidNotIssue();
+    void searchOnMissingBaseIsNoSuchObject();
 };
 
 // The password policy is the domain object's: minPwdLength, pwdHistoryLength and
@@ -322,6 +333,123 @@ void LdapTest::rejectsCookieItDidNotIssue()
     QVERIFY(!message.isEmpty());
     QCOMPARE(operationTag(message), 0x65);
     QCOMPARE(resultCode(message), 53); // unwillingToPerform
+}
+
+// RFC 4511 §4.5.1: a search whose base names no entry is noSuchObject, not an
+// empty success. Search was the only operation that skipped that check, so a
+// client validating a DN (a referral chase, a FSMO owner, a replication target)
+// was told the object exists and is empty.
+void LdapTest::searchOnMissingBaseIsNoSuchObject()
+{
+    const QString domainDn = QStringLiteral("DC=corp,DC=example,DC=com");
+    const QString usersDn = QStringLiteral("CN=Users,%1").arg(domainDn);
+    const QString emptyDn = QStringLiteral("OU=Empty,%1").arg(domainDn);
+
+    DirectoryObject domain;
+    domain.id = domainDn;
+    domain.name = QStringLiteral("CORP");
+    domain.type = QStringLiteral("domainDNS");
+    domain.kind = ObjectKind::Domain;
+
+    DirectoryObject users;
+    users.id = usersDn;
+    users.name = QStringLiteral("Users");
+    users.type = QStringLiteral("container");
+    users.kind = ObjectKind::Container;
+
+    DirectoryObject alice;
+    alice.id = QStringLiteral("CN=alice,%1").arg(usersDn);
+    alice.name = QStringLiteral("alice");
+    alice.type = QStringLiteral("User");
+    alice.kind = ObjectKind::User;
+
+    // Exists, has no children: the case that must stay an empty success.
+    DirectoryObject empty;
+    empty.id = emptyDn;
+    empty.name = QStringLiteral("Empty");
+    empty.type = QStringLiteral("organizationalUnit");
+    empty.kind = ObjectKind::Container;
+
+    LdapServer server;
+    server.setObjects({domain, users, alice, empty});
+    QVERIFY(server.listen(0));
+
+    QTcpSocket client;
+    client.connectToHost(QHostAddress::LocalHost, server.serverPort());
+    QVERIFY(client.waitForConnected(3000));
+    Reader reader(&client);
+
+    const auto search = [&](int id, const QByteArray &base, int scope) {
+        client.write(scopedSearch(id, base, scope));
+        QList<QByteArray> messages;
+        while (true) {
+            const QByteArray message = reader.next();
+            if (message.isEmpty())
+                break;
+            messages.append(message);
+            if (operationTag(message) == 0x65)
+                break;
+        }
+        return messages;
+    };
+
+    // Missing entry inside a naming context the server holds: every scope is
+    // noSuchObject, and no entry precedes the done message.
+    for (int scope = 0; scope <= 2; ++scope) {
+        const QList<QByteArray> reply =
+            search(10 + scope, QStringLiteral("CN=nobody,%1").arg(usersDn).toUtf8(), scope);
+        QCOMPARE(reply.size(), 1);
+        QCOMPARE(operationTag(reply.first()), 0x65);
+        QCOMPARE(resultCode(reply.first()), 32);
+    }
+
+    // A naming context the server does not hold at all.
+    for (int scope = 0; scope <= 2; ++scope) {
+        const QList<QByteArray> reply =
+            search(20 + scope, "DC=nosuchdomain,DC=example,DC=com", scope);
+        QCOMPARE(reply.size(), 1);
+        QCOMPARE(resultCode(reply.first()), 32);
+    }
+
+    // The configuration partition shares the DN suffix, and is checked apart.
+    {
+        const QList<QByteArray> reply = search(
+            30, "CN=nobody,CN=Configuration,DC=corp,DC=example,DC=com", 0);
+        QCOMPARE(reply.size(), 1);
+        QCOMPARE(resultCode(reply.first()), 32);
+    }
+
+    // A subtree search includes its base, so a container with no children answers
+    // one entry — itself — and success. It must not be noSuchObject.
+    {
+        const QList<QByteArray> reply = search(31, emptyDn.toUtf8(), 2);
+        QCOMPARE(reply.size(), 2);
+        QCOMPARE(operationTag(reply.first()), 0x64);
+        QCOMPARE(entryDn(reply.first()), emptyDn);
+        QCOMPARE(resultCode(reply.last()), 0);
+    }
+
+    // An existing base still answers itself and its children.
+    {
+        const QList<QByteArray> reply = search(32, usersDn.toUtf8(), 2);
+        QCOMPARE(reply.size(), 3);
+        QCOMPARE(resultCode(reply.last()), 0);
+        QSet<QString> returned;
+        for (const QByteArray &message : reply) {
+            if (operationTag(message) == 0x64)
+                returned.insert(entryDn(message));
+        }
+        QVERIFY((returned == QSet<QString>{usersDn, alice.id}));
+    }
+
+    // The root DSE is synthesized rather than stored, so the empty base is never
+    // missing and stays answerable, as RFC 4512 requires.
+    {
+        const QList<QByteArray> reply = search(33, QByteArray(), 0);
+        QCOMPARE(reply.size(), 2);
+        QCOMPARE(operationTag(reply.first()), 0x64);
+        QCOMPARE(resultCode(reply.last()), 0);
+    }
 }
 
 QTEST_MAIN(LdapTest)

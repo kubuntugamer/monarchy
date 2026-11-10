@@ -2202,6 +2202,41 @@ QByteArray LdapServer::handleSearch(ClientState *st, int msgId, const QByteArray
 
     emit requestReceived(QStringLiteral("Search: %1").arg(base));
 
+    // RFC 4511 §4.5.1: a base that names no entry is noSuchObject, not an empty
+    // success. Without this, "you may not see it", "it is not there" and "it has
+    // no children" are all the same answer, and a client validating a DN — a
+    // referral chase, a FSMO owner, a replication target — is told yes when the
+    // answer is no. Modify, modifyDN and compare already answer 32 for a missing
+    // target; search was the only operation that did not.
+    //
+    // The empty base is the root DSE, which is synthesized rather than stored, so
+    // it is never missing. The comparison is trimmed and case-insensitive
+    // because that is how inScope() below matches it: a client that varies the
+    // case or pads a valid DN must still find the entry.
+    const QString searchBase = base.trimmed();
+    if (!searchBase.isEmpty()) {
+        const QString lowerBase = searchBase.toLower();
+        const QString childSuffix = QLatin1Char(',') + lowerBase;
+        bool baseExists = false;
+        for (const DirectoryObject &o : m_objects) {
+            if (o.id.isEmpty())
+                continue;
+            const QString dn = o.id.toLower();
+            // The entry itself, or an entry under it. A store can carry objects
+            // beneath a naming context without materialising the context root
+            // (the sample store does); inScope() already treats such a base as
+            // the root of the subtree it serves, so refusing it here would turn
+            // every search in that store into noSuchObject. A base with neither
+            // an entry nor a descendant is genuinely absent.
+            if (dn == lowerBase || dn.endsWith(childSuffix)) {
+                baseExists = true;
+                break;
+            }
+        }
+        if (!baseExists)
+            return makeSearchDone(msgId, 32); // noSuchObject
+    }
+
     QList<DirectoryObject> matches;
     for (const DirectoryObject &o : m_objects) {
         if (!inScope(o, base, scope)) continue;
