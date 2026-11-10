@@ -263,7 +263,8 @@ private:
     // connection anonymous after StartTLS, so nothing that authenticated or was
     // wrapped before the upgrade may survive it.
     void resetSecurityContext(ClientState *st);
-    void processMessage(ClientState *st, const QByteArray &msg);
+    // Returns false when the message closed the connection and freed `st`.
+    bool processMessage(ClientState *st, const QByteArray &msg);
     QByteArray handleBind(ClientState *st, int msgId, const QByteArray &payload);
     QByteArray handleSaslBind(ClientState *st, int msgId, const QByteArray &payload);
     QByteArray handleGssapiBind(ClientState *st, int msgId, const QByteArray &credentials,

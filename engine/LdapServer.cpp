@@ -1459,7 +1459,11 @@ void LdapServer::pump(ClientState *st, QSslSocket *sock) {
         if (st->buffer.size() < total) break;
         QByteArray msg = st->buffer.left(total);
         st->buffer.remove(0, total);
-        processMessage(st, msg);
+        // An UnbindRequest disconnects synchronously, which frees `st` from
+        // onDisconnected(); nothing may read it after that. processMessage()
+        // reports the close so the loop stops on a state that still exists.
+        if (!processMessage(st, msg))
+            return;
     }
 }
 
@@ -1478,10 +1482,12 @@ void LdapServer::onDisconnected() {
     sock->deleteLater();
 }
 
-void LdapServer::processMessage(ClientState *st, const QByteArray &msg) {
+// Returns false when the message closed the connection: `st` is freed by
+// onDisconnected() during the call and must not be touched again.
+bool LdapServer::processMessage(ClientState *st, const QByteArray &msg) {
     int pos = 0;
     int tag = readTag(msg, pos);
-    if (tag != 0x30) return;
+    if (tag != 0x30) return true;
     int len = readLength(msg, pos);
     Q_UNUSED(len)
     int msgId = readInt(msg, pos);
@@ -1507,7 +1513,7 @@ void LdapServer::processMessage(ClientState *st, const QByteArray &msg) {
                                      .arg(control.oid));
             if (st->socket)
                 st->socket->write(makeLdapResult(msgId, responseTag, 12));
-            return;
+            return true;
         }
     }
 
@@ -1526,7 +1532,7 @@ void LdapServer::processMessage(ClientState *st, const QByteArray &msg) {
             else
                 st->socket->write(denied);
         }
-        return;
+        return true;
     }
 
     // Captured up front: a request can make the connection go away, and with it
@@ -1555,8 +1561,10 @@ void LdapServer::processMessage(ClientState *st, const QByteArray &msg) {
         // no response
         response.clear();
     } else if (opTag == 0x42) { // UnbindRequest
+        // The close is synchronous here: onDisconnected() deletes `st` before
+        // this returns, so the caller must stop instead of re-reading it.
         socket->disconnectFromHost();
-        response.clear();
+        return false;
     } else {
         response = makeLdapResult(msgId, 0x65, 2); // protocolError via search done-ish; fallback
     }
@@ -1581,6 +1589,7 @@ void LdapServer::processMessage(ClientState *st, const QByteArray &msg) {
         socket->flush();
         socket->startServerEncryption();
     }
+    return true;
 }
 
 QByteArray LdapServer::handleBind(ClientState *st, int msgId, const QByteArray &payload) {
