@@ -248,6 +248,32 @@ inline int resultCode(const QByteArray &message)
     return (unsigned char)rc.at(0);
 }
 
+// Message id of a reply, so a test can prove the server echoed the id it was
+// given. Accumulated as unsigned for the same reason the server does: an id of
+// 0xFFFFFFFF is legal on the wire, and shifting a signed int into the sign bit
+// is undefined, so a signed accumulator here would fault the test rather than
+// the code it is checking.
+inline int messageId(const QByteArray &message)
+{
+    int pos = 0, tag = -1;
+    QByteArray body;
+    if (!nextElement(message, &pos, &tag, &body) || tag != 0x30)
+        return -1;
+    int innerPos = 0, idTag = -1;
+    QByteArray id;
+    if (!nextElement(body, &innerPos, &idTag, &id) || idTag != 0x02 || id.isEmpty())
+        return -1;
+    quint32 value = 0;
+    for (char c : id)
+        value = (value << 8) | (unsigned char)c;
+    // BER INTEGERs are signed and minimally encoded, so -1 arrives as a single
+    // 0xFF; without this it would read back as 255 and the comparison below
+    // would pass for the wrong reason.
+    if ((id.at(0) & 0x80) && id.size() < int(sizeof(int)))
+        value |= ~quint32(0) << (8 * id.size());
+    return int(value);
+}
+
 // Distinguished name carried by a SearchResultEntry, or an empty string.
 inline QString entryDn(const QByteArray &message)
 {

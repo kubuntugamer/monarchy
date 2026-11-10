@@ -93,6 +93,7 @@ private slots:
     void simpleBindRecordsTheConnectionIdentity();
     void searchMissingRequiredFieldsIsProtocolError();
     void searchOversizeIntegerIsProtocolError();
+    void messageIdWithTheTopBitSetIsEchoed();
 };
 
 // The password policy is the domain object's: minPwdLength, pwdHistoryLength and
@@ -644,6 +645,36 @@ void LdapTest::searchOversizeIntegerIsProtocolError()
     QVERIFY(!reply.isEmpty());
     QCOMPARE(operationTag(reply), 0x65); // searchResDone
     QCOMPARE(resultCode(reply), 2); // protocolError
+}
+
+// The id is a client-supplied INTEGER that can carry the top bit set, and every
+// suite sent a small one, so the path that accumulates into the sign bit was
+// never walked. The reply must carry the same four bytes back.
+void LdapTest::messageIdWithTheTopBitSetIsEchoed()
+{
+    LdapServer server;
+    QVERIFY(server.listen(0));
+
+    QTcpSocket client;
+    client.connectToHost(QHostAddress::LocalHost, server.serverPort());
+    QVERIFY(client.waitForConnected(3000));
+    Reader reader(&client);
+
+    QByteArray inner = tlv(0x04, QByteArray()); // root DSE
+    inner += tlv(char(0x0a), QByteArray(1, char(0))); // scope: baseObject
+    inner += tlv(char(0x0a), QByteArray(1, char(0))); // derefAliases: never
+    inner += tlv(0x02, QByteArray(1, char(0))); // sizeLimit
+    inner += tlv(0x02, QByteArray(1, char(0))); // timeLimit
+    inner += tlv(char(0x01), QByteArray(1, char(0))); // typesOnly
+    inner += tlv(char(0x87), QByteArray("objectClass")); // present filter
+    inner += tlv(char(0x30), QByteArray()); // no attributes requested
+    const int id = -1; // encodes as 0xFFFFFFFF
+    client.write(ldapMessage(id, char(0x63), inner));
+
+    const QByteArray reply = reader.next();
+    QVERIFY(!reply.isEmpty());
+    QCOMPARE(messageId(reply), id);
+    QCOMPARE(operationTag(reply), 0x65); // searchResDone, not a refusal
 }
 
 QTEST_MAIN(LdapTest)
