@@ -901,7 +901,33 @@ ProvisionResult provisionDomain(const ProvisionConfig &config)
         conf.setValue(QStringLiteral("tlsCertPath"), result.tlsCertPath);
         conf.setValue(QStringLiteral("tlsKeyPath"), result.tlsKeyPath);
     }
+
+    // Replication partner configuration. A single-DC domain has no partner, so
+    // the address stays empty and no pull arms until an administrator adds one
+    // with DsReplicaAdd (or sets replicaHost by hand). The credential fields are
+    // written anyway so the running DC exercises the same path a multi-DC domain
+    // uses, and so the secrets file is the single place the replica password
+    // lives (not dc.conf, which is world-readable in some layouts).
+    conf.setValue(QStringLiteral("replicaNamingContext"), b.baseDn);
+    conf.setValue(QStringLiteral("replicaDomain"), b.netbios);
+    conf.setValue(QStringLiteral("replicaUser"), QStringLiteral("Administrator"));
+    conf.setValue(QStringLiteral("replicaHost"), QString());
+    conf.setValue(QStringLiteral("replicaPort"), 0);
+    conf.setValue(QStringLiteral("replicaIntervalSeconds"), 300);
     conf.sync();
+
+    // The replica password lives in the secrets file, not dc.conf.
+    secrets[QStringLiteral("replicaPassword")] = config.adminPassword;
+    if (!writeFile(result.secretsPath,
+                   QJsonDocument(secrets).toJson(QJsonDocument::Indented), &error)) {
+        result.error = error;
+        return result;
+    }
+    if (!QFile::setPermissions(result.secretsPath,
+                               QFileDevice::ReadOwner | QFileDevice::WriteOwner)) {
+        result.error = QStringLiteral("cannot restrict permissions on %1").arg(result.secretsPath);
+        return result;
+    }
     if (conf.status() != QSettings::NoError) {
         result.error = QStringLiteral("cannot write %1").arg(result.configPath);
         return result;

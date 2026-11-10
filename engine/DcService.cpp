@@ -630,6 +630,15 @@ bool DcService::start(const QString &dcDir)
     m_replicaTimer->setSingleShot(true);
     connect(m_replicaTimer, &QTimer::timeout, this, &DcService::runReplicaCycle);
 
+    // When dc.conf names no partner, the agent stays idle (empty source) and
+    // no timer is armed. Report that so the administrator can tell the difference
+    // between "no partner yet" and "a partner was removed".
+    if (m_replicationAgent->source().isEmpty()) {
+        emit statusMessage(
+            tr("No replication partner configured; add one with DsReplicaAdd or set "
+               "replicaHost in dc.conf."));
+    }
+
     // A DRS address is a bare host, host:port, or an ncacn_ip_tcp binding; the
     // agent needs the host and the port separately.
     const auto parseAddress = [](const QString &address, QString *host, quint16 *port) {
