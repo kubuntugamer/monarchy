@@ -247,8 +247,10 @@ cmake "${configure_args[@]}"
 printf '== build (%s jobs)\n' "$jobs"
 cmake --build "$build_dir" --parallel "$jobs"
 
-printf '== test\n'
-ctest --test-dir "$build_dir" --output-on-failure
+# Every suite binds port 0, so they do not compete for a fixed port; the
+# conformance stage below is the exception and stays serial.
+printf '== test (%s jobs)\n' "$jobs"
+ctest --test-dir "$build_dir" --parallel "$jobs" --output-on-failure
 
 if ((conformance)); then
     run_conformance
