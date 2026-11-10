@@ -2633,6 +2633,12 @@ QByteArray LdapServer::makeSearchEntry(int msgId, const DirectoryObject &o) {
         if (isSecretAttribute(key))
             continue;
         QStringList values = it.value().split(QStringLiteral("; "), Qt::SkipEmptyParts);
+        // The rootDSE is a cached object rebuilt only on a write, so the time
+        // stamped into it at startup would go stale. RFC 4512 expects
+        // currentTime to be the server's clock at the moment of the query, so
+        // the rootDSE answers with the time now rather than when it was built.
+        if (o.id.isEmpty() && key == QLatin1String("currenttime"))
+            values = {QDateTime::currentDateTimeUtc().toString(Qt::ISODate)};
         if (key == QLatin1String("cn") && it.value().isEmpty())
             values = {o.name};
         addAttr(it.key(), values);
