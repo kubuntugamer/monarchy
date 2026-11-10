@@ -283,7 +283,12 @@ configure_and_build() {
     fi
 
     log "Building with $JOBS jobs"
-    cmake --build "$BUILD_DIR" --parallel "$JOBS"
+    # Build only the shipped targets. CMake still builds every target in
+    # the default "all" even when tests are skipped, so a broken test
+    # target (for example monarchy-kpasswd-tests when libkrb5-dev is
+    # absent) would fail the whole install. Building the three shipped
+    # binaries keeps --skip-tests meaningful.
+    cmake --build "$BUILD_DIR" --target monarchy-ui monarchy-dcd monarchy-provision --parallel "$JOBS"
 }
 
 run_tests() {
@@ -618,7 +623,17 @@ EOF
 
     local domain_name="" netbios="" ip="" answer="" password_note=""
     local domain_default=""
-    [[ $REALM_GIVEN -eq 1 ]] && domain_default="$REALM"
+
+    # Prefer an explicit --realm/--domain if given; otherwise start the
+    # guided prompts from the values the operator asked for. The hostname
+    # is never used to seed the domain or computer name: the wizard asks
+    # for both.
+    if [[ $REALM_GIVEN -eq 1 || $DOMAIN_GIVEN -eq 1 ]]; then
+        domain_default="${DOMAIN:-$REALM}"
+    else
+        domain_default="cyberdyne.lan"
+    fi
+
     while :; do
         domain_name="$(wizard_ask "DNS domain name (domain only, e.g. domainname.lan)" "$domain_default")"
         wizard_valid_fqdn "$domain_name" && break
@@ -644,8 +659,7 @@ EOF
     if [[ -n "$DC_HOST" ]]; then
         host_default="${DC_HOST,,}"
     else
-        host_default="$(detect_host_label)"
-        host_default="${host_default,,}"
+        host_default="minerva"
     fi
     [[ -n "$host_default" ]] || host_default="dc1"
     while :; do
@@ -744,15 +758,18 @@ if [[ $WIZARD -eq 1 ]]; then
     [[ $USER_MODE -eq 0 ]] || die "the promotion wizard cannot be combined with --user"
     [[ $PROVISION -eq 1 ]] || die "the promotion wizard needs provisioning; remove --no-provision"
     run_promotion_wizard
-elif [[ $PROVISION -eq 1 && -z "$ADMINPASS" \
-        && ( $FORCE -eq 1 || ! -f "$DCDIR/dc.conf" ) ]]; then
-    # No default password: ask for one interactively, and fail fast in
-    # unattended runs before spending time on the build.
-    if [[ -t 0 ]]; then
-        prompt_admin_password
-    else
-        die "an Administrator password is required; pass --adminpass or run interactively"
-    fi
+elif [[ $PROVISION -eq 1 && -z "$ADMINPASS" && -t 0 ]]; then
+    # No default password: ask for one interactively. Fail fast in
+    # unattended runs before spending time on the build. This branch is
+    # reached both by the guided non-wizard path (a user who passes
+    # --realm/--domain or nothing, defaulting to MONARCHY.EXAMPLE.COM, but
+    # no --adminpass) and by a re-run that replaces an existing store with
+    # --force. An existing store without --force is left untouched by
+    # provision_domain(), so we still ask here so the guided path always
+    # prompts when the user is interactively setting a domain.
+    prompt_admin_password
+elif [[ $PROVISION -eq 1 && -z "$ADMINPASS" ]]; then
+    die "an Administrator password is required; pass --adminpass or run interactively"
 fi
 
 if [[ $INSTALL_DEPS -eq 1 ]]; then
