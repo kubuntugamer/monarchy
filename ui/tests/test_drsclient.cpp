@@ -12,6 +12,8 @@
 
 #include <QHash>
 #include <QHostAddress>
+
+#include <optional>
 #include <QMutex>
 #include <QMutexLocker>
 #include <QSemaphore>
@@ -154,13 +156,15 @@ QByteArray replicaDelStub(const QByteArray &handle, const QString &ncDn, const Q
     return out;
 }
 
-const DirectoryObject *liveObject(const LdapServer &store, const QString &name)
+// objects() returns a QList by value, so a pointer into it dangles as soon as
+// the range-for ends. Return the object itself; nullopt means absent.
+std::optional<DirectoryObject> liveObject(const LdapServer &store, const QString &name)
 {
     for (const DirectoryObject &object : store.objects()) {
         if (object.name == name)
-            return &object;
+            return object;
     }
-    return nullptr;
+    return std::nullopt;
 }
 
 // The acceptor side, wired the way DcService wires it: the password's NT hash
@@ -562,8 +566,8 @@ private slots:
             ++cycles;
         } while (moreData && cycles < 10);
 
-        const DirectoryObject *aliceOnTarget = liveObject(target, QStringLiteral("alice"));
-        QVERIFY(aliceOnTarget != nullptr);
+        const auto aliceOnTarget = liveObject(target, QStringLiteral("alice"));
+        QVERIFY(aliceOnTarget.has_value());
         QCOMPARE(aliceOnTarget->attributes.value(QStringLiteral("sAMAccountName")),
                  QStringLiteral("alice"));
         QCOMPARE(aliceOnTarget->attributes.value(QStringLiteral("objectGUID")).toLower(),
@@ -578,7 +582,7 @@ private slots:
         QVERIFY2(client.getNCChanges(kBaseDn, 0, &deletion, &deletionUsn, &moreData, &error),
                  qPrintable(error));
         QVERIFY(target.applyReplication(deletion) >= 1);
-        QVERIFY(liveObject(target, QStringLiteral("alice")) == nullptr);
+        QVERIFY(!liveObject(target, QStringLiteral("alice")).has_value());
         QCOMPARE(target.tombstones().size(), 1);
 
         QVERIFY2(client.dsUnbind(&error), qPrintable(error));
@@ -641,7 +645,7 @@ private slots:
         const int first = agent.pullOnce(&error);
         QVERIFY2(first >= 0, qPrintable(error));
         QCOMPARE(first, 2);
-        QVERIFY(liveObject(target, QStringLiteral("alice")) != nullptr);
+        QVERIFY(liveObject(target, QStringLiteral("alice")).has_value());
         QVERIFY(agent.lastUsn() > 0);
 
         // The cursor is the point: a second pull takes nothing new.
@@ -676,7 +680,7 @@ private slots:
 
         QString error;
         QVERIFY2(agent.pullOnce(&error) >= 0, qPrintable(error));
-        QVERIFY(liveObject(target, QStringLiteral("alice")) != nullptr);
+        QVERIFY(liveObject(target, QStringLiteral("alice")).has_value());
 
         QVERIFY(source.removeObject(alice().id));
         shared.set(source.objects() + source.tombstones());
@@ -686,7 +690,7 @@ private slots:
                                 .arg(second)
                                 .arg(agent.lastUsn())
                                 .arg(error)));
-        QVERIFY(liveObject(target, QStringLiteral("alice")) == nullptr);
+        QVERIFY(!liveObject(target, QStringLiteral("alice")).has_value());
         QCOMPARE(target.tombstones().size(), 1);
 
         peer.quit();
@@ -731,13 +735,13 @@ private slots:
 
         QString error;
         QVERIFY2(agent.pullOnce(&error) >= 0, qPrintable(error));
-        QVERIFY(liveObject(target, QStringLiteral("alice")) != nullptr);
+        QVERIFY(liveObject(target, QStringLiteral("alice")).has_value());
 
         // A deletion on the source reaches the second store on the next cycle.
         QVERIFY(source.removeObject(alice().id));
         shared.set(source.objects() + source.tombstones());
         QVERIFY2(agent.pullOnce(&error) >= 1, qPrintable(error));
-        QVERIFY(liveObject(target, QStringLiteral("alice")) == nullptr);
+        QVERIFY(!liveObject(target, QStringLiteral("alice")).has_value());
         QCOMPARE(target.tombstones().size(), 1);
 
         // Retiring the link removes it, and a second delete reports that there

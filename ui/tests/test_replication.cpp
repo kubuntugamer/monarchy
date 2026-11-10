@@ -13,6 +13,8 @@
 
 #include <QTimeZone>
 
+#include <optional>
+
 namespace {
 
 DirectoryObject domainObject()
@@ -41,13 +43,15 @@ QList<DirectoryObject> cycleFrom(const LdapServer &source)
     return source.objects() + source.tombstones();
 }
 
-const DirectoryObject *liveObject(const LdapServer &store, const QString &cn)
+// objects() returns a QList by value, so a pointer into it dangles as soon as
+// the range-for ends. Return the object itself; nullopt means absent.
+std::optional<DirectoryObject> liveObject(const LdapServer &store, const QString &cn)
 {
     for (const DirectoryObject &object : store.objects()) {
         if (object.name == cn)
-            return &object;
+            return object;
     }
-    return nullptr;
+    return std::nullopt;
 }
 
 } // namespace
@@ -68,7 +72,7 @@ private slots:
         target.addObject(domainObject());
 
         QVERIFY(target.applyReplication(cycleFrom(source)) >= 1);
-        QVERIFY(liveObject(target, QStringLiteral("alice")) != nullptr);
+        QVERIFY(liveObject(target, QStringLiteral("alice")).has_value());
         QCOMPARE(liveObject(target, QStringLiteral("alice"))
                      ->attributes.value(QStringLiteral("sAMAccountName")),
                  QStringLiteral("alice"));
@@ -85,12 +89,12 @@ private slots:
         LdapServer target;
         target.addObject(domainObject());
         target.applyReplication(cycleFrom(source));
-        QVERIFY(liveObject(target, QStringLiteral("alice")) != nullptr);
+        QVERIFY(liveObject(target, QStringLiteral("alice")).has_value());
 
         QVERIFY(source.removeObject(alice.id));
         QVERIFY(target.applyReplication(cycleFrom(source)) >= 1);
 
-        QVERIFY(liveObject(target, QStringLiteral("alice")) == nullptr);
+        QVERIFY(!liveObject(target, QStringLiteral("alice")).has_value());
         QCOMPARE(target.tombstones().size(), 1);
         QCOMPARE(target.tombstones().first().attributes.value(QStringLiteral("isDeleted")),
                  QStringLiteral("TRUE"));
@@ -112,7 +116,7 @@ private slots:
 
         target.applyReplication(cycleFrom(source));
         QCOMPARE(target.tombstones().size(), tombstoneCount);
-        QVERIFY(liveObject(target, QStringLiteral("alice")) == nullptr);
+        QVERIFY(!liveObject(target, QStringLiteral("alice")).has_value());
     }
 
     // REPLTIMES (MS-DRSR 5.165): 672 bits, 15 minutes each, counted from Sunday
@@ -188,7 +192,7 @@ private slots:
         // deletion; it must not bring the account back.
         const int applied = target.applyReplication(QList<DirectoryObject>{alice});
         QCOMPARE(applied, 0);
-        QVERIFY(liveObject(target, QStringLiteral("alice")) == nullptr);
+        QVERIFY(!liveObject(target, QStringLiteral("alice")).has_value());
     }
 };
 
