@@ -233,6 +233,23 @@ if(BUILD_TESTING)
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
     )
 
+    # The daemon's own claim: every port the provisioned dc.conf declares is a
+    # listener. A listener that failed used to be visible only in the daemon's
+    # log, which is how a domain came to advertise locators to a dead port.
+    add_executable(monarchy-dcservice-tests
+        tests/test_dcservice.cpp
+    )
+
+    target_link_libraries(monarchy-dcservice-tests PRIVATE
+        monarchy-ui-core
+        Qt6::Test
+    )
+
+    add_test(NAME monarchy-dcservice-tests COMMAND monarchy-dcservice-tests)
+    set_tests_properties(monarchy-dcservice-tests PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+    )
+
     add_executable(monarchy-dns-tests
         tests/test_dns.cpp
     )
