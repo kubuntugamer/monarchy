@@ -102,8 +102,17 @@ target_compile_definitions(monarchy-ui-core PUBLIC
 )
 
 if(MONARCHY_WITH_LDAP)
-    find_library(LDAP_LIBRARY ldap REQUIRED)
-    find_library(LBER_LIBRARY lber REQUIRED)
+    # The runtime libraries are not enough: ldap.h and lber.h come from the -dev
+    # package, and a bare find_library failure sends a contributor looking for a
+    # library that is already installed.
+    find_library(LDAP_LIBRARY ldap)
+    find_library(LBER_LIBRARY lber)
+    if(NOT LDAP_LIBRARY OR NOT LBER_LIBRARY)
+        message(FATAL_ERROR
+            "MONARCHY_WITH_LDAP=ON needs the OpenLDAP development files, which "
+            "provide ldap.h and lber.h. Install libldap2-dev (Debian/Ubuntu), "
+            "openldap-devel (Fedora) or openldap-dev (Alpine) and configure again.")
+    endif()
     find_library(SASL2_LIBRARY sasl2)
     target_link_libraries(monarchy-ui-core PUBLIC ${LDAP_LIBRARY} ${LBER_LIBRARY})
     if(SASL2_LIBRARY)
