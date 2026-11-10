@@ -916,8 +916,11 @@ ProvisionResult provisionDomain(const ProvisionConfig &config)
     conf.setValue(QStringLiteral("replicaIntervalSeconds"), 300);
     conf.sync();
 
-    // The replica password lives in the secrets file, not dc.conf.
-    secrets[QStringLiteral("replicaPassword")] = config.adminPassword;
+    // No replica credential is written here. This file holds a salted verifier
+    // and the domain SID; the administrator's password is one the DC must never
+    // be able to read back, so a domain that gains a partner gets
+    // `replicaPassword` added by the operator who configures that partner —
+    // which is why DcService warns when it finds the value in dc.conf instead.
     if (!writeFile(result.secretsPath,
                    QJsonDocument(secrets).toJson(QJsonDocument::Indented), &error)) {
         result.error = error;
