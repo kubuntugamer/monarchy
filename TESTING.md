@@ -61,7 +61,7 @@ when you want the narrow loop first.
 | `Smb1.cpp`, `Smb2.cpp` | `monarchy-smb-tests` `monarchy-smb1-tests` | `smbclient -m NT1` |
 | `Provisioner.cpp` | `monarchy-provision-tests` | **full** `ci.sh --conformance`: it seeds the tree every other suite starts from |
 | `DcService.cpp` | full `ci.sh --conformance` | `check-dc-health.sh` — port composition has no suite (gap G3) |
-| `ui/src/mainwindow.cpp` | `monarchy-ui-tests` `monarchy-backend-tests` | full `ci.sh` |
+| `ui/src/mainwindow.cpp`, `mainwindow.h` | `monarchy-mainwindow-tests` `monarchy-ui-tests` `monarchy-backend-tests` | full `ci.sh` — it is what listens on every port |
 | `CMakeLists.txt`, `ui/CMakeLists.txt` | — | `ci.sh --with-ldap` as well |
 
 A suite that passes while its independent client fails is the signal this table
