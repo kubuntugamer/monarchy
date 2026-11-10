@@ -5,7 +5,7 @@ does, how each capability is proven, and what is deliberately **not** claimed.
 Anything not listed under "Implemented and verified" is absent, not partial.
 
 Verified on this tree with `scripts/ci.sh` — a fresh configure, a build that
-emits no warnings, and every suite → **21/21 suites pass**. `scripts/ci.sh
+emits no warnings, and every suite → **22/22 suites pass**. `scripts/ci.sh
 --conformance` goes further: it provisions a throwaway domain, starts the daemon
 on free ports and drives the running DC with impacket's own DRSR and LSAD NDR
 clients, so a reply only this tree's encoder understands fails the check.
