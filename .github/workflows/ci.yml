@@ -66,3 +66,27 @@ jobs:
 
       - name: Build and test against OpenLDAP
         run: scripts/ci.sh --with-ldap
+
+  # The suite that found the three defects closed in #8, #9 and #10 was a
+  # throwaway sanitizer build on one developer's box. Nothing ran it again, so
+  # the next one would have been found the same way: by accident. This job is
+  # that build, and it halts on a UBSan diagnostic rather than printing one.
+  sanitizers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build openssl libgl1
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.*'
+          cache: true
+
+      - name: Build and test under ASan and UBSan
+        run: scripts/ci.sh --sanitize --build-dir build-sanitize

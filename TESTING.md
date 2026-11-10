@@ -96,9 +96,6 @@ DC believes it started.
 These are places where a change can pass everything and still be wrong. They are
 recorded, not hidden:
 
-- **G1 — no sanitizer build in CI.** No configuration in the tree enables ASan
-  or UBSan, and these parsers read attacker-controlled DCE/RPC. A local build
-  with the flags finds real defects (#8–#10), which is the argument for a job.
 - **G4 — SMB has no independent client in CI.** The suites are self-contained;
   `smbclient` and impacket over `ncacn_np` are live-only, so a byte that only
   this tree's SMB encoder accepts would pass.
@@ -112,6 +109,15 @@ recorded, not hidden:
 
 Two of the original seven are closed; their entries stay here so a reference in
 #7 still resolves:
+
+- **G1 — closed.** `scripts/ci.sh --sanitize` configures a Debug build with
+  AddressSanitizer and UndefinedBehaviorSanitizer, halts on a UBSan diagnostic
+  instead of printing one and exiting 0, and the `sanitizers` CI job runs it. It
+  found nothing to fix on the tree it landed on, and it has one limit worth
+  knowing: the compiler does not instrument a left shift whose result fits the
+  unsigned type, which C++11 defines, so the wider-than-four-byte BER INTEGER
+  behind #9 stays undefined while this job stays green. That one is pinned by
+  the code and the message-id test, not by the sanitizer.
 
 - **G2 — closed.** `MONARCHY_WITH_LDAP=ON` is the `openldap-backend` CI job,
   which installs `libldap2-dev` and runs `scripts/ci.sh --with-ldap`; the

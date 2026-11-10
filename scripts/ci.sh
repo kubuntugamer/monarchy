@@ -4,7 +4,7 @@
 #
 # Configure, build and test the tree: the check a change has to pass.
 #
-# Usage: scripts/ci.sh [--build-dir DIR] [--jobs N] [--with-ldap] [--conformance]
+# Usage: scripts/ci.sh [--build-dir DIR] [--jobs N] [--with-ldap] [--sanitize] [--conformance]
 #
 # The default build directory is removed first, so a stale CMake cache cannot
 # hide a missing dependency or a source file that was never added to a target.
@@ -23,6 +23,13 @@
 # with impacket's own NDR, so they fail where a reply only this tree's encoder
 # understands would pass. They need impacket for python3 and are therefore
 # opt-in rather than automatic.
+#
+# --sanitize configures a Debug build with AddressSanitizer and
+# UndefinedBehaviorSanitizer and runs every suite. UBSan is set to halt rather
+# than recover: by default it prints a runtime error and still exits 0, so a
+# job built on it would report a shift of a negative number as a pass. Leak
+# detection is off because the suites deliberately leave Qt objects alive at
+# exit; that is the only check this mode weakens.
 
 set -euo pipefail
 
@@ -30,6 +37,7 @@ root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 build_dir=${root}/build-ci
 jobs=$(nproc 2>/dev/null || echo 2)
 with_ldap=0
+sanitize=0
 conformance=0
 
 # The throwaway domain the conformance stage creates. Its password exists only
@@ -41,8 +49,7 @@ conformance_base_dn=DC=ci,DC=example,DC=org
 conformance_password='Ci-Repl!cate-2026'
 
 usage()
-{
-    sed -n '5,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+{        sed -n '5,34p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 run_conformance()
@@ -212,6 +219,10 @@ while (($#)); do
             with_ldap=1
             shift
             ;;
+        --sanitize)
+            sanitize=1
+            shift
+            ;;
         --conformance)
             conformance=1
             shift
@@ -240,6 +251,17 @@ configure_args=(-S "$root" -B "$build_dir" -DCMAKE_BUILD_TYPE=Release)
 if ((with_ldap)); then
     configure_args+=(-DMONARCHY_WITH_LDAP=ON)
 fi
+if ((sanitize)); then
+    # Debug because the optimiser is what turns a report into a wrong answer
+    # the tests cannot see, and -O0 keeps the reported line honest.
+    sanitize_flags='-fsanitize=address,undefined -fno-omit-frame-pointer -g -O1'
+    configure_args+=(
+        -DCMAKE_BUILD_TYPE=Debug
+        -DCMAKE_C_FLAGS="$sanitize_flags"
+        -DCMAKE_CXX_FLAGS="$sanitize_flags"
+        -DCMAKE_EXE_LINKER_FLAGS='-fsanitize=address,undefined'
+    )
+fi
 
 printf '== configure\n'
 cmake "${configure_args[@]}"
@@ -250,6 +272,11 @@ cmake --build "$build_dir" --parallel "$jobs"
 # Every suite binds port 0, so they do not compete for a fixed port; the
 # conformance stage below is the exception and stays serial.
 printf '== test (%s jobs)\n' "$jobs"
+if ((sanitize)); then
+    # halt_on_error is the difference between a sanitizer job and a decoration.
+    export ASAN_OPTIONS="detect_leaks=0"
+    export UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1"
+fi
 ctest --test-dir "$build_dir" --parallel "$jobs" --output-on-failure
 
 if ((conformance)); then
