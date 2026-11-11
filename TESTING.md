@@ -99,16 +99,13 @@ recorded, not hidden:
 - **G4 — SMB has no independent client in CI.** The suites are self-contained;
   `smbclient` and impacket over `ncacn_np` are live-only, so a byte that only
   this tree's SMB encoder accepts would pass.
-- **G5 — `check-dc-health.sh` does not check `kpasswdPort`** although `dc.conf`
-  declares it. A `_kpasswd` SRV locator would still expose a dead port, but only
-  when the zone publishes one.
 - **G6 — the LDAP path has no live external client in CI.** `ldap3` is a
   development convenience on one box, not a stage in `ci.sh`.
 - **G7 — `check-dc-health.sh` needs an install,** so CI runs the suites and the
   conformance scripts but never the health check.
 
-Two of the original seven are closed; their entries stay here so a reference in
-#7 still resolves:
+Four of the original seven are closed; their entries stay here so a reference
+in #7 still resolves:
 
 - **G1 — closed.** `scripts/ci.sh --sanitize` configures a Debug build with
   AddressSanitizer and UndefinedBehaviorSanitizer, halts on a UBSan diagnostic
@@ -126,6 +123,17 @@ Two of the original seven are closed; their entries stay here so a reference in
   ports another process already holds, and asserts that a TCP connection to every
   port `dc.conf` still declares is accepted. A port the daemon cannot take must
   be reported, so a locator is never derived from a listener that failed.
+
+- **G5 — closed.** `scripts/check-dc-health.sh` walks `kpasswdPort` with the ten
+  ports beside it, taking 464 as the default because that is the port a client
+  falls back to when the zone publishes no `_kpasswd` record at all
+  (`krb5 1.22.2 src/lib/krb5/os/locate_kdc.c`, `locate_service_kpasswd`). On one
+  tree, same daemon, only `dc.conf` changed to name a port with nothing behind
+  it, the check reported 24 checks with one failing where the previous version
+  reported 23 passing. It does not make the SRV section stronger: that section
+  still fails only on a record pointing at a dead port, never on a missing one,
+  and the new probe is TCP-only, so a DC answering kpasswd over UDP alone is a
+  false FAIL rather than a pass.
 
 ## 5. Parity between two working copies
 
