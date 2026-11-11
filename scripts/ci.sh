@@ -18,11 +18,13 @@
 # under a temporary directory, starts monarchy-dcd on the unprivileged dev port
 # set, and drives the running DC with scripts/drs-conformance.py, the impacket
 # half of scripts/lsad-conformance.py, scripts/samr-conformance.py (the account
-# lifecycle) and scripts/netlogon-conformance.py (the locator and the secure
-# channel a logon rides on, with a machine account it creates over SAMR). Those checks marshal every call
-# with impacket's own NDR, so they fail where a reply only this tree's encoder
-# understands would pass. They need impacket for python3 and are therefore
-# opt-in rather than automatic.
+# lifecycle), scripts/netlogon-conformance.py (the locator and the secure
+# channel a logon rides on, with a machine account it creates over SAMR) and
+# scripts/smb-conformance.py (the SMB2 transport those pipes ride on, driven at
+# a pinned dialect by smbclient, rpcclient and impacket). Those checks marshal
+# with impacket's own NDR or with Samba's, so they fail where a reply only this
+# tree's encoder understands would pass. They need impacket for python3 and the
+# smbclient package, and are therefore opt-in rather than automatic.
 #
 # --sanitize configures a Debug build with AddressSanitizer and
 # UndefinedBehaviorSanitizer and runs every suite. UBSan is set to halt rather
@@ -58,6 +60,13 @@ run_conformance()
         printf 'ci.sh: --conformance needs impacket for the python3 on PATH\n' >&2
         return 1
     fi
+    # The SMB driver runs against real clients rather than impacket's own SMB
+    # stack for the file half, so both binaries have to exist before the
+    # daemon is provisioned and started.
+    if ! command -v smbclient >/dev/null 2>&1 || ! command -v rpcclient >/dev/null 2>&1; then
+        printf 'ci.sh: --conformance needs smbclient and rpcclient (the smbclient package)\n' >&2
+        return 1
+    fi
 
     local work
     work=$(mktemp -d -t monarchy-ci-XXXXXX)
@@ -68,15 +77,18 @@ run_conformance()
     # Netlogon (1037) and DRSUAPI (1038) are the same number in every port set,
     # so a host already running a Monarchy DC holds them and the throwaway
     # instance silently loses those binds while a probe still sees the other
-    # DC answering. Ask the kernel for two free ports instead; the sockets are
-    # closed before the daemon starts, which is the window this accepts.
-    local netlogon_port drs_port
-    read -r netlogon_port drs_port < <(python3 - <<'PY'
+    # DC answering. Ask the kernel for free ports instead; the sockets are
+    # closed before the daemon starts, which is the window this accepts. SMB is
+    # the same problem with a different cause: 445 needs root, and the SMB
+    # stage has to reach the shares and the pipes, so the throwaway instance
+    # moves that port too.
+    local netlogon_port drs_port smb_port
+    read -r netlogon_port drs_port smb_port < <(python3 - <<'PY'
 import socket
 
 held = []
 ports = []
-for _ in range(2):
+for _ in range(3):
     probe = socket.socket()
     probe.bind(('127.0.0.1', 0))
     held.append(probe)
@@ -96,6 +108,11 @@ PY
         rm -rf -- "$work"
         return 1
     fi
+
+    # The daemon reads smbPort from dc.conf when it starts, so the move has to
+    # happen after provisioning and before that. Without it the SMB listener
+    # fails with "port 445 needs root" and the SMB stage has nothing to reach.
+    sed -i "s/^smbPort=.*/smbPort=$smb_port/" "$dc_dir/dc.conf"
 
     printf '== start the daemon on the dev ports\n'
     "$build_dir/ui/monarchy-dcd" --dcdir "$dc_dir" >"$log" 2>&1 &
@@ -151,6 +168,14 @@ PY
         rm -rf -- "$work"
         return 1
     fi
+    if ! grep -q 'SMB2 served on' "$log"; then
+        printf 'ci.sh: the daemon did not report an SMB2 listener\n' >&2
+        tail -n 40 "$log" >&2 || true
+        cleanup
+        trap - EXIT
+        rm -rf -- "$work"
+        return 1
+    fi
 
     local status=0
     printf '== DRSR conformance (impacket NDR)\n'
@@ -193,6 +218,15 @@ PY
         --port "$netlogon_port" --samr-port "$samr_port" \
         --user Administrator --password "$conformance_password" \
         --domain "$conformance_domain" || status=1
+
+    # The share root is the parent of the domain directory the daemon serves,
+    # which is what the SYSVOL share is mapped to; the driver writes its fixture
+    # there so the bytes it reads back over SMB have something to match.
+    printf '== SMB2 conformance (smbclient, rpcclient, impacket pipes)\n'
+    python3 "$root/scripts/smb-conformance.py" --host 127.0.0.1 --port "$smb_port" \
+        --user Administrator --password "$conformance_password" \
+        --domain "$conformance_domain" --dns-domain "$conformance_dns" \
+        --sysvol-root "$dc_dir/sysvol" || status=1
 
     if ((status != 0)); then
         printf '== daemon log (last 40 lines)\n' >&2

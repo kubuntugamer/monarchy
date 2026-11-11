@@ -22,8 +22,10 @@ jobs:
       - name: Install build toolchain
         run: |
           sudo apt-get update
+          # smbclient carries both smbclient and rpcclient, which the SMB2
+          # conformance stage drives the provisioned DC with.
           sudo apt-get install -y --no-install-recommends \
-            build-essential cmake ninja-build openssl libgl1
+            build-essential cmake ninja-build openssl libgl1 smbclient
 
       - name: Install Qt
         uses: jurplel/install-qt-action@v4
