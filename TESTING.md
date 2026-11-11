@@ -238,15 +238,33 @@ executes as `chazz` with `ProtectSystem=strict`, `ProtectHome=read-only` and onl
 the worktree and the ledger writable. Measured inside the real unit: writes to
 `~/.ssh`, `/etc` and `/usr/local/bin` were refused by the read-only mounts,
 `unshare` was refused, the signing key stayed readable and the worktree writable,
-and a `git push` to a repository outside the writable paths failed. One probe was
-**not** confined, and it is the open gap rather than a detail: `git push
---dry-run origin main` succeeded, so a woken run can reach GitHub with the
-account's own credential. Closing that needs a credential that may comment and
-may not write contents, which is a token's scope, not a sandbox directive.
+and a `git push` to a repository outside the writable paths failed. One thing the
+sandbox cannot bound is `git push --dry-run origin main`, which succeeded: the
+filesystem is confined, the credential it uses is not. That is closed by the
+credential rather than by a directive, and no longer by a promise — the unit
+refuses to start without a scoped token. Measured in the real unit, with an
+engine named: no token path, a missing token file, an empty one, and a
+root-owned 600 one (unreadable by the unit's user) each stopped at
+`Result=exit-code ExecMainStatus=1` with `no readable scoped token at
+MONARCHY_WAKE_GH_TOKEN_FILE`, before any engine ran. With a file readable by
+`chazz` holding a deliberately bad token, the same run reached `gh: Bad
+credentials (HTTP 401)`; the account credential would have succeeded, so that
+401 is the proof the token replaced it.
+
+The token is a fine-grained personal access token with `Issues: Read and write`
+and nothing else (GitHub adds `Metadata: Read-only` itself), scoped to
+`kubuntugamer/monarchy`. It has to be made in the web UI, because GitHub has no
+API for it: `POST /user/personal-access-tokens` answers 404 even to the account's
+own OAuth token. It lives at `/etc/monarchy-agent-wake.token`, mode 600 and owned
+by `chazz` — root-owned 600 is unreadable to the unit and is refused — and is
+named, never copied, by `MONARCHY_WAKE_GH_TOKEN_FILE` in
+`/etc/monarchy-agent-wake.env`.
 
 With no `/etc/monarchy-agent-wake.env` the unit is skipped rather than failed, so
-the timer can be installed and silent before any engine is named — and naming an
-engine is still the holder's decision, because `opencode run` was measured
+the timer can be installed and silent before any engine is named. Naming an
+engine with no token beside it is now a refusal rather than a silent fallback to
+the account credential. Naming the engine is still the holder's decision, because
+`opencode run` was measured
 writing files and running shell commands with no approval prompt at all.
 
 Measured, so the expectation is not a guess: comments posted 05:45:53 and 05:53:03
