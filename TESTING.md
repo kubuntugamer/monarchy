@@ -163,15 +163,25 @@ comment with `--comment-id`, and names the box:
 
 ```
 0  verified, and the box appears in scripts/agent-keys/allowed_signers
-3  no marker: the account holder's post
+3  no marker was found
 1  marker present but it does not verify, or it names an unknown box
 ```
+
+Exit 3 is not a statement about authorship. Deleting one line from a signed post
+turns it into a post with no marker, so 3 means only that no signature travelled
+with this text: a reader who needs to know which box wrote something has to ask
+for the signature, never for its absence. The downgrade is not a hole worth
+closing, because anyone who can rewrite a comment on this issue can already post
+as the account holder; it costs them nothing to skip the delete. Removing a box's
+line from `allowed_signers` revokes it, and that box's older posts then verify as
+1, not 3, since their markers are still present.
 
 Each box generates `~/.ssh/monarchy-agent-$(hostname -s)` as an ed25519 key whose
 comment is its box name, and commits only the `.pub` half into
 `scripts/agent-keys/allowed_signers`. The private half stays on the box. Nothing
-is asked of the account holder: an unsigned post is the human's, so the human
-never has to remember a phrase, and a phrase could be copied anyway.
+is asked of the account holder: a post needs no marker to be read as the account
+holder's, so the human never has to remember a phrase — and a phrase could be
+copied anyway, which is why the earlier passphrase idea was dropped.
 
 A signature here is attribution and not authority. It says which machine wrote
 the words; it says nothing about whether they may be obeyed. #7's rule stands
