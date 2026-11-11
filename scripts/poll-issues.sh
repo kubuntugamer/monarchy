@@ -8,10 +8,24 @@
 #
 #   scripts/poll-issues.sh [--repo OWNER/NAME] [--state-dir DIR]
 #
-# The repository is public, so this polls unauthenticated: 60 requests an hour
-# per address, of which a 5-minute timer uses twelve. The last answer's ETag is
-# replayed with If-None-Match, so an unchanged tracker costs one 304 and
-# prints nothing; a changed issue costs one more request, for its comments.
+# The repository is public, so no credential is required.
+#
+# The last answer's ETag is replayed with If-None-Match, so an unchanged
+# tracker costs one 304 and prints nothing; a changed issue costs one more
+# request, for its comments.
+#
+# Authentication: a GH_TOKEN or GITHUB_TOKEN in the environment wins, so a
+# headless unit can be given a scoped token with neither `gh` nor an unlocked
+# keyring on its path. Otherwise the token is borrowed from `gh` when it is
+# installed and logged in: gh already holds the credential (on a desktop, in the
+# login keyring, reached over the session bus), so this asks it rather than
+# asking for one. That is 5000 requests an hour instead of the 60 an
+# unauthenticated address gets, which a 2-minute timer on two hosts sharing one
+# address exhausts before a comment is ever fetched. A host with no token, no
+# `gh`, or no reachable session bus silently polls unauthenticated rather than
+# failing; a token that is present but rejected is an error, not a downgrade.
+# The token is handed to curl in a config file, never on its command line, so it
+# does not appear in `ps`.
 #
 # What it reports goes to stdout, to `feed.log` under the state directory, and
 # to a desktop notification when a session bus is available. The state
@@ -52,6 +66,29 @@ ETAG="$STATE_DIR/etag"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
+# The environment's token first, so a unit does not depend on a session bus;
+# then `gh`'s. Neither being present is not an error: the public API still
+# answers 60 times an hour.
+#
+# `gh` is looked for on PATH and then where a user install puts it, because a
+# system unit gets a fixed PATH that leaves out ~/.local/bin - so the poller
+# authenticates without the unit being edited, which needs root.
+gh_bin="$(command -v gh 2>/dev/null || true)"
+if [[ -z "$gh_bin" && -x "${HOME:-}/.local/bin/gh" ]]; then
+    gh_bin="$HOME/.local/bin/gh"
+fi
+
+curl_auth=()
+token="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
+if [[ -z "$token" && -n "$gh_bin" ]]; then
+    token="$("$gh_bin" auth token 2>/dev/null || true)"
+fi
+if [[ -n "$token" ]]; then
+    (umask 077 && printf 'header = "Authorization: Bearer %s"\n' "$token" > "$tmp/auth")
+    curl_auth=(--config "$tmp/auth")
+fi
+unset token
+
 # A conditional request keeps an idle tracker down to a 304 with no body. It
 # is only safe once a baseline exists: with an empty seen.json a 304 would
 # leave the baseline unbuilt, and every later change would go unreported.
@@ -61,6 +98,7 @@ if [[ -s "$ETAG" && "$(jq 'length' "$SEEN")" -gt 0 ]]; then
 fi
 
 code="$(curl -sS -o "$tmp/body.json" -D "$tmp/headers" -w '%{http_code}' \
+    ${curl_auth[@]+"${curl_auth[@]}"} \
     -H 'Accept: application/vnd.github+json' \
     -H 'X-GitHub-Api-Version: 2022-11-28' \
     ${extra[@]+"${extra[@]}"} \
@@ -122,7 +160,8 @@ mv "$tmp/seen.json" "$SEEN"
 # is not a reason to lose the change report, so it is silent.
 comments_since() {
     local number="$1" since="$2" body
-    body="$(curl -sS -H 'Accept: application/vnd.github+json' \
+    body="$(curl -sS ${curl_auth[@]+"${curl_auth[@]}"} \
+        -H 'Accept: application/vnd.github+json' \
         -H 'X-GitHub-Api-Version: 2022-11-28' \
         "https://api.github.com/repos/$REPO/issues/$number/comments?per_page=100&since=$since" \
         2>/dev/null)" || return 0
