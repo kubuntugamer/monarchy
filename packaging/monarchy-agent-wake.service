@@ -1,0 +1,59 @@
+[Unit]
+# SPDX-FileCopyrightText: 2026 Monarchy contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# One bounded agent run per verified comment, on a timer.
+#
+# This unit is the confinement, not the engine: the engine is named in
+# /etc/monarchy-agent-wake.env, which ships absent on purpose. With no engine the
+# wake is skipped rather than failed, so the timer can be installed before anyone
+# decides what may run inside it.
+#
+# What the sandbox is for: `opencode run` was measured writing files and running
+# shell commands with no approval prompt at all, because a headless run has no
+# terminal to ask in. Bounding its time and frequency (scripts/agent-trigger.sh)
+# does not bound what it may do; these directives do.
+Description=Wake one agent run for a signed comment (bounded)
+Documentation=https://github.com/kubuntugamer/monarchy/blob/main/TESTING.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=chazz
+Group=chazz
+EnvironmentFile=-/etc/monarchy-agent-wake.env
+# Skipped, not failed, when no engine is named: the timer stays installed and
+# silent until someone writes that file.
+ExecCondition=/bin/sh -c '[ -n "${MONARCHY_WAKE_ENGINE}" ]'
+ExecStart=/home/chazz/monarchy/scripts/agent-trigger.sh --agent-cmd ${MONARCHY_WAKE_ENGINE}
+TimeoutStartSec=900
+
+# The worktree and the ledger are the only writable places. Everything else in
+# the home directory is readable - the signing key and gh's credential are how a
+# run answers at all - but no write outside these two paths can succeed.
+ReadWritePaths=/home/chazz/monarchy -/home/chazz/.local/state/monarchy-agent
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+PrivateDevices=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+# @system-service plus the socket families a model API and DNS need. JIT is left
+# alone: MemoryDenyWriteExecute would break every engine worth waking.
+SystemCallFilter=@system-service
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+UMask=0077
+Nice=10

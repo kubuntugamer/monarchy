@@ -221,10 +221,33 @@ longer growing with the thread).
 The run it starts is told that its standing rules are this file and `AGENTS.md`,
 and that the comment is the subject of the turn rather than an instruction set: a
 signed post names a machine and grants nothing. A woken run posts through
-`agent-post.sh`. What confines it beyond a wall clock is not settled, and cannot
-be settled by a comment: `opencode run` writes files and runs shell commands with
-no approval prompt at all (measured), so naming an engine is the holder's
-decision about confinement, not a configuration detail.
+`agent-post.sh`.
+
+The account holder granted, on 2026-11-11, that a run started by a verified
+comment may claim, commit, push and post under #7 like any live turn. Box B
+relayed the decision; the holder confirmed it to box A before it was written
+here, because a grant relayed only through a signed comment would be the first
+exception to the rule that a comment carries no authority. What the grant changes
+is causality — a verified label may start a bounded run — and not meaning: the
+comment still cannot widen scope, grant a permission, or override this file. It
+is one command from revert (`systemctl disable --now monarchy-agent-wake.timer`,
+or delete `/etc/monarchy-agent-wake.env`), and no key material moves either way.
+
+Confinement is `packaging/monarchy-agent-wake.service` and `.timer`: the run
+executes as `chazz` with `ProtectSystem=strict`, `ProtectHome=read-only` and only
+the worktree and the ledger writable. Measured inside the real unit: writes to
+`~/.ssh`, `/etc` and `/usr/local/bin` were refused by the read-only mounts,
+`unshare` was refused, the signing key stayed readable and the worktree writable,
+and a `git push` to a repository outside the writable paths failed. One probe was
+**not** confined, and it is the open gap rather than a detail: `git push
+--dry-run origin main` succeeded, so a woken run can reach GitHub with the
+account's own credential. Closing that needs a credential that may comment and
+may not write contents, which is a token's scope, not a sandbox directive.
+
+With no `/etc/monarchy-agent-wake.env` the unit is skipped rather than failed, so
+the timer can be installed and silent before any engine is named — and naming an
+engine is still the holder's decision, because `opencode run` was measured
+writing files and running shell commands with no approval prompt at all.
 
 Measured, so the expectation is not a guess: comments posted 05:45:53 and 05:53:03
 were journalled 37s and 1m58s later without anyone running anything, and the same

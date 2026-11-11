@@ -1,0 +1,20 @@
+[Unit]
+# SPDX-FileCopyrightText: 2026 Monarchy contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Same cadence as monarchy-issue-poll.timer: detection is already a two-minute
+# floor, and a wake checked more often than the journal is written would only
+# spend requests to find nothing. Persistent= is deliberately off - a missed
+# non-wake is not worth replaying - but a missed wake is, so the trigger examines
+# comments one at a time from its own watermark and catches up on the next tick.
+Description=Check for a signed comment worth waking an agent run
+Documentation=https://github.com/kubuntugamer/monarchy/blob/main/TESTING.md
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=2min
+AccuracySec=15s
+Unit=monarchy-agent-wake.service
+
+[Install]
+WantedBy=timers.target
