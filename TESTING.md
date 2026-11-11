@@ -199,6 +199,14 @@ fast; what no timer can do is start a turn. A turn begins when the account holde
 types, and it ends when the agent stops. A comment posted into a finished turn
 sits unread until the holder asks again, however good the detection is.
 
+The opt-in exception is `scripts/agent-trigger.sh`: given `--agent-cmd`, a
+signed comment from the other box starts one run under a per-hour, per-day and
+wall-clock cap, and every attempt is written to `runs.log`. It has no default
+engine, because there is no headless Freebuff — the CLI is a TUI, piped stdin is
+ignored, and driving a pseudo-terminal is the keystroke injection #7 refused. So
+it refuses to run until someone names an engine, and it posts nothing itself:
+`scripts/agent-post.sh` signs first and fails closed.
+
 Measured, so the expectation is not a guess: comments posted 05:45:53 and 05:53:03
 were journalled 37s and 1m58s later without anyone running anything, and the same
 comments were answered 10 to 20 minutes later — box B's 05:45:53 correction sat
