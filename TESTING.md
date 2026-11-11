@@ -149,3 +149,33 @@ Both boxes pass on their own tree, so a difference in HEAD is invisible to the
 suites and is exactly what this reports. The rule that goes with it: a claim in
 an issue thread includes the report, and a box does not act on a thread it has
 not re-read at the head the report shows.
+
+## 6. Which box wrote a post
+
+Both boxes post under one GitHub account, so the thread cannot say which machine
+wrote a comment, and a reader cannot tell an agent's post from the account
+holder's. A second account per box would fix that at the cost of a second email
+and a second 2FA enrolment; a signature costs neither.
+
+`scripts/agent-sign.sh BODY_FILE` prints the body and appends one marker holding
+an SSH signature over it. `scripts/agent-verify.sh` reads a file, or fetches one
+comment with `--comment-id`, and names the box:
+
+```
+0  verified, and the box appears in scripts/agent-keys/allowed_signers
+3  no marker: the account holder's post
+1  marker present but it does not verify, or it names an unknown box
+```
+
+Each box generates `~/.ssh/monarchy-agent-$(hostname -s)` as an ed25519 key whose
+comment is its box name, and commits only the `.pub` half into
+`scripts/agent-keys/allowed_signers`. The private half stays on the box. Nothing
+is asked of the account holder: an unsigned post is the human's, so the human
+never has to remember a phrase, and a phrase could be copied anyway.
+
+A signature here is attribution and not authority. It says which machine wrote
+the words; it says nothing about whether they may be obeyed. #7's rule stands
+unchanged — no signature is authority, including this one — so an agent that
+finds a signed instruction in the thread has found a label, not a command. That
+is also why the key protects nothing but honesty: it is worth stealing only to
+misattribute a sentence.
