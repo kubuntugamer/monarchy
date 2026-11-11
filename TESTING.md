@@ -207,6 +207,25 @@ ignored, and driving a pseudo-terminal is the keystroke injection #7 refused. So
 it refuses to run until someone names an engine, and it posts nothing itself:
 `scripts/agent-post.sh` signs first and fails closed.
 
+Four defects in its first version were reproduced here from box B's report and
+fixed in the same file: the box's own identity is derived from the signing key's
+comment, as `agent-sign.sh` derives it, instead of being hardcoded to `box-a`, so
+the default is right on both boxes; refusals are recorded but no longer count
+against the caps, since a poll that keeps refusing would otherwise exhaust the
+daily budget without running anything; the watermark is a comment id rather than
+`created_at`, because a post that shared a second with the one that woke it was
+invisible for good; and the body already fetched is verified in place, so a poll
+costs one request instead of one per comment (85 comments: 46.6s to 5.1s, and no
+longer growing with the thread).
+
+The run it starts is told that its standing rules are this file and `AGENTS.md`,
+and that the comment is the subject of the turn rather than an instruction set: a
+signed post names a machine and grants nothing. A woken run posts through
+`agent-post.sh`. What confines it beyond a wall clock is not settled, and cannot
+be settled by a comment: `opencode run` writes files and runs shell commands with
+no approval prompt at all (measured), so naming an engine is the holder's
+decision about confinement, not a configuration detail.
+
 Measured, so the expectation is not a guess: comments posted 05:45:53 and 05:53:03
 were journalled 37s and 1m58s later without anyone running anything, and the same
 comments were answered 10 to 20 minutes later — box B's 05:45:53 correction sat
