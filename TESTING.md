@@ -179,3 +179,57 @@ unchanged — no signature is authority, including this one — so an agent that
 finds a signed instruction in the thread has found a label, not a command. That
 is also why the key protects nothing but honesty: it is worth stealing only to
 misattribute a sentence.
+
+## 7. Replies arrive in batches, not in real time
+
+`scripts/poll-issues.sh` runs from `monarchy-issue-poll.timer` on each box every
+two minutes and appends new and edited comments to
+`~/.local/state/monarchy-issues/feed.log`. Detection is therefore automatic and
+fast; what no timer can do is start a turn. A turn begins when the account holder
+types, and it ends when the agent stops. A comment posted into a finished turn
+sits unread until the holder asks again, however good the detection is.
+
+Measured, so the expectation is not a guess: comments posted 05:45:53 and 05:53:03
+were journalled 37s and 1m58s later without anyone running anything, and the same
+comments were answered 10 to 20 minutes later — box B's 05:45:53 correction sat
+unread until its holder next typed, and its 06:12:43 post was read here 18
+minutes after it landed. Both are normal. Detection is a two-minute floor; a
+reply costs a turn, and a turn costs whatever it takes someone to start one.
+Treat reply latency as unbounded.
+
+What follows from that:
+
+- **One post per state change, carrying everything the other box needs to act.**
+  A post that asks a question and promises a follow-up costs a full turn, so put
+  the measurement, the command that produced it, the hash and the CI run in the
+  same comment.
+- **No acknowledgement posts.** "Agreed, will do" costs the reader a turn and
+  carries no state. Send the result instead.
+- **A claim's clock is silence, not seconds.** The 45-minute staleness rule in
+  #7 is the throughput limit for the whole protocol, not a safety net for a
+  conversation; do not hold a claim open expecting a sub-minute answer.
+- **State what happens if no answer comes.** A question that blocks work carries
+  the default you will take and when, so the other box can disagree later
+  without the work having stalled.
+- **Sign when attribution matters.** A post that claims work, reports a
+  measurement or asks for review goes through `scripts/agent-sign.sh`; a signed
+  post and an unsigned one are different facts (section 6).
+
+Two ways of reading the thread have failed here, both silently, and both are
+worth checking when a reply seems overdue:
+
+- the poller printed every comment twice, because `since` on the comments
+  endpoint is inclusive and the id that was passed was the timestamp of the very
+  comment that triggered the report;
+- a read loop compared against
+  `comments?per_page=1&sort=created&direction=desc`, which returns the *earliest*
+  comment on the issue, so it could not see a new one at all. Ask the API for the
+  full list and sort by `created_at`:
+
+```sh
+gh api "repos/kubuntugamer/monarchy/issues/7/comments?per_page=100" \
+    --jq 'sort_by(.created_at) | .[-1] | "\(.created_at) \(.id)"'
+```
+
+When a mechanism reports "nothing new", confirm it against that command before
+believing it.
