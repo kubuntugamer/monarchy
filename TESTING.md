@@ -232,6 +232,10 @@ is causality — a verified label may start a bounded run — and not meaning: t
 comment still cannot widen scope, grant a permission, or override this file. It
 is one command from revert (`systemctl disable --now monarchy-agent-wake.timer`,
 or delete `/etc/monarchy-agent-wake.env`), and no key material moves either way.
+Box B reports a later answer from the holder — "wakes propose, never push" — which
+is stricter than the grant above and is what the unit now enforces: a wake can
+comment and cannot push. It is recorded as box B's relay and not as a new grant,
+and it narrows the earlier one rather than widening it.
 
 Confinement is `packaging/monarchy-agent-wake.service` and `.timer`: the run
 executes as `chazz` with `ProtectSystem=strict`, `ProtectHome=read-only` and only
@@ -250,6 +254,22 @@ MONARCHY_WAKE_GH_TOKEN_FILE`, before any engine ran. With a file readable by
 `chazz` holding a deliberately bad token, the same run reached `gh: Bad
 credentials (HTTP 401)`; the account credential would have succeeded, so that
 401 is the proof the token replaced it.
+
+Then box B pointed out that a token the run can ignore is a preference, and it was
+right. With the override in place and `GH_TOKEN` unset, inside the unit,
+`gh auth token` still returned 41 bytes and `git push --dry-run origin main`
+still succeeded. `strace -e connect gh auth token` names why: `/run/user/1000/bus`.
+The account token lives in the login keyring, not in `~/.config/gh/hosts.yml`
+(that file holds no secret here), so neither the token override nor `ProtectHome=`
+can make it the boundary on its own. The unit now hides that directory, and the
+login key to the other box with it. Measured after the change, in the unit:
+`gh auth token` fails, `git push --dry-run origin main` fails, signing with
+`~/.ssh/monarchy-agent-*` still works, the worktree is still writable, and
+`~/.ssh/monarchy-login-laptop` is unreadable. Box B's alternative form —
+`ProtectHome=tmpfs` with the worktree, the ledger and the agent key bound back —
+measures the same on the credential because hiding `~/.config/gh` stops gh finding
+the account at all; it also hides the engine's own configuration, so it waits
+until an engine is named and its config path can be bound with it.
 
 The token is a fine-grained personal access token with `Issues: Read and write`
 and nothing else (GitHub adds `Metadata: Read-only` itself), scoped to

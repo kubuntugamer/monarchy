@@ -48,6 +48,21 @@ TimeoutStartSec=720
 ReadWritePaths=/home/chazz/monarchy -/home/chazz/.local/state/monarchy-agent
 ProtectSystem=strict
 ProtectHome=read-only
+# ProtectHome= does not reach the credential that matters. gh keeps the account
+# token in the login keyring - ~/.config/gh/hosts.yml holds no secret here - and
+# `strace -e connect gh auth token` shows it opening /run/user/1000/bus. So with
+# only the token override, an engine unsets GH_TOKEN and asks the keyring instead,
+# which is the same push credential again. Hiding the runtime directory removes
+# the bus and the keyring with it. Measured in this unit: `gh auth token` fails and
+# `git push --dry-run origin main` fails, while signing and writing the worktree
+# still work. The whole directory, not /run/user/%U: %U is the manager's UID (0
+# here), not User=, so the first attempt hid the wrong path and changed nothing.
+InaccessiblePaths=-/run/user
+# The login key to the other box is not one a woken run needs: the signing key is
+# what answers, and it grants nothing. Hiding this one keeps an engine from using
+# the run's own shell to reach a machine the run was never given.
+InaccessiblePaths=-/home/chazz/.ssh/monarchy-login-laptop
+InaccessiblePaths=-/home/chazz/.ssh/monarchy-login-laptop.pub
 PrivateTmp=yes
 NoNewPrivileges=yes
 CapabilityBoundingSet=
