@@ -79,6 +79,7 @@ declare -A declared=(
     [ldapPort]="$(conf_value ldapPort 1389)"
     [gcPort]="$(conf_value gcPort 3268)"
     [kdcPort]="$(conf_value kdcPort 8888)"
+    [kpasswdPort]="$(conf_value kpasswdPort 464)"
     [dnsPort]="$DNS_PORT"
     [smbPort]="$(conf_value smbPort 445)"
     [epmPort]="$(conf_value epmPort 135)"
@@ -87,7 +88,7 @@ declare -A declared=(
     [netlogonPort]="$(conf_value netlogonPort 1037)"
     [drsPort]="$(conf_value drsPort 1038)"
 )
-for key in ldapPort gcPort kdcPort dnsPort smbPort epmPort samrPort lsadPort netlogonPort drsPort; do
+for key in ldapPort gcPort kdcPort kpasswdPort dnsPort smbPort epmPort samrPort lsadPort netlogonPort drsPort; do
     port="${declared[$key]}"
     CHECKS=$((CHECKS + 1))
     if reachable "$port"; then
