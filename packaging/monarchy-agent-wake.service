@@ -26,8 +26,20 @@ EnvironmentFile=-/etc/monarchy-agent-wake.env
 # Skipped, not failed, when no engine is named: the timer stays installed and
 # silent until someone writes that file.
 ExecCondition=/bin/sh -c '[ -n "${MONARCHY_WAKE_ENGINE}" ]'
-ExecStart=/home/chazz/monarchy/scripts/agent-trigger.sh --agent-cmd ${MONARCHY_WAKE_ENGINE}
-TimeoutStartSec=900
+# A scoped token, when one is installed, replaces the account credential for the
+# whole run: the trigger, agent-post.sh and git all read GH_TOKEN. The variable
+# holds a *path*, never the secret, so the token cannot appear in the unit's
+# environment or in `systemctl show`. Unset, the run uses gh's account
+# credential and a woken run can push main - see TESTING.md §7.
+#
+# LoadCredential= is the harder version (a tmpfs copy owned by the unit), but it
+# fails the unit when the file is missing, which is why the optional path is used
+# here. Switch to LoadCredential= on the day a token becomes mandatory.
+ExecStart=/bin/sh -c 'if [ -n "$$MONARCHY_WAKE_GH_TOKEN_FILE" ] && [ -r "$$MONARCHY_WAKE_GH_TOKEN_FILE" ]; then GH_TOKEN=$$(cat "$$MONARCHY_WAKE_GH_TOKEN_FILE"); export GH_TOKEN; fi; exec /home/chazz/monarchy/scripts/agent-trigger.sh --agent-cmd "${MONARCHY_WAKE_ENGINE}"'
+# 600s is the trigger's own --max-runtime default; the rest is verification,
+# posting and the engine's own shutdown. For Type=oneshot this is the knob that
+# bounds runtime - RuntimeMaxSec= is documented not to apply to oneshot units.
+TimeoutStartSec=720
 
 # The worktree and the ledger are the only writable places. Everything else in
 # the home directory is readable - the signing key and gh's credential are how a
@@ -55,5 +67,13 @@ SystemCallArchitectures=native
 # alone: MemoryDenyWriteExecute would break every engine worth waking.
 SystemCallFilter=@system-service
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# No IPAddressAllow= here, and that is a measurement rather than an omission.
+# IPAddressAllow= alone is not a firewall - the man page's own rule is deny wins
+# only when it matches, so an allow list needs IPAddressDeny=any beside it. With
+# both set to localhost, the trigger died at "dial tcp 140.82.114.6:443: i/o
+# timeout" before it could verify a single comment, and an allowance wide enough
+# to reach api.github.com is equally wide enough to push to github.com, because
+# they are the same service. Network filtering cannot separate commenting from
+# pushing here; a token that may comment and may not write contents can.
 UMask=0077
 Nice=10
