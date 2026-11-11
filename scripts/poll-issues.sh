@@ -165,9 +165,14 @@ comments_since() {
         -H 'X-GitHub-Api-Version: 2022-11-28' \
         "https://api.github.com/repos/$REPO/issues/$number/comments?per_page=100&since=$since" \
         2>/dev/null)" || return 0
-    jq -r '.[] | "  " + (if .user then .user.login else "ghost" end)
-                  + " @ " + .created_at + ": "
-                  + (.body | gsub("\\s+"; " ") | .[0:240])' <<< "$body" 2>/dev/null || true
+    # `since` is inclusive, so the comment whose timestamp *is* the previous
+    # updated_at - the one that caused this change to be reported at all - comes
+    # back on every poll. Without this filter every comment is printed twice:
+    # once when it arrives, once on the next tick.
+    jq -r --arg since "$since" '.[] | select(.created_at != $since)
+        | "  " + (if .user then .user.login else "ghost" end)
+        + " @ " + .created_at + ": "
+        + (.body | gsub("\\s+"; " ") | .[0:240])' <<< "$body" 2>/dev/null || true
 }
 
 while IFS=$'\t' read -r kind number a b c; do
