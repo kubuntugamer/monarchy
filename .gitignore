@@ -39,3 +39,8 @@ __pycache__/
 *~
 .DS_Store
 build-ci/
+
+# Session id the agent harness (freebuff) writes into its working directory.
+# Not the engine: nothing here reads or writes this name. The harness should be
+# given a state directory instead; this records the workaround until it is.
+sessid
