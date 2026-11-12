@@ -59,7 +59,7 @@ when you want the narrow loop first.
 | `Rpc.cpp`, `Ndr.cpp` | `monarchy-samr-tests` `monarchy-lsad-tests` `monarchy-drs-tests` `monarchy-epm-tests` | every conformance script — this is the shared marshaller |
 | `Ntlm.cpp`, `Gss.cpp` | `monarchy-ntlm-tests` `monarchy-samr-tests` `monarchy-lsad-tests` | a conformance script with credentials |
 | `LdapServer.cpp`, `LdapServer.h` | `monarchy-ldap-tests` `monarchy-tls-tests` `monarchy-backend-tests` `monarchy-provision-tests` | a bind/search probe on 1389 |
-| `Kdc.cpp`, `Krb5.cpp`, `Aes.cpp` | `monarchy-kerberos-tests` `monarchy-kpasswd-tests` | `scripts/kerberos-conformance.py` — it reads the ticket flags back through `klist`, which no suite here does |
+| `Kdc.cpp`, `Krb5.cpp`, `Aes.cpp` | `monarchy-kerberos-tests` `monarchy-kpasswd-tests` | `scripts/kerberos-conformance.py` — it reads the ticket flags back through `klist`, which no suite here does. It needs the `krb5-user` package; without it the conformance stage says so and skips, because a missing client tested nothing |
 | `Samr.cpp` | `monarchy-samr-tests` `monarchy-netlogon-tests` | `samr-conformance.py` |
 | `Lsad.cpp` | `monarchy-lsad-tests` | `lsad-conformance.py --skip-samba` |
 | `Drs.cpp`, `DrsClient.cpp`, `ReplicationAgent.cpp` | `monarchy-drs-tests` `monarchy-drsclient-tests` `monarchy-replication-tests` | `drs-conformance.py` |

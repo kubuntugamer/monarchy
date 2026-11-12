@@ -221,11 +221,19 @@ PY
     kdc_port=$(sed -n 's/^kdcPort=//p' "$dc_dir/dc.conf" | head -1)
     : "${kdc_port:=88}"
     printf '== Kerberos conformance (MIT kinit/klist/kvno)\n'
-    python3 "$root/scripts/kerberos-conformance.py" --kdc 127.0.0.1 --kdc-port "$kdc_port" \
-        --realm "$conformance_realm" --user Administrator \
-        --password "$conformance_password" \
-        --dc-host "$(printf '%s' "$conformance_domain" | tr '[:upper:]' '[:lower:]')dc1.$conformance_dns" \
-        || status=1
+    if ! command -v kinit >/dev/null 2>&1 || ! command -v kvno >/dev/null 2>&1; then
+        # No client means nothing was tested, not that something broke: this is
+        # reported as a skip, the way the health script treats a missing dig, so
+        # a box without krb5-user does not show a red run no change could cause.
+        # CI installs it, so the stage always runs there.
+        printf 'ci.sh: skipped - kinit/kvno are not on PATH (install krb5-user)\n' >&2
+    else
+        python3 "$root/scripts/kerberos-conformance.py" --kdc 127.0.0.1 --kdc-port "$kdc_port" \
+            --realm "$conformance_realm" --user Administrator \
+            --password "$conformance_password" \
+            --dc-host "$(printf '%s' "$conformance_domain" | tr '[:upper:]' '[:lower:]')dc1.$conformance_dns" \
+            || status=1
+    fi
 
     printf '== DRSR conformance (impacket NDR)\n'
     python3 "$root/scripts/drs-conformance.py" --host 127.0.0.1 --port "$drs_port" \
