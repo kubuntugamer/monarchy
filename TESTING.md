@@ -20,7 +20,7 @@ endpoint mapper (135) and SMB (445) stay native under `--dev-ports`.
 
 | Endpoint | Port | Suites | Independent client | Live probe |
 |---|---|---|---|---|
-| LDAP (RFC 4511 subset) | 389 / 1389 | `monarchy-ldap-tests`, `monarchy-backend-tests` | raw BER on a socket (`ui/tests/ldap_wire_helpers.h`) | raw-BER bind/search, `ldap3` |
+| LDAP (RFC 4511 subset) | 389 / 1389 | `monarchy-ldap-tests`, `monarchy-backend-tests` | raw BER on a socket (`ui/tests/ldap_wire_helpers.h`), and **OpenLDAP** `ldapsearch` by DN, UPN and `DOMAIN\user` | `scripts/ldap-conformance.py`: rootDSE, bind, search, attribute selection, four refusals |
 | Global Catalog (same store) | 3268 / 3268 | `monarchy-provision-tests` (`publishesItsIdentityAndGlobalCatalog`) | none — the suite drives both ports itself | search the same object on 3268 |
 | StartTLS (RFC 4511 §4.14.1) | as LDAP | `monarchy-tls-tests` | **openssl** `s_client -starttls ldap` | ldap3 against `private/ldap.crt` as CA |
 | SASL NTLM + signing/sealing | as LDAP | `monarchy-ntlm-tests` | **impacket** message layouts, byte-exact | — |

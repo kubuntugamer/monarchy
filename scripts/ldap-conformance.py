@@ -53,6 +53,8 @@ CHECKS = [
     'a search asking for one attribute receives only that attribute',
     'a search asking for no attributes receives an entry carrying none',
     'a bind with the DN in the wrong case still succeeds',
+    'a bind by UPN succeeds, and a wrong UPN suffix is refused (49)',
+    'a bind as DOMAIN\\user succeeds, and a wrong domain is refused (49)',
     'a wrong password is refused with invalidCredentials (49)',
     'an account that does not exist is refused like a wrong password (49)',
     'a base that does not exist is refused with noSuchObject (32)',
@@ -129,6 +131,7 @@ class Driver:
     def __init__(self, options):
         self.options = options
         self.admin_dn = f'CN={options.user},CN=Users,{options.base_dn}'
+        self.dns_domain = options.dns_domain
 
     def bind(self, dn, password, base, scope='base'):
         return search(self.options.ldapsearch, self.options.host, self.options.port,
@@ -252,6 +255,31 @@ class Driver:
             return False, f'refused but returned {len(entries)} entries anyway'
         return True, f'invalidCredentials ({INVALID_CREDENTIALS}), same as a wrong password'
 
+    def check_upn_bind(self):
+        # A Windows client may name the account `<user>@<dns-domain>` instead of
+        # its DN, and only that name form was refused while the DN bound.
+        upn = f'{self.options.user}@{self.dns_domain}'
+        status, entries, error = self.bind(upn, self.options.password, self.options.base_dn)
+        if status != SUCCESS or not entries:
+            return False, f'{upn}: exit {status}: {error or "no entry returned"}'
+        wrong = f'{self.options.user}@not-{self.dns_domain}'
+        status, entries, _ = self.bind(wrong, self.options.password, self.options.base_dn)
+        if status != INVALID_CREDENTIALS or entries:
+            return False, f'{wrong}: exit {status}, expected {INVALID_CREDENTIALS}'
+        return True, f'{upn} binds, {wrong} refused ({INVALID_CREDENTIALS})'
+
+    def check_netbios_bind(self):
+        options = self.options
+        account = f'{options.netbios}\\{options.user}'
+        status, entries, error = self.bind(account, options.password, options.base_dn)
+        if status != SUCCESS or not entries:
+            return False, f'{account}: exit {status}: {error or "no entry returned"}'
+        wrong = f'NOT{options.netbios}\\{options.user}'
+        status, entries, _ = self.bind(wrong, options.password, options.base_dn)
+        if status != INVALID_CREDENTIALS or entries:
+            return False, f'{wrong}: exit {status}, expected {INVALID_CREDENTIALS}'
+        return True, f'{account} binds, {wrong} refused ({INVALID_CREDENTIALS})'
+
     def check_missing_base(self):
         missing = f'CN=No-Such-Container,{self.options.base_dn}'
         status, entries, _ = self.bind(self.admin_dn, self.options.password, missing)
@@ -270,6 +298,9 @@ def main():
     parser.add_argument('--user', default='Administrator')
     parser.add_argument('--password', default='P@ssw0rd123!')
     parser.add_argument('--dns-domain', default='')
+    parser.add_argument('--netbios', default='',
+                        help='NetBIOS name for the DOMAIN\\user bind. '
+                             'Default: the DNS domain with its first label upper-cased')
     parser.add_argument('--ldapsearch', default='ldapsearch')
     parser.add_argument('--list', action='store_true')
     options = parser.parse_args()
@@ -285,6 +316,9 @@ def main():
         return 1
 
     dns_domain = options.dns_domain or domain_from_base_dn(options.base_dn)
+    # Set after the base DN is parsed: Driver reads these for the two bind forms.
+    options.dns_domain = dns_domain
+    options.netbios = options.netbios or dns_domain.split('.')[0].upper()
     print(f'LDAP conformance against {options.host}:{options.port}, '
           f'base {options.base_dn} ({dns_domain or "no DNS domain"})')
 
@@ -297,6 +331,8 @@ def main():
         driver.check_selected_attribute_only,
         driver.check_no_attributes,
         driver.check_shuffled_case_bind,
+        driver.check_upn_bind,
+        driver.check_netbios_bind,
         driver.check_wrong_password,
         driver.check_missing_account,
         driver.check_missing_base,

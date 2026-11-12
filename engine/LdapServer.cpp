@@ -1639,6 +1639,9 @@ QByteArray LdapServer::handleBind(ClientState *st, int msgId, const QByteArray &
     // Without any stored secret every bind succeeds (the console's sample
     // directory). Once a password exists — on the object itself or in the
     // provisioned secrets — simple binds are verified against its verifier.
+    // AD takes three bind names for an account and only the first is a DN;
+    // resolving the other two here leaves one form to compare below.
+    const QString bindName = resolveBindName(name);
     const bool anonymous = name.isEmpty() && password.isEmpty();
     if (!anonymous) {
         QByteArray salt;
@@ -1659,7 +1662,7 @@ QByteArray LdapServer::handleBind(ClientState *st, int msgId, const QByteArray &
                 (!objectSalt.isEmpty() && !objectHash.isEmpty()) || !objectNtHash.isEmpty();
             if (stored)
                 anyVerifier = true;
-            if (stored && object.id.compare(name, Qt::CaseInsensitive) == 0) {
+            if (stored && object.id.compare(bindName, Qt::CaseInsensitive) == 0) {
                 salt = objectSalt.toLatin1();
                 hash = objectHash.toLatin1();
                 ntHashHex = objectNtHash.toLatin1();
@@ -1672,7 +1675,7 @@ QByteArray LdapServer::handleBind(ClientState *st, int msgId, const QByteArray &
             }
         }
         if (!haveVerifier) {
-            const auto it = m_credentials.constFind(name.toLower());
+            const auto it = m_credentials.constFind(bindName.toLower());
             if (it != m_credentials.constEnd()) {
                 salt = it->salt;
                 hash = it->hash;
@@ -1706,8 +1709,51 @@ QByteArray LdapServer::handleBind(ClientState *st, int msgId, const QByteArray &
             return makeBindResponse(msgId, 49);
     }
     if (!name.isEmpty())
-        st->authenticatedDn = name;
+        st->authenticatedDn = bindName;
     return makeBindResponse(msgId, 0); // success
+}
+
+QString LdapServer::resolveBindName(const QString &name) const
+{
+    // `CN=Administrator,CN=Users,DC=…` is already the form the verifier lookup
+    // uses. `user@dns-domain` (UPN) and `DOMAIN\user` are the two names a
+    // Windows client may send instead, and neither matches an entry id, so an
+    // account that binds fine by DN was refused with invalidCredentials.
+    if (name.contains(QLatin1Char('=')))
+        return name;
+    const QString lookup = name.trimmed();
+    if (lookup.isEmpty())
+        return name;
+    const int slash = lookup.indexOf(QLatin1Char('\\'));
+    const int at = lookup.indexOf(QLatin1Char('@'));
+    for (const DirectoryObject &object : m_objects) {
+        const QString account = object.attributes.value(QStringLiteral("sAMAccountName"));
+        if (account.isEmpty())
+            continue;
+        // The UPN the account carries is authoritative, so a domain with a
+        // renamed UPN suffix still binds by the name it published.
+        const QString upn = object.attributes.value(QStringLiteral("userPrincipalName"));
+        if (!upn.isEmpty() && upn.compare(lookup, Qt::CaseInsensitive) == 0)
+            return object.id;
+        if (slash > 0 && slash + 1 < lookup.size()) {
+            const QString domain = lookup.left(slash);
+            if ((!m_identity.netbios.isEmpty()
+                 && domain.compare(m_identity.netbios, Qt::CaseInsensitive) == 0)
+                || (!m_identity.dnsDomain.isEmpty()
+                    && domain.compare(m_identity.dnsDomain, Qt::CaseInsensitive) == 0)) {
+                if (account.compare(lookup.mid(slash + 1), Qt::CaseInsensitive) == 0)
+                    return object.id;
+            }
+        }
+        if (at > 0 && at + 1 < lookup.size()) {
+            const QString domain = lookup.mid(at + 1);
+            if (!m_identity.dnsDomain.isEmpty()
+                && domain.compare(m_identity.dnsDomain, Qt::CaseInsensitive) == 0
+                && account.compare(lookup.left(at), Qt::CaseInsensitive) == 0)
+                return object.id;
+        }
+    }
+    return name;
 }
 
 QString LdapServer::ntlmDomainName() const

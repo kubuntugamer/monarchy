@@ -189,6 +189,10 @@ private slots:
     void onSslErrors(const QList<QSslError> &errors);
 
 private:
+    // A bind name may be a DN, a UPN or `DOMAIN\user`; the last two are mapped
+    // to the entry's id before the verifier lookup, which compares one form.
+    QString resolveBindName(const QString &name) const;
+
     struct ClientState {
         // Plaintext until the client asks for StartTLS, then the same socket
         // carries TLS.
