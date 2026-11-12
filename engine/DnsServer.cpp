@@ -793,9 +793,18 @@ QByteArray DnsServer::handlePacket(const QByteArray &packet, const QHostAddress 
 
     QList<Record> answers;
     const int rcode = handleQuery(message, answers);
+    // A negative answer carries the zone's SOA in AUTHORITY so the client knows
+    // how long it may cache the absence (RFC 2308 §3). Without it a resolver
+    // treats the answer as uncacheable and asks again every time.
+    QList<Record> authority;
+    if (answers.isEmpty()) {
+        const QList<Record> soa = records(m_zone, TypeSoa);
+        if (!soa.isEmpty())
+            authority.append(soa.first());
+    }
     if (rcode != NoError)
         answers.clear();
-    return buildResponse(packet, answers, rcode);
+    return buildResponse(packet, answers, rcode, authority);
 }
 
 QByteArray DnsServer::forwardQuery(const Message &message, const QByteArray &packet,
@@ -1217,6 +1226,16 @@ int DnsServer::handleQuery(const Message &message, QList<Record> &answers) {
         }
     }
     answers = found;
+    if (!found.isEmpty())
+        return NoError;
+    // Two different negatives, and a client acts on the difference: a name that
+    // is not in the zone is NXDOMAIN, while a name that exists without this type
+    // is an empty NOERROR. Answering the first as the second told every client
+    // and every cache that the name merely had no A record, so a negative lookup
+    // was retried instead of cached (RFC 2308 §2.1).
+    const auto it = m_records.constFind(question.name.toLower());
+    if (it == m_records.constEnd() || it->isEmpty())
+        return NxDomain;
     return NoError;
 }
 
@@ -1341,7 +1360,7 @@ int DnsServer::handleUpdate(const Message &message) {
 }
 
 QByteArray DnsServer::buildResponse(const QByteArray &query, const QList<Record> &answers,
-                                    int rcode) const {
+                                    int rcode, const QList<Record> &authority) const {
     int pos = 0;
     quint16 id = 0;
     quint16 queryFlags = 0;
@@ -1356,12 +1375,16 @@ QByteArray DnsServer::buildResponse(const QByteArray &query, const QList<Record>
     const quint16 rd = quint16(queryFlags & 0x0100);
     // AA only means something on a successful authoritative answer; RA says
     // this server can recurse for names outside the zone.
-    const quint16 aa = rcode == NoError ? quint16(0x0400) : quint16(0);
+    // AA is about who answered, not whether the name existed: a NXDOMAIN from
+    // this zone is as authoritative as a positive answer, and a resolver keeps
+    // it only if it believes that.
+    const quint16 aa = (rcode == NoError || rcode == NxDomain) ? quint16(0x0400)
+                                                              : quint16(0);
     const quint16 ra = m_forwarding ? quint16(0x0080) : quint16(0);
     wr16(response, quint16(0x8000 | opcode | rd | ra | aa | quint16(rcode & 0x0f)));
     wr16(response, qdcount);
     wr16(response, quint16(answers.size()));
-    wr16(response, 0);
+    wr16(response, quint16(authority.size()));
     wr16(response, 0);
 
     // Echo the question (or, for UPDATE, the zone) section verbatim.
@@ -1376,13 +1399,15 @@ QByteArray DnsServer::buildResponse(const QByteArray &query, const QList<Record>
         return {};
     response.append(query.mid(12, qpos - 12));
 
-    for (const Record &record : answers) {
-        response.append(encodeName(record.name));
-        wr16(response, record.type);
-        wr16(response, ClassIn);
-        wr32(response, record.ttl);
-        wr16(response, quint16(record.rdata.size()));
-        response.append(record.rdata);
+    for (const QList<Record> *section : { &answers, &authority }) {
+        for (const Record &record : *section) {
+            response.append(encodeName(record.name));
+            wr16(response, record.type);
+            wr16(response, ClassIn);
+            wr32(response, record.ttl);
+            wr16(response, quint16(record.rdata.size()));
+            response.append(record.rdata);
+        }
     }
     return response;
 }

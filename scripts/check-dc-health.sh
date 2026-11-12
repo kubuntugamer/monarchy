@@ -160,6 +160,42 @@ else
     elif [[ "$resolved" -eq 0 ]]; then
         skip "SRV locators" "the zone at $DC_IP:$DNS_PORT holds none for $DNS_DOMAIN"
     fi
+
+    # A negative answer is a claim a client caches, and the two negatives are
+    # not the same one: a name outside the zone is NXDOMAIN, an existing name
+    # without the type asked for is an empty NOERROR. Both have to carry the
+    # zone's SOA in AUTHORITY or a resolver cannot cache the absence.
+    absent="no-such-name-$RANDOM.$DNS_DOMAIN"
+    negative_status=0
+    answer="$(dig @"$DC_IP" -p "$DNS_PORT" +time=2 +tries=1 A "$absent" 2>/dev/null)" \
+        || negative_status=$?
+    CHECKS=$((CHECKS + 1))
+    if [[ "$negative_status" -ne 0 ]]; then
+        fail "NXDOMAIN" "dig exited $negative_status asking for $absent"
+    elif ! grep -q 'status: NXDOMAIN' <<<"$answer"; then
+        fail "NXDOMAIN" "$absent did not answer NXDOMAIN"
+    elif ! grep -q 'AUTHORITY: 1' <<<"$answer"; then
+        fail "NXDOMAIN" "$absent answered NXDOMAIN without the zone's SOA"
+    elif ! grep -q 'flags: qr aa' <<<"$answer"; then
+        fail "NXDOMAIN" "$absent answered without AA, so a resolver will not keep it"
+    else
+        ok "NXDOMAIN + SOA"
+    fi
+
+    # The zone apex exists, so a type it does not carry is NODATA, not NXDOMAIN.
+    nodata_status=0
+    answer="$(dig @"$DC_IP" -p "$DNS_PORT" +time=2 +tries=1 TXT "$DNS_DOMAIN" 2>/dev/null)" \
+        || nodata_status=$?
+    CHECKS=$((CHECKS + 1))
+    if [[ "$nodata_status" -ne 0 ]]; then
+        fail "NODATA" "dig exited $nodata_status asking for a TXT at the apex"
+    elif ! grep -q 'status: NOERROR' <<<"$answer"; then
+        fail "NODATA" "the zone apex did not answer NOERROR for a type it lacks"
+    elif ! grep -q 'AUTHORITY: 1' <<<"$answer"; then
+        fail "NODATA" "the empty answer carried no SOA, so nothing can be cached"
+    else
+        ok "NODATA + SOA"
+    fi
 fi
 
 # --- summary ---------------------------------------------------------------

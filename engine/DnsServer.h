@@ -178,7 +178,8 @@ private:
     // Returns the rcode; fills `answers` for standard queries.
     int handleQuery(const Message &message, QList<Record> &answers);
     int handleUpdate(const Message &message);
-    QByteArray buildResponse(const QByteArray &query, const QList<Record> &answers, int rcode) const;
+    QByteArray buildResponse(const QByteArray &query, const QList<Record> &answers, int rcode,
+                             const QList<Record> &authority = {}) const;
 
     void bumpSerial();
     bool inZone(const QString &name) const;
