@@ -101,6 +101,15 @@ DC believes it started.
 These are places where a change can pass everything and still be wrong. They are
 recorded, not hidden:
 
+- **G11 — share enumeration is absent on both transports.** Measured with
+  Samba's `smbclient -L` against a provisioned tree, at 2.1 and pinned to NT1:
+  both print an empty share list, while connecting to `SYSVOL` by name and
+  listing it works on both. There is no `srvsvc` pipe and no RAP
+  `NetShareEnum` handler anywhere in `engine/`, so this is absence rather than a
+  broken reply — box B's `shares` answering `0xc0000034` over SMB1 is the same
+  fact seen through impacket. None of the drivers asserted it, which is why it
+  went unnoticed; nothing in the tree claims it.
+
 - **G10 — a create on a read-only share is refused with the wrong status.**
   SYSVOL and NETLOGON accept no writes, which is deliberate, but opening a file
   that does not exist for writing answers `OBJECT_NAME_NOT_FOUND` rather than
