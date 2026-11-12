@@ -100,8 +100,12 @@ DC believes it started.
 These are places where a change can pass everything and still be wrong. They are
 recorded, not hidden:
 
-- **G6 — the LDAP path has no live external client in CI.** `ldap3` is a
-  development convenience on one box, not a stage in `ci.sh`.
+- **G9 — a search ignores the attribute selection list.** `ldapsearch` asking
+  for `cn` alone receives every attribute of the entry, and `1.1` — RFC 4511's
+  spelling of "no attributes" — returns the whole entry as well. Found by the
+  external client G6 added, on its first run; the wire tests never noticed
+  because each one reads back the attributes it asked for and tolerates extra
+  values. Not fixed yet.
 - **G8 — SMB1 (NT LM 0.12) still has no client in CI.** `scripts/smb-conformance.py`
   asks for 2.1 and, when it is refused, 2.0.2, and reads the answer back; it
   never sends the NT LM 0.12 negotiate `Smb1.cpp` serves, so the SMB1 path is
@@ -109,8 +113,8 @@ recorded, not hidden:
   Adding it means a second pinned dialect and the pre-SMB2 header the other
   checks do not share.
 
-Six of the original seven are closed; their entries stay here so a reference
-in #7 still resolves:
+All seven original gaps are closed; their entries stay here so a reference in
+#7 still resolves, and G8 was added afterwards:
 
 - **G1 — closed.** `scripts/ci.sh --sanitize` configures a Debug build with
   AddressSanitizer and UndefinedBehaviorSanitizer, halts on a UBSan diagnostic
@@ -134,6 +138,27 @@ in #7 still resolves:
   and the `build-and-test` job installs `smbclient` and runs that stage, so a
   byte only this tree's SMB2 encoder accepts now fails in CI. The SMB1 half was
   never in this driver and is recorded separately as G8.
+
+- **G6 — closed.** `ci.sh --conformance` runs `scripts/ldap-conformance.py`,
+  which drives the LDAP listener with OpenLDAP's `ldapsearch`, so the client's
+  BER length encoder, DN parser and filter compiler are libldap's and not this
+  tree's. Eight checks, measured on a provisioned tree: an anonymous rootDSE
+  read that must name this domain in `namingContexts`, this server in
+  `vendorName` and version 3 in `supportedLDAPVersion`; a simple bind as the
+  administrator; the domain object at the base DN; a subtree search that finds
+  the administrator by `sAMAccountName`; a bind whose DN is sent with lowercased
+  attribute types; a wrong password refused with `invalidCredentials` (49) and
+  no entry; an account that does not exist refused the same way, so the
+  directory does not answer "does this user exist"; and a missing base refused
+  with `noSuchObject` (32). Three negative controls were run against it — wrong
+  password, wrong base DN and nothing listening — and it exits 1 on each rather
+  than printing a pass.
+
+  The first check is also the attribution G7 needed: `ldapPort` stays at 1389,
+  so a client alone cannot tell whose server answered, but a server that is not
+  this domain fails the rootDSE read before any later check runs.
+
+  It found a real defect on its first run, recorded as **G9** below.
 
 - **G7 — closed.** `ci.sh --conformance` now runs `scripts/check-dc-health.sh`
   against the throwaway tree it just provisioned, after the readiness greps and

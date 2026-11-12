@@ -16,15 +16,18 @@
 #
 # --conformance goes further than the suites: it provisions a throwaway domain
 # under a temporary directory, starts monarchy-dcd on the unprivileged dev port
-# set, and drives the running DC with scripts/drs-conformance.py, the impacket
+# set, and drives the running DC with scripts/ldap-conformance.py (the LDAP
+# listener, driven by OpenLDAP's ldapsearch so neither the BER encoder nor the
+# DN parser is this tree's), scripts/drs-conformance.py, the impacket
 # half of scripts/lsad-conformance.py, scripts/samr-conformance.py (the account
 # lifecycle), scripts/netlogon-conformance.py (the locator and the secure
 # channel a logon rides on, with a machine account it creates over SAMR) and
 # scripts/smb-conformance.py (the SMB2 transport those pipes ride on, driven at
 # a pinned dialect by smbclient, rpcclient and impacket). Those checks marshal
-# with impacket's own NDR or with Samba's, so they fail where a reply only this
-# tree's encoder understands would pass. They need impacket for python3 and the
-# smbclient package, and are therefore opt-in rather than automatic.
+# with impacket's own NDR or with Samba's or OpenLDAP's, so they fail where a
+# reply only this tree's encoder understands would pass. They need impacket for
+# python3, the smbclient package and the ldap-utils package, and are therefore
+# opt-in rather than automatic.
 #
 # --sanitize configures a Debug build with AddressSanitizer and
 # UndefinedBehaviorSanitizer and runs every suite. UBSan is set to halt rather
@@ -197,6 +200,20 @@ PY
     }
 
     local status=0
+
+    # Every other driver marshals with impacket or a Samba binary; this one is
+    # the only place an LDAP client that is not this tree talks to the LISTENER,
+    # and libldap brings its own BER length encoder and DN parser, so a reply
+    # only our encoder accepts fails here. The port comes from dc.conf because
+    # --dev-ports moves the privileged ones.
+    local ldap_port
+    ldap_port=$(sed -n 's/^ldapPort=//p' "$dc_dir/dc.conf" | head -1)
+    : "${ldap_port:=389}"
+    printf '== LDAP conformance (OpenLDAP ldapsearch)\n'
+    python3 "$root/scripts/ldap-conformance.py" --host 127.0.0.1 --port "$ldap_port" \
+        --base-dn "$conformance_base_dn" --user Administrator \
+        --password "$conformance_password" --dns-domain "$conformance_dns" || status=1
+
     printf '== DRSR conformance (impacket NDR)\n'
     python3 "$root/scripts/drs-conformance.py" --host 127.0.0.1 --port "$drs_port" \
         --basedn "$conformance_base_dn" --dnsdomain "$conformance_dns" \

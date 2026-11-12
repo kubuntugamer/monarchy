@@ -25,9 +25,11 @@ jobs:
           # smbclient carries both smbclient and rpcclient, which the SMB2
           # conformance stage drives the provisioned DC with; dnsutils carries
           # dig, without which the health check reports its SRV section as
-          # skipped and the locator half of that stage proves nothing.
+          # skipped and the locator half of that stage proves nothing; ldap-utils
+          # carries ldapsearch, the LDAP client whose BER encoder and DN parser
+          # are not this tree's.
           sudo apt-get install -y --no-install-recommends \
-            build-essential cmake ninja-build openssl libgl1 smbclient dnsutils
+            build-essential cmake ninja-build openssl libgl1 smbclient dnsutils ldap-utils
 
       - name: Install Qt
         uses: jurplel/install-qt-action@v4
