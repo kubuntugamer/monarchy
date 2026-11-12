@@ -5,8 +5,10 @@
 
 #include <QSet>
 #include <QTcpSocket>
+#include <QUdpSocket>
 
 #include "LdapServer.h"
+#include "ObjectGuid.h"
 #include "Ntlm.h"
 #include "SampleData.h"
 #include "ldap_wire_helpers.h"
@@ -75,6 +77,82 @@ void authenticate(QTcpSocket &client, Reader &reader, const QByteArray &dn, int 
 
 const char kSampleUserDn[] = "CN=Alice Chen,CN=Users,DC=corp,DC=example,DC=com";
 
+// The Windows DC locator's query (MS-ADTS 6.3.1.4.1.1): a baseObject search on
+// the root DSE whose filter asserts DnsDomain and the NtVer capabilities it
+// speaks. This is the only LDAP query sent over UDP.
+QByteArray locatorPing(const QByteArray &domain, int id = 7)
+{
+    QByteArray filter = tlv(char(0xa0),
+                            tlv(char(0xa3), tlv(0x04, "DnsDomain") + tlv(0x04, domain))
+                                + tlv(char(0xa3), tlv(0x04, "NtVer")
+                                                      + tlv(0x04, QByteArray("\x06\x00\x00\x00", 4))));
+    QByteArray inner = tlv(0x04, QByteArray());        // base: the root DSE
+    inner += tlv(char(0x0a), QByteArray(1, char(0)));   // scope: baseObject
+    inner += tlv(char(0x0a), QByteArray(1, char(0)));   // derefAliases: never
+    inner += tlv(char(0x02), QByteArray(1, char(0)));   // sizeLimit
+    inner += tlv(char(0x02), QByteArray(1, char(0)));   // timeLimit
+    inner += tlv(char(0x01), QByteArray(1, char(0)));   // typesOnly: FALSE
+    inner += filter;
+    inner += tlv(char(0x30), QByteArray());             // no attributes named
+    return ldapMessage(id, char(0x63), inner);
+}
+
+// The GUID a Windows client is told and then matches against the directory, in
+// the byte order a GUID wears on the wire.
+QByteArray wireGuid(const QUuid &guid)
+{
+    QByteArray out;
+    for (int shift = 0; shift <= 24; shift += 8)
+        out.append(char((guid.data1 >> shift) & 0xff));
+    out.append(char(guid.data2 & 0xff));
+    out.append(char((guid.data2 >> 8) & 0xff));
+    out.append(char(guid.data3 & 0xff));
+    out.append(char((guid.data3 >> 8) & 0xff));
+    for (int i = 0; i < 8; ++i)
+        out.append(char(guid.data4[i]));
+    return out;
+}
+
+// Everything one UDP query gets back, or empty when nothing arrives.
+QByteArray udpQuery(quint16 port, const QByteArray &request, int waitMs = 1500)
+{
+    QUdpSocket client;
+    if (client.writeDatagram(request, QHostAddress::LocalHost, port) != request.size())
+        return QByteArray();
+    // The server lives in this thread, so its socket notifiers only run while
+    // the event loop is pumped; a plain waitForReadyRead would block them.
+    QByteArray reply;
+    QElapsedTimer timer;
+    timer.start();
+    while (timer.elapsed() < waitMs && reply.isEmpty()) {
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+        if (!client.hasPendingDatagrams() && !client.waitForReadyRead(20))
+            continue;
+        while (client.hasPendingDatagrams()) {
+            QByteArray buffer;
+            buffer.resize(int(client.pendingDatagramSize()));
+            const qint64 read = client.readDatagram(buffer.data(), buffer.size());
+            if (read <= 0)
+                continue;
+            buffer.truncate(int(read));
+            reply = buffer;
+        }
+    }
+    return reply;
+}
+
+void addSampleDomain(LdapServer &server)
+{
+    DirectoryObject domain;
+    domain.id = QStringLiteral("DC=corp,DC=example,DC=com");
+    domain.name = QStringLiteral("CORP");
+    domain.kind = ObjectKind::Domain;
+    domain.attributes.insert(QStringLiteral("distinguishedName"), domain.id);
+    domain.attributes.insert(QStringLiteral("objectClass"),
+                             QStringLiteral("top;domain;domainDNS"));
+    server.addObject(domain);
+}
+
 } // namespace
 
 class LdapTest : public QObject
@@ -95,6 +173,9 @@ private slots:
     void searchMissingRequiredFieldsIsProtocolError();
     void searchOversizeIntegerIsProtocolError();
     void messageIdWithTheTopBitSetIsEchoed();
+    void answersTheDcLocatorPingOverUdp();
+    void locatorPingForAnotherDomainIsNoSuchObject();
+    void udpIsSilentForAnythingButTheLocatorPing();
 };
 
 // The password policy is the domain object's: minPwdLength, pwdHistoryLength and
@@ -718,6 +799,93 @@ void LdapTest::messageIdWithTheTopBitSetIsEchoed()
     QVERIFY(!reply.isEmpty());
     QCOMPARE(messageId(reply), id);
     QCOMPARE(operationTag(reply), 0x65); // searchResDone, not a refusal
+}
+
+// DsGetDcName follows a DC's SRV record and then pings UDP/389 to satisfy
+// itself that the machine really hosts the domain; a candidate that stays
+// silent is discarded and the client reports ERROR_NO_SUCH_DOMAIN, so this is
+// the difference between a directory and a directory a Windows client can find.
+void LdapTest::answersTheDcLocatorPingOverUdp()
+{
+    LdapServer server;
+    server.setObjects(sampleObjects());
+    addSampleDomain(server);
+    LdapServer::Identity identity;
+    identity.realm = QStringLiteral("CORP.EXAMPLE.COM");
+    identity.netbios = QStringLiteral("CORP");
+    identity.dnsDomain = QStringLiteral("corp.example.com");
+    identity.dcHost = QStringLiteral("dc1.corp.example.com");
+    identity.siteName = QStringLiteral("Default-First-Site-Name");
+    server.setIdentity(identity);
+    QVERIFY(server.listen(0));
+    QVERIFY2(server.cldapListening(), "no CLDAP listener was bound");
+    // The locator sends the ping to the same port number as LDAP.
+    QCOMPARE(server.cldapPort(), server.serverPort());
+
+    const QByteArray direct = server.cldapResponse(locatorPing("corp.example.com"));
+    QVERIFY2(!direct.isEmpty(), "cldapResponse returned nothing for a valid ping");
+    const QByteArray reply = udpQuery(server.cldapPort(), locatorPing("corp.example.com"));
+    QVERIFY2(!reply.isEmpty(), "the locator ping went unanswered");
+    QCOMPARE(operationTag(reply), 0x64); // searchResEntry
+    QCOMPARE(messageId(reply), 7);
+
+    // What the client reads to decide this DC hosts the domain.
+    QVERIFY(reply.contains("DnsDomain"));
+    QVERIFY(reply.contains("corp.example.com"));
+    QVERIFY(reply.contains("DnsForestName"));
+    QVERIFY(reply.contains("DcSiteName"));
+    QVERIFY(reply.contains("NetbiosDomainName"));
+    QVERIFY(reply.contains("CORP"));
+    QVERIFY(reply.contains("HostName"));
+    QVERIFY(reply.contains("dc1.corp.example.com"));
+    QVERIFY(reply.contains("NtVer"));
+    QVERIFY(reply.contains(QByteArray("\x06\x00\x00\x00", 4)));
+    QVERIFY(reply.contains("LdapService"));
+    // The domain GUID the client is told is the one the directory publishes for
+    // the same object, so a join can match them up.
+    QVERIFY(reply.contains("DomainGuid"));
+    QVERIFY(reply.contains(wireGuid(objectGuidFor(QStringLiteral("DC=corp,DC=example,DC=com")))));
+}
+
+// The ping names the domain it is looking for. Answering a different name
+// would claim this DC hosts somebody else's namespace.
+void LdapTest::locatorPingForAnotherDomainIsNoSuchObject()
+{
+    LdapServer server;
+    LdapServer::Identity identity;
+    identity.dnsDomain = QStringLiteral("corp.example.com");
+    identity.netbios = QStringLiteral("CORP");
+    identity.dcHost = QStringLiteral("dc1.corp.example.com");
+    server.setIdentity(identity);
+    QVERIFY(server.listen(0));
+
+    const QByteArray reply = udpQuery(server.cldapPort(), locatorPing("other.example.com"));
+    QVERIFY(!reply.isEmpty());
+    QCOMPARE(operationTag(reply), 0x65); // searchResDone only
+    QCOMPARE(resultCode(reply), 32);     // noSuchObject
+}
+
+// RFC 4511 dropped LDAP over UDP; only the locator ping survives on it. A
+// search that is not a ping must not be answered, because a reply would tell a
+// client that a transport it does not implement works.
+void LdapTest::udpIsSilentForAnythingButTheLocatorPing()
+{
+    LdapServer server;
+    LdapServer::Identity identity;
+    identity.dnsDomain = QStringLiteral("corp.example.com");
+    server.setIdentity(identity);
+    QVERIFY(server.listen(0));
+
+    QByteArray inner = tlv(0x04, QByteArray());          // root DSE
+    inner += tlv(char(0x0a), QByteArray(1, char(0)));    // baseObject
+    inner += tlv(char(0x0a), QByteArray(1, char(0)));    // derefAliases
+    inner += tlv(char(0x02), QByteArray(1, char(0)));    // sizeLimit
+    inner += tlv(char(0x02), QByteArray(1, char(0)));    // timeLimit
+    inner += tlv(char(0x01), QByteArray(1, char(0)));    // typesOnly
+    inner += tlv(char(0x87), QByteArray("objectClass")); // plain present filter
+    inner += tlv(char(0x30), QByteArray());
+    const QByteArray reply = udpQuery(server.cldapPort(), ldapMessage(1, char(0x63), inner), 700);
+    QVERIFY2(reply.isEmpty(), "a non-locator search was answered over UDP");
 }
 
 QTEST_MAIN(LdapTest)

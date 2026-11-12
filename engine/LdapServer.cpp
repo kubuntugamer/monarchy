@@ -5,12 +5,14 @@
 
 #include "Asn1.h"
 #include "Gss.h"
+#include "ObjectGuid.h"
 #include "Kdc.h"
 #include "LogonHours.h"
 #include "PasswordAge.h"
 #include "Ntlm.h"
 
 #include <QtNetwork/QTcpSocket>
+#include <QtNetwork/QUdpSocket>
 #include <QtNetwork/QHostAddress>
 #include <QtNetwork/QSslCipher>
 #include <QtNetwork/QSslConfiguration>
@@ -374,7 +376,177 @@ LdapServer::LdapServer(QObject *parent) : QObject(parent) {
 LdapServer::~LdapServer() { close(); }
 
 bool LdapServer::listen(quint16 port) {
-    return m_server->listen(QHostAddress::Any, port);
+    const bool ok = m_server->listen(QHostAddress::Any, port);
+    // The locator's ping arrives on UDP at the same port number as the LDAP
+    // listener; TCP and UDP bind independently, so a port already taken for UDP
+    // (another CLDAP responder, say) does not cost us the directory itself.
+    if (ok) listenCldap(m_server->serverPort());
+    return ok;
+}
+
+bool LdapServer::listenCldap(quint16 port) {
+    if (!m_cldap) {
+        m_cldap = new QUdpSocket(this);
+        connect(m_cldap, &QUdpSocket::readyRead, this, &LdapServer::onCldapDatagram);
+    }
+    if (m_cldap->state() == QAbstractSocket::BoundState) m_cldap->close();
+    return m_cldap->bind(QHostAddress::Any, port);
+}
+
+void LdapServer::closeCldap() {
+    if (m_cldap) m_cldap->close();
+}
+
+bool LdapServer::cldapListening() const {
+    return m_cldap && m_cldap->state() == QAbstractSocket::BoundState;
+}
+
+quint16 LdapServer::cldapPort() const { return m_cldap ? m_cldap->localPort() : 0; }
+
+void LdapServer::onCldapDatagram() {
+    while (m_cldap && m_cldap->hasPendingDatagrams()) {
+        QByteArray datagram;
+        datagram.resize(int(m_cldap->pendingDatagramSize()));
+        QHostAddress peer;
+        quint16 peerPort = 0;
+        const qint64 read = m_cldap->readDatagram(datagram.data(), datagram.size(), &peer, &peerPort);
+        if (read < 0) continue;
+        datagram.truncate(int(read));
+        const QByteArray reply = cldapResponse(datagram);
+        if (!reply.isEmpty()) m_cldap->writeDatagram(reply, peer, peerPort);
+    }
+}
+
+QByteArray LdapServer::cldapResponse(const QByteArray &request) const {
+    // The only query a DC answers over UDP is the locator's ping: a baseObject
+    // search on the root DSE whose filter asserts DnsDomain (MS-ADTS 6.3.1.4.1).
+    // It is how a client satisfies itself that the machine its SRV record points
+    // at really hosts this domain, and the answer carries the facts it needs to
+    // carry on — the NetBIOS and DNS names, the site, the domain GUID and the
+    // NtVer capabilities mask.
+    Asn1::Element message;
+    if (!Asn1::parse(request, &message) || message.tag != 0x30) return {};
+    const Asn1::Element *idField = Asn1::child(message, 0x02);
+    const Asn1::Element *search = Asn1::child(message, 0x63);
+    if (!idField || !search) return {};
+
+    const QList<const Asn1::Element *> scopeFields = Asn1::children(*search, 0x0a);
+    if (!scopeFields.isEmpty() && Asn1::toInteger(*scopeFields.first()) != 0) return {};
+
+    // Collect the filter's assertions. A ping names a domain; one that names a
+    // different domain is answered with noSuchObject, the way a DC that hosts
+    // only its own namespace would.
+    QStringList assertions;
+    QList<const Asn1::Element *> pending;
+    for (const Asn1::Element &child : search->children) {
+        // The filter is the context-tagged field of the search request; its
+        // assertions are the leaf values beneath it.
+        if ((child.tag & 0xa0) == 0xa0) pending.append(&child);
+    }
+    while (!pending.isEmpty()) {
+        const Asn1::Element *element = pending.takeFirst();
+        if (element->children.isEmpty()) {
+            assertions.append(QString::fromUtf8(element->value));
+            continue;
+        }
+        for (const Asn1::Element &child : element->children) pending.append(&child);
+    }
+
+    int domainIndex = -1;
+    for (int i = 0; i < assertions.size(); ++i) {
+        if (assertions.at(i).compare(QStringLiteral("DnsDomain"), Qt::CaseInsensitive) == 0) {
+            domainIndex = i + 1;
+            break;
+        }
+    }
+    if (domainIndex <= 0 || domainIndex >= assertions.size()) return {};
+
+    const int msgId = int(Asn1::toInteger(*idField));
+    if (assertions.at(domainIndex).compare(m_identity.dnsDomain, Qt::CaseInsensitive) != 0) {
+        QByteArray inner;
+        writeInt(inner, 0x0a, 32); // noSuchObject
+        writeString(inner, 0x04, QString());
+        writeString(inner, 0x04, QString());
+        QByteArray out;
+        writeInt(out, 0x02, msgId);
+        writeTLV(out, 0x65, inner);
+        QByteArray seq;
+        writeTLV(seq, 0x30, out);
+        return seq;
+    }
+
+    const QString site = m_identity.siteName.isEmpty()
+                             ? QStringLiteral("Default-First-Site-Name")
+                             : m_identity.siteName;
+    const QString host = m_identity.dcHost;
+    const QString netbiosHost = host.section(QLatin1Char('.'), 0, 0).toUpper();
+
+    // The domain's GUID, in the mixed-endian layout a GUID wears on the wire.
+    QByteArray domainGuid;
+    for (const DirectoryObject &object : m_objects) {
+        if (object.kind != ObjectKind::Domain) continue;
+        const QUuid stored(object.attributes.value(QStringLiteral("objectGUID")));
+        const QUuid guid = stored.isNull() ? objectGuidFor(object.id) : stored;
+        if (guid.isNull()) continue;
+        const quint32 d1 = guid.data1;
+        const quint16 d2 = guid.data2;
+        const quint16 d3 = guid.data3;
+        domainGuid.append(char(d1 & 0xff));
+        domainGuid.append(char((d1 >> 8) & 0xff));
+        domainGuid.append(char((d1 >> 16) & 0xff));
+        domainGuid.append(char((d1 >> 24) & 0xff));
+        domainGuid.append(char(d2 & 0xff));
+        domainGuid.append(char((d2 >> 8) & 0xff));
+        domainGuid.append(char(d3 & 0xff));
+        domainGuid.append(char((d3 >> 8) & 0xff));
+        for (int i = 0; i < 8; ++i) domainGuid.append(char(guid.data4[i]));
+        break;
+    }
+
+    auto attribute = [](const QString &type, const QByteArray &value) {
+        QByteArray set;
+        writeTLV(set, 0x04, value);
+        QByteArray partial;
+        writeString(partial, 0x04, type);
+        writeTLV(partial, 0x31, set);
+        QByteArray sequence;
+        writeTLV(sequence, 0x30, partial);
+        return sequence;
+    };
+
+    QByteArray attributes;
+    attributes.append(attribute(QStringLiteral("DnsDomain"), m_identity.dnsDomain.toUtf8()));
+    // One namespace here: the domain is its own forest root.
+    attributes.append(attribute(QStringLiteral("DnsForestName"), m_identity.dnsDomain.toUtf8()));
+    attributes.append(attribute(QStringLiteral("DcSiteName"), site.toUtf8()));
+    attributes.append(attribute(QStringLiteral("NetbiosDomainName"), m_identity.netbios.toUtf8()));
+    attributes.append(attribute(QStringLiteral("NetbiosComputerName"), netbiosHost.toUtf8()));
+    attributes.append(attribute(QStringLiteral("HostName"), host.toUtf8()));
+    // NT_VERSION_5 | NT_VERSION_5EX: the capabilities mask a Windows DC
+    // publishes, and the value the locator's own filter asks for.
+    attributes.append(attribute(QStringLiteral("NtVer"), QByteArray("\x06\x00\x00\x00", 4)));
+    if (!domainGuid.isEmpty())
+        attributes.append(attribute(QStringLiteral("DomainGuid"), domainGuid));
+    attributes.append(attribute(QStringLiteral("LdapService"), QByteArray("LDAP")));
+
+    QByteArray entry;
+    writeString(entry, 0x04, QString()); // objectName: the root DSE
+    QByteArray attrsSequence;
+    writeTLV(attrsSequence, 0x30, attributes);
+    entry.append(attrsSequence);
+
+    QByteArray done;
+    writeInt(done, 0x0a, 0); // success
+    writeString(done, 0x04, QString());
+    writeString(done, 0x04, QString());
+
+    QByteArray body;
+    writeInt(body, 0x02, msgId);
+    writeTLV(body, 0x64, entry); // searchResEntry
+    writeTLV(body, 0x65, done);  // searchResDone
+    QByteArray response;
+    writeTLV(response, 0x30, body);
+    return response;
 }
 
 void LdapServer::setIdentity(const Identity &identity) {
@@ -415,6 +587,7 @@ void LdapServer::close() {
         delete c;
     }
     m_clients.clear();
+    closeCldap();
     if (m_server) m_server->close();
     if (m_gcServer) {
         m_gcServer->close();

@@ -20,6 +20,7 @@
 
 class Kdc;
 class LdapListener;
+class QUdpSocket;
 
 // A minimal in-process LDAP server (RFC 4511 subset) so Monarchy can act as a DC
 // on this machine without root or external packages. Supports Bind (simple) and
@@ -54,6 +55,23 @@ public:
     void closeGc();
     bool gcListening() const;
     quint16 gcServerPort() const;
+
+    // CLDAP (LDAP over UDP, the transport RFC 4511 dropped). It survives on the
+    // wire because the Windows DC locator uses it: after following a DC's SRV
+    // record it verifies the candidate with an LDAP ping on UDP/389 and
+    // discards any candidate that does not answer. A TCP-only listener is
+    // therefore invisible to DsGetDcName, and a client reports
+    // ERROR_NO_SUCH_DOMAIN without ever reaching SAMR or Netlogon — so the join
+    // protocol the rest of the engine implements is never asked to run. Bound
+    // from listen() on the LDAP port; a refused bind leaves TCP working.
+    bool listenCldap(quint16 port);
+    void closeCldap();
+    bool cldapListening() const;
+    quint16 cldapPort() const;
+    // One datagram in, one reply out. Empty when the datagram is not a locator
+    // ping: the ping is the only LDAP query AD answers over UDP, and answering
+    // anything else here would claim a transport it does not implement.
+    QByteArray cldapResponse(const QByteArray &request) const;
 
     // TLS for StartTLS (RFC 4511 §4.14.1). The listener accepts plaintext and
     // upgrades a connection in place when the client sends the StartTLS extended
@@ -183,6 +201,7 @@ signals:
     void requestReceived(const QString &op);
 
 private slots:
+    void onCldapDatagram();
     void onReadyRead();
     void onDisconnected();
     void onEncrypted();
@@ -338,6 +357,7 @@ private:
 
     QTcpServer *m_server = nullptr;
     QTcpServer *m_gcServer = nullptr;
+    QUdpSocket *m_cldap = nullptr;
     Identity m_identity;
     Kdc *m_kdc = nullptr;
     QSslCertificate m_tlsCertificate;

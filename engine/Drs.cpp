@@ -9,6 +9,7 @@
 #include <algorithm>
 
 #include "Ndr.h"
+#include "ObjectGuid.h"
 
 namespace {
 
@@ -95,18 +96,6 @@ QByteArray stubReply(quint32 status)
     QByteArray out;
     putLe32(out, status);
     return out;
-}
-
-QUuid derivedGuid(const QString &seed)
-{
-    const QByteArray digest =
-        QCryptographicHash::hash(seed.toUtf8(), QCryptographicHash::Md5);
-    return QUuid::fromRfc4122(digest);
-}
-
-QUuid objectGuidFor(const QString &dn)
-{
-    return derivedGuid(QStringLiteral("monarchy-object/") + dn);
 }
 
 // The GUID an object wears on the wire: the stored objectGUID when the
@@ -1988,13 +1977,13 @@ QByteArray partialBinaryOid(const char *oidText)
 // and GUID checks survive a restart without a store write.
 QUuid invocationId(const QString &domainSid, const QString &dcName)
 {
-    return derivedGuid(QStringLiteral("monarchy-invocation/") + domainSid
+    return monarchyGuidForSeed(QStringLiteral("monarchy-invocation/") + domainSid
                        + QLatin1Char('/') + dcName);
 }
 
 QUuid sourceDsaGuid(const QString &domainSid, const QString &dcName)
 {
-    return derivedGuid(QStringLiteral("monarchy-dsa/") + domainSid
+    return monarchyGuidForSeed(QStringLiteral("monarchy-dsa/") + domainSid
                        + QLatin1Char('/') + dcName);
 }
 
