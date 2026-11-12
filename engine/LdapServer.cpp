@@ -2336,7 +2336,7 @@ QByteArray LdapServer::handleSearch(ClientState *st, int msgId, const QByteArray
     QByteArray out;
     if (!paged) {
         for (const DirectoryObject &o : matches)
-            out.append(makeSearchEntry(msgId, o));
+            out.append(makeSearchEntry(msgId, o, attrs));
         out.append(makeSearchDone(msgId, 0));
         return out;
     }
@@ -2380,6 +2380,7 @@ QByteArray LdapServer::handleSearch(ClientState *st, int msgId, const QByteArray
         st->paged.id = m_nextPagedId++;
         st->paged.offset = 0;
         st->paged.results = matches;
+        st->paged.attributes = attrs;
     }
 
     // RFC 2696 §3: size 0 with a cookie abandons the paged search.
@@ -2392,7 +2393,7 @@ QByteArray LdapServer::handleSearch(ClientState *st, int msgId, const QByteArray
     const int total = st->paged.results.size();
     const int end = qMin(total, st->paged.offset + pageSize);
     for (int i = st->paged.offset; i < end; ++i)
-        out.append(makeSearchEntry(msgId, st->paged.results.at(i)));
+        out.append(makeSearchEntry(msgId, st->paged.results.at(i), st->paged.attributes));
 
     QByteArray nextCookie;
     if (end < total) {
@@ -2720,7 +2721,31 @@ QByteArray LdapServer::makeBindResponse(int msgId, int resultCode, const QByteAr
     return seq;
 }
 
-QByteArray LdapServer::makeSearchEntry(int msgId, const DirectoryObject &o) {
+QByteArray LdapServer::makeSearchEntry(int msgId, const DirectoryObject &o,
+                                       const QStringList &requested) {
+    // RFC 4511 §4.5.1.8: the selection list is what the client asked to see. An
+    // empty list is every attribute; "*" and "+" are that request spelled out;
+    // "1.1" names no attribute type, so a client that sends it alone gets
+    // entries carrying their DN and nothing else. Honouring none of this meant
+    // a search for `cn` returned password-free but still complete entries, and
+    // no client could ask for less.
+    auto wanted = [&requested](const QString &type) {
+        if (requested.isEmpty())
+            return true;
+        bool every = false;
+        for (const QString &name : requested) {
+            if (name.isEmpty())
+                continue;
+            if (name == QLatin1String("*") || name == QLatin1String("+")) {
+                every = true;
+                continue;
+            }
+            if (name.compare(type, Qt::CaseInsensitive) == 0)
+                return true;
+        }
+        return every;
+    };
+
     QByteArray attrs;
     auto addAttr = [&attrs](const QString &type, const QStringList &values) {
         if (type.isEmpty())
@@ -2750,6 +2775,8 @@ QByteArray LdapServer::makeSearchEntry(int msgId, const DirectoryObject &o) {
             continue;
         if (isSecretAttribute(key))
             continue;
+        if (!wanted(it.key()))
+            continue;
         QStringList values = it.value().split(QStringLiteral("; "), Qt::SkipEmptyParts);
         // The rootDSE is a cached object rebuilt only on a write, so the time
         // stamped into it at startup would go stale. RFC 4512 expects
@@ -2762,21 +2789,24 @@ QByteArray LdapServer::makeSearchEntry(int msgId, const DirectoryObject &o) {
         addAttr(it.key(), values);
         emitted.append(key);
     }
-    if (!o.members.isEmpty()) {
+    if (!o.members.isEmpty() && wanted(QStringLiteral("member"))) {
         addAttr(QStringLiteral("member"), o.members);
         emitted.append(QStringLiteral("member"));
     }
-    if (!o.memberOf.isEmpty()) {
+    if (!o.memberOf.isEmpty() && wanted(QStringLiteral("memberOf"))) {
         addAttr(QStringLiteral("memberOf"), o.memberOf);
         emitted.append(QStringLiteral("memberof"));
     }
-    if (!emitted.contains(QStringLiteral("cn")) && !o.name.isEmpty())
+    if (!emitted.contains(QStringLiteral("cn")) && !o.name.isEmpty()
+        && wanted(QStringLiteral("cn")))
         addAttr(QStringLiteral("cn"), {o.name});
-    if (!emitted.contains(QStringLiteral("objectclass")))
+    if (!emitted.contains(QStringLiteral("objectclass")) && wanted(QStringLiteral("objectClass")))
         addAttr(QStringLiteral("objectClass"), {QStringLiteral("top")});
-    if (!emitted.contains(QStringLiteral("description")) && !o.description.isEmpty())
+    if (!emitted.contains(QStringLiteral("description")) && !o.description.isEmpty()
+        && wanted(QStringLiteral("description")))
         addAttr(QStringLiteral("description"), {o.description});
-    if (!emitted.contains(QStringLiteral("distinguishedname")) && !o.id.isEmpty())
+    if (!emitted.contains(QStringLiteral("distinguishedname")) && !o.id.isEmpty()
+        && wanted(QStringLiteral("distinguishedName")))
         addAttr(QStringLiteral("distinguishedName"), {o.id});
 
     QByteArray entry;

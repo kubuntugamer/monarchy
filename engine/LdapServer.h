@@ -235,6 +235,10 @@ private:
             quint64 id = 0;
             int offset = 0;
             QList<DirectoryObject> results;
+            // RFC 4511 §4.5.1.8 sends the selection list once, with the first
+            // page; later pages have to answer with the same attributes, so it
+            // is kept here rather than re-read from a request that lacks it.
+            QStringList attributes;
         };
         PagedSearch paged;
         // PAC from the AP-REQ's service ticket, held until the bind completes.
@@ -318,7 +322,8 @@ private:
     QByteArray makeBindResponse(int msgId, int resultCode, const QByteArray &saslCreds = {});
     QByteArray makeLdapResult(int msgId, int opTag, int resultCode);
     QByteArray makeExtendedResponse(int msgId, int resultCode, const QString &name, const QByteArray &value);
-    QByteArray makeSearchEntry(int msgId, const DirectoryObject &o);
+    QByteArray makeSearchEntry(int msgId, const DirectoryObject &o,
+                               const QStringList &requested);
     QByteArray makeSearchDone(int msgId, int resultCode, const QByteArray &controls = QByteArray());
 
     // SID of the domain itself, taken from the objects already in the store.

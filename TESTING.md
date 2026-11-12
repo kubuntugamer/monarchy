@@ -100,12 +100,6 @@ DC believes it started.
 These are places where a change can pass everything and still be wrong. They are
 recorded, not hidden:
 
-- **G9 — a search ignores the attribute selection list.** `ldapsearch` asking
-  for `cn` alone receives every attribute of the entry, and `1.1` — RFC 4511's
-  spelling of "no attributes" — returns the whole entry as well. Found by the
-  external client G6 added, on its first run; the wire tests never noticed
-  because each one reads back the attributes it asked for and tolerates extra
-  values. Not fixed yet.
 - **G8 — SMB1 (NT LM 0.12) still has no client in CI.** `scripts/smb-conformance.py`
   asks for 2.1 and, when it is refused, 2.0.2, and reads the answer back; it
   never sends the NT LM 0.12 negotiate `Smb1.cpp` serves, so the SMB1 path is
@@ -138,6 +132,16 @@ All seven original gaps are closed; their entries stay here so a reference in
   and the `build-and-test` job installs `smbclient` and runs that stage, so a
   byte only this tree's SMB2 encoder accepts now fails in CI. The SMB1 half was
   never in this driver and is recorded separately as G8.
+
+- **G9 — closed.** Found by G6's driver on its first run and fixed in the same
+  follow-up: a search ignored the attribute selection list, so `ldapsearch`
+  asking for `cn` received all seventeen attributes of the entry, and `1.1` —
+  RFC 4511's spelling of "no attributes" — returned the whole entry too.
+  `makeSearchEntry` now honours the list: empty means every attribute, `*` and
+  `+` say so explicitly, `1.1` matches no type, and the selection is carried
+  into a paged search's later pages, which do not repeat it. Negative control:
+  against the daemon built before the fix the two new checks fail and report the
+  seventeen attributes they received; against the fixed daemon 10/10 pass.
 
 - **G6 — closed.** `ci.sh --conformance` runs `scripts/ldap-conformance.py`,
   which drives the LDAP listener with OpenLDAP's `ldapsearch`, so the client's

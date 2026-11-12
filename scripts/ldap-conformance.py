@@ -50,6 +50,8 @@ CHECKS = [
     'a simple bind as the administrator succeeds',
     'the domain object is readable at the base DN',
     'a subtree search finds the administrator by sAMAccountName',
+    'a search asking for one attribute receives only that attribute',
+    'a search asking for no attributes receives an entry carrying none',
     'a bind with the DN in the wrong case still succeeds',
     'a wrong password is refused with invalidCredentials (49)',
     'an account that does not exist is refused like a wrong password (49)',
@@ -186,6 +188,37 @@ class Driver:
             return False, f"sAMAccountName is {first(entries[0], 'sAMAccountName')!r}"
         return True, f'{found[0]}'
 
+    def administrator_entry(self, attributes):
+        """Search CN=Users for the administrator, asking for `attributes`."""
+        return search(
+            self.options.ldapsearch, self.options.host, self.options.port,
+            ['-D', self.admin_dn, '-w', self.options.password,
+             '-b', f'CN=Users,{self.options.base_dn}',
+             '(sAMAccountName=%s)' % self.options.user] + attributes)
+
+    def check_selected_attribute_only(self):
+        # RFC 4511 4.5.1.8: the selection list is what the client asked to see.
+        # Before this was honoured, asking for `cn` returned the whole entry -
+        # password-free, but complete - and a client had no way to ask for less.
+        status, entries, error = self.administrator_entry(['cn'])
+        if status != SUCCESS or len(entries) != 1:
+            return False, f'exit {status}, {len(entries)} entries: {error}'
+        returned = sorted(name for name in entries[0] if name != 'dn')
+        if returned != ['cn']:
+            return False, f'asked for cn, received {returned}'
+        return True, 'cn and nothing else'
+
+    def check_no_attributes(self):
+        # 1.1 names no attribute type: a client asking for it wants the DN and
+        # nothing else, which is how it tests existence without reading data.
+        status, entries, error = self.administrator_entry(['1.1'])
+        if status != SUCCESS or len(entries) != 1:
+            return False, f'exit {status}, {len(entries)} entries: {error}'
+        returned = sorted(name for name in entries[0] if name != 'dn')
+        if returned:
+            return False, f'asked for no attributes, received {returned}'
+        return True, 'the DN alone, as 1.1 asks'
+
     def check_shuffled_case_bind(self):
         # MS-ADTS 3.1.1.3.1.2 and RFC 4517: a DN is case-insensitive, so a client
         # that upper-cases or lower-cases a DN it stored must still bind. The
@@ -261,6 +294,8 @@ def main():
         driver.check_admin_bind,
         driver.check_base_object,
         driver.check_administrator_search,
+        driver.check_selected_attribute_only,
+        driver.check_no_attributes,
         driver.check_shuffled_case_bind,
         driver.check_wrong_password,
         driver.check_missing_account,
