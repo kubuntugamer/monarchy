@@ -81,14 +81,16 @@ run_conformance()
     # closed before the daemon starts, which is the window this accepts. SMB is
     # the same problem with a different cause: 445 needs root, and the SMB
     # stage has to reach the shares and the pipes, so the throwaway instance
-    # moves that port too.
-    local netlogon_port drs_port smb_port
-    read -r netlogon_port drs_port smb_port < <(python3 - <<'PY'
+    # moves that port too. The endpoint mapper is the other port below 1024,
+    # and the health check below reads it from dc.conf, so it moves for the
+    # same reason instead of being left to fail as an unprivileged bind.
+    local netlogon_port drs_port smb_port epm_port
+    read -r netlogon_port drs_port smb_port epm_port < <(python3 - <<'PY'
 import socket
 
 held = []
 ports = []
-for _ in range(3):
+for _ in range(4):
     probe = socket.socket()
     probe.bind(('127.0.0.1', 0))
     held.append(probe)
@@ -109,10 +111,12 @@ PY
         return 1
     fi
 
-    # The daemon reads smbPort from dc.conf when it starts, so the move has to
+    # The daemon reads these from dc.conf when it starts, so the move has to
     # happen after provisioning and before that. Without it the SMB listener
-    # fails with "port 445 needs root" and the SMB stage has nothing to reach.
-    sed -i "s/^smbPort=.*/smbPort=$smb_port/" "$dc_dir/dc.conf"
+    # fails with "port 445 needs root" and the SMB stage has nothing to reach,
+    # and the endpoint mapper does the same on 135.
+    sed -i -e "s/^smbPort=.*/smbPort=$smb_port/" \
+        -e "s/^epmPort=.*/epmPort=$epm_port/" "$dc_dir/dc.conf"
 
     printf '== start the daemon on the dev ports\n'
     "$build_dir/ui/monarchy-dcd" --dcdir "$dc_dir" >"$log" 2>&1 &
@@ -176,6 +180,21 @@ PY
         rm -rf -- "$work"
         return 1
     fi
+
+    # The greps above prove the listeners started; this proves a client that
+    # reads dc.conf and follows the zone's SRV records reaches them. It runs
+    # here, after those greps, because it cannot tell whose listener answered:
+    # on one box a daemon that had failed four listeners reported all passing
+    # because an installed DC held the ports. The greps are what make the
+    # absence of this daemon's own line a failure before the check runs.
+    printf '== health check (dc.conf ports and advertised locators)\n'
+    "$root/scripts/check-dc-health.sh" "$dc_dir" || {
+        printf 'ci.sh: the provisioned DC does not answer where it says it does\n' >&2
+        cleanup
+        trap - EXIT
+        rm -rf -- "$work"
+        return 1
+    }
 
     local status=0
     printf '== DRSR conformance (impacket NDR)\n'
