@@ -113,6 +113,9 @@ recorded, not hidden:
   (`SMB1 disabled -- no workgroup available`) without asking the server, and
   over NT1 it ends in `NT_STATUS_CONNECTION_DISCONNECTED`. Nothing in the tree
   claims enumeration and no driver asserts it, which is how it stayed quiet.
+  **Deferred** by decision on #7 (box B): a new endpoint rather than a fix,
+  named shares already work, and nothing we run asks for a browse list. Revisit
+  only if a real client needs it — the entry stays so the absence is stated.
 
 - **G10 — closed.** SYSVOL and NETLOGON accept no writes, which is deliberate,
   but over SMB1 the refusal was wrong twice over. A create answered
@@ -128,6 +131,8 @@ recorded, not hidden:
   Measured on a provisioned tree, `put` over NT1: `ACCESS_DENIED` on this build,
   `NT_STATUS_INVALID_NETWORK_RESPONSE` on `d6064cb` running against the same
   store. The SMB2 path already answered `ACCESS_DENIED` and is unchanged.
+  Graded independently on box B's live domain the same day: SMB1 `put` answers
+  `ACCESS_DENIED`, SMB2 `put` is unchanged, and no file appeared on the store.
 
   The same pass found that an unimplemented SMB1 command was answered with
   nothing at all, so the client sat in its own timeout: `mkdir` over NT1 took
