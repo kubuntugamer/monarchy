@@ -25,7 +25,7 @@ endpoint mapper (135) and SMB (445) stay native under `--dev-ports`.
 | StartTLS (RFC 4511 §4.14.1) | as LDAP | `monarchy-tls-tests` | **openssl** `s_client -starttls ldap` | ldap3 against `private/ldap.crt` as CA |
 | SASL NTLM + signing/sealing | as LDAP | `monarchy-ntlm-tests` | **impacket** message layouts, byte-exact | — |
 | DNS (locator, A/SRV/ANY, RFC 2136) | 53 / 1053 | `monarchy-dns-tests` | **dig** and a hand-built query | `dig @dc -p port SRV …`; `scripts/check-dc-health.sh` follows every locator |
-| KDC (RC4-HMAC, AES-128/256) | 88 / 8888 | `monarchy-kerberos-tests` | **MIT krb5** `kinit` / GSSAPI | `kinit` into a provisioned realm |
+| KDC (RC4-HMAC, AES-128/256) | 88 / 8888 | `monarchy-kerberos-tests` | **MIT krb5** `kinit` / GSSAPI, and `klist -f` / `kvno` for the ticket flags | `scripts/kerberos-conformance.py`: TGT and service tickets read back by the client's own decoder, the flags they carry, AES-256, and both refusals |
 | kpasswd (RFC 3244) | 464 / 1464 | `monarchy-kpasswd-tests` | **MIT** `krb5_change_password` / `krb5_set_password` | same, against the daemon |
 | SAMR | 49152 / 1035 (loopback) | `monarchy-samr-tests` | **impacket** NDR, **Samba** `dcerpc.samr` | `scripts/samr-conformance.py` |
 | LSAD | 49153 / 1036 (loopback) | `monarchy-lsad-tests` | **impacket** NDR (Samba half needs pidl) | `scripts/lsad-conformance.py --skip-samba` |
@@ -59,7 +59,7 @@ when you want the narrow loop first.
 | `Rpc.cpp`, `Ndr.cpp` | `monarchy-samr-tests` `monarchy-lsad-tests` `monarchy-drs-tests` `monarchy-epm-tests` | every conformance script — this is the shared marshaller |
 | `Ntlm.cpp`, `Gss.cpp` | `monarchy-ntlm-tests` `monarchy-samr-tests` `monarchy-lsad-tests` | a conformance script with credentials |
 | `LdapServer.cpp`, `LdapServer.h` | `monarchy-ldap-tests` `monarchy-tls-tests` `monarchy-backend-tests` `monarchy-provision-tests` | a bind/search probe on 1389 |
-| `Kdc.cpp`, `Krb5.cpp`, `Aes.cpp` | `monarchy-kerberos-tests` `monarchy-kpasswd-tests` | `kinit` |
+| `Kdc.cpp`, `Krb5.cpp`, `Aes.cpp` | `monarchy-kerberos-tests` `monarchy-kpasswd-tests` | `scripts/kerberos-conformance.py` — it reads the ticket flags back through `klist`, which no suite here does |
 | `Samr.cpp` | `monarchy-samr-tests` `monarchy-netlogon-tests` | `samr-conformance.py` |
 | `Lsad.cpp` | `monarchy-lsad-tests` | `lsad-conformance.py --skip-samba` |
 | `Drs.cpp`, `DrsClient.cpp`, `ReplicationAgent.cpp` | `monarchy-drs-tests` `monarchy-drsclient-tests` `monarchy-replication-tests` | `drs-conformance.py` |

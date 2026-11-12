@@ -214,6 +214,19 @@ PY
         --base-dn "$conformance_base_dn" --user Administrator \
         --password "$conformance_password" --dns-domain "$conformance_dns" || status=1
 
+    # MIT's own client against the KDC. The ticket flags a reply carries are
+    # what a client acts on — forwardable for delegation, initial for whether it
+    # may renew — and no suite in this tree decodes them the way a client does.
+    local kdc_port
+    kdc_port=$(sed -n 's/^kdcPort=//p' "$dc_dir/dc.conf" | head -1)
+    : "${kdc_port:=88}"
+    printf '== Kerberos conformance (MIT kinit/klist/kvno)\n'
+    python3 "$root/scripts/kerberos-conformance.py" --kdc 127.0.0.1 --kdc-port "$kdc_port" \
+        --realm "$conformance_realm" --user Administrator \
+        --password "$conformance_password" \
+        --dc-host "$(printf '%s' "$conformance_domain" | tr '[:upper:]' '[:lower:]')dc1.$conformance_dns" \
+        || status=1
+
     printf '== DRSR conformance (impacket NDR)\n'
     python3 "$root/scripts/drs-conformance.py" --host 127.0.0.1 --port "$drs_port" \
         --basedn "$conformance_base_dn" --dnsdomain "$conformance_dns" \

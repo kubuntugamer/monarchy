@@ -46,12 +46,17 @@ constexpr int kErrTicketExpired = 32;
 constexpr int kErrClockSkew = 37;
 constexpr int kErrGeneric = 60;
 
-// Ticket flags (RFC 4120 §5.3).
-constexpr quint32 kFlagForwardable = 0x20000000;
+// Ticket flags and KDCOptions share the numbering in RFC 4120 §5.3, bit 0
+// first: reserved, forwardable, forwarded, proxiable, proxiable-allowed-to,
+// may-postdate, postdated, invalid, renewable, initial, pre-authenticated. The
+// value of a flag is therefore its bit from the top of a 32-bit word, which is
+// what MIT's TKT_FLG_* names encode: 0x40000000 is *forwardable*, and marking a
+// ticket "initial" with that constant marked every TGT forwardable instead.
+constexpr quint32 kFlagForwardable = 0x40000000;
 constexpr quint32 kFlagProxiable = 0x10000000;
 constexpr quint32 kFlagRenewable = 0x00800000;
+constexpr quint32 kFlagInitial = 0x00400000;
 constexpr quint32 kFlagPreAuthent = 0x00200000;
-constexpr quint32 kFlagInitial = 0x40000000;
 
 constexpr qint64 kTicketLifetime = 10 * 3600;
 

@@ -29,7 +29,7 @@ jobs:
           # carries ldapsearch, the LDAP client whose BER encoder and DN parser
           # are not this tree's.
           sudo apt-get install -y --no-install-recommends \
-            build-essential cmake ninja-build openssl libgl1 smbclient dnsutils ldap-utils
+            build-essential cmake ninja-build openssl libgl1 smbclient dnsutils ldap-utils krb5-user
 
       - name: Install Qt
         uses: jurplel/install-qt-action@v4
