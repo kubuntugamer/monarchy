@@ -209,10 +209,12 @@ QByteArray Session::reply(const QByteArray &request, quint32 status, const QByte
     return nbtFrame(out);
 }
 
-QByteArray Session::unsupported(quint8 command)
+QByteArray Session::unsupportedReply(const QByteArray &message)
 {
-    Q_UNUSED(command);
-    return QByteArray();
+    // A command this server does not implement still has to be answered. An
+    // empty reply leaves the client waiting for its own timeout, which reads as
+    // a broken transport instead of an unimplemented command.
+    return reply(message, kStatusNotSupported, QByteArray(2, '\0'), QByteArray());
 }
 
 bool Session::signatureValid(const QByteArray &message) const
@@ -269,11 +271,10 @@ QByteArray Session::feed(const QByteArray &message)
     case CmdTrans2:
         return trans2(message);
     default:
-        if (qEnvironmentVariableIsEmpty("MONARCHY_SMB1_TRACE"))
-            return unsupported(header.command);
-        qWarning("SMB1 unhandled cmd %u wc=%d words=%s", header.command,
-                 int(header.words.size() / 2), header.words.toHex().constData());
-        return unsupported(header.command);
+        if (!qEnvironmentVariableIsEmpty("MONARCHY_SMB1_TRACE"))
+            qWarning("SMB1 unhandled cmd %u wc=%d words=%s", header.command,
+                     int(header.words.size() / 2), header.words.toHex().constData());
+        return unsupportedReply(message);
     }
 }
 
@@ -524,18 +525,46 @@ QByteArray Session::ntCreate(const QByteArray &message)
     // share's root, resolved case-insensitively and never allowed to climb
     // out of it. Writes are not accepted: SYSVOL and NETLOGON are read-only
     // here, as they are until a GPO editor exists to write them.
+    //
+    // A refusal below carries no parameter block. An NT_CREATE_ANDX error is
+    // read as one only when WordCount is zero; replying with the success
+    // layout's 34 zero words instead made Samba's client report
+    // NT_STATUS_INVALID_NETWORK_RESPONSE for every failure, so the status this
+    // function chose never reached the client.
     const QString shareName = m_trees.value(header.tid);
     const QString shareRoot = m_shares.value(shareName.toLower());
     if (!shareRoot.isEmpty()) {
         if (!m_authenticated)
-            return reply(message, kStatusAccessDenied, QByteArray(68, '\0'), QByteArray());
+            return reply(message, kStatusAccessDenied, QByteArray(), QByteArray());
+        // Every disk share here is read-only, so an access that could change it
+        // is refused before the name is resolved: a client creating a new name
+        // on SYSVOL gets access denied, not "not found", which is what a
+        // Windows read-only share answers and what the SMB2 path already does.
+        // MS-CIFS 2.2.4.7 puts DesiredAccess at word 15 and CreateDisposition
+        // at word 35 of the NT_CREATE_ANDX request.
+        constexpr quint32 kWriteAccess = 0x00000002u  // FILE_WRITE_DATA / FILE_ADD_FILE
+                                         | 0x00000004u // FILE_APPEND_DATA / ADD_SUBDIRECTORY
+                                         | 0x00000010u // FILE_WRITE_EA
+                                         | 0x00000100u // FILE_WRITE_ATTRIBUTES
+                                         | 0x00010000u // DELETE
+                                         | 0x00040000u // WRITE_DAC
+                                         | 0x00080000u; // WRITE_OWNER
+        const quint32 desiredAccess = readLe32(header.words, 15);
+        const quint32 createDisposition = readLe32(header.words, 35);
+        if ((desiredAccess & kWriteAccess) || createDisposition == 2 /* FILE_CREATE */
+            || createDisposition == 5 /* FILE_OVERWRITE_IF */) {
+            if (m_notifier)
+                m_notifier(QStringLiteral("SMB1 create \\\\%1\\%2 refused: share is read-only")
+                               .arg(shareName, name));
+            return reply(message, kStatusAccessDenied, QByteArray(), QByteArray());
+        }
         QString relative;
         QString resolved;
         if (SmbPaths::safeRelativeName(name, &relative))
             resolved = SmbPaths::resolveCaseInsensitive(shareRoot, relative);
         const QFileInfo info(resolved);
         if (resolved.isEmpty() || !info.exists())
-            return reply(message, kStatusObjectNameNotFound, QByteArray(68, '\0'), QByteArray());
+            return reply(message, kStatusObjectNameNotFound, QByteArray(), QByteArray());
 
         OpenFile file;
         file.kind = info.isDir() ? OpenFile::Kind::DiskDirectory : OpenFile::Kind::DiskFile;
@@ -581,7 +610,7 @@ QByteArray Session::ntCreate(const QByteArray &message)
     if (!m_trees.contains(header.tid) || !endpoint) {
         if (m_notifier)
             m_notifier(QStringLiteral("SMB1 create \\\\pipe\\\\%1 refused").arg(name));
-        return reply(message, kStatusObjectNameNotFound, QByteArray(68, '\0'), QByteArray());
+        return reply(message, kStatusObjectNameNotFound, QByteArray(), QByteArray());
     }
 
     const quint16 fid = ++m_nextFid;

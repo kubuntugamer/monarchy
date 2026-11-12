@@ -114,13 +114,26 @@ recorded, not hidden:
   over NT1 it ends in `NT_STATUS_CONNECTION_DISCONNECTED`. Nothing in the tree
   claims enumeration and no driver asserts it, which is how it stayed quiet.
 
-- **G10 — a create on a read-only share is refused with the wrong status.**
-  SYSVOL and NETLOGON accept no writes, which is deliberate, but opening a file
-  that does not exist for writing answers `OBJECT_NAME_NOT_FOUND` rather than
-  `ACCESS_DENIED`: the name really is absent, and that is the only thing the
-  check looks at. Found while driving SMB1 `put`, where Samba's client turns the
-  status into `NT_STATUS_INVALID_NETWORK_RESPONSE` and the refusal reads as a
-  malformed reply. Not fixed yet.
+- **G10 — closed.** SYSVOL and NETLOGON accept no writes, which is deliberate,
+  but over SMB1 the refusal was wrong twice over. A create answered
+  `OBJECT_NAME_NOT_FOUND` — true that the name is absent, and useless, because
+  the share is what refuses — and the reply carried the success layout's 34
+  parameter words, which Samba's client does not accept for an
+  `NT_CREATE_ANDX` error, so **every** SMB1 create failure arrived as
+  `NT_STATUS_INVALID_NETWORK_RESPONSE` and the status the server chose never
+  reached anyone. Both are fixed: a desired access with write bits, or a create
+  or overwrite-if disposition, answers `ACCESS_DENIED` before the name is
+  resolved, and the refusal carries no parameter words.
+
+  Measured on a provisioned tree, `put` over NT1: `ACCESS_DENIED` on this build,
+  `NT_STATUS_INVALID_NETWORK_RESPONSE` on `d6064cb` running against the same
+  store. The SMB2 path already answered `ACCESS_DENIED` and is unchanged.
+
+  The same pass found that an unimplemented SMB1 command was answered with
+  nothing at all, so the client sat in its own timeout: `mkdir` over NT1 took
+  `NT_STATUS_IO_TIMEOUT` on `d6064cb` and now reads
+  `NT_STATUS_NOT_SUPPORTED` immediately. `SMB_COM_CREATE_DIRECTORY` itself is
+  still unimplemented — the fix is that its absence is a status, not silence.
 
 All seven original gaps are closed; their entries stay here so a reference in
 #7 still resolves, and G8, G9 and G10 were added afterwards:
@@ -172,9 +185,9 @@ All seven original gaps are closed; their entries stay here so a reference in
 
   Two answers had to be measured rather than reasoned about. An empty match is
   an error, not an empty success: a client parses the first record out of the
-  reply's data block and reports `NO_MEMORY` when there is none. And
-  `put` still fails, because these shares are read-only — recorded as **G10**,
-  which is about the status, not about writing.
+  reply's data block and reports `NO_MEMORY` when there is none. And `put` still
+  fails, because these shares are read-only — recorded as **G10**, which was
+  about the status it failed with, and is now closed.
 
 - **G9 — closed.** Found by G6's driver on its first run and fixed in the same
   follow-up: a search ignored the attribute selection list, so `ldapsearch`

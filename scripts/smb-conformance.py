@@ -81,6 +81,8 @@ CHECKS = [
     'an SMB1 client negotiates NT LM 0.12 and lists the domain directory',
     'SMB1 lists a subdirectory rather than the directory itself',
     'SMB1 answers a pattern that matches nothing with NO_SUCH_FILE',
+    'SMB1 refuses a create on a read-only share with ACCESS_DENIED',
+    'SMB1 answers an unimplemented command with a status, not silence',
     'a file read over SMB1 matches the bytes on disk',
     r'\pipe\samr carries SAMR over SMB 2.1 (impacket NDR)',
     r'\pipe\lsarpc carries LSAD over SMB 2.1 (impacket NDR)',
@@ -96,6 +98,8 @@ CHECKS = [
     SMB1_LIST,
     SMB1_SUBDIR,
     SMB1_EMPTY,
+    SMB1_CREATE_REFUSED,
+    SMB1_UNSUPPORTED,
     SMB1_BYTES,
     PIPE_SAMR,
     PIPE_LSARPC,
@@ -337,6 +341,38 @@ def main():
         check(SMB1_EMPTY, ok, '' if ok else (seen or 'the empty match was accepted'))
     except Exception as error:  # noqa: BLE001
         check(SMB1_EMPTY, False, '%s: %s' % (type(error).__name__, error))
+
+    # A create on a read-only share is access denied, not "not found": the
+    # refusal is about the share, so it must not depend on whether the name
+    # exists. An upload opens the name with write access for a name that is
+    # absent, which is the case that used to answer OBJECT_NAME_NOT_FOUND.
+    forbidden = 'smb1conf-create-%s.bin' % os.urandom(4).hex()
+    local = os.path.join(tempfile.gettempdir(), forbidden)
+    with open(local, 'w', encoding='utf-8') as handle:
+        handle.write('this must not land on the share\n')
+    try:
+        result = smb1client(options, 'SYSVOL', 'put %s %s' % (local, forbidden))
+        seen = output(result)
+        ok = result.returncode != 0 and 'NT_STATUS_ACCESS_DENIED' in seen
+        check(SMB1_CREATE_REFUSED, ok, '' if ok else (seen or 'the create was accepted'))
+    except Exception as error:  # noqa: BLE001
+        check(SMB1_CREATE_REFUSED, False, '%s: %s' % (type(error).__name__, error))
+    finally:
+        if os.path.exists(local):
+            os.unlink(local)
+
+    # SMB_COM_CREATE_DIRECTORY is not implemented. What matters is that it is
+    # answered: a command with no reply leaves the client in its own timeout and
+    # a hang reads as a broken transport rather than an unimplemented command.
+    try:
+        result = smb1client(options, 'SYSVOL', 'mkdir smb1conf-dir-%s' % os.urandom(4).hex())
+        seen = output(result)
+        # The status, not the exit code: smbclient reports the refusal on stderr
+        # and still exits 0 when a -c command fails.
+        ok = 'NT_STATUS_NOT_SUPPORTED' in seen
+        check(SMB1_UNSUPPORTED, ok, '' if ok else (seen or 'no reply was read'))
+    except Exception as error:  # noqa: BLE001
+        check(SMB1_UNSUPPORTED, False, '%s: %s' % (type(error).__name__, error))
 
     fixture = 'smb1conf-%s.bin' % os.urandom(4).hex()
     body = os.urandom(4096 + 11)

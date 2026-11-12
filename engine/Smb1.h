@@ -101,7 +101,7 @@ private:
     // listing needs. MS-CIFS 2.2.6.3.
     QByteArray find(const QByteArray &message, quint16 subcommand,
                     const QByteArray &parameters, const QString &shareRoot);
-    QByteArray unsupported(quint8 command);
+    QByteArray unsupportedReply(const QByteArray &message);
     bool signatureValid(const QByteArray &message) const;
 
     QByteArray reply(const QByteArray &request, quint32 status, const QByteArray &words,
