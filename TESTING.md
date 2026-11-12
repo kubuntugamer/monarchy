@@ -33,6 +33,7 @@ endpoint mapper (135) and SMB (445) stay native under `--dev-ports`.
 | DRSUAPI | 1038 / 1038 (loopback) | `monarchy-drs-tests`, `monarchy-drsclient-tests`, `monarchy-replication-tests` | **impacket** NDR | `scripts/drs-conformance.py` |
 | Endpoint mapper (C706) | 135 / 135 (loopback) | `monarchy-epm-tests` | **impacket** `hept_lookup` / `hept_map`, C706 appendix L towers | `hept_lookup` returns a port that accepts a connection |
 | SMB2 + named pipes | 445 / 445 | `monarchy-smb-tests` | **Samba** `smbclient` and `rpcclient` plus **impacket** `ncacn_np`, dialect pinned to 2.0.2/2.1 | `scripts/smb-conformance.py`: negotiate, SYSVOL read, NETLOGON write refused, `\pipe\samr` and `\pipe\lsarpc` |
+| SMB1 (NT LM 0.12) | 445 / 445 | `monarchy-smb1-tests` | **Samba** `smbclient` pinned to NT1 | `scripts/smb-conformance.py`: SYSVOL listing, subdirectory listing, empty match refused, byte-exact read |
 | SMB1 (NT LM 0.12) | 445 / 445 | `monarchy-smb1-tests` | **Samba** `smbclient -m NT1` (live only) | fetch `GPT.INI` byte for byte, anonymous refused |
 | The endpoint set as a whole | every port `dc.conf` declares | `monarchy-dcservice-tests` | a TCP connection to each declared port, made by the kernel | `scripts/check-dc-health.sh` |
 | RPC auth (NTLMSSP + SPNEGO + Kerberos) | all RPC | `monarchy-samr-tests`, `monarchy-kerberos-tests` | **impacket** and **Samba** with credentials | every conformance script binds at `PKT_PRIVACY` |
@@ -65,7 +66,7 @@ when you want the narrow loop first.
 | `Netlogon.cpp` | `monarchy-netlogon-tests` `monarchy-logonhours-tests` `monarchy-workstation-tests` | `netlogon-conformance.py` |
 | `Epm.cpp` | `monarchy-epm-tests` | `hept_lookup` — a tower naming a dead port is the failure this catches |
 | `DnsServer.cpp` | `monarchy-dns-tests` | `scripts/check-dc-health.sh` |
-| `Smb1.cpp`, `Smb2.cpp` | `monarchy-smb-tests` `monarchy-smb1-tests` | `smb-conformance.py` for SMB2, `smbclient -m NT1` for SMB1 |
+| `Smb1.cpp`, `Smb2.cpp` | `monarchy-smb-tests` `monarchy-smb1-tests` | `smb-conformance.py` for SMB2 and for SMB1 (dialect pinned to NT1 in a second set of checks) |
 | `Provisioner.cpp` | `monarchy-provision-tests` | **full** `ci.sh --conformance`: it seeds the tree every other suite starts from |
 | `DcService.cpp` | `monarchy-dcservice-tests`, full `ci.sh --conformance` | `check-dc-health.sh` |
 | `ui/src/mainwindow.cpp`, `mainwindow.h` | `monarchy-mainwindow-tests` `monarchy-ui-tests` `monarchy-backend-tests` | full `ci.sh` — it is what listens on every port |
@@ -100,15 +101,16 @@ DC believes it started.
 These are places where a change can pass everything and still be wrong. They are
 recorded, not hidden:
 
-- **G8 — SMB1 (NT LM 0.12) still has no client in CI.** `scripts/smb-conformance.py`
-  asks for 2.1 and, when it is refused, 2.0.2, and reads the answer back; it
-  never sends the NT LM 0.12 negotiate `Smb1.cpp` serves, so the SMB1 path is
-  still exercised only by this tree's own encoder plus a live `smbclient -m NT1`.
-  Adding it means a second pinned dialect and the pre-SMB2 header the other
-  checks do not share.
+- **G10 — a create on a read-only share is refused with the wrong status.**
+  SYSVOL and NETLOGON accept no writes, which is deliberate, but opening a file
+  that does not exist for writing answers `OBJECT_NAME_NOT_FOUND` rather than
+  `ACCESS_DENIED`: the name really is absent, and that is the only thing the
+  check looks at. Found while driving SMB1 `put`, where Samba's client turns the
+  status into `NT_STATUS_INVALID_NETWORK_RESPONSE` and the refusal reads as a
+  malformed reply. Not fixed yet.
 
 All seven original gaps are closed; their entries stay here so a reference in
-#7 still resolves, and G8 was added afterwards:
+#7 still resolves, and G8, G9 and G10 were added afterwards:
 
 - **G1 — closed.** `scripts/ci.sh --sanitize` configures a Debug build with
   AddressSanitizer and UndefinedBehaviorSanitizer, halts on a UBSan diagnostic
@@ -132,6 +134,34 @@ All seven original gaps are closed; their entries stay here so a reference in
   and the `build-and-test` job installs `smbclient` and runs that stage, so a
   byte only this tree's SMB2 encoder accepts now fails in CI. The SMB1 half was
   never in this driver and is recorded separately as G8.
+
+- **G8 — closed.** `scripts/smb-conformance.py` now pins NT LM 0.12 in a second
+  set of checks, because a Windows 2000 workstation cannot negotiate 2.x at all
+  and the browsing it does first is a TRANS2 directory listing. It is driven by
+  Samba's `smbclient` with `client min protocol` and `client max protocol` both
+  set to NT1 — measured, not assumed: with `-m NT1` alone Samba 4.24.7 answers
+  "Max protocol NT1 is less than min protocol SMB2_02" and never connects.
+
+  Four checks: a listing of SYSVOL that must name the domain directory; a
+  listing of that directory that must contain `Policies` and must not contain
+  the directory itself; a pattern that matches nothing, which must answer
+  `NO_SUCH_FILE`; and a file read over SMB1 compared byte for byte with the copy
+  on disk. Negative control measured: the three listing checks fail against the
+  daemon built before the change, each with `NT_STATUS_NOT_SUPPORTED`, and the
+  byte-read check passes on both — it was never the part that was broken.
+
+  What the server gained: TRANS2 `FIND_FIRST2` (0x0001), `FIND_NEXT2` (0x0002)
+  and `FIND_CLOSE2` (0x0004) at information levels 0x0101 to 0x0104, a search
+  handle per session so a resumed page returns the set the first page resolved,
+  a bare path that names a directory treated as a listing of that directory, and
+  `SMB_COM_QUERY_INFORMATION_DISK` (0x0080), which `smbclient` asks after a
+  listing to print its free-space line and waits on when it gets no answer.
+
+  Two answers had to be measured rather than reasoned about. An empty match is
+  an error, not an empty success: a client parses the first record out of the
+  reply's data block and reports `NO_MEMORY` when there is none. And
+  `put` still fails, because these shares are read-only — recorded as **G10**,
+  which is about the status, not about writing.
 
 - **G9 — closed.** Found by G6's driver on its first run and fixed in the same
   follow-up: a search ignored the attribute selection list, so `ldapsearch`

@@ -32,7 +32,10 @@ enum Command : quint8 {
     CmdSessionSetupAndX = 0x73,
     CmdLogoffAndX = 0x74,
     CmdTreeConnectAndX = 0x75,
-    CmdNtCreateAndX = 0xa2
+    CmdNtCreateAndX = 0xa2,
+    // SMB_COM_QUERY_INFORMATION_DISK. smbclient asks it after a listing to
+    // print the free-space line; a client that gets no answer waits for one.
+    CmdQueryDisk = 0x80
 };
 
 constexpr quint32 kStatusSuccess = 0x00000000u;
@@ -43,6 +46,10 @@ constexpr quint32 kStatusBadNetworkName = 0xc00000ccu;
 constexpr quint32 kStatusObjectNameNotFound = 0xc0000034u;
 constexpr quint32 kStatusNotSupported = 0xc00000bbu;
 constexpr quint32 kStatusInvalidHandle = 0xc0000008u;
+// A FIND_FIRST2 whose pattern matches nothing is an error in SMB1, not an
+// empty success: clients parse the reply as a first record and answer NO_MEMORY
+// when the data block is empty.
+constexpr quint32 kStatusNoSuchFile = 0xc000000fu;
 
 // One SMB1 connection's state. feed() takes one deframed SMB message and
 // returns zero or one NetBIOS-framed replies.
@@ -83,12 +90,17 @@ private:
     QByteArray treeDisconnect(const QByteArray &message);
     QByteArray logoff(const QByteArray &message);
     QByteArray echo(const QByteArray &message);
+    QByteArray queryDisk(const QByteArray &message);
     QByteArray ntCreate(const QByteArray &message);
     QByteArray closeFile(const QByteArray &message);
     QByteArray readAndX(const QByteArray &message);
     QByteArray writeAndX(const QByteArray &message);
     QByteArray transact(const QByteArray &message);
     QByteArray trans2(const QByteArray &message);
+    // FIND_FIRST2 / FIND_NEXT2 / FIND_CLOSE2, the TRANS2 half a directory
+    // listing needs. MS-CIFS 2.2.6.3.
+    QByteArray find(const QByteArray &message, quint16 subcommand,
+                    const QByteArray &parameters, const QString &shareRoot);
     QByteArray unsupported(quint8 command);
     bool signatureValid(const QByteArray &message) const;
 
@@ -112,6 +124,17 @@ private:
     QString m_user;
     bool m_unicode = false;
     quint16 m_uid = 0;
+
+    // A directory search an SMB1 client is walking. The matches are resolved on
+    // FIND_FIRST2 and kept, so FIND_NEXT2 returns the same set even if the
+    // directory changes between calls — which is what the resume key promises.
+    struct Search {
+        QStringList paths;
+        int index = 0;
+    };
+
+    quint16 m_nextSearchId = 0x200;
+    QHash<quint16, Search> m_searches;
 
     quint16 m_nextTree = 0x100;
     quint16 m_nextFid = 0x4000;

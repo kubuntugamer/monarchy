@@ -11,8 +11,10 @@
 #include <QRandomGenerator>
 #include <QDateTime>
 #include <QDebug>
+#include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QRegularExpression>
 
 namespace {
 
@@ -252,6 +254,8 @@ QByteArray Session::feed(const QByteArray &message)
         return logoff(message);
     case CmdEcho:
         return echo(message);
+    case CmdQueryDisk:
+        return queryDisk(message);
     case CmdNtCreateAndX:
         return ntCreate(message);
     case CmdClose:
@@ -796,6 +800,9 @@ QByteArray Session::trans2(const QByteArray &message)
     if (!m_authenticated)
         return reply(message, kStatusAccessDenied, QByteArray(), QByteArray());
 
+    if (subcommand == 0x0001 || subcommand == 0x0002 || subcommand == 0x0004)
+        return find(message, subcommand, parameters, shareRoot);
+
     // QUERY_PATH_INFORMATION names the file; QUERY_FILE_INFORMATION names the
     // handle the client already has, which is what a 2000 client asks for
     // before reading a file it just created.
@@ -905,6 +912,229 @@ QByteArray Session::trans2(const QByteArray &message)
     QByteArray data(1, '\0'); // pad so parameters start at offset 56
     data.append(params);
     data.append(infoBytes);
+    return reply(message, kStatusSuccess, words, data);
+}
+
+// SMB_COM_QUERY_INFORMATION_DISK: word parameters only, no data. The numbers
+// are a well-formed answer for a share rather than a measurement of the host
+// filesystem — a 4096-byte block size and a generous unit count, which is what
+// a client needs to print its free-space line and continue.
+QByteArray Session::queryDisk(const QByteArray &message)
+{
+    const Header header = parseHeader(message);
+    const QString shareName = m_trees.value(header.tid);
+    if (m_shares.value(shareName.toLower()).isEmpty())
+        return reply(message, kStatusBadNetworkName, QByteArray(), QByteArray());
+    if (!m_authenticated)
+        return reply(message, kStatusAccessDenied, QByteArray(), QByteArray());
+
+    constexpr quint32 kBlockSize = 4096;
+    constexpr quint32 kTotalUnits = 0xffff;
+    QByteArray words;
+    putLe16(words, quint16(kTotalUnits));      // TotalUnits
+    putLe16(words, 1);                         // BlocksPerUnit
+    putLe16(words, quint16(kBlockSize));       // BlockSize
+    putLe16(words, quint16(kTotalUnits / 2));  // FreeUnits
+    return reply(message, kStatusSuccess, words, QByteArray());
+}
+
+// FIND_FIRST2 / FIND_NEXT2 / FIND_CLOSE2. A client that can authenticate,
+// connect to a share and open a file by exact name still cannot browse without
+// these, and browsing is the first thing a 2000 workstation does: smbclient
+// pinned to NT1 asked for FIND_FIRST2 on `\*` and stopped at NOT_SUPPORTED,
+// which is the gap G8 records. MS-CIFS 2.2.6.3 (request), 2.2.6.4 and 2.2.6.6
+// (response).
+QByteArray Session::find(const QByteArray &message, quint16 subcommand,
+                         const QByteArray &parameters, const QString &shareRoot)
+{
+    // One record of a listing. Every layout starts with NextEntryOffset, so a
+    // reply is a chain whose last link carries zero; NAMES_INFO is the one
+    // layout without timestamps or sizes, and the others differ only in what
+    // follows FileAttributes.
+    auto record = [](quint16 level, const QFileInfo &info) -> QByteArray {
+        const quint64 created = fileTime(info.birthTime().isValid() ? info.birthTime()
+                                                                    : info.lastModified());
+        const quint64 accessed = fileTime(info.lastRead());
+        const quint64 written = fileTime(info.lastModified());
+        const quint32 attributes = info.isDir() ? 0x10u : 0x80u;
+        const quint64 size = info.isDir() ? 0 : quint64(info.size());
+        const QByteArray name = toUtf16Bytes(info.fileName());
+
+        QByteArray out;
+        putLe32(out, 0); // NextEntryOffset, patched once the chain is complete
+        if (level == 0x0103) { // SMB_FIND_FILE_NAMES_INFO
+            putLe32(out, 0); // FileIndex
+            putLe32(out, quint32(name.size()));
+            out.append(name);
+            return out;
+        }
+        putLe32(out, 0); // FileIndex
+        for (quint64 stamp : {created, accessed, written, written}) { // four times
+            putLe32(out, quint32(stamp & 0xffffffffu));
+            putLe32(out, quint32(stamp >> 32));
+        }
+        putLe32(out, quint32(size & 0xffffffffu)); // EndOfFile
+        putLe32(out, quint32(size >> 32));
+        putLe32(out, quint32(size & 0xffffffffu)); // AllocationSize
+        putLe32(out, quint32(size >> 32));
+        putLe32(out, attributes);
+        putLe32(out, quint32(name.size()));
+        if (level == 0x0101) { // SMB_FIND_FILE_DIRECTORY_INFO: name at offset 64
+        } else if (level == 0x0102) { // SMB_FIND_FILE_FULL_DIRECTORY_INFO
+            putLe32(out, 0); // EaSize
+        } else if (level == 0x0104) { // SMB_FIND_FILE_BOTH_DIRECTORY_INFO
+            putLe32(out, 0);           // EaSize
+            out.append(char(0));       // ShortNameLength
+            out.append(char(0));       // Reserved
+            out.append(QByteArray(24, '\0')); // ShortName, unused
+        } else {
+            return QByteArray();
+        }
+        out.append(name);
+        return out;
+    };
+
+    if (subcommand == 0x0004) { // FIND_CLOSE2
+        m_searches.remove(readLe16(parameters, 0));
+        QByteArray words;
+        putLe16(words, 0); // SearchCount
+        return reply(message, kStatusSuccess, words, QByteArray());
+    }
+
+    quint16 sid = 0;
+    quint16 requested = 0;
+    quint16 level = 0;
+    Search *search = nullptr;
+    bool closeAtEnd = false;
+
+    if (subcommand == 0x0001) { // FIND_FIRST2
+        sid = m_nextSearchId++;
+        if (m_nextSearchId < 0x200)
+            m_nextSearchId = 0x200;
+        requested = readLe16(parameters, 2);
+        closeAtEnd = (readLe16(parameters, 4) & 0x0001) != 0;
+        level = readLe16(parameters, 6);
+        const QString pattern = stringAt(parameters, 12);
+
+        // The pattern names a directory and a wildcard within it. A bare name
+        // with no wildcard is still a pattern over the share root, which is how
+        // a client asks for one directory's contents by full path.
+        QString relative;
+        if (!SmbPaths::safeRelativeName(pattern, &relative))
+            return reply(message, kStatusObjectNameNotFound, QByteArray(), QByteArray());
+        QString directory;
+        QString namePattern = QStringLiteral("*");
+        const int slash = relative.lastIndexOf(QLatin1Char('/'));
+        if (slash >= 0) {
+            directory = relative.left(slash);
+            namePattern = relative.mid(slash + 1);
+        } else {
+            namePattern = relative;
+        }
+        // A path that names a directory lists what is inside it: `ls subdir`
+        // sends the directory with no wildcard, and matching that name alone
+        // would answer with the directory itself instead of its contents.
+        const bool wildcard = namePattern.contains(QLatin1Char('*'))
+                              || namePattern.contains(QLatin1Char('?'));
+        if (!wildcard && !relative.isEmpty()) {
+            const QString candidate = SmbPaths::resolveCaseInsensitive(shareRoot, relative);
+            if (!candidate.isEmpty() && QFileInfo(candidate).isDir()) {
+                directory = relative;
+                namePattern = QStringLiteral("*");
+            }
+        }
+        if (namePattern.isEmpty())
+            namePattern = QStringLiteral("*");
+
+        const QString directoryPath = SmbPaths::resolveCaseInsensitive(shareRoot, directory);
+        if (directoryPath.isEmpty() || !QFileInfo(directoryPath).isDir())
+            return reply(message, kStatusObjectNameNotFound, QByteArray(), QByteArray());
+
+        QString expression = QRegularExpression::escape(namePattern);
+        expression.replace(QStringLiteral("\\*"), QStringLiteral(".*"));
+        expression.replace(QStringLiteral("\\?"), QStringLiteral("."));
+        const QRegularExpression wanted(QRegularExpression::anchoredPattern(expression),
+                                        QRegularExpression::CaseInsensitiveOption);
+
+        Search fresh;
+        const QFileInfoList entries = QDir(directoryPath).entryInfoList(
+            QDir::AllEntries | QDir::Hidden | QDir::System | QDir::NoDotAndDotDot, QDir::Name);
+        for (const QFileInfo &entry : entries) {
+            if (wanted.match(entry.fileName()).hasMatch())
+                fresh.paths.append(entry.absoluteFilePath());
+        }
+        // A pattern that matches nothing is answered with an error, not with an
+        // empty success: a client parses the first record out of the data block
+        // and reports NO_MEMORY when there is none. Windows answers the same
+        // way for SMB1.
+        if (fresh.paths.isEmpty())
+            return reply(message, kStatusNoSuchFile, QByteArray(), QByteArray());
+        search = &m_searches.insert(sid, fresh).value();
+    } else { // FIND_NEXT2
+        sid = readLe16(parameters, 0);
+        requested = readLe16(parameters, 2);
+        level = readLe16(parameters, 4);
+        const auto it = m_searches.find(sid);
+        if (it == m_searches.end())
+            return reply(message, kStatusInvalidHandle, QByteArray(), QByteArray());
+        search = &it.value();
+    }
+
+    QByteArray records;
+    int previousStart = -1;
+    quint16 emitted = 0;
+    if (requested == 0)
+        requested = 1;
+    while (search->index < search->paths.size() && emitted < requested
+           && records.size() < 0x8000) {
+        const QByteArray entry = record(level, QFileInfo(search->paths.at(search->index)));
+        if (entry.isEmpty())
+            return reply(message, kStatusNotSupported, QByteArray(), QByteArray());
+        if (previousStart >= 0) {
+            // The previous record names the distance to this one, in a field
+            // whose width is already fixed at the front of that record.
+            const quint32 delta = quint32(records.size() - previousStart);
+            records[previousStart + 0] = char(delta & 0xff);
+            records[previousStart + 1] = char((delta >> 8) & 0xff);
+            records[previousStart + 2] = char((delta >> 16) & 0xff);
+            records[previousStart + 3] = char((delta >> 24) & 0xff);
+        }
+        previousStart = records.size();
+        records.append(entry);
+        ++search->index;
+        ++emitted;
+    }
+
+    const bool endOfSearch = search->index >= search->paths.size();
+    if (endOfSearch && closeAtEnd)
+        m_searches.remove(sid);
+
+    QByteArray params;
+    if (subcommand == 0x0001)
+        putLe16(params, sid);
+    putLe16(params, emitted);          // SearchCount
+    putLe16(params, endOfSearch ? 1 : 0); // EndOfSearch
+    putLe16(params, 0);                // EaErrorOffset
+    putLe16(params, 0);                // LastNameOffset
+
+    QByteArray words;
+    putLe16(words, quint16(params.size()));    // TotalParameterCount
+    putLe16(words, quint16(records.size()));   // TotalDataCount
+    putLe16(words, 0);                         // Reserved
+    putLe16(words, quint16(params.size()));    // ParameterCount
+    putLe16(words, 56);                        // ParameterOffset
+    putLe16(words, 0);                         // ParameterDisplacement
+    putLe16(words, quint16(records.size()));   // DataCount
+    // An empty listing still has to name a place its data would start. Samba's
+    // client validates the offset against the byte count even when DataCount is
+    // zero and answers NO_MEMORY when 56 + parameters runs past the message.
+    putLe16(words, records.isEmpty() ? 0 : quint16(56 + params.size())); // DataOffset
+    putLe16(words, 0);                         // DataDisplacement
+    words.append(char(0));                     // SetupCount
+    words.append(char(0));                     // Reserved2
+    QByteArray data(1, '\0'); // pad so parameters start at offset 56
+    data.append(params);
+    data.append(records);
     return reply(message, kStatusSuccess, words, data);
 }
 

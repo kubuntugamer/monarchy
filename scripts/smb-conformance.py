@@ -19,6 +19,13 @@ asks for 2.1. Impacket's own constant is checked here against the number the
 server reports, which is why the two negotiate checks read the negotiated
 dialect back out of the client instead of trusting the request.
 
+Two dialects are driven, not one. SMB 2.1 is pinned for the pipe and file
+checks; NT LM 0.12 is pinned separately, because a Windows 2000 workstation
+cannot negotiate 2.x at all and the browsing a workstation does first is a
+TRANS2 directory listing rather than a negotiate. G8 was that path having no
+client in CI: negotiate, session setup and tree connect already worked, and a
+check that stopped there would pass on a transport that cannot list a share.
+
 Two clients drive the pipes. Impacket marshals its own NDR, so a reply only
 this tree's encoder understands fails. It authenticates at
 RPC_C_AUTHN_LEVEL_PKT_INTEGRITY rather than PKT_PRIVACY: impacket's SMB
@@ -71,6 +78,10 @@ CHECKS = [
     'an SMB 2.1 session opens SYSVOL and lists the domain directory',
     'a file read over SMB 2.1 matches the bytes on disk',
     'NETLOGON refuses a write over SMB 2.1 and creates nothing',
+    'an SMB1 client negotiates NT LM 0.12 and lists the domain directory',
+    'SMB1 lists a subdirectory rather than the directory itself',
+    'SMB1 answers a pattern that matches nothing with NO_SUCH_FILE',
+    'a file read over SMB1 matches the bytes on disk',
     r'\pipe\samr carries SAMR over SMB 2.1 (impacket NDR)',
     r'\pipe\lsarpc carries LSAD over SMB 2.1 (impacket NDR)',
     r'\pipe\samr serves SAMR to rpcclient over SMB 2.1',
@@ -82,6 +93,10 @@ CHECKS = [
     SESSION,
     FILE_BYTES,
     WRITE_REFUSED,
+    SMB1_LIST,
+    SMB1_SUBDIR,
+    SMB1_EMPTY,
+    SMB1_BYTES,
     PIPE_SAMR,
     PIPE_LSARPC,
     RPC_SAMR,
@@ -129,8 +144,37 @@ def smbclient(options, share, command):
     ])
 
 
+def smb1client(options, share, command):
+    """smbclient pinned to NT LM 0.12. Samba 4.24.7 refuses the dialect unless
+    the *minimum* is lowered as well as the maximum - with -m NT1 alone it says
+    "Max protocol NT1 is less than min protocol SMB2_02" and never connects - so
+    both are set, and the client is what proves which dialect the server used."""
+    return run([
+        options.smbclient,
+        '//%s/%s' % (options.host, share),
+        '--option=client min protocol=NT1',
+        '--option=client max protocol=NT1',
+        '-p', str(options.port),
+        '-U', credential(options),
+        '-c', command,
+    ])
+
+
 def output(result):
     return (result.stdout + result.stderr).strip()
+
+
+def listing_names(text):
+    """Entry names from an smbclient `ls`. Entries are the lines indented by
+    two spaces; the client's own lines and its free-space footer are not."""
+    names = []
+    for line in text.splitlines():
+        if not line.startswith('  ') or 'blocks of size' in line:
+            continue
+        fields = line.split()
+        if fields:
+            names.append(fields[0])
+    return names
 
 
 def negotiated(options, dialect):
@@ -257,6 +301,68 @@ def main():
     finally:
         if os.path.exists(local):
             os.unlink(local)
+
+    # SMB1. Every check above pins SMB 2.1, so before these the NT LM 0.12 path
+    # was exercised by live clients and by nothing in CI - G8. Listing is the
+    # part that matters: negotiate, session setup and tree connect already
+    # worked, and a driver that stopped there would pass on a transport that
+    # cannot browse.
+    try:
+        result = smb1client(options, 'SYSVOL', 'ls')
+        # The raw streams, not output(): that strips the whole text, which eats
+        # the indentation of the first entry and with it the first name.
+        names = listing_names(result.stdout + result.stderr)
+        ok = result.returncode == 0 and dns_domain.lower() in [n.lower() for n in names]
+        check(SMB1_LIST, ok, '' if ok else (output(result) or 'no output'))
+    except Exception as error:  # noqa: BLE001
+        check(SMB1_LIST, False, '%s: %s' % (type(error).__name__, error))
+
+    try:
+        result = smb1client(options, 'SYSVOL', 'ls %s' % dns_domain)
+        names = [name.lower() for name in listing_names(result.stdout + result.stderr)]
+        ok = (result.returncode == 0 and 'policies' in names
+              and dns_domain.lower() not in names)
+        check(SMB1_SUBDIR, ok, '' if ok else (output(result) or 'no output'))
+    except Exception as error:  # noqa: BLE001
+        check(SMB1_SUBDIR, False, '%s: %s' % (type(error).__name__, error))
+
+    # A pattern that matches nothing is an error in SMB1, not an empty success:
+    # a client parses the first record out of the reply's data block and reports
+    # NO_MEMORY when the block is empty, so an empty success is a lie a client
+    # cannot read.
+    try:
+        result = smb1client(options, 'SYSVOL', 'ls smbconf-nomatch-*.bin')
+        seen = output(result)
+        ok = result.returncode != 0 and 'NO_SUCH_FILE' in seen
+        check(SMB1_EMPTY, ok, '' if ok else (seen or 'the empty match was accepted'))
+    except Exception as error:  # noqa: BLE001
+        check(SMB1_EMPTY, False, '%s: %s' % (type(error).__name__, error))
+
+    fixture = 'smb1conf-%s.bin' % os.urandom(4).hex()
+    body = os.urandom(4096 + 11)
+    local = os.path.join(tempfile.gettempdir(), fixture)
+    if not options.sysvol_root:
+        check(SMB1_BYTES, False, '--sysvol-root not given, so nothing could be compared')
+    else:
+        stored = os.path.join(options.sysvol_root, fixture)
+        try:
+            with open(stored, 'wb') as handle:
+                handle.write(body)
+            result = smb1client(options, 'SYSVOL', 'get %s %s' % (fixture, local))
+            read_back = None
+            if os.path.exists(local):
+                with open(local, 'rb') as handle:
+                    read_back = handle.read()
+                os.unlink(local)
+            check(SMB1_BYTES, result.returncode == 0 and read_back == body,
+                  'rc=%d, %s of %d bytes' % (result.returncode,
+                                             len(read_back) if read_back is not None else 'no',
+                                             len(body)))
+        except Exception as error:  # noqa: BLE001
+            check(SMB1_BYTES, False, '%s: %s' % (type(error).__name__, error))
+        finally:
+            if os.path.exists(stored):
+                os.unlink(stored)
 
     # SAMR over the pipe: the same calls scripts/samr-conformance.py makes over
     # TCP, so a difference between the two transports shows up as a difference
