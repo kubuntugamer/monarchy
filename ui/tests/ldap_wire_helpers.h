@@ -62,6 +62,12 @@ inline QByteArray startTlsRequest(int id)
                        tlv(char(0x80), QByteArray("1.3.6.1.4.1.1466.20037")));
 }
 
+inline QByteArray whoAmIRequest(int id)
+{
+    return ldapMessage(id, char(0x77),
+                       tlv(char(0x80), QByteArray("1.3.6.1.4.1.4203.1.11.3")));
+}
+
 inline QByteArray bindRequest(int id, const QByteArray &dn, const QByteArray &password)
 {
     QByteArray inner = tlv(0x02, ldapInt(3));
@@ -246,6 +252,24 @@ inline int resultCode(const QByteArray &message)
     if (!nextElement(op, &opPos, &rcTag, &rc) || rcTag != 0x0a || rc.size() != 1)
         return -1;
     return (unsigned char)rc.at(0);
+}
+
+// responseValue [11] of an ExtendedResponse, or empty when it carries none.
+inline QByteArray extendedResponseValue(const QByteArray &message)
+{
+    int tag = -1;
+    QByteArray op, ignored;
+    if (!splitMessage(message, &tag, &op, &ignored) || tag != 0x78)
+        return QByteArray();
+    int pos = 0, elementTag = -1;
+    QByteArray content;
+    while (pos < op.size()) {
+        if (!nextElement(op, &pos, &elementTag, &content))
+            break;
+        if (elementTag == 0x8b)
+            return content;
+    }
+    return QByteArray();
 }
 
 // Message id of a reply, so a test can prove the server echoed the id it was

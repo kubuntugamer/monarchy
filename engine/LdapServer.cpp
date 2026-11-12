@@ -2697,9 +2697,13 @@ QByteArray LdapServer::handleExtended(ClientState *st, int msgId, const QByteArr
         return makeExtendedResponse(msgId, 0, QString(), QByteArray());
     }
     if (reqName == QStringLiteral("1.3.6.1.4.1.4203.1.11.3")) {
-        // WhoAmI
+        // WhoAmI (RFC 4532): the authzid this connection is bound as, which is
+        // what ldapwhoami prints. The empty form was answered unconditionally,
+        // so a client that had bound by DN, UPN or DOMAIN\user — and so could
+        // read the directory — still could not learn what it was bound as.
         emit requestReceived(QStringLiteral("Extended: WhoAmI"));
-        QByteArray val = QByteArray("dn:").append(""); // anonymous
+        const QByteArray val =
+            QByteArray("dn:") + (st ? st->authenticatedDn.toUtf8() : QByteArray());
         return makeExtendedResponse(msgId, 0, QStringLiteral("1.3.6.1.4.1.4203.1.11.3"), val);
     }
     // Unknown extended op

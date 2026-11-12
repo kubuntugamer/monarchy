@@ -91,6 +91,7 @@ private slots:
     void searchOnMissingBaseIsNoSuchObject();
     void anonymousSearchesOnlyTheRootDse();
     void simpleBindRecordsTheConnectionIdentity();
+    void whoAmIReportsTheBoundIdentity();
     void searchMissingRequiredFieldsIsProtocolError();
     void searchOversizeIntegerIsProtocolError();
     void messageIdWithTheTopBitSetIsEchoed();
@@ -597,6 +598,48 @@ void LdapTest::simpleBindRecordsTheConnectionIdentity()
 // the parser checked tags, the presence filter's "objectClass" value was read
 // as derefAliases, the remaining fields were filled with zeros from whatever
 // followed, and the search succeeded on a malformed request.
+// RFC 4532 WhoAmI: a client asks what it is bound as. The empty `dn:` answered
+// unconditionally told every client the same thing — nothing — so a session that
+// had bound could neither learn its own identity nor tell that it had one.
+void LdapTest::whoAmIReportsTheBoundIdentity()
+{
+    LdapServer server;
+    server.setObjects(sampleObjects());
+    QVERIFY(server.listen(0));
+
+    QTcpSocket client;
+    client.connectToHost(QHostAddress::LocalHost, server.serverPort());
+    QVERIFY(client.waitForConnected(3000));
+    Reader reader(&client);
+
+    // Anonymous answers the empty authzid, the form RFC 4532 defines for a
+    // connection that has not bound.
+    client.write(whoAmIRequest(2));
+    QByteArray reply = reader.next();
+    QVERIFY(!reply.isEmpty());
+    QCOMPARE(operationTag(reply), 0x78); // extendedResponse
+    QCOMPARE(resultCode(reply), 0);
+    QCOMPARE(extendedResponseValue(reply), QByteArray("dn:"));
+
+    // Bound, it names the entry the connection is bound as — the same DN the
+    // read side gates on, not the name the client happened to send.
+    authenticate(client, reader, kSampleUserDn, 3);
+    client.write(whoAmIRequest(4));
+    reply = reader.next();
+    QVERIFY(!reply.isEmpty());
+    QCOMPARE(resultCode(reply), 0);
+    QCOMPARE(extendedResponseValue(reply), QByteArray("dn:") + QByteArray(kSampleUserDn));
+
+    // A later anonymous bind replaces the identity, so the answer follows it
+    // back to empty rather than keeping the account it once held.
+    client.write(bindRequest(5, QByteArray(), QByteArray()));
+    QCOMPARE(resultCode(reader.next()), 0);
+    client.write(whoAmIRequest(6));
+    reply = reader.next();
+    QVERIFY(!reply.isEmpty());
+    QCOMPARE(extendedResponseValue(reply), QByteArray("dn:"));
+}
+
 void LdapTest::searchMissingRequiredFieldsIsProtocolError()
 {
     LdapServer server;
