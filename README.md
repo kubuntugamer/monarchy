@@ -118,8 +118,9 @@ exactly as it would to a remote domain controller. Ordinary Kerberos clients
 - **Wiring** — the console hosts the engine on ports 1389 (LDAP), 8888 (KDC)
   and 1053 (DNS), the DCE/RPC endpoints on `samrPort` 1035, `lsadPort` 1036,
   `netlogonPort` 1037
-  and `drsPort` 1038 (loopback only), plus the endpoint mapper and SMB2 on
-  `epmPort`/`smbPort`, then connects to it over LDAP. Create, edit, delete, refresh, and
+  and `drsPort` 1038 (loopback unless `rpcAddress` in `dc.conf` names another
+  address, which is what a join from another machine needs), plus the endpoint
+  mapper and SMB2 on `epmPort`/`smbPort`, then connects to it over LDAP. Create, edit, delete, refresh, and
   password resets round-trip through the directory and survive a restart. The
   property sheet's Members / Member Of tabs edit membership with Add/Remove,
   writing `member` on the group and letting the server update `memberOf`. The
@@ -575,7 +576,8 @@ fault, NDR32 negotiation) and `engine/Ndr.cpp` the NDR primitives, with
 DRSR. The DC process serves those endpoints itself, from
 the same store the LDAP engine holds: `monarchy-ui` listens on `127.0.0.1`, on the
 ports in `dc.conf` (`samrPort` 1035, `lsadPort` 1036, `netlogonPort` 1037 and
-`drsPort` 1038 by default), so the accounts and RIDs returned
+`drsPort` 1038 by default, on the address `rpcAddress` names — `127.0.0.1` when
+it is unset), so the accounts and RIDs returned
 over SAMR are the provisioned domain's own (a provisioned domain yields
 RIDs 500/501/502/1000 over both protocols). Binds authenticate with NTLMSSP,
 either directly (`auth_type` 10) or wrapped in GSS-SPNEGO (`auth_type` 9), which

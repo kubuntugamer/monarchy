@@ -41,12 +41,28 @@ tcp_open() { # host port
     timeout 3 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null
 }
 
-# The endpoints this daemon serves are reached at dcIp, except the RPC
-# interfaces, which bind loopback only. Either address counts as answering.
+# Either address counts as answering here. That is deliberate for the ports a
+# client resolves, and it is not enough for the RPC ones: those are checked
+# again below from this host's own non-loopback address, because binding
+# loopback only looks identical from here.
 reachable() { # port
     tcp_open "$DC_IP" "$1" && return 0
     tcp_open 127.0.0.1 "$1" && return 0
     return 1
+}
+
+# The address a client on another host would use, taken from the route the
+# kernel would pick. Empty when this host has no route at all.
+host_address() {
+    local address=""
+    if command -v ip >/dev/null 2>&1; then
+        address="$(ip -4 route get 192.0.2.1 2>/dev/null |
+            awk '{ for (i = 1; i <= NF; i++) if ($i == "src") print $(i + 1) }' | head -1)"
+    fi
+    if [[ -z "$address" ]] && command -v hostname >/dev/null 2>&1; then
+        address="$(hostname -I 2>/dev/null | awk '{ print $1 }')"
+    fi
+    printf '%s' "$address"
 }
 
 ok() { printf '  %-32s %s\n' "$1" "ok"; }
@@ -97,6 +113,38 @@ for key in ldapPort gcPort kdcPort kpasswdPort dnsPort smbPort epmPort samrPort 
         fail "$key $port" "nothing is listening"
     fi
 done
+
+# The RPC endpoints — the endpoint mapper a client asks first, and the dynamic
+# ports it names — are on loopback unless dc.conf sets rpcAddress, which STATUS.md
+# keeps that way until per-account RPC authorization exists. A loopback set is
+# therefore not a failure: it is a DC no other machine can join, and the skip says
+# so. When rpcAddress does take them off loopback, ask for them from this host's
+# own routable address, because a bind that silently stayed on loopback passes
+# every check above.
+printf '\nRPC endpoints as another host reaches them:\n'
+HOST_ADDRESS="$(host_address)"
+RPC_ADDRESS="$(conf_value rpcAddress '')"
+case "$RPC_ADDRESS" in
+    ""|127.*|::1|localhost) LOOPBACK_ONLY=1 ;;
+    *) LOOPBACK_ONLY=0 ;;
+esac
+if (( LOOPBACK_ONLY )); then
+    skip "RPC endpoints off-host" \
+        "rpcAddress is loopback (STATUS.md 4); a domain join from another host cannot reach them"
+elif [[ -z "$HOST_ADDRESS" ]]; then
+    skip "RPC endpoints off-host" "this host has no non-loopback address"
+else
+    for key in epmPort samrPort lsadPort netlogonPort drsPort; do
+        port="${declared[$key]}"
+        CHECKS=$((CHECKS + 1))
+        if tcp_open "$HOST_ADDRESS" "$port"; then
+            ok "$key $port at $HOST_ADDRESS"
+        else
+            fail "$key $port at $HOST_ADDRESS" \
+                "not reachable off this host; a domain join cannot reach it"
+        fi
+    done
+fi
 
 # --- 2. what the zone tells clients to connect to ---------------------------
 printf '\nAdvertised SRV locators:\n'

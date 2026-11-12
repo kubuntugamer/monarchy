@@ -20,6 +20,7 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QHostAddress>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QRegularExpression>
@@ -129,6 +130,33 @@ bool DcService::start(const QString &dcDir)
                                           QStringLiteral("dc1.") + dnsDomain).toString();
     const QString dcIp = dcConfig.value(QStringLiteral("dcIp"),
                                         QStringLiteral("127.0.0.1")).toString();
+    // A development DC keeps its RPC endpoints — SAMR, LSAD, Netlogon, DRSR and
+    // the endpoint mapper — on loopback, because any account that authenticates
+    // can administer this directory and there is no per-account RPC
+    // authorization yet (STATUS.md section 4). rpcAddress is how an operator
+    // takes that on: 0.0.0.0, or this host's address, is what a domain join from
+    // another machine needs. Before this key existed the endpoints could not
+    // leave loopback at all, so the trade could not even be made deliberately.
+    QHostAddress rpcAddress = QHostAddress::LocalHost;
+    const QString rpcAddressText =
+        dcConfig.value(QStringLiteral("rpcAddress"), QString()).toString().trimmed();
+    if (!rpcAddressText.isEmpty() && !rpcAddress.setAddress(rpcAddressText)) {
+        emit statusMessage(
+            tr("rpcAddress %1 is not an address; RPC endpoints stay on loopback.")
+                .arg(rpcAddressText));
+        rpcAddress = QHostAddress::LocalHost;
+    }
+    const QString rpcLabel = rpcAddress.toString();
+    // The address the endpoint mapper's towers name has to be one a client can
+    // reach: a loopback-only DC says 127.0.0.1, and a DC that serves its network
+    // names the address it publishes for itself. It named 127.0.0.1 either way.
+    QHostAddress advertisedAddress = QHostAddress::LocalHost;
+    if (!rpcAddress.isLoopback() && !advertisedAddress.setAddress(dcIp)) {
+        emit statusMessage(tr("dcIp %1 is not an address; the endpoint mapper keeps naming "
+                              "127.0.0.1.")
+                               .arg(dcIp));
+        advertisedAddress = QHostAddress::LocalHost;
+    }
     const QString siteName = dcConfig.value(QStringLiteral("siteName"),
                                             QStringLiteral("Default-First-Site-Name")).toString();
     m_zonePath = dcConfig.value(QStringLiteral("zonePath"),
@@ -436,10 +464,12 @@ bool DcService::start(const QString &dcDir)
                                          context.ticketEtype, context.sendSeq, error);
         });
     const int samrPort = dcConfig.value(QStringLiteral("samrPort"), 1035).toInt();
-    if (!m_samrServer->listen(quint16(samrPort))) {
+    if (!m_samrServer->listen(quint16(samrPort), rpcAddress)) {
         emit statusMessage(tr("SAMR endpoint failed to listen on port %1.").arg(samrPort));
     } else {
-        emit statusMessage(tr("SAMR served on 127.0.0.1:%1.").arg(m_samrServer->serverPort()));
+        emit statusMessage(tr("SAMR served on %1:%2.")
+                               .arg(rpcLabel)
+                               .arg(m_samrServer->serverPort()));
     }
 
     // LSAD on its own endpoint: the domain identity a client reads before it
@@ -504,10 +534,12 @@ bool DcService::start(const QString &dcDir)
     };
     m_lsadServer->setWriteBackend(lsadWrites);
     const int lsadPort = dcConfig.value(QStringLiteral("lsadPort"), 1036).toInt();
-    if (!m_lsadServer->listen(quint16(lsadPort))) {
+    if (!m_lsadServer->listen(quint16(lsadPort), rpcAddress)) {
         emit statusMessage(tr("LSAD endpoint failed to listen on port %1.").arg(lsadPort));
     } else {
-        emit statusMessage(tr("LSAD served on 127.0.0.1:%1.").arg(m_lsadServer->serverPort()));
+        emit statusMessage(tr("LSAD served on %1:%2.")
+                               .arg(rpcLabel)
+                               .arg(m_lsadServer->serverPort()));
     }
 
     // Netlogon: the secure channel a joined machine opens to prove its machine
@@ -552,12 +584,13 @@ bool DcService::start(const QString &dcDir)
     connect(m_netlogonServer, &NetlogonServer::requestReceived, this,
             [this](const QString &operation) { emit statusMessage(operation); });
     const int netlogonPort = dcConfig.value(QStringLiteral("netlogonPort"), 1037).toInt();
-    if (!m_netlogonServer->listen(quint16(netlogonPort))) {
+    if (!m_netlogonServer->listen(quint16(netlogonPort), rpcAddress)) {
         emit statusMessage(tr("Netlogon endpoint failed to listen on port %1.")
                                .arg(netlogonPort));
     } else {
-        emit statusMessage(
-            tr("Netlogon served on 127.0.0.1:%1.").arg(m_netlogonServer->serverPort()));
+        emit statusMessage(tr("Netlogon served on %1:%2.")
+                               .arg(rpcLabel)
+                               .arg(m_netlogonServer->serverPort()));
     }
 
     // Replication (MS-DRSR): what a partner — or a DCSync-style tool — calls
@@ -583,12 +616,13 @@ bool DcService::start(const QString &dcDir)
     connect(m_drsServer, &DrsServer::requestReceived, this,
             [this](const QString &operation) { emit statusMessage(operation); });
     const int drsPort = dcConfig.value(QStringLiteral("drsPort"), 1038).toInt();
-    if (!m_drsServer->listen(quint16(drsPort))) {
+    if (!m_drsServer->listen(quint16(drsPort), rpcAddress)) {
         emit statusMessage(tr("DRSR endpoint failed to listen on port %1.")
                                .arg(drsPort));
     } else {
-        emit statusMessage(
-            tr("DRSR served on 127.0.0.1:%1.").arg(m_drsServer->serverPort()));
+        emit statusMessage(tr("DRSR served on %1:%2.")
+                               .arg(rpcLabel)
+                               .arg(m_drsServer->serverPort()));
     }
 
     // Pull replication: when dc.conf names a partner, this DC takes changes from
@@ -749,6 +783,7 @@ bool DcService::start(const QString &dcDir)
     // never advertises something that refuses the connection.
     m_epmServer = new EpmServer(this);
     m_epmServer->setHostName(dcHost.section(QLatin1Char('.'), 0, 0));
+    m_epmServer->setAdvertisedAddress(advertisedAddress);
     {
         QList<Epm::Entry> entries;
         const Rpc::Interface lsad = Lsad::interface();
@@ -823,7 +858,7 @@ bool DcService::start(const QString &dcDir)
         m_epmServer->setEntries(entries);
     }
     const int epmPort = dcConfig.value(QStringLiteral("epmPort"), 135).toInt();
-    if (!m_epmServer->listen(quint16(epmPort))) {
+    if (!m_epmServer->listen(quint16(epmPort), rpcAddress)) {
         emit statusMessage(
             tr("Endpoint mapper failed to listen on port %1 (port 135 needs root).")
                 .arg(epmPort));
@@ -837,8 +872,10 @@ bool DcService::start(const QString &dcDir)
                 entry.port = m_epmServer->serverPort();
         }
         m_epmServer->setEntries(entries);
-        emit statusMessage(
-            tr("Endpoint mapper served on 127.0.0.1:%1.").arg(m_epmServer->serverPort()));
+        emit statusMessage(tr("Endpoint mapper served on %1:%2, advertising %3.")
+                               .arg(rpcLabel)
+                               .arg(m_epmServer->serverPort())
+                               .arg(advertisedAddress.toString()));
     }
 
     // SMB2 and the named pipes the management interfaces are addressed by on a

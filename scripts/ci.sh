@@ -114,12 +114,43 @@ PY
         return 1
     fi
 
+    # The runner's own non-loopback address, which stands in for the second
+    # host the endpoint mapper stage needs. A UDP connect sends nothing; it only
+    # asks the kernel which address a packet would leave from. A machine with no
+    # route leaves this empty and that stage skips the remote half.
+    local lan_ip
+    lan_ip=$(python3 - 2>/dev/null <<'PY' || true
+import socket
+
+probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+try:
+    probe.connect(('192.0.2.1', 9))
+    print(probe.getsockname()[0])
+except OSError:
+    pass
+PY
+)
+
     # The daemon reads these from dc.conf when it starts, so the move has to
     # happen after provisioning and before that. Without it the SMB listener
     # fails with "port 445 needs root" and the SMB stage has nothing to reach,
-    # and the endpoint mapper does the same on 135.
+    # and the endpoint mapper does the same on 135. dcIp is the address the DC
+    # publishes for itself, which the endpoint mapper's towers name: leaving it
+    # at the provisioner's loopback default would make that stage test the very
+    # answer it exists to rule out.
     sed -i -e "s/^smbPort=.*/smbPort=$smb_port/" \
         -e "s/^epmPort=.*/epmPort=$epm_port/" "$dc_dir/dc.conf"
+    if [[ -n "${lan_ip:-}" ]]; then
+        sed -i "s/^dcIp=.*/dcIp=$lan_ip/" "$dc_dir/dc.conf"
+        # The endpoint mapper stage asks from that address, so the throwaway
+        # instance serves there: rpcAddress is the operator's opt-in to taking
+        # the RPC endpoints off loopback, and this stage is the workload for it.
+        if grep -q '^rpcAddress=' "$dc_dir/dc.conf"; then
+            sed -i "s/^rpcAddress=.*/rpcAddress=0.0.0.0/" "$dc_dir/dc.conf"
+        else
+            printf 'rpcAddress=0.0.0.0\n' >>"$dc_dir/dc.conf"
+        fi
+    fi
 
     printf '== start the daemon on the dev ports\n'
     "$build_dir/ui/monarchy-dcd" --dcdir "$dc_dir" >"$log" 2>&1 &
@@ -275,6 +306,26 @@ PY
         --port "$netlogon_port" --samr-port "$samr_port" \
         --user Administrator --password "$conformance_password" \
         --domain "$conformance_domain" || status=1
+
+    # The endpoint mapper: the service a client asks when it knows an interface
+    # but not the port, so it has to answer where a *remote* client looks. The
+    # mapper and the endpoints it named once bound loopback only while the tower
+    # named loopback too, and a probe on this host could see neither. Questions
+    # go over the LAN address for exactly that reason.
+    if [[ -n "${lan_ip:-}" ]]; then
+        printf '== EPM conformance (impacket, over %s)\n' "$lan_ip"
+        python3 "$root/scripts/epm-conformance.py" --host "$lan_ip" \
+            --epm-port "$epm_port" --advertised "$lan_ip" \
+            --user Administrator --password "$conformance_password" \
+            --domain "$conformance_domain" || status=1
+    else
+        printf '== EPM conformance (impacket)\n'
+        python3 "$root/scripts/epm-conformance.py" --host 127.0.0.1 \
+            --epm-port "$epm_port" --advertised 127.0.0.1 \
+            --user Administrator --password "$conformance_password" \
+            --domain "$conformance_domain" || status=1
+        printf 'ci.sh: skipped the remote half - this host has no non-loopback address\n' >&2
+    fi
 
     # The share root is the parent of the domain directory the daemon serves,
     # which is what the SYSVOL share is mapped to; the driver writes its fixture

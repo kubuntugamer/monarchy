@@ -27,11 +27,12 @@ endpoint mapper (135) and SMB (445) stay native under `--dev-ports`.
 | DNS (locator, A/SRV/ANY, RFC 2136, negative answers) | 53 / 1053 | `monarchy-dns-tests` | **dig**, `nsupdate`, and a hand-built query | `dig @dc -p port SRV …`; `scripts/check-dc-health.sh` follows every locator and asserts both negatives (`NXDOMAIN` with the zone's SOA, empty `NOERROR` with it) |
 | KDC (RC4-HMAC, AES-128/256) | 88 / 8888 | `monarchy-kerberos-tests` | **MIT krb5** `kinit` / GSSAPI, and `klist -f` / `kvno` for the ticket flags | `scripts/kerberos-conformance.py`: TGT and service tickets read back by the client's own decoder, the flags they carry, AES-256, and both refusals |
 | kpasswd (RFC 3244) | 464 / 1464 | `monarchy-kpasswd-tests` | **MIT** `krb5_change_password` / `krb5_set_password` | same, against the daemon |
-| SAMR | 49152 / 1035 (loopback) | `monarchy-samr-tests` | **impacket** NDR, **Samba** `dcerpc.samr` | `scripts/samr-conformance.py` |
-| LSAD | 49153 / 1036 (loopback) | `monarchy-lsad-tests` | **impacket** NDR (Samba half needs pidl) | `scripts/lsad-conformance.py --skip-samba` |
-| Netlogon (MS-NRPC) | 1037 / 1037 (loopback) | `monarchy-netlogon-tests` | **impacket** NDR | `scripts/netlogon-conformance.py` (creates its machine account over SAMR) |
-| DRSUAPI | 1038 / 1038 (loopback) | `monarchy-drs-tests`, `monarchy-drsclient-tests`, `monarchy-replication-tests` | **impacket** NDR | `scripts/drs-conformance.py` |
-| Endpoint mapper (C706) | 135 / 135 (loopback) | `monarchy-epm-tests` | **impacket** `hept_lookup` / `hept_map`, C706 appendix L towers | `hept_lookup` returns a port that accepts a connection |
+| SAMR | 49152 / 1035 | `monarchy-samr-tests` | **impacket** NDR, **Samba** `dcerpc.samr` | `scripts/samr-conformance.py` |
+| LSAD | 49153 / 1036 | `monarchy-lsad-tests` | **impacket** NDR (Samba half needs pidl) | `scripts/lsad-conformance.py --skip-samba` |
+| Netlogon (MS-NRPC) | 1037 / 1037 | `monarchy-netlogon-tests` | **impacket** NDR | `scripts/netlogon-conformance.py` (creates its machine account over SAMR) |
+| DRSUAPI | 1038 / 1038 | `monarchy-drs-tests`, `monarchy-drsclient-tests`, `monarchy-replication-tests` | **impacket** NDR | `scripts/drs-conformance.py` |
+| Endpoint mapper (C706) | 135 / 135 | `monarchy-epm-tests` | **impacket** `hept_lookup` / `hept_map`, C706 appendix L towers | `scripts/epm-conformance.py`: each tower's port is opened and bound for the interface it named |
+| The RPC endpoints from **another host's** address | `epmPort` and each RPC port, with `rpcAddress` set off loopback | `monarchy-epm-tests` | **impacket** over the LAN address rather than 127.0.0.1 | `scripts/epm-conformance.py --host <lan>`; `scripts/check-dc-health.sh` asks the same five ports from the host's routable address, and skips when `rpcAddress` is loopback, which is the default posture |
 | SMB2 + named pipes | 445 / 445 | `monarchy-smb-tests` | **Samba** `smbclient` and `rpcclient` plus **impacket** `ncacn_np`, dialect pinned to 2.0.2/2.1 | `scripts/smb-conformance.py`: negotiate, SYSVOL read, NETLOGON write refused, `\pipe\samr` and `\pipe\lsarpc` |
 | SMB1 (NT LM 0.12) | 445 / 445 | `monarchy-smb1-tests` | **Samba** `smbclient` pinned to NT1 | `scripts/smb-conformance.py`: SYSVOL listing, subdirectory listing, empty match refused, byte-exact read |
 | SMB1 (NT LM 0.12) | 445 / 445 | `monarchy-smb1-tests` | **Samba** `smbclient -m NT1` (live only) | fetch `GPT.INI` byte for byte, anonymous refused |
@@ -40,7 +41,7 @@ endpoint mapper (135) and SMB (445) stay native under `--dev-ports`.
 
 `scripts/ci.sh --conformance` is the row-for-row proof of the RPC half: it
 provisions a throwaway domain, starts the daemon on free ports, and drives DRSR,
-LSAD, SAMR and Netlogon with impacket's own NDR, and the SMB2 transport those
+LSAD, SAMR, Netlogon and the endpoint mapper with impacket's own NDR, and the SMB2 transport those
 pipes ride on with Samba's `smbclient` and `rpcclient` beside impacket's own
 client. The dialect is pinned to what this server answers — 2.0.2 and 2.1 — and
 read back out of the client, so a client that agreed to something else fails
@@ -64,7 +65,8 @@ when you want the narrow loop first.
 | `Lsad.cpp` | `monarchy-lsad-tests` | `lsad-conformance.py --skip-samba` |
 | `Drs.cpp`, `DrsClient.cpp`, `ReplicationAgent.cpp` | `monarchy-drs-tests` `monarchy-drsclient-tests` `monarchy-replication-tests` | `drs-conformance.py` |
 | `Netlogon.cpp` | `monarchy-netlogon-tests` `monarchy-logonhours-tests` `monarchy-workstation-tests` | `netlogon-conformance.py` |
-| `Epm.cpp` | `monarchy-epm-tests` | `hept_lookup` — a tower naming a dead port is the failure this catches |
+| `Epm.cpp` | `monarchy-epm-tests` | `epm-conformance.py` — a tower naming a dead port, or the wrong address, is the failure this catches |
+| `DcService.cpp` (which address a listener binds) | `monarchy-dcservice-tests` `monarchy-epm-tests` | `epm-conformance.py --host <lan>` — a loopback bind passes every probe made on this host |
 | `DnsServer.cpp` | `monarchy-dns-tests` | `scripts/check-dc-health.sh` — the locators *and* the two negative answers |
 | `Smb1.cpp`, `Smb2.cpp` | `monarchy-smb-tests` `monarchy-smb1-tests` | `smb-conformance.py` for SMB2 and for SMB1 (dialect pinned to NT1 in a second set of checks) |
 | `Provisioner.cpp` | `monarchy-provision-tests` | **full** `ci.sh --conformance`: it seeds the tree every other suite starts from |

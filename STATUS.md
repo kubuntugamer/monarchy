@@ -157,7 +157,10 @@ failure) |
 - **The endpoint mapper's limits**: it binds `epmPort` (135 by default), and
   binding 135 needs `CAP_NET_BIND_SERVICE` or root: an unprivileged console
   reports that on the status bar and the endpoints stay reachable by explicit
-  port, which is the same trade a non-root Samba makes. The reply layout is
+  port, which is the same trade a non-root Samba makes. It follows whatever
+  address the RPC endpoints bound: `127.0.0.1` while they stay on loopback, and
+  `dcIp` — the address this DC publishes for itself — once `rpcAddress` takes
+  them off it, so a tower is only ever usable where something answers. The reply layout is
   verified against impacket's decoder and against Samba's DCE client at bind
   time; Samba's pidl decoder has not been driven through a lookup here (its
   python binding cannot construct the call's `policy_handle`), so an interop
@@ -222,6 +225,13 @@ authenticates can administer. The RPC endpoints therefore bind `127.0.0.1`
 only (`samrPort` 1035, `lsadPort` 1036 and `drsPort` 1038 by default). Do not
 expose ports 1389/1053/1035/1036/1038 to untrusted networks, and do not move
 the RPC endpoints off loopback until per-account RPC authorization exists.
+
+`rpcAddress` in `dc.conf` is how that decision is made deliberately: unset it
+and the endpoints stay on loopback; set it to `0.0.0.0`, or to this host's
+address, and SAMR, LSAD, Netlogon, DRSR and the endpoint mapper serve the
+network — which is what a domain join from another machine needs, and it hands
+every account in the domain administrative reach over RPC. Provisioning leaves
+it unset.
 
 ## 5. Third-party references
 
