@@ -48,7 +48,12 @@ RUN_TESTS=1
 RUN_BUILD=1
 PROVISION=1
 FORCE=0
-SERVICE=0
+# Tri-state, resolved after the arguments are parsed: empty means the flag was
+# not given, 0 means the caller asked for a binaries-only install, 1 means the
+# caller asked for the service. Initialising it to 0 here used to make the root
+# default unreachable, so a root run without --service installed into
+# $HOME/.local and left the system service on its old binary.
+SERVICE=
 USER_MODE=0
 SERVICE_USER="monarchy-dc"
 REALM_GIVEN=0
@@ -77,7 +82,9 @@ Install
                     ~/.local otherwise)
   --service         Install and start the monarchy-dcd systemd unit
                     (default when run as root)
-  --no-service      Install binaries only; do not touch systemd
+  --no-service      Install binaries only; do not touch systemd. Under root
+                    this is now distinguishable from the default, and the
+                    summary says the service was left alone
   --user            Rootless install: ~/.local, development ports,
                     no systemd (default for a non-root run)
 
@@ -130,10 +137,12 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ $EUID -eq 0 && -z "$SERVICE" ]]; then
-    SERVICE=1
-elif [[ -z "$SERVICE" ]]; then
-    SERVICE=0
+if [[ -z "$SERVICE" ]]; then
+    if [[ $EUID -eq 0 && $USER_MODE -eq 0 ]]; then
+        SERVICE=1
+    else
+        SERVICE=0
+    fi
 fi
 
 if [[ $SERVICE -eq 1 ]]; then
@@ -364,10 +373,20 @@ if [[ $SERVICE -eq 1 ]]; then
            journalctl -u monarchy-dcd
   Log in:  Administrator@$REALM
   KRB5:    $DCDIR/krb5.conf
+  Health:  sudo $ROOT/scripts/check-dc-health.sh "$DCDIR"
+           (needs root: $SERVICE_USER owns the store)
 EOF
 else
     cat <<EOF
+  Service: not installed (--no-service)
   Run:     $PREFIX/bin/monarchy-ui
   Daemon:  $PREFIX/bin/monarchy-dcd --dcdir "$DCDIR"
 EOF
+    # A root run that skips the service still installs binaries and prints
+    # success, so say which binary is actually answering rather than leaving a
+    # passing run to be read as "the daemon was upgraded".
+    if [[ -f /etc/systemd/system/monarchy-dcd.service ]]; then
+        warn "systemd was not touched: monarchy-dcd.service keeps its own ExecStart binary"
+        warn "restart it separately if you meant to upgrade the running daemon"
+    fi
 fi
