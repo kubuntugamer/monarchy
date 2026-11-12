@@ -101,14 +101,18 @@ DC believes it started.
 These are places where a change can pass everything and still be wrong. They are
 recorded, not hidden:
 
-- **G11 — share enumeration is absent on both transports.** Measured with
-  Samba's `smbclient -L` against a provisioned tree, at 2.1 and pinned to NT1:
-  both print an empty share list, while connecting to `SYSVOL` by name and
-  listing it works on both. There is no `srvsvc` pipe and no RAP
-  `NetShareEnum` handler anywhere in `engine/`, so this is absence rather than a
-  broken reply — box B's `shares` answering `0xc0000034` over SMB1 is the same
-  fact seen through impacket. None of the drivers asserted it, which is why it
-  went unnoticed; nothing in the tree claims it.
+- **G11 — share enumeration is absent.** The probe that reaches the server is
+  the pipe open: `rpcclient -c netshareenum` fails with
+  `Could not initialise srvsvc. Error was NT_STATUS_OBJECT_NAME_NOT_FOUND`, while
+  `rpcclient -c enumdomusers` on the same `IPC$` connection answers (box B,
+  live domain, with the Administrator credential) — so one endpoint is missing,
+  not the IPC path. There is no `srvsvc` pipe and no RAP `NetShareEnum`
+  handler anywhere in `engine/`; the only pipes it serves are `lsarpc`,
+  `netlogon` and `samr`. `smbclient -L` is **not** evidence here: it browses over
+  SMB1/RAP only, so over SMB2 it declines on the client side
+  (`SMB1 disabled -- no workgroup available`) without asking the server, and
+  over NT1 it ends in `NT_STATUS_CONNECTION_DISCONNECTED`. Nothing in the tree
+  claims enumeration and no driver asserts it, which is how it stayed quiet.
 
 - **G10 — a create on a read-only share is refused with the wrong status.**
   SYSVOL and NETLOGON accept no writes, which is deliberate, but opening a file
