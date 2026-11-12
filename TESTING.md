@@ -32,14 +32,18 @@ endpoint mapper (135) and SMB (445) stay native under `--dev-ports`.
 | Netlogon (MS-NRPC) | 1037 / 1037 (loopback) | `monarchy-netlogon-tests` | **impacket** NDR | `scripts/netlogon-conformance.py` (creates its machine account over SAMR) |
 | DRSUAPI | 1038 / 1038 (loopback) | `monarchy-drs-tests`, `monarchy-drsclient-tests`, `monarchy-replication-tests` | **impacket** NDR | `scripts/drs-conformance.py` |
 | Endpoint mapper (C706) | 135 / 135 (loopback) | `monarchy-epm-tests` | **impacket** `hept_lookup` / `hept_map`, C706 appendix L towers | `hept_lookup` returns a port that accepts a connection |
-| SMB2 + named pipes | 445 / 445 | `monarchy-smb-tests` | **impacket** over `ncacn_np` (live only) | binary walk of `\pipe\samr`, `\\dc\SYSVOL` |
+| SMB2 + named pipes | 445 / 445 | `monarchy-smb-tests` | **Samba** `smbclient` and `rpcclient` plus **impacket** `ncacn_np`, dialect pinned to 2.0.2/2.1 | `scripts/smb-conformance.py`: negotiate, SYSVOL read, NETLOGON write refused, `\pipe\samr` and `\pipe\lsarpc` |
 | SMB1 (NT LM 0.12) | 445 / 445 | `monarchy-smb1-tests` | **Samba** `smbclient -m NT1` (live only) | fetch `GPT.INI` byte for byte, anonymous refused |
 | The endpoint set as a whole | every port `dc.conf` declares | `monarchy-dcservice-tests` | a TCP connection to each declared port, made by the kernel | `scripts/check-dc-health.sh` |
 | RPC auth (NTLMSSP + SPNEGO + Kerberos) | all RPC | `monarchy-samr-tests`, `monarchy-kerberos-tests` | **impacket** and **Samba** with credentials | every conformance script binds at `PKT_PRIVACY` |
 
 `scripts/ci.sh --conformance` is the row-for-row proof of the RPC half: it
 provisions a throwaway domain, starts the daemon on free ports, and drives DRSR,
-LSAD, SAMR and Netlogon with impacket's own NDR. CI runs it on every push, and a second job builds the tree with
+LSAD, SAMR and Netlogon with impacket's own NDR, and the SMB2 transport those
+pipes ride on with Samba's `smbclient` and `rpcclient` beside impacket's own
+client. The dialect is pinned to what this server answers — 2.0.2 and 2.1 — and
+read back out of the client, so a client that agreed to something else fails
+instead of passing on a fallback. CI runs it on every push, and a second job builds the tree with
 `MONARCHY_WITH_LDAP=ON` so the OpenLDAP configuration is compiled and its suites
 run rather than assumed to work.
 
@@ -61,7 +65,7 @@ when you want the narrow loop first.
 | `Netlogon.cpp` | `monarchy-netlogon-tests` `monarchy-logonhours-tests` `monarchy-workstation-tests` | `netlogon-conformance.py` |
 | `Epm.cpp` | `monarchy-epm-tests` | `hept_lookup` — a tower naming a dead port is the failure this catches |
 | `DnsServer.cpp` | `monarchy-dns-tests` | `scripts/check-dc-health.sh` |
-| `Smb1.cpp`, `Smb2.cpp` | `monarchy-smb-tests` `monarchy-smb1-tests` | `smbclient -m NT1` |
+| `Smb1.cpp`, `Smb2.cpp` | `monarchy-smb-tests` `monarchy-smb1-tests` | `smb-conformance.py` for SMB2, `smbclient -m NT1` for SMB1 |
 | `Provisioner.cpp` | `monarchy-provision-tests` | **full** `ci.sh --conformance`: it seeds the tree every other suite starts from |
 | `DcService.cpp` | `monarchy-dcservice-tests`, full `ci.sh --conformance` | `check-dc-health.sh` |
 | `ui/src/mainwindow.cpp`, `mainwindow.h` | `monarchy-mainwindow-tests` `monarchy-ui-tests` `monarchy-backend-tests` | full `ci.sh` — it is what listens on every port |
@@ -96,15 +100,16 @@ DC believes it started.
 These are places where a change can pass everything and still be wrong. They are
 recorded, not hidden:
 
-- **G4 — SMB has no independent client in CI.** The suites are self-contained;
-  `smbclient` and impacket over `ncacn_np` are live-only, so a byte that only
-  this tree's SMB encoder accepts would pass.
 - **G6 — the LDAP path has no live external client in CI.** `ldap3` is a
   development convenience on one box, not a stage in `ci.sh`.
-- **G7 — `check-dc-health.sh` needs an install,** so CI runs the suites and the
-  conformance scripts but never the health check.
+- **G8 — SMB1 (NT LM 0.12) still has no client in CI.** `scripts/smb-conformance.py`
+  asks for 2.1 and, when it is refused, 2.0.2, and reads the answer back; it
+  never sends the NT LM 0.12 negotiate `Smb1.cpp` serves, so the SMB1 path is
+  still exercised only by this tree's own encoder plus a live `smbclient -m NT1`.
+  Adding it means a second pinned dialect and the pre-SMB2 header the other
+  checks do not share.
 
-Four of the original seven are closed; their entries stay here so a reference
+Six of the original seven are closed; their entries stay here so a reference
 in #7 still resolves:
 
 - **G1 — closed.** `scripts/ci.sh --sanitize` configures a Debug build with
@@ -123,6 +128,24 @@ in #7 still resolves:
   ports another process already holds, and asserts that a TCP connection to every
   port `dc.conf` still declares is accepted. A port the daemon cannot take must
   be reported, so a locator is never derived from a listener that failed.
+
+- **G4 — closed for SMB2, and it was the whole of the gap when it was written.**
+  `51a2c2b` added `scripts/smb-conformance.py`, `ci.sh --conformance` calls it,
+  and the `build-and-test` job installs `smbclient` and runs that stage, so a
+  byte only this tree's SMB2 encoder accepts now fails in CI. The SMB1 half was
+  never in this driver and is recorded separately as G8.
+
+- **G7 — closed.** `ci.sh --conformance` now runs `scripts/check-dc-health.sh`
+  against the throwaway tree it just provisioned, after the readiness greps and
+  before the RPC drivers, and the `build-and-test` job installs `dnsutils` so
+  the SRV half finds `dig` instead of reporting itself skipped. Verified on a
+  tree provisioned on non-overlapping ports: nine listeners, 24 checks, all
+  passing, exit 0. The check proves a TCP connection is accepted, not whose
+  listener accepted it — on a box with an installed DC holding 1037 and 1038 it
+  passed while the daemon under test had lost those binds — which is why it runs
+  after the greps that require this daemon's own "DRSR served on" and "SMB2
+  served on" lines. CI also moves `epmPort`, because the check reads it from
+  `dc.conf` and 135 cannot bind unprivileged.
 
 - **G5 — closed.** `scripts/check-dc-health.sh` walks `kpasswdPort` with the ten
   ports beside it, taking 464 as the default because that is the port a client
