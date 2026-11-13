@@ -261,6 +261,25 @@ def main():
             run.check("the reply parses as an LDAPMessage", True)
         if parsed:
             run.check("the reply echoes the message id", msg_id == 0x0000FB3D, str(msg_id))
+
+            # The outer SEQUENCE has to account for the datagram exactly. A
+            # decoder that skips its own declared length will happily read a
+            # truncated answer or one with bytes appended, and two clients can
+            # then disagree about how long the same answer is while each walks it
+            # consistently — which is a wire bug reported as a counting quirk.
+            declared = None
+            if reply and reply[0] == 0x30:
+                form = reply[1]
+                if form & 0x80:
+                    width = form & 0x7F
+                    declared = 2 + width + int.from_bytes(reply[2:2 + width], "big")
+                else:
+                    declared = 2 + form
+            run.check(
+                "the outer SEQUENCE length accounts for the whole datagram",
+                declared == len(reply),
+                "datagram %d bytes, header declares %r" % (len(reply), declared),
+            )
             for name in (
                 "DnsDomain",
                 "DnsForestName",
@@ -283,8 +302,12 @@ def main():
             # reply that changes with the question tells a client it supports
             # whatever it happened to ask for, which is worse than saying
             # nothing because it is a claim about fields the client will parse.
+            # Same message id as the vector, so the echo cannot account for a
+            # difference: whatever the mask asked, the answer has to be the same
+            # bytes. Comparing lengths alone would pass on a different id, which
+            # echoes one byte wider, and would miss a field that changed size.
             other = search(
-                0x4242,
+                0x0000FB3D,
                 "",
                 0,
                 and_filter(equality("NtVer", b"\x1f\x00\x00\x00")),
@@ -301,6 +324,12 @@ def main():
                             other_ntver = (other_attrs.get("NtVer") or [None])[0]
                 except Exception:  # noqa: BLE001 - a malformed reply fails the check below
                     other_ntver = None
+            run.check(
+                "the answer is the same bytes whatever mask was asked",
+                other_reply is not None and other_reply == reply,
+                "asked \\x1f: %r bytes, asked \\x06: %d bytes"
+                % (len(other_reply) if other_reply else None, len(reply)),
+            )
             run.check(
                 "the answer advertises the server's NtVer, not the value asked",
                 other_reply is not None and other_ntver == (attrs.get("NtVer") or [None])[0],

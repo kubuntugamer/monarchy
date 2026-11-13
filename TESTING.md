@@ -38,7 +38,11 @@ endpoint mapper (135) and SMB (445) stay native under `--dev-ports`.
 | SMB1 (NT LM 0.12) | 445 / 445 | `monarchy-smb1-tests` | **Samba** `smbclient -m NT1` (live only) | fetch `GPT.INI` byte for byte, anonymous refused |
 | The endpoint set as a whole | every port `dc.conf` declares | `monarchy-dcservice-tests` | a TCP connection to each declared port, made by the kernel | `scripts/check-dc-health.sh` |
 | RPC auth (NTLMSSP + SPNEGO + Kerberos) | all RPC | `monarchy-samr-tests`, `monarchy-kerberos-tests` | **impacket** and **Samba** with credentials | every conformance script binds at `PKT_PRIVACY` |
-| **DC locator over UDP** (CLDAP, RFC 1798) | the LDAP port over UDP — the ping a client sends before it joins | `monarchy-ldap-tests` (`cldap*` cases) | a datagram built in the driver, with **Samba's own real ping pinned byte for byte**, and the reply decoded as BER rather than by this tree's parser | `scripts/cldap-conformance.py`: the `NtVer`-only ping Samba sends, the `DsGetDcName` ping that names the domain, the attribute set a client reads, a foreign domain answered `noSuchObject`, and a subtree search left unanswered. **Absent**: the binary `Netlogon` attribute, so Samba's `net ads lookup` reports `NOT_FOUND` — see `STATUS.md` §3 item 6 |
+| **DC locator over UDP** (CLDAP, RFC 1798) | the LDAP port over UDP — the ping a client sends before it joins | `monarchy-ldap-tests` (`cldap*` cases) | a datagram built in the driver, with **Samba's own real ping pinned byte for byte**, and the reply decoded as BER rather than by this tree's parser | `scripts/cldap-conformance.py`: the `NtVer`-only ping Samba sends, the `DsGetDcName` ping that names the domain, the attribute set a client reads, a foreign domain answered `noSuchObject`, and a subtree search left unanswered. The reply's outer
+SEQUENCE must also account for the whole datagram, and an answer must be the **same bytes** whatever
+`NtVer` mask was asked — the echoed message id widens with the id's value, so a 1-byte id gives a
+357-byte answer and Samba's 3-byte `0x00fb3d` gives 359, which is length arithmetic rather than a
+different reply. **Absent**: the binary `Netlogon` attribute, so Samba's `net ads lookup` reports `NOT_FOUND` — see `STATUS.md` §3 item 6 |
 
 `scripts/ci.sh --conformance` is the row-for-row proof of the RPC half: it
 provisions a throwaway domain, starts the daemon on free ports, and drives DRSR,
