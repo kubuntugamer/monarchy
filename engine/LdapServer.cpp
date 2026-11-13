@@ -452,17 +452,28 @@ QByteArray LdapServer::cldapResponse(const QByteArray &request) const {
         for (const Asn1::Element &child : element->children) pending.append(&child);
     }
 
+    // A ping carries NtVer, DnsDomain, or both: Samba asks with NtVer alone
+    // (and its own attribute, NetLogon), while DsGetDcName names the domain.
+    // One that carries neither is a UDP LDAP search, not a locator ping, and
+    // stays unanswered. A ping that names no domain is asking "are you a DC?",
+    // so it is answered — refusing it looked exactly like a DC being absent,
+    // which is the failure this reply exists to prevent.
     int domainIndex = -1;
+    bool asksAboutDomain = false;
     for (int i = 0; i < assertions.size(); ++i) {
-        if (assertions.at(i).compare(QStringLiteral("DnsDomain"), Qt::CaseInsensitive) == 0) {
+        const QString &assertion = assertions.at(i);
+        if (assertion.compare(QStringLiteral("DnsDomain"), Qt::CaseInsensitive) == 0) {
             domainIndex = i + 1;
-            break;
+            asksAboutDomain = true;
+        } else if (assertion.compare(QStringLiteral("NtVer"), Qt::CaseInsensitive) == 0) {
+            asksAboutDomain = true;
         }
     }
-    if (domainIndex <= 0 || domainIndex >= assertions.size()) return {};
+    if (!asksAboutDomain) return {};
 
     const int msgId = int(Asn1::toInteger(*idField));
-    if (assertions.at(domainIndex).compare(m_identity.dnsDomain, Qt::CaseInsensitive) != 0) {
+    if (domainIndex > 0 && domainIndex < assertions.size() &&
+        assertions.at(domainIndex).compare(m_identity.dnsDomain, Qt::CaseInsensitive) != 0) {
         QByteArray inner;
         writeInt(inner, 0x0a, 32); // noSuchObject
         writeString(inner, 0x04, QString());
@@ -521,6 +532,9 @@ QByteArray LdapServer::cldapResponse(const QByteArray &request) const {
     attributes.append(attribute(QStringLiteral("DcSiteName"), site.toUtf8()));
     attributes.append(attribute(QStringLiteral("NetbiosDomainName"), m_identity.netbios.toUtf8()));
     attributes.append(attribute(QStringLiteral("NetbiosComputerName"), netbiosHost.toUtf8()));
+    // DnsHostName is the name a client puts in its DC list; HostName is what a
+    // Windows DC also publishes, so both are here.
+    attributes.append(attribute(QStringLiteral("DnsHostName"), host.toUtf8()));
     attributes.append(attribute(QStringLiteral("HostName"), host.toUtf8()));
     // NT_VERSION_5 | NT_VERSION_5EX: the capabilities mask a Windows DC
     // publishes, and the value the locator's own filter asks for.

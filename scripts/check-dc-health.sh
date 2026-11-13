@@ -121,6 +121,45 @@ done
 # so. When rpcAddress does take them off loopback, ask for them from this host's
 # own routable address, because a bind that silently stayed on loopback passes
 # every check above.
+# The DC locator: a client verifies the machine its SRV record names with an
+# LDAP ping over UDP, and one that gets no datagram back reports
+# ERROR_NO_SUCH_DOMAIN — indistinguishable from the domain not existing. The
+# datagram is the one Samba's `net ads lookup` sends, pinned from a capture;
+# an answer proves the locator answers a real client's question rather than a
+# shape this tree invented.
+printf '\nDC locator (CLDAP):\n'
+LDAP_PORT="$(conf_value ldapPort 1389)"
+CHECKS=$((CHECKS + 1))
+if ! command -v python3 >/dev/null 2>&1; then
+    skip "locator ping on UDP $LDAP_PORT" "python3 is not installed"
+else
+    LOCATOR="$(python3 - "$DC_IP" "$LDAP_PORT" <<'PY'
+import socket, sys
+ping = bytes.fromhex(
+    "3035020300fb3d632e0400"
+    "0a01000a0100020100020100010100"
+    "a00fa30d04054e74566572040406000000"
+    "300a04084e65744c6f676f6e")
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.settimeout(2.0)
+try:
+    sock.sendto(ping, (sys.argv[1], int(sys.argv[2])))
+    data, _ = sock.recvfrom(65535)
+except OSError:
+    print("no answer")
+else:
+    print("answered" if b"DnsDomain" in data else "answered without a domain")
+finally:
+    sock.close()
+PY
+)"
+    if [[ "$LOCATOR" == "answered" ]]; then
+        ok "locator ping on UDP $LDAP_PORT"
+    else
+        fail "locator ping on UDP $LDAP_PORT" "$LOCATOR"
+    fi
+fi
+
 printf '\nRPC endpoints as another host reaches them:\n'
 HOST_ADDRESS="$(host_address)"
 RPC_ADDRESS="$(conf_value rpcAddress '')"

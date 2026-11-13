@@ -38,6 +38,7 @@ endpoint mapper (135) and SMB (445) stay native under `--dev-ports`.
 | SMB1 (NT LM 0.12) | 445 / 445 | `monarchy-smb1-tests` | **Samba** `smbclient -m NT1` (live only) | fetch `GPT.INI` byte for byte, anonymous refused |
 | The endpoint set as a whole | every port `dc.conf` declares | `monarchy-dcservice-tests` | a TCP connection to each declared port, made by the kernel | `scripts/check-dc-health.sh` |
 | RPC auth (NTLMSSP + SPNEGO + Kerberos) | all RPC | `monarchy-samr-tests`, `monarchy-kerberos-tests` | **impacket** and **Samba** with credentials | every conformance script binds at `PKT_PRIVACY` |
+| **DC locator over UDP** (CLDAP, RFC 1798) | the LDAP port over UDP — the ping a client sends before it joins | `monarchy-ldap-tests` (`cldap*` cases) | a datagram built in the driver, with **Samba's own real ping pinned byte for byte**, and the reply decoded as BER rather than by this tree's parser | `scripts/cldap-conformance.py`: the `NtVer`-only ping Samba sends, the `DsGetDcName` ping that names the domain, the attribute set a client reads, a foreign domain answered `noSuchObject`, and a subtree search left unanswered. **Absent**: the binary `Netlogon` attribute, so Samba's `net ads lookup` reports `NOT_FOUND` — see `STATUS.md` §3 item 6 |
 
 `scripts/ci.sh --conformance` is the row-for-row proof of the RPC half: it
 provisions a throwaway domain, starts the daemon on free ports, and drives DRSR,
@@ -59,7 +60,7 @@ when you want the narrow loop first.
 |---|---|---|
 | `Rpc.cpp`, `Ndr.cpp` | `monarchy-samr-tests` `monarchy-lsad-tests` `monarchy-drs-tests` `monarchy-epm-tests` | every conformance script — this is the shared marshaller |
 | `Ntlm.cpp`, `Gss.cpp` | `monarchy-ntlm-tests` `monarchy-samr-tests` `monarchy-lsad-tests` | a conformance script with credentials |
-| `LdapServer.cpp`, `LdapServer.h` | `monarchy-ldap-tests` `monarchy-tls-tests` `monarchy-backend-tests` `monarchy-provision-tests` | a bind/search probe on 1389 |
+| `LdapServer.cpp`, `LdapServer.h` | `monarchy-ldap-tests` `monarchy-tls-tests` `monarchy-backend-tests` `monarchy-provision-tests` | a bind/search probe on 1389, and `scripts/cldap-conformance.py` for the locator ping on UDP |
 | `Kdc.cpp`, `Krb5.cpp`, `Aes.cpp` | `monarchy-kerberos-tests` `monarchy-kpasswd-tests` | `scripts/kerberos-conformance.py` — it reads the ticket flags back through `klist`, which no suite here does. It needs the `krb5-user` package; without it the conformance stage says so and skips, because a missing client tested nothing |
 | `Samr.cpp` | `monarchy-samr-tests` `monarchy-netlogon-tests` | `samr-conformance.py` |
 | `Lsad.cpp` | `monarchy-lsad-tests` | `lsad-conformance.py --skip-samba` |

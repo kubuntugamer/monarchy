@@ -245,6 +245,15 @@ PY
         --base-dn "$conformance_base_dn" --user Administrator \
         --password "$conformance_password" --dns-domain "$conformance_dns" || status=1
 
+    # The DC locator is one datagram, not a search a client repeats: a client
+    # that gets nothing back reports ERROR_NO_SUCH_DOMAIN and never starts the
+    # join. Two real ping shapes exist — Samba's NtVer-only one and the
+    # DsGetDcName one that names the domain — and the driver sends both, with
+    # the Samba datagram pinned byte for byte from a capture.
+    printf '== CLDAP conformance (DC locator ping over UDP)\n'
+    python3 "$root/scripts/cldap-conformance.py" --host 127.0.0.1 --port "$ldap_port" \
+        --domain "$conformance_dns" || status=1
+
     # MIT's own client against the KDC. The ticket flags a reply carries are
     # what a client acts on — forwardable for delegation, initial for whether it
     # may renew — and no suite in this tree decodes them the way a client does.

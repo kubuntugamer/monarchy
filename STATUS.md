@@ -197,8 +197,16 @@ The gaps above are not independent. Working outward from what exists:
    Samba's reference NDR decoder and impacket by `scripts/lsad-conformance.py`.
    Remaining here: trust-password rotation and the Netlogon trust channel.
 6. ~~Netlogon~~ — secure channel, machine-password write, SamLogon validation
-   and the DC locator are served and verified (§1). Remaining here: a real
-   member's join flow, RPC-layer schannel, and trust creation over the channel.
+   and the DC locator calls are served and verified (§1). The locator's
+   **CLDAP ping over UDP** is answered too: both shapes real clients send —
+   Samba's `NtVer`-only ping and the `DsGetDcName` ping that names the domain —
+   are served and driven by `scripts/cldap-conformance.py`, which pins Samba's
+   own datagram from a capture. **Not answered**: the binary `Netlogon`
+   attribute (`NETLOGON_SAM_LOGON_RESPONSE_EX`). Samba's `net ads lookup`
+   parses only that blob, so it still reports `NOT_FOUND` against this DC — the
+   named attributes this server sends are for clients that read them, and
+   Samba is not one. Remaining here: that blob, a real member's join flow,
+   RPC-layer schannel, and trust creation over the channel.
 7. ~~DRSR~~ — `DsBind`/`DsGetNCChanges`/`DsReplicaSync` plus `DsCrackNames`
    and `DsGetDomainControllerInfo` are served and verified (§1). A pull side now exists — `ReplicationAgent` takes a partner from
    `dc.conf` or a wire `DsReplicaAdd` on a timer and applies what it fetches —
