@@ -160,7 +160,15 @@ failure) |
   port, which is the same trade a non-root Samba makes. It follows whatever
   address the RPC endpoints bound: `127.0.0.1` while they stay on loopback, and
   `dcIp` — the address this DC publishes for itself — once `rpcAddress` takes
-  them off it, so a tower is only ever usable where something answers. The reply layout is
+  them off it, so a tower is only ever usable where something answers.
+- **`dcIp` is the address clients must use, and the zone publishes it**: the
+  DC's own A records and the site's are written from it, so a DC that serves
+  other machines and keeps the provisioning default of `127.0.0.1` hands every
+  client a locator answer that points at the client's own loopback. That is a
+  configuration mistake, not a bug this tree can rule out — provisioning does
+  not know which interface is the reachable one — so it is recorded here: set
+  `dcIp` to the address a client on another host would use, restart, and the
+  swept records follow (`dig @<dcIp> <dcHost> A`). The reply layout is
   verified against impacket's decoder and against Samba's DCE client at bind
   time; Samba's pidl decoder has not been driven through a lookup here (its
   python binding cannot construct the call's `policy_handle`), so an interop

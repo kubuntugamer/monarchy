@@ -277,6 +277,35 @@ def main():
                 (attrs.get("DnsDomain") or [b""])[0].decode().lower() == args.domain.lower(),
                 (attrs.get("DnsDomain") or [b""])[0].decode(),
             )
+
+            # NtVer in an answer is the DC's own capability mask, not the
+            # question repeated. Ask with a mask the DC does not advertise: a
+            # reply that changes with the question tells a client it supports
+            # whatever it happened to ask for, which is worse than saying
+            # nothing because it is a claim about fields the client will parse.
+            other = search(
+                0x4242,
+                "",
+                0,
+                and_filter(equality("NtVer", b"\x1f\x00\x00\x00")),
+                ["Netlogon"],
+            )
+            _, other_reply = ask(host, port, other)
+            other_ntver = None
+            if other_reply:
+                try:
+                    _, other_ops = decode_message(other_reply)
+                    for op, inner in other_ops:
+                        if op == 0x64:
+                            _, other_attrs = decode_entry(inner)
+                            other_ntver = (other_attrs.get("NtVer") or [None])[0]
+                except Exception:  # noqa: BLE001 - a malformed reply fails the check below
+                    other_ntver = None
+            run.check(
+                "the answer advertises the server's NtVer, not the value asked",
+                other_reply is not None and other_ntver == (attrs.get("NtVer") or [None])[0],
+                "asked \\x1f\\x00\\x00\\x00, answered %r" % other_ntver,
+            )
             if verbose:
                 for name in sorted(attrs):
                     print("    %s = %r" % (name, attrs[name]))
