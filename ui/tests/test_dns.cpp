@@ -121,6 +121,7 @@ struct Reply {
     int rcode = -1;
     quint16 qdcount = 0;
     QList<Answer> answers;
+    QList<Answer> authority;
     bool parsed = false;
 };
 
@@ -131,9 +132,10 @@ bool parseReply(const QByteArray &packet, Reply *reply)
     quint16 flags = 0;
     quint16 qdcount = 0;
     quint16 ancount = 0;
+    quint16 nscount = 0;
     quint16 ignored = 0;
     if (!take16(packet, pos, &id) || !take16(packet, pos, &flags) || !take16(packet, pos, &qdcount)
-        || !take16(packet, pos, &ancount) || !take16(packet, pos, &ignored)
+        || !take16(packet, pos, &ancount) || !take16(packet, pos, &nscount)
         || !take16(packet, pos, &ignored))
         return false;
     reply->id = id;
@@ -156,6 +158,19 @@ bool parseReply(const QByteArray &packet, Reply *reply)
         answer.rdata = packet.mid(pos, rdlength);
         pos += rdlength;
         reply->answers.append(answer);
+    }
+    for (int i = 0; i < nscount; ++i) {
+        Answer answer;
+        answer.name = readName(packet, pos);
+        quint16 rdlength = 0;
+        if (!take16(packet, pos, &answer.type) || !take16(packet, pos, &answer.rclass)
+            || !take32(packet, pos, &answer.ttl) || !take16(packet, pos, &rdlength))
+            return false;
+        if (pos + rdlength > packet.size())
+            return false;
+        answer.rdata = packet.mid(pos, rdlength);
+        pos += rdlength;
+        reply->authority.append(answer);
     }
     reply->parsed = true;
     return true;
@@ -285,6 +300,7 @@ private slots:
     void followsConfiguredAddressOnDiskZone();
     void answersQueriesOverUdp();
     void refusesOutOfZoneQueries();
+    void pinsTheSoaOnlyToANegativeAnswerAboutThisZone();
     void answersQueriesOverTcp();
     void forwardsAndCachesOutOfZoneQueries();
     void forwardsTcpQueriesOverTcp();
@@ -530,6 +546,58 @@ void DnsTest::refusesOutOfZoneQueries()
                        &reply));
     QCOMPARE(reply.rcode, 5); // REFUSED: not authoritative, not a resolver
     QVERIFY(reply.answers.isEmpty());
+}
+
+void DnsTest::pinsTheSoaOnlyToANegativeAnswerAboutThisZone()
+{
+    DnsServer server;
+    QVERIFY(server.listen(0));
+    server.loadDefaultZone(QStringLiteral("corp.example.com"));
+
+    // NODATA and NXDOMAIN inside the zone carry the SOA so a resolver can cache
+    // the absence (RFC 2308). A refusal is not a negative answer: pinning an
+    // IN-class SOA to a CHAOS question made the whole packet unparseable for a
+    // client that checks the class — dig called it malformed and threw away the
+    // rcode it had already read.
+    Reply nodata;
+    QVERIFY(parseReply(exchange(server.serverPort(),
+                                DnsServer::buildQuery(QStringLiteral("corp.example.com"),
+                                                      DnsServer::TypeTxt, 0x6001)),
+                       &nodata));
+    QCOMPARE(nodata.rcode, 0);
+    QVERIFY(nodata.answers.isEmpty());
+    QCOMPARE(nodata.authority.size(), 1);
+    QCOMPARE(nodata.authority.first().type, DnsServer::TypeSoa);
+
+    Reply nxdomain;
+    QVERIFY(parseReply(exchange(server.serverPort(),
+                                DnsServer::buildQuery(QStringLiteral("nope.corp.example.com"),
+                                                      DnsServer::TypeA, 0x6002)),
+                       &nxdomain));
+    QCOMPARE(nxdomain.rcode, 3);
+    QCOMPARE(nxdomain.authority.size(), 1);
+
+    // The same name, asked in class CH: refused, and refused cleanly. buildQuery
+    // writes the question in class IN, so its last two bytes are patched here.
+    QByteArray chaos = DnsServer::buildQuery(QStringLiteral("version.bind"),
+                                             DnsServer::TypeTxt, 0x6003);
+    chaos[chaos.size() - 2] = 0x00;
+    chaos[chaos.size() - 1] = 0x03;
+    Reply refused;
+    QVERIFY(parseReply(exchange(server.serverPort(), chaos), &refused));
+    QCOMPARE(refused.rcode, 5); // REFUSED
+    QVERIFY(refused.answers.isEmpty());
+    QVERIFY2(refused.authority.isEmpty(),
+             "a refusal about another class must not carry this zone's SOA");
+
+    // And out of zone with recursion off: refused, no SOA either.
+    QByteArray outside = DnsServer::buildQuery(QStringLiteral("www.example.org"),
+                                               DnsServer::TypeA, 0x6004);
+    outside[2] = char(outside.at(2) & ~0x01); // clear RD
+    Reply notOurs;
+    QVERIFY(parseReply(exchange(server.serverPort(), outside), &notOurs));
+    QCOMPARE(notOurs.rcode, 5);
+    QVERIFY(notOurs.authority.isEmpty());
 }
 
 void DnsTest::answersQueriesOverTcp()

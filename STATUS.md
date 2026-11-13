@@ -173,6 +173,16 @@ failure) |
   time; Samba's pidl decoder has not been driven through a lookup here (its
   python binding cannot construct the call's `policy_handle`), so an interop
   report from a pidl client would be worth having.
+- **DNS, what a server that answers queries does not do here**: no **EDNS** (RFC
+  6891) — a query's OPT record is ignored, the reply carries none, and
+  `+edns=1` is answered `NOERROR` instead of `BADVERS`; no **DNSSEC** — a `+dnssec`
+  query gets the DO bit echoed and no `RRSIG`, so a validating resolver treats
+  every answer as insecure; no **CHAOS** class (`version.bind` is refused, which
+  is a choice, and now refused cleanly); and no **AXFR** — a transfer request is
+  answered with a single SOA and then nothing, where a server that does not
+  transfer should refuse it. Zone data is served over UDP/TCP, from the store,
+  with RFC 2136 updates and the forwarding resolver above; those four are
+  absences, not partial implementations.
 - **PKINIT** (needs an X.509/CMS path and a CA), **S4U2Self/S4U2Proxy**.
 - **Multi-hop/transitive trusts**, transited-realm encoding beyond one hop, SID
   filtering, selective authentication, trust-password rotation.

@@ -796,8 +796,16 @@ QByteArray DnsServer::handlePacket(const QByteArray &packet, const QHostAddress 
     // A negative answer carries the zone's SOA in AUTHORITY so the client knows
     // how long it may cache the absence (RFC 2308 §3). Without it a resolver
     // treats the answer as uncacheable and asks again every time.
+    //
+    // "Negative answer" is narrower than "no answer": it is a NODATA or
+    // NXDOMAIN for a name this zone holds, in class IN. Attaching the SOA to a
+    // refusal put an IN-class record under a CHAOS question, and a client that
+    // checks the class calls the whole packet malformed (dig: "Message parser
+    // reports malformed message packet") instead of reading the refusal.
     QList<Record> authority;
-    if (answers.isEmpty()) {
+    if (answers.isEmpty() && (rcode == NoError || rcode == NxDomain)
+        && message.questions.size() == 1 && message.questions.first().qclass == ClassIn
+        && inZone(message.questions.first().name)) {
         const QList<Record> soa = records(m_zone, TypeSoa);
         if (!soa.isEmpty())
             authority.append(soa.first());
