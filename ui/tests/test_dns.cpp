@@ -1005,6 +1005,34 @@ void DnsTest::dropsItsOwnListenerFromAConfiguredList()
     QVERIFY(lastDetail.contains(self));
     QVERIFY(lastDetail.contains(QStringLiteral("own listener")));
 
+    // Every spelling that reaches this daemon's own socket: the wildcard binds
+    // the host, so 0.0.0.0:<port> and [::]:<port> arrive here just as
+    // 127.0.0.1:<port> does, and an operator copying an address out of a bind
+    // setting writes the wildcard form first.
+    const QString any4 = QStringLiteral("0.0.0.0:%1").arg(server.serverPort());
+    server.setForwarders({any4});
+    QCOMPARE(server.ignoredForwarders(), QStringList{any4});
+    QVERIFY(server.effectiveForwarders().isEmpty());
+
+    Reply wildcard;
+    QVERIFY(parseReply(exchange(server.serverPort(),
+                               DnsServer::buildQuery(QStringLiteral("wild.example.org"),
+                                                     DnsServer::TypeA, 0x5503)),
+                       &wildcard));
+    QCOMPARE(wildcard.rcode, 2);
+
+    const QString any6 = QStringLiteral("[::]:%1").arg(server.serverPort());
+    server.setForwarders({any6});
+    QCOMPARE(server.ignoredForwarders(), QStringList{any6});
+    QVERIFY(server.effectiveForwarders().isEmpty());
+
+    // Only the port makes an entry this server: another port on the wildcard is
+    // some other listener's rule and stays in the list.
+    const QString any4Other = QStringLiteral("0.0.0.0:5307");
+    server.setForwarders({any4Other});
+    QVERIFY(server.ignoredForwarders().isEmpty());
+    QCOMPARE(server.effectiveForwarders(), QStringList{any4Other});
+
     // A loopback upstream on a different port is kept, and answers.
     auto *upstream = new QUdpSocket;
     upstream->bind(QHostAddress::LocalHost, 0);

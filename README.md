@@ -346,7 +346,13 @@ daemon's own port is dropped and named in the status line (`Ignoring
 127.0.0.1:53, which is this DC's own listener`) rather than listed as an
 upstream: asking itself returns REFUSED, which reaches the client as an empty
 `SERVFAIL`. A loopback stub resolver on any other port is a real upstream and is
-kept. Only SIGHUP is a reload; it used
+kept, and so is the wildcard on another port; the wildcard on this daemon's own
+port (`0.0.0.0:53`, `[::]:53`) is the same mistake, because the kernel delivers
+it to this host's socket.
+
+Separate the list with commas or spaces. A semicolon does not work unquoted: the
+INI reader ends the value at `;`, so `forwarders=a;b` reaches the daemon as `a`
+and nothing reports the loss — the status line simply names one upstream. Only SIGHUP is a reload; it used
 to terminate the daemon. Set `forwarding=false` in `dc.conf` to answer out-of-zone
 queries with REFUSED instead, which is the standalone engine's default.
 

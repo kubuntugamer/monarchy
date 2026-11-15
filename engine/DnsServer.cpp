@@ -1271,7 +1271,17 @@ bool DnsServer::isOwnListener(const QString &spec) const
     // nameserver list from looping back here would throw it away.
     if (port != serverPort())
         return false;
-    if (address.isLoopback())
+    // The wildcard is the shape most likely to be copied: an operator reading a
+    // bind setting types 0.0.0.0:53, and as a destination the kernel delivers
+    // that to this host's socket, so it reaches this daemon exactly as
+    // 127.0.0.1:53 does. It is neither loopback nor in the interface list.
+    // isNull() is not the answer here: a parsed 0.0.0.0 is a valid IPv4 address
+    // and is not equal to QHostAddress::Any either — both were measured — so the
+    // all-zero checks are written out.
+    const bool wildcard = (address.protocol() == QAbstractSocket::IPv4Protocol
+                           && address.toIPv4Address() == 0)
+                          || address == QHostAddress(QHostAddress::AnyIPv6);
+    if (wildcard || address.isNull() || address.isLoopback())
         return true;
     for (const QHostAddress &local : QNetworkInterface::allAddresses()) {
         if (local == address)
