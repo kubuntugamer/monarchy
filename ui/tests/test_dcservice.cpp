@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <QtTest>
+#include <QFile>
 #include <QMap>
 #include <QSettings>
 #include <QSignalSpy>
@@ -72,7 +73,50 @@ class DcServiceTest : public QObject
 
 private slots:
     void ownsEveryPortItAdvertises();
+    void readsEveryShapeOfForwardersKey();
 };
+
+// The writer and the reader of `forwarders=` met nowhere in a test before this:
+// the provisioner test checks the string it stored with QSettings, which is not
+// how the daemon reads it. QSettings reads a comma-containing value as a
+// QStringList, and toString() on that is empty, so a recorded list of two
+// upstreams read as none and the DC silently fell back to the host's
+// nameservers — including across the SIGHUP reload, which has the same reader.
+void DcServiceTest::readsEveryShapeOfForwardersKey()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString path = dir.path() + QStringLiteral("/dc.conf");
+
+    auto read = [&path](const QByteArray &forwardersLine) {
+        QFile file(path);
+        if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate))
+            return QStringList{QStringLiteral("<write failed>")};
+        file.write("[General]\nrealm=PROBE.EXAMPLE.ORG\n" + forwardersLine + "\n");
+        file.close();
+        const QSettings conf(path, QSettings::IniFormat);
+        return DcService::forwardersFrom(conf);
+    };
+
+    // What the installer writes, and what a hand edit following the daemon's
+    // own "Set forwarders= in dc.conf" advice looks like.
+    QCOMPARE(read("forwarders=192.0.2.1,192.0.2.2"),
+             QStringList({"192.0.2.1", "192.0.2.2"}));
+    QCOMPARE(read("forwarders=192.0.2.1, 192.0.2.2"),
+             QStringList({"192.0.2.1", "192.0.2.2"}));
+    // What the provisioner writes through QSettings::setValue (quoted).
+    QCOMPARE(read("forwarders=\"192.0.2.53, 192.0.2.54:5353\""),
+             QStringList({"192.0.2.53", "192.0.2.54:5353"}));
+    // Space and semicolon separated, and the single-upstream host.
+    QCOMPARE(read("forwarders=192.0.2.1 192.0.2.2"),
+             QStringList({"192.0.2.1", "192.0.2.2"}));
+    QCOMPARE(read("forwarders=192.0.2.1;192.0.2.2"),
+             QStringList({"192.0.2.1", "192.0.2.2"}));
+    QCOMPARE(read("forwarders=192.168.1.1"), QStringList({"192.168.1.1"}));
+    // No key and an empty key both mean "use the host's nameservers".
+    QCOMPARE(read(QByteArray()), QStringList());
+    QCOMPARE(read("forwarders="), QStringList());
+}
 
 // The failure this catches is the one issue #3 was filed for: a DC that
 // publishes a locator to a port whose listener never came up. The daemon

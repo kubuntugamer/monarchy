@@ -6,6 +6,7 @@
 
 #include <QByteArray>
 #include <QObject>
+#include <QStringList>
 
 class LdapServer;
 class DnsServer;
@@ -19,6 +20,7 @@ class EpmServer;
 class Smb2Server;
 class ReplicationAgent;
 class QTimer;
+class QSettings;
 
 // The domain controller as a standalone unit: loads the provisioned domain's
 // dc.conf, owns every service endpoint (LDAP, KDC, DNS, SAMR, LSAD, Netlogon,
@@ -46,6 +48,14 @@ public:
     // disk, so this is the last flush for uncommitted session edits.
     void stop();
 
+    // The `forwarders=` list from a parsed dc.conf, in every shape the key is
+    // written in: the provisioner's quoted string list, the bare `a, b` the
+    // installer writes (and a hand edit following the error message asks for),
+    // and a space-separated list. QSettings reads a value containing a comma as
+    // a QStringList and toString() on that is the empty string, so the bare
+    // forms used to read as "no forwarders" and silently fall back to the
+    // host's nameservers. Static so a test can pin that without a live daemon.
+    static QStringList forwardersFrom(const QSettings &config);
     // Re-read forwarders= and forwarding= from dc.conf and apply them to the
     // running DNS server. The daemon calls this on SIGHUP (`systemctl reload`):
     // the forwarder list is otherwise fixed at start-up, and an operator who

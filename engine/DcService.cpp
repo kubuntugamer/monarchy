@@ -88,6 +88,18 @@ QString DcService::dnsZone() const
     return m_dnsServer ? m_dnsServer->zone() : QString();
 }
 
+QStringList DcService::forwardersFrom(const QSettings &config)
+{
+    // toStringList() is a one-element list for a plain QString and the stored
+    // list for the comma form, so this one call covers every shape; each entry
+    // is then split on the separators a handwritten value may still carry.
+    const QStringList entries = config.value(QStringLiteral("forwarders")).toStringList();
+    QStringList forwarders;
+    for (const QString &entry : entries)
+        forwarders += entry.split(QRegularExpression(QStringLiteral("[,;\\s]+")), Qt::SkipEmptyParts);
+    return forwarders;
+}
+
 void DcService::reportForwarders()
 {
     if (!m_dnsServer)
@@ -141,10 +153,7 @@ void DcService::reloadForwarders()
         return;
     const QString path = m_dcDir + QStringLiteral("/dc.conf");
     const QSettings dcConfig(path, QSettings::IniFormat);
-    const QStringList forwarders =
-        dcConfig.value(QStringLiteral("forwarders")).toString()
-            .split(QRegularExpression(QStringLiteral("[,;\\s]+")), Qt::SkipEmptyParts);
-    m_dnsServer->setForwarders(forwarders);
+    m_dnsServer->setForwarders(forwardersFrom(dcConfig));
     m_dnsServer->setForwardingEnabled(dcConfig.value(QStringLiteral("forwarding"), true).toBool());
     emit statusMessage(tr("Re-read the DNS forwarder configuration from %1 on SIGHUP.").arg(path));
     reportForwarders();
@@ -1006,10 +1015,7 @@ bool DcService::start(const QString &dcDir)
     // host's own nameservers when none are listed. This is what lets the DC be
     // the machine's resolver: it answers its zone authoritatively and caches
     // everything else.
-    const QStringList forwarders =
-        dcConfig.value(QStringLiteral("forwarders")).toString()
-            .split(QRegularExpression(QStringLiteral("[,;\\s]+")), Qt::SkipEmptyParts);
-    m_dnsServer->setForwarders(forwarders);
+    m_dnsServer->setForwarders(forwardersFrom(dcConfig));
     m_dnsServer->setForwardingEnabled(dcConfig.value(QStringLiteral("forwarding"), true).toBool());
     if (!m_dnsServer->loadZone(m_zonePath)) {
         m_dnsServer->loadAdZone(dnsDomain, dcHost, dcIp, boundLdapPort, boundGcPort, siteName,
