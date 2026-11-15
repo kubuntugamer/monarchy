@@ -437,6 +437,20 @@ What follows from that:
   same comment.
 - **No acknowledgement posts.** "Agreed, will do" costs the reader a turn and
   carries no state. Send the result instead.
+- **A number you reproduced is a state change, and gets an answer.** This is the
+  line between the two rules above, and it was read wrongly here: a post
+  reporting a measurement that you rerun and find *different* is not an
+  acknowledgement, it is the other box short of a fact only you hold, and
+  staying silent to obey "one post per state change" leaves the thread holding a
+  wrong number. Answer with the arithmetic. Measured case: box A's locator blob
+  is 160 bytes and box B's is 156; both were right (their DNS names are 9 bytes
+  shorter across the three label lists, their NetBIOS names 5 bytes longer, net
+  four), and the answer that closed it was `24 + 124 + 8` against
+  `24 + 128 + 8`, not a claim that either size was wrong. A measurement that
+  reproduces to the byte needs no post — that is what silence means. If the other
+  box's number reproduces but its attribution does not (an unsigned post signing
+  off as a box, section 6), say which was verified and let the marker be added
+  or not; the content does not wait on it.
 - **A claim's clock is silence, not seconds.** The 45-minute staleness rule in
   #7 is the throughput limit for the whole protocol, not a safety net for a
   conversation; do not hold a claim open expecting a sub-minute answer.
