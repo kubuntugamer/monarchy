@@ -327,12 +327,15 @@ or edit `dc.conf` directly. When `--forwarder` is omitted the provisioner and
 the installer record this host's nameservers, skipping loopback and the DC's
 own address.
 
-That filter is what a DC that is *also* its host's only resolver runs into:
-`/etc/resolv.conf` then names nothing but `127.0.0.1`, there is no upstream left
-to ask, and names outside the domain are answered `SERVFAIL`. The recorded
-`forwarders=` is what keeps that from happening, and if it is missing the
-daemon says so — at startup and on the first query it cannot forward — instead
-of failing quietly. Set `forwarding=false` in `dc.conf` to answer out-of-zone
+That filter is what a DC that is *also* its host's only resolver runs into. The
+daemon reads the host's nameservers from `/etc/resolv.conf` and, when that
+leaves nothing usable, from `systemd-resolved`'s uplink file. Once the DC is the
+host's only resolver the first names nothing but `127.0.0.1`, so only that
+second file still carries an upstream; when it is absent or also loopback-only
+there is none left to ask and names outside the domain are answered `SERVFAIL`.
+The recorded `forwarders=` is what keeps that from happening, and if it is
+missing the daemon says so — at startup and on the first query it cannot
+forward — instead of failing quietly. Set `forwarding=false` in `dc.conf` to answer out-of-zone
 queries with REFUSED instead, which is the standalone engine's default.
 
 The daemon serves the provisioned domain on **LDAP 389**, the Global Catalog
