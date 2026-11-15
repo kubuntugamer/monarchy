@@ -409,6 +409,53 @@ EOF
     log "systemd-resolved no longer listens on port 53"
 }
 
+# The DC is the host's resolver once the stub listener is gone, so the
+# upstreams it forwards to have to be written down: after that,
+# /etc/resolv.conf names the DC itself, and a DC reading it finds only addresses
+# it has to drop as a loop. A domain provisioned by this build records the
+# host's nameservers itself; this covers one provisioned before that.
+record_dc_conf_forwarders() {
+    [[ -f "$DCDIR/dc.conf" ]] || return 0
+    grep -qE '^[[:space:]]*forwarders[[:space:]]*=' "$DCDIR/dc.conf" && return 0
+
+    local upstreams=() value
+    while read -r key value _; do
+        [[ "$key" == "nameserver" && -n "$value" ]] || continue
+        [[ "$value" == 127.* || "$value" == "::1" ]] && continue
+        upstreams+=("$value")
+        [[ ${#upstreams[@]} -ge 2 ]] && break
+    done < /etc/resolv.conf
+    if [[ ${#upstreams[@]} -eq 0 && -r /run/systemd/resolve/resolv.conf ]]; then
+        while read -r key value _; do
+            [[ "$key" == "nameserver" && -n "$value" ]] || continue
+            [[ "$value" == 127.* || "$value" == "::1" ]] && continue
+            upstreams+=("$value")
+            [[ ${#upstreams[@]} -ge 2 ]] && break
+        done < /run/systemd/resolve/resolv.conf
+    fi
+    if [[ ${#upstreams[@]} -eq 0 ]]; then
+        warn "no upstream nameserver found; names outside the domain will not resolve"
+        warn "until forwarders= is set in $DCDIR/dc.conf"
+        return 0
+    fi
+
+    local joined owner mode
+    joined="$(IFS=', '; echo "${upstreams[*]}")"
+    owner="$(stat -c '%u:%g' "$DCDIR/dc.conf" 2>/dev/null || true)"
+    mode="$(stat -c '%a' "$DCDIR/dc.conf" 2>/dev/null || true)"
+    # sed -i would leave the file owned by root; the service reads it, so the
+    # replacement is restored to the original owner and mode.
+    if sed "/^\\[General\\]/a forwarders=$joined" "$DCDIR/dc.conf" > "$DCDIR/dc.conf.new" \
+        && mv -f "$DCDIR/dc.conf.new" "$DCDIR/dc.conf"; then
+        [[ -n "$owner" ]] && chown "$owner" "$DCDIR/dc.conf" 2>/dev/null || true
+        [[ -n "$mode" ]] && chmod "$mode" "$DCDIR/dc.conf" 2>/dev/null || true
+        log "Recorded DNS forwarders in dc.conf: $joined"
+    else
+        rm -f "$DCDIR/dc.conf.new"
+        warn "could not record forwarders in $DCDIR/dc.conf"
+    fi
+}
+
 check_dns_port_conflict() {
     [[ $SERVICE -eq 1 && $DEV_PORTS -eq 0 ]] || return 0
     if ! command -v ss >/dev/null 2>&1; then
@@ -783,6 +830,7 @@ install_binaries
 [[ $SERVICE -eq 1 ]] && install_service_unit
 check_dns_port_conflict
 provision_domain
+record_dc_conf_forwarders
 start_service
 
 cat <<EOF

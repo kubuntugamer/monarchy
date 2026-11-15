@@ -969,12 +969,37 @@ bool DcService::start(const QString &dcDir)
         else
             emit statusMessage(tr("Repaired the domain's service locator records."));
     }
+    connect(m_dnsServer, &DnsServer::forwardingUnavailable, this,
+            [this](const QString &detail) {
+                emit statusMessage(
+                    tr("DNS forwarding unavailable, so out-of-zone names are answered "
+                       "SERVFAIL: %1. Set forwarders= in dc.conf or provision with "
+                       "--forwarder.")
+                        .arg(detail));
+            });
     if (!m_dnsServer->listen(quint16(dcConfig.value(QStringLiteral("dnsPort"), 1053).toInt()))) {
         emit statusMessage(tr("DNS server failed to bind its port."));
     } else {
         emit statusMessage(tr("Authoritative for %1 on port %2.")
                                .arg(m_dnsServer->zone())
                                .arg(m_dnsServer->serverPort()));
+        // A DC pointed at itself for everything is a trap: the installer makes
+        // it the host's only resolver, and from then on the host's nameservers
+        // are the DC's own address — which is dropped as a loop, leaving
+        // nothing to forward to. Report which upstreams are in effect so an
+        // empty set is visible at startup rather than as a silent SERVFAIL.
+        if (m_dnsServer->forwardingEnabled()) {
+            const QStringList effective = m_dnsServer->effectiveForwarders();
+            emit statusMessage(effective.isEmpty()
+                                   ? tr("No usable DNS forwarder: this host's nameservers are "
+                                        "loopback or this DC itself, so names outside %1 will "
+                                        "not resolve. Set forwarders= in %2.")
+                                         .arg(m_dnsServer->zone())
+                                         .arg(resolvedDcDir + QStringLiteral("/dc.conf"))
+                                   : tr("Forwarding names outside %1 to %2.")
+                                         .arg(m_dnsServer->zone())
+                                         .arg(effective.join(QStringLiteral(", "))));
+        }
     }
 
     m_started = true;

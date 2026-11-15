@@ -4,6 +4,7 @@
 #include <QtTest>
 
 #include <QElapsedTimer>
+#include <QFile>
 #include <QHash>
 #include <QHostAddress>
 #include <QTcpServer>
@@ -304,6 +305,7 @@ private slots:
     void answersQueriesOverTcp();
     void forwardsAndCachesOutOfZoneQueries();
     void forwardsTcpQueriesOverTcp();
+    void dropsNameserversThatWouldLoopBack();
     void appliesDynamicUpdates();
     void enforcesUpdatePolicy();
     void persistsZone();
@@ -790,6 +792,46 @@ void DnsTest::forwardsAndCachesOutOfZoneQueries()
                        &refused));
     QCOMPARE(refused.rcode, 5); // REFUSED
     QCOMPARE(upstreamQueries, 1);
+}
+
+void DnsTest::dropsNameserversThatWouldLoopBack()
+{
+    // The state a DC is left in when the installer makes it the host's only
+    // resolver: resolv.conf names the loopback stub, and the DC's own address
+    // is the only other thing anyone wrote down. Forwarding to either asks this
+    // server to ask itself, so both are dropped and nothing is left — which is
+    // why out-of-zone names silently stopped resolving. The filter is what
+    // turns that into "no forwarder", and the caller can then say so.
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString path = dir.filePath(QStringLiteral("resolv.conf"));
+    QFile file(path);
+    QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Text));
+    file.write("# generated\n"
+               "nameserver 127.0.0.1\n"
+               "nameserver ::1\n"
+               "nameserver 10.0.0.10\n"
+               "nameserver 192.0.2.53:5353\n"
+               "search corp.example.com\n");
+    file.close();
+
+    const QStringList written = DnsServer::nameserversIn(path);
+    QCOMPARE(written.size(), 4);
+    QCOMPARE(written.first(), QStringLiteral("127.0.0.1"));
+    QCOMPARE(written.last(), QStringLiteral("192.0.2.53:5353"));
+
+    // 10.0.0.10 is this machine (dcIp), so it loops back just like loopback.
+    const QStringList usable =
+        DnsServer::usableForwarders(written, {QStringLiteral("10.0.0.10")});
+    QCOMPARE(usable, QStringList{QStringLiteral("192.0.2.53:5353")});
+
+    // Only loopback and self left: nothing usable, which is the SERVFAIL case.
+    QVERIFY(DnsServer::usableForwarders({QStringLiteral("127.0.0.1"), QStringLiteral("10.0.0.10")},
+                                        {QStringLiteral("10.0.0.10")})
+                .isEmpty());
+
+    // A file that does not exist contributes nothing rather than throwing.
+    QVERIFY(DnsServer::nameserversIn(dir.filePath(QStringLiteral("absent.conf"))).isEmpty());
 }
 
 void DnsTest::appliesDynamicUpdates()

@@ -120,6 +120,22 @@ public:
     bool forwardingEnabled() const;
     void setForwarders(const QStringList &forwarders);
     QStringList forwarders() const;
+    // The upstreams an out-of-zone name would actually be asked about: the
+    // configured list, or the host's nameservers once the ones that would loop
+    // back here are dropped. An empty result is why every out-of-zone query
+    // would be answered SERVFAIL, so forwardingUnavailable() reports it once.
+    QStringList effectiveForwarders() const;
+    // The same lookup and filter, for callers that seed dc.conf with what this
+    // host can actually resolve through (the provisioner and the installer)
+    // rather than serve queries.
+    static QStringList systemForwarders();
+    // The filter on its own: `nameservers` minus loopback and this machine's
+    // own addresses. Static so a test can pin it without this host's
+    // /etc/resolv.conf becoming a fixture.
+    static QStringList usableForwarders(const QStringList &nameservers,
+                                        const QStringList &localAddresses);
+    // The `nameserver` entries of one resolv.conf-style file, in order.
+    static QStringList nameserversIn(const QString &path);
     void clearCache();
     int cachedResponseCount() const;
 
@@ -134,6 +150,11 @@ public:
 signals:
     void queryReceived(const QString &name, quint16 type);
     void updateApplied(const QString &name, quint16 type, bool added);
+    // Emitted once, when an out-of-zone query could not be sent because no
+    // usable forwarder was configured or discovered. The query is answered
+    // SERVFAIL either way; this is what makes a DC that has become its host's
+    // only resolver say so instead of looking like a resolver that refuses.
+    void forwardingUnavailable(const QString &detail);
 
 private slots:
     void onReadyRead();
@@ -174,7 +195,6 @@ private:
     void failPending(quint16 upstreamId);
     void sendTcpResponse(QTcpSocket *socket, const QByteArray &response);
     void timeoutPending(quint16 upstreamId);
-    QStringList effectiveForwarders() const;
     // Returns the rcode; fills `answers` for standard queries.
     int handleQuery(const Message &message, QList<Record> &answers);
     int handleUpdate(const Message &message);
@@ -202,6 +222,7 @@ private:
     quint16 m_forwarderIndex = 0;
     bool m_updatesEnabled = true;
     bool m_forwarding = false;
+    bool m_reportedNoForwarder = false;
 };
 
 #endif // DNSSERVER_H

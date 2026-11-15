@@ -5,6 +5,7 @@
 // No Samba, no system directory server: the resulting store is loaded and
 // served by Monarchy's LDAP engine.
 
+#include "DnsServer.h"
 #include "Provisioner.h"
 
 #include <QCommandLineParser>
@@ -105,6 +106,12 @@ int main(int argc, char *argv[])
     if (config.devPorts && !parser.isSet(kdcPortOption))
         config.kdcPort = 8888; // rootless development binding
     config.forwarders = parser.values(forwarderOption);
+    // A DC that becomes its host's only resolver has no upstream to read once
+    // the installer has pointed /etc/resolv.conf at it, so the upstreams are
+    // recorded here while they are still this host's real ones. --forwarder
+    // overrides the discovered list.
+    if (config.forwarders.isEmpty())
+        config.forwarders = DnsServer::systemForwarders();
     config.force = parser.isSet(forceOption);
 
     QTextStream out(stdout);
@@ -133,6 +140,11 @@ int main(int argc, char *argv[])
         << "  secrets:   " << result.secretsPath << '\n'
         << "  dc host:   " << result.dcHost << '\n'
         << "  config:    " << result.configPath << '\n'
+        << "  forwarders: "
+        << (config.forwarders.isEmpty() ? QStringLiteral("(none: out-of-zone names "
+                                                       "will not resolve)")
+                                       : config.forwarders.join(QStringLiteral(", ")))
+        << '\n'
         << "  krb5.conf: " << result.krb5ConfPath << '\n'
         << "  dns zone:  " << result.zonePath << '\n'
         << "  sysvol:    " << result.sysvolPath << '\n';

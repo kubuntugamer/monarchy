@@ -847,8 +847,22 @@ QByteArray DnsServer::forwardQuery(const Message &message, const QByteArray &pac
         const QString spec = servers.at(int(m_forwarderIndex++) % servers.size());
         parseForwarder(spec, &upstream, &upstreamPort);
     }
-    if (upstream.isNull())
+    if (upstream.isNull()) {
+        // Nothing to ask. A resolver that is also its host's only resolver has
+        // no upstream left once the loopback entries are dropped, and the
+        // operator sees only "this server does not resolve anything". Say why,
+        // once, instead of answering in silence.
+        if (!m_reportedNoForwarder) {
+            m_reportedNoForwarder = true;
+            emit forwardingUnavailable(
+                servers.isEmpty()
+                    ? tr("no forwarder is configured, and this host's nameservers are "
+                         "loopback or this DC itself")
+                    : tr("no forwarder could be parsed from %1")
+                          .arg(servers.join(QStringLiteral(", "))));
+        }
         return buildResponse(packet, {}, ServFail);
+    }
 
     quint16 upstreamId = m_nextUpstreamId++;
     int guard = 0;
@@ -1164,52 +1178,67 @@ QByteArray DnsServer::cachedResponse(const CacheEntry &entry, quint16 id) const
     return packet;
 }
 
-QStringList DnsServer::effectiveForwarders() const
+QStringList DnsServer::nameserversIn(const QString &path)
 {
-    if (!m_forwarders.isEmpty())
-        return m_forwarders;
-
-    const auto readNameservers = [](const QString &path) {
-        QStringList servers;
-        QFile file(path);
-        if (!file.open(QIODevice::ReadOnly | QIODevice::Text))
-            return servers;
-        static const QRegularExpression whitespace(QStringLiteral("\\s+"));
-        while (!file.atEnd()) {
-            const QString line = QString::fromUtf8(file.readLine()).trimmed();
-            if (!line.startsWith(QLatin1String("nameserver")))
-                continue;
-            const QStringList parts = line.split(whitespace, Qt::SkipEmptyParts);
-            if (parts.size() >= 2)
-                servers.append(parts.at(1));
-        }
+    QStringList servers;
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly | QIODevice::Text))
         return servers;
-    };
+    static const QRegularExpression whitespace(QStringLiteral("\\s+"));
+    while (!file.atEnd()) {
+        const QString line = QString::fromUtf8(file.readLine()).trimmed();
+        if (!line.startsWith(QLatin1String("nameserver")))
+            continue;
+        const QStringList parts = line.split(whitespace, Qt::SkipEmptyParts);
+        if (parts.size() >= 2)
+            servers.append(parts.at(1));
+    }
+    return servers;
+}
 
+QStringList DnsServer::usableForwarders(const QStringList &nameservers,
+                                        const QStringList &localAddresses)
+{
+    QStringList result;
+    for (const QString &spec : nameservers) {
+        QHostAddress address;
+        quint16 port = 53;
+        if (!parseForwarder(spec, &address, &port))
+            continue;
+        // Skip ourselves and a local stub: forwarding there would either loop
+        // or depend on the resolver this server replaces. What is left is the
+        // whole difference between a forwarding resolver and one that answers
+        // SERVFAIL to everything outside its zone.
+        if (address.isLoopback() || localAddresses.contains(address.toString()))
+            continue;
+        result.append(spec);
+    }
+    return result;
+}
+
+QStringList DnsServer::systemForwarders()
+{
     QStringList localAddresses;
     for (const QHostAddress &address : QNetworkInterface::allAddresses())
         localAddresses.append(address.toString());
 
-    const auto usable = [&localAddresses](const QStringList &servers) {
-        QStringList result;
-        for (const QString &spec : servers) {
-            QHostAddress address;
-            quint16 port = 53;
-            if (!parseForwarder(spec, &address, &port))
-                continue;
-            // Skip ourselves and a local stub: forwarding there would either
-            // loop or depend on the resolver this server replaces.
-            if (address.isLoopback() || localAddresses.contains(address.toString()))
-                continue;
-            result.append(spec);
-        }
-        return result;
-    };
-
-    QStringList servers = usable(readNameservers(QStringLiteral("/etc/resolv.conf")));
-    if (servers.isEmpty())
-        servers = usable(readNameservers(QStringLiteral("/run/systemd/resolve/resolv.conf")));
+    QStringList servers =
+        usableForwarders(nameserversIn(QStringLiteral("/etc/resolv.conf")), localAddresses);
+    // systemd-resolved's stub file names only 127.0.0.53, so the addresses it
+    // actually asks are in the file beside it. When /etc/resolv.conf has no
+    // usable entry left, that is where the real upstream is.
+    if (servers.isEmpty()) {
+        servers = usableForwarders(
+            nameserversIn(QStringLiteral("/run/systemd/resolve/resolv.conf")), localAddresses);
+    }
     return servers;
+}
+
+QStringList DnsServer::effectiveForwarders() const
+{
+    if (!m_forwarders.isEmpty())
+        return m_forwarders;
+    return systemForwarders();
 }
 
 int DnsServer::handleQuery(const Message &message, QList<Record> &answers) {
