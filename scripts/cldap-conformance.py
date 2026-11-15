@@ -205,11 +205,16 @@ def decode_netlogon_ex(blob):
 
     Samba's librpc/idl/nbt.idl definition pushed with NDR_NOALIGN: no padding
     anywhere, one length-prefixed DNS label per string component ending in a
-    NUL, and the last eight bytes carrying the capability word plus the two
-    legacy tokens a client checks before it believes anything above them. The
-    optional IP and closest-site fields are present only when the capability
-    word says so, which is why the same blob has to be readable whatever mask
-    was asked.
+    NUL, and the last eight bytes carrying nt_version plus the two legacy
+    tokens a client checks before it believes anything above them. The
+    optional IP and closest-site fields are present only when nt_version says
+    so, which is why the same blob has to be readable whatever mask was asked.
+
+    Field names are nbt.idl's, because this blob has been read at the wrong
+    offset more than once: `command` and `sbz` occupy the first four bytes,
+    `server_type` the next four, and `nt_version` is the last four before the
+    tokens — eight bytes from the end, never four. `server_type` and the
+    requested `NtVer` mask are different numbers answering different questions.
     """
     if len(blob) < 8:
         raise ValueError("blob of %d bytes cannot hold the trailing tokens" % len(blob))
@@ -505,7 +510,7 @@ def main():
                 % (len(other_reply) if other_reply else None, len(reply)),
             )
             run.check(
-                "the blob's capability word does not follow the mask asked",
+                "the blob's server_type and nt_version do not follow the mask asked",
                 other_nt_version is not None and other_nt_version == (ex["nt_version"] if parsed else None),
                 "asked \\x1f\\x00\\x00\\x00, blob declares %r" % other_nt_version,
             )

@@ -41,12 +41,17 @@ endpoint mapper (135) and SMB (445) stay native under `--dev-ports`.
 | **DC locator over UDP** (CLDAP, RFC 1798) | the LDAP port over UDP — the ping a client sends before it joins | `monarchy-ldap-tests` (`cldap*` cases) | a datagram built in the driver, with **Samba's own real ping pinned byte for byte**, and the reply decoded as BER rather than by this tree's parser | `scripts/cldap-conformance.py`: the `NtVer`-only ping Samba sends, the `DsGetDcName` ping that names the domain, the attribute set a client reads, a foreign domain answered `noSuchObject`, and a subtree search left unanswered. The answer must be **two LDAPMessages** — the entry then the
 result, each its own SEQUENCE — because a single SEQUENCE around both is not an LDAPMessage: a client
 decodes the id, finds no result after it, and drops the answer silently. The binary `Netlogon`
-attribute is decoded field by field against `nbt.idl` — command word, capability word, the DNS label
-lists, the GUID, both site names, and the two legacy tokens a client checks before anything above
-them — and the entry must carry **exactly the attributes the ping named**, since Samba's client reads
+attribute is decoded field by field against `nbt.idl`, by that file's own field names — `command`,
+`sbz`, `server_type`, `nt_version`, the DNS label lists, the GUID, both site names, and the two legacy
+tokens a client checks before anything above them. `server_type` and the asked `NtVer` are different
+numbers answering different questions (`0x1bd` and `0x06` here), and `nt_version` is eight bytes from
+the blob's end, not four — the offsets this exchange got wrong three times before it stopped reading
+by eye. The entry must carry **exactly the attributes the ping named**, since Samba's client reads
 an answer whose entry is not one attribute `netlogon` as no answer at all. An answer must also be the
-**same bytes** whatever `NtVer` mask was asked; the capability word inside the blob is what decides
-whether the optional address field is there, so the datagram cannot follow the mask. Its length does
+**same bytes** whatever `NtVer` mask was asked; the blob's own `nt_version` is what decides whether the
+optional address field is there, so the datagram cannot follow the mask — and it is `0x5`
+(`NT_VERSION_1|NT_VERSION_5EX`), the value MS-ADTS 6.3.3.2 fixes for this structure, measured
+constant under masks `06`, `1f`, `01` and `04` while the `NtVer` *attribute* stayed `0x06`. Its length does
 follow the echoed id — 207 bytes for a 1-byte id, 211 for Samba's 3-byte `0x00fb3d`, two ids at two
 bytes each — which is arithmetic rather than a different reply. `monarchy-ldap-tests`
 `answersTheDcLocatorPingOverUdp` asserts the same framing and blob on a served datagram, and both it
