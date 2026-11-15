@@ -159,6 +159,9 @@ public:
         // proven the principal, which is how Windows authorises these calls on
         // \\dc\pipe\... without a second NTLMSSP exchange inside the pipe.
         void setTransportIdentity(const QString &user);
+        // The session key of that transport, for the calls that cipher their own
+        // payload with it (SAMR's password buffers over a named pipe).
+        void setTransportSessionKey(const QByteArray &sessionKey);
 
     private:
         friend class RpcServer;
@@ -206,6 +209,10 @@ private:
             // session carrying the pipe), not from an NTLMSSP/Kerberos bind, so
             // calls carry no verifier and none is required.
             bool transportOnly = false;
+            // The session key of the transport that authenticated the pipe, so
+            // interfaces that cipher their own payload (SAMR's password buffers)
+            // can key off it the way they do over ncacn_ip_tcp.
+            QByteArray transportSessionKey;
             bool privacy = false;
             bool rejected = false; // AUTHENTICATE did not verify; no more calls
             QString user;

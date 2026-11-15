@@ -352,8 +352,12 @@ klist   # krbtgt/CORP.EXAMPLE.COM@CORP.EXAMPLE.COM, aes256-cts-hmac-sha1-96
 
 SASL `GSSAPI` binds (and `SPNEGO` with a Kerberos token) then authenticate with
 that ticket cache: an initial client token, the server's AP-REP, the RFC 4752
-security-layer negotiation, and a success result. The server offers `none`,
-`integrity` and `confidentiality`; when a client selects one, every LDAP PDU
+security-layer negotiation, and a success result. `GSSAPI` clients name the
+layer themselves — there is no server offer to wait for, and a client that
+sends nothing wants none. `GSS-SPNEGO` has no RFC 4752 step at all: the layer
+is the one the negotiated mechanism provides, so the bind simply succeeds and
+the client seals its next PDU (Samba's `net ads join` does exactly that). When a
+client selects a layer, every LDAP PDU
 after the bind is carried in length-prefixed GSS-API wrap tokens — RFC 4121
 Wrap tokens for AES contexts, RFC 1964/RFC 4757 sealing for RC4 ones — with the
 per-direction key usages, sequence numbers and checksums those documents

@@ -41,10 +41,6 @@ QByteArray spnegoNegotiatedToken(const QByteArray &token);
 // exchange wraps it in a GSS-API envelope, the RPC bind does not.
 QByteArray spnegoResponse(quint8 negState, const QString &mech, const QByteArray &token);
 
-// NegTokenResp accepting the AP-REP, for a SPNEGO client that keeps its GSS
-// state machine running after the bind.
-QByteArray spnegoAcceptToken(const QByteArray &apRep);
-
 // GSS-API token envelope: [APPLICATION 0] { OID, token id, body }.
 QByteArray gssEnvelope(const QByteArray &body);
 bool stripGssEnvelope(const QByteArray &token, QByteArray *inner);

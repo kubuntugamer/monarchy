@@ -169,18 +169,6 @@ QByteArray spnegoResponse(quint8 negState, const QString &mech, const QByteArray
     return Asn1::tlv(0xA1, Asn1::sequence(fields));
 }
 
-QByteArray spnegoAcceptToken(const QByteArray &apRep)
-{
-    // accept-completed carries no supportedMech: RFC 4178 §4.2.2 says the field
-    // "MUST be present when the negState is not accept-completed", and Samba's
-    // SPNEGO parser enforces the other direction — naming the mechanism beside
-    // accept-completed is what turned its Kerberos session setup into
-    // NT_STATUS_INVALID_PARAMETER while the AP-REP behind it was well formed.
-    const QByteArray response = spnegoResponse(0, QString(), apRep);
-    QByteArray content = Asn1::objectIdentifier(QStringLiteral("1.3.6.1.5.5.2"));
-    content.append(response);
-    return Asn1::tlv(0x60, content);
-}
 
 // RFC 4121 §4.2.6.2 Wrap token.
 QByteArray cfxWrapToken(const QByteArray &data, bool conf, quint64 seq, int etype,

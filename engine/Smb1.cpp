@@ -617,8 +617,10 @@ QByteArray Session::ntCreate(const QByteArray &message)
     OpenFile file;
     file.name = name;
     file.channel = endpoint->newChannel(QStringLiteral("smb1:%1").arg(name));
-    if (m_authenticated && file.channel)
+    if (m_authenticated && file.channel) {
         file.channel->setTransportIdentity(m_user);
+        file.channel->setTransportSessionKey(m_sessionKey);
+    }
     m_files.insert(fid, file);
     if (m_notifier)
         m_notifier(QStringLiteral("SMB1 open \\\\pipe\\\\%1").arg(name));

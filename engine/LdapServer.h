@@ -300,6 +300,10 @@ private:
     // LDAP framing that carries them.
     QByteArray gssWrap(ClientState *st, const QByteArray &data, bool conf);
     bool gssUnwrap(ClientState *st, const QByteArray &token, QByteArray *data);
+    // Finishes a Kerberos SASL bind once the layer is known: the identity and
+    // PAC become the session's, and the response either carries the wrapped
+    // authorization id (RFC 4752) or nothing (GSS-SPNEGO).
+    QByteArray completeGssBind(ClientState *st, int msgId, int layer, bool wrapAuthorizationId);
     QByteArray gssFrame(ClientState *st, const QByteArray &data);
     bool gssUnframe(ClientState *st, QByteArray *out);
     // NTLM per-message tokens (MS-NLMP §3.4.5.2) and the RFC 4422 framing that

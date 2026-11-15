@@ -278,20 +278,30 @@ QByteArray spnegoResponseToken(const QByteArray &token)
     Asn1::Element outer;
     if (!Asn1::parse(token, &outer))
         return {};
-    for (const Asn1::Element &child : outer.children) {
-        if (child.tag != 0xA1) // negTokenResp
-            continue;
-        Asn1::Element response;
-        if (!Asn1::parse(child.value, &response) || response.tag != 0x30)
-            continue;
-        const Asn1::Element *responseToken = Asn1::child(response, 0xA2);
-        if (!responseToken)
-            continue;
-        Asn1::Element octets;
-        int used = 0;
-        if (Asn1::parse(responseToken->value, &octets, &used) && octets.tag == 0x04)
-            return octets.value;
+    // GSS-SPNEGO answers with a bare NegTokenResp (0xA1); only the GSSAPI
+    // mechanism wraps one inside an InitialContextToken (0x60). Both arms are
+    // driven by these tests, so both are read.
+    const QByteArray *negTokenResp = nullptr;
+    if (outer.tag == 0x60) {
+        const Asn1::Element *neg = Asn1::child(outer, 0xA1);
+        if (!neg)
+            return {};
+        negTokenResp = &neg->value;
+    } else if (outer.tag == 0xA1) {
+        negTokenResp = &outer.value;
+    } else {
+        return {};
     }
+    Asn1::Element response;
+    if (!Asn1::parse(*negTokenResp, &response) || response.tag != 0x30)
+        return {};
+    const Asn1::Element *responseToken = Asn1::child(response, 0xA2);
+    if (!responseToken)
+        return {};
+    Asn1::Element octets;
+    int used = 0;
+    if (Asn1::parse(responseToken->value, &octets, &used) && octets.tag == 0x04)
+        return octets.value;
     return {};
 }
 
@@ -737,13 +747,9 @@ bool gssBindAs(Fixture &fixture, const QString &user, const QString &password,
     if (!gssStep(&client, challenge.saslCreds, &continuation, error))
         return false;
 
-    const BindReply offer = exchange(*socket, saslBindRequest(2, QByteArray(), "GSSAPI"));
-    if (!offer.parsed || offer.resultCode != 14) {
-        if (error)
-            *error = QStringLiteral("no security-layer offer");
-        return false;
-    }
-    const BindReply done = exchange(*socket, saslBindRequest(3, QByteArray("\x01\x00\x00\x00", 4),
+    // RFC 4752 §3.1: the client names the layer. There is no server offer, and
+    // asking for none is a four-byte selection like any other.
+    const BindReply done = exchange(*socket, saslBindRequest(2, QByteArray("\x01\x00\x00\x00", 4),
                                                             "GSSAPI"));
     if (!done.parsed || done.resultCode != 0) {
         if (error)
@@ -825,14 +831,6 @@ bool runWrappedLdapSession(Fixture &fixture, QString *error)
     if (!gssStep(&client, challenge.saslCreds, &continuation, error))
         return false;
 
-    const BindReply offer = exchange(socket, saslBindRequest(2, QByteArray(), "GSSAPI"));
-    if (!offer.parsed || offer.resultCode != 14 || offer.saslCreds.size() != 4
-        || quint8(offer.saslCreds.at(0)) != 0x07) {
-        if (error)
-            *error = QStringLiteral("the server did not offer the security layers");
-        return false;
-    }
-
     QByteArray wrappedId;
     if (!gssWrapClient(&client, QByteArray(4, '\0'), 1, &wrappedId, nullptr, error))
         return false;
@@ -841,7 +839,7 @@ bool runWrappedLdapSession(Fixture &fixture, QString *error)
     selection.append("\x00\xff\xff", 3);
     selection.append(wrappedId);
 
-    const BindReply done = exchange(socket, saslBindRequest(3, selection, "GSSAPI"));
+    const BindReply done = exchange(socket, saslBindRequest(2, selection, "GSSAPI"));
     if (!done.parsed || done.resultCode != 0) {
         if (error)
             *error = QStringLiteral("the layer selection was refused (rc %1)")
@@ -1048,12 +1046,8 @@ void KerberosTest::kerberosBindOverLdap()
     QVERIFY2(gssStep(&client, challenge.saslCreds, &continuation, &error), qPrintable(error));
     QVERIFY(client.flags & GSS_C_MUTUAL_FLAG);
 
-    const BindReply offer = exchange(socket, saslBindRequest(2, QByteArray(), "GSSAPI"));
-    QVERIFY(offer.parsed);
-    QCOMPARE(offer.resultCode, 14);
-    QCOMPARE(offer.saslCreds.size(), 4);
-
-    const BindReply done = exchange(socket, saslBindRequest(3, QByteArray("\x01\x00\x00\x00", 4),
+    // RFC 4752 §3.1: the client names the layer itself.
+    const BindReply done = exchange(socket, saslBindRequest(2, QByteArray("\x01\x00\x00\x00", 4),
                                                            "GSSAPI"));
     QVERIFY(done.parsed);
     QCOMPARE(done.resultCode, 0);
@@ -1092,10 +1086,8 @@ void KerberosTest::spnegoKerberosBind()
     QVERIFY2(gssStep(&client, apRep, &continuation, &error), qPrintable(error));
     QVERIFY(client.flags & GSS_C_MUTUAL_FLAG);
 
-    const BindReply offer = exchange(socket, saslBindRequest(2, QByteArray(), "GSS-SPNEGO"));
-    QCOMPARE(offer.resultCode, 14);
     const BindReply done =
-        exchange(socket, saslBindRequest(3, QByteArray("\x01\x00\x00\x00", 4), "GSS-SPNEGO"));
+        exchange(socket, saslBindRequest(2, QByteArray("\x01\x00\x00\x00", 4), "GSS-SPNEGO"));
     QVERIFY(done.parsed);
     QCOMPARE(done.resultCode, 0);
 }

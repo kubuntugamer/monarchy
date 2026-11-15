@@ -2268,41 +2268,61 @@ QByteArray LdapServer::handleGssapiBind(ClientState *st, int msgId,
         st->gssRecvSeq = 0;
         emit requestReceived(QStringLiteral("Kerberos authentication: %1 (%2)")
                                  .arg(result.clientPrincipal, result.servicePrincipal));
-        const QByteArray reply = spnego ? Gss::spnegoAcceptToken(result.replyToken)
-                                        : result.replyToken;
+        // GSS-SPNEGO carries a bare NegTokenResp; only the GSSAPI mechanism wraps
+        // its token in the 0x60 InitialContextToken, and a client that offered
+        // GSS-SPNEGO reads a 0x60 as a second negTokenInit — Samba answered
+        // NT_STATUS_INVALID_PARAMETER for the whole bind on exactly that.
+        const QByteArray reply = spnego
+                                     ? Gss::spnegoResponse(0, QString(), result.replyToken)
+                                     : result.replyToken;
         return makeBindResponse(msgId, 14, reply); // saslBindInProgress
     }
 
+    // GSS-SPNEGO has no RFC 4752 step: the negotiated mechanism's own layer is
+    // the SASL layer, so a client that completes with an empty token has already
+    // said everything and seals the very next PDU. Samba's net ads join is such
+    // a client — it answers the AP-REP with an empty GSS-SPNEGO bind and then
+    // sends `05 04 02 ..` wrapped LDAP — and answering it with the RFC 4752
+    // offer made it read four raw bytes as a GSS token.
+    if (spnego && st->saslStage == 1 && credentials.isEmpty()) {
+        st->gssLayer = 0x04; // the layer Kerberos provides: confidentiality
+        st->gssMaxBuf = 0;
+        return completeGssBind(st, msgId, st->gssLayer, false);
+    }
+
+    // RFC 4752 §3.1 has the client name the layer it wants; there is no server
+    // offer in between. A client that sends an empty token at this point wants no
+    // layer, which is what a Windows DC answers with.
+    QByteArray selection = credentials;
     if (st->saslStage == 1) {
-        // The client has processed the AP-REP. Some clients select the security
-        // layer straight away, others wait for the server's offer.
-        // Offer the three RFC 4752 layers and the largest SASL buffer we send.
-        if (credentials.size() < 4)
-            return makeBindResponse(msgId, 14, QByteArray("\x07\x00\xff\xff", 4));
+        if (selection.isEmpty())
+            selection = QByteArray("\x01\x00\x00\x00", 4); // no layer
+        if (selection.size() < 4)
+            return makeBindResponse(msgId, 2);
         st->saslStage = 2;
     }
 
     if (st->saslStage == 2) {
-        if (credentials.size() < 4)
+        if (selection.size() < 4)
             return makeBindResponse(msgId, 2);
 
-        // RFC 4752 §3.1: the client picks one layer and advertises the largest
-        // buffer it will accept, then proves the choice by wrapping the
-        // authorization id with the freshly negotiated context.
-        const int layer = quint8(credentials.at(0));
+        // The client picks one layer and advertises the largest buffer it will
+        // accept, then proves the choice by wrapping the authorization id with
+        // the freshly negotiated context.
+        const int layer = quint8(selection.at(0));
         if (layer != 0x01 && layer != 0x02 && layer != 0x04) {
             st->saslStage = 0;
             return makeBindResponse(msgId, 7); // authMethodNotSupported
         }
         st->gssLayer = layer;
-        st->gssMaxBuf = (quint32(quint8(credentials.at(1))) << 16)
-                        | (quint32(quint8(credentials.at(2))) << 8)
-                        | quint32(quint8(credentials.at(3)));
+        st->gssMaxBuf = (quint32(quint8(selection.at(1))) << 16)
+                        | (quint32(quint8(selection.at(2))) << 8)
+                        | quint32(quint8(selection.at(3)));
 
         if (layer != 0x01) {
             QByteArray authorizationId;
-            if (credentials.size() <= 4
-                || !gssUnwrap(st, credentials.mid(4), &authorizationId)) {
+            if (selection.size() <= 4
+                || !gssUnwrap(st, selection.mid(4), &authorizationId)) {
                 emit requestReceived(QStringLiteral("GSSAPI layer token rejected"));
                 st->saslStage = 0;
                 st->gssLayer = 1;
@@ -2310,34 +2330,7 @@ QByteArray LdapServer::handleGssapiBind(ClientState *st, int msgId,
             }
         }
 
-        st->authenticatedDn = st->gssClientDn;
-        st->saslStage = 0;
-        st->gssClientDn.clear();
-        // The verified PAC is the authority for what this session may do.
-        st->gssHasIdentity = !st->gssPac.isEmpty()
-                             && Pac::readIdentity(st->gssPac, &st->gssIdentity);
-        st->gssPac.clear();
-        if (st->authenticatedDn.isEmpty())
-            return makeBindResponse(msgId, 49);
-
-        // The same authorization id comes back wrapped, so the client knows the
-        // server accepted the layer.
-        QByteArray replyCredentials;
-        if (layer != 0x01)
-            replyCredentials = gssWrap(st, QByteArray(4, '\0'), layer == 0x04);
-        st->gssBindResponse = !replyCredentials.isEmpty();
-        // Anything the client pipelined behind the bind request is already
-        // sealed, so hand it to the framed decoder rather than the LDAP parser.
-        if (layer != 0x01 && !st->buffer.isEmpty()) {
-            st->raw.prepend(st->buffer);
-            st->buffer.clear();
-        }
-        emit requestReceived(QStringLiteral("Kerberos bind: %1 (layer %2)")
-                                 .arg(st->authenticatedDn)
-                                 .arg(layer == 0x04 ? QStringLiteral("confidentiality")
-                                      : layer == 0x02 ? QStringLiteral("integrity")
-                                                      : QStringLiteral("none")));
-        return makeBindResponse(msgId, 0, replyCredentials);
+        return completeGssBind(st, msgId, layer, layer != 0x01);
     }
 
     return makeBindResponse(msgId, 2);
@@ -2811,6 +2804,41 @@ QByteArray LdapServer::handleModify(int msgId, const QByteArray &payload) {
     const int rcode = applyModify(dn, changes);
     emit requestReceived(QStringLiteral("Modify: %1").arg(dn));
     return makeLdapResult(msgId, 0x67, rcode);
+}
+
+QByteArray LdapServer::completeGssBind(ClientState *st, int msgId, int layer,
+                                       bool wrapAuthorizationId)
+{
+    st->authenticatedDn = st->gssClientDn;
+    st->saslStage = 0;
+    st->gssClientDn.clear();
+    // The verified PAC is the authority for what this session may do.
+    st->gssHasIdentity = !st->gssPac.isEmpty()
+                         && Pac::readIdentity(st->gssPac, &st->gssIdentity);
+    st->gssPac.clear();
+    if (st->authenticatedDn.isEmpty())
+        return makeBindResponse(msgId, 49);
+
+    // RFC 4752 has the server prove the layer by returning the wrapped
+    // authorization id. GSS-SPNEGO has no such step: its layer is the one the
+    // negotiated mechanism provides, so the bind simply succeeds and the next
+    // PDU is already sealed.
+    QByteArray replyCredentials;
+    if (wrapAuthorizationId)
+        replyCredentials = gssWrap(st, QByteArray(4, '\0'), layer == 0x04);
+    st->gssBindResponse = !replyCredentials.isEmpty() || !wrapAuthorizationId;
+    // Anything the client pipelined behind the bind request is already sealed,
+    // so hand it to the framed decoder rather than the LDAP parser.
+    if (layer != 0x01 && !st->buffer.isEmpty()) {
+        st->raw.prepend(st->buffer);
+        st->buffer.clear();
+    }
+    emit requestReceived(QStringLiteral("Kerberos bind: %1 (layer %2)")
+                             .arg(st->authenticatedDn)
+                             .arg(layer == 0x04 ? QStringLiteral("confidentiality")
+                                  : layer == 0x02 ? QStringLiteral("integrity")
+                                                  : QStringLiteral("none")));
+    return makeBindResponse(msgId, 0, replyCredentials);
 }
 
 QByteArray LdapServer::handleAdd(int msgId, const QByteArray &payload) {

@@ -308,6 +308,13 @@ void RpcServer::Channel::setTransportIdentity(const QString &user)
     client->security.level = 1;
 }
 
+void RpcServer::Channel::setTransportSessionKey(const QByteArray &sessionKey)
+{
+    if (!m_state || !m_state->client || sessionKey.isEmpty())
+        return;
+    m_state->client->security.transportSessionKey = sessionKey;
+}
+
 RpcServer::Channel *RpcServer::newChannel(const QString &peer)
 {
     auto *channel = new Channel;
@@ -538,9 +545,12 @@ void RpcServer::handlePdu(Client *client, const QByteArray &pdu)
         // The interfaces that cipher their own payload (SAMR's password
         // buffers) key it off the session key: NTLM's exported key, or for
         // Kerberos the service ticket's session key (RFC 4120 §7.5.1).
-        call.sessionKey = client->security.kerberos
-                              ? client->security.gss.ticketKey
-                              : client->security.keys.sessionBaseKey;
+        if (client->security.transportOnly)
+            call.sessionKey = client->security.transportSessionKey;
+        else
+            call.sessionKey = client->security.kerberos
+                                  ? client->security.gss.ticketKey
+                                  : client->security.keys.sessionBaseKey;
         emit requestReceived(QStringLiteral("%1 call %2 (opnum %3)")
                                  .arg(m_interface.name)
                                  .arg(callId)

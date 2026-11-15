@@ -862,8 +862,13 @@ QByteArray Smb2Server::create(Connection *connection, quint32 treeId, const QByt
     handle.channel = endpoint->newChannel(QStringLiteral("smb2:%1").arg(name));
     // The session authenticated the principal; the pipe carries that identity to
     // the endpoint the same way a Windows DC does for \pipe\samr.
-    if (connection->authenticated)
+    if (connection->authenticated) {
         handle.channel->setTransportIdentity(connection->user);
+        // SAMR ciphers a machine password with the session key of the pipe's
+        // transport when the pipe itself carries no NTLMSSP bind, which is what
+        // a Windows client does over \\dc\pipe\samr.
+        handle.channel->setTransportSessionKey(connection->sessionKey);
+    }
     connection->handles.insert(id, handle);
 
     emit requestReceived(QStringLiteral("SMB2 open \\pipe\\%1").arg(name));
