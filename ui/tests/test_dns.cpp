@@ -306,6 +306,8 @@ private slots:
     void forwardsAndCachesOutOfZoneQueries();
     void forwardsTcpQueriesOverTcp();
     void dropsNameserversThatWouldLoopBack();
+    void followsForwarderChangesWhileRunning();
+    void reportsMissingForwarderAgainAfterReconfiguration();
     void appliesDynamicUpdates();
     void enforcesUpdatePolicy();
     void persistsZone();
@@ -832,6 +834,124 @@ void DnsTest::dropsNameserversThatWouldLoopBack()
 
     // A file that does not exist contributes nothing rather than throwing.
     QVERIFY(DnsServer::nameserversIn(dir.filePath(QStringLiteral("absent.conf"))).isEmpty());
+}
+
+void DnsTest::followsForwarderChangesWhileRunning()
+{
+    // What `systemctl reload` (SIGHUP) depends on: replacing the list on an
+    // already-listening server sends the next new name to the new upstream,
+    // with no restart and no rebuilt zone. Before the reload path existed the
+    // list was fixed until the process was restarted.
+    auto makeUpstream = [](const QByteArray &address, int *count) {
+        auto *socket = new QUdpSocket;
+        socket->bind(QHostAddress::LocalHost, 0);
+        QObject::connect(socket, &QUdpSocket::readyRead, socket, [socket, address, count]() {
+            while (socket->hasPendingDatagrams()) {
+                QByteArray query;
+                query.resize(int(socket->pendingDatagramSize()));
+                QHostAddress peer;
+                quint16 peerPort = 0;
+                const qint64 read = socket->readDatagram(query.data(), query.size(), &peer, &peerPort);
+                if (read < 12)
+                    continue;
+                query.truncate(int(read));
+                ++*count;
+
+                QByteArray response;
+                put16(response, quint16((quint8(query[0]) << 8) | quint8(query[1])));
+                put16(response, 0x8180);
+                put16(response, 1);
+                put16(response, 1);
+                put16(response, 0);
+                put16(response, 0);
+                response += query.mid(12);
+                response.append(char(0xc0));
+                response.append(char(0x0c));
+                put16(response, DnsServer::TypeA);
+                put16(response, 1);
+                put32(response, 60);
+                put16(response, 4);
+                response.append(address);
+                socket->writeDatagram(response, peer, peerPort);
+            }
+        });
+        return socket;
+    };
+
+    int firstCount = 0;
+    int secondCount = 0;
+    QUdpSocket *first = makeUpstream(QByteArray::fromHex("c0000201"), &firstCount);
+    QUdpSocket *second = makeUpstream(QByteArray::fromHex("c0000202"), &secondCount);
+    QVERIFY(first->localPort() != 0);
+    QVERIFY(second->localPort() != 0);
+
+    DnsServer server;
+    server.setForwardingEnabled(true);
+    server.setForwarders({QStringLiteral("127.0.0.1:%1").arg(first->localPort())});
+    QVERIFY(server.listen(0));
+    server.loadDefaultZone(QStringLiteral("corp.example.com"));
+
+    Reply before;
+    QVERIFY(parseReply(exchange(server.serverPort(),
+                                DnsServer::buildQuery(QStringLiteral("before.example.org"),
+                                                      DnsServer::TypeA, 0x5301)),
+                       &before));
+    QCOMPARE(before.rcode, 0);
+    QCOMPARE(firstCount, 1);
+    QCOMPARE(secondCount, 0);
+
+    // Same process, same listener, new list: this is the whole reload.
+    server.setForwarders({QStringLiteral("127.0.0.1:%1").arg(second->localPort())});
+
+    Reply after;
+    QVERIFY(parseReply(exchange(server.serverPort(),
+                                DnsServer::buildQuery(QStringLiteral("after.example.org"),
+                                                      DnsServer::TypeA, 0x5302)),
+                       &after));
+    QCOMPARE(after.rcode, 0);
+    QCOMPARE(secondCount, 1);
+    QCOMPARE(firstCount, 1); // the old upstream is not consulted any more
+
+    delete first;
+    delete second;
+}
+
+void DnsTest::reportsMissingForwarderAgainAfterReconfiguration()
+{
+    // The warning is once per configuration, not once per process: a reload on
+    // a DC that still has nothing to forward to has to say so again, or the
+    // operator who just fixed dc.conf the wrong way sees silence.
+    DnsServer server;
+    server.setForwardingEnabled(true);
+    server.setForwarders({QStringLiteral("not-an-address")});
+    QVERIFY(server.listen(0));
+    server.loadDefaultZone(QStringLiteral("corp.example.com"));
+
+    int reports = 0;
+    QString lastDetail;
+    QObject::connect(&server, &DnsServer::forwardingUnavailable, &server,
+                     [&reports, &lastDetail](const QString &detail) {
+                         ++reports;
+                         lastDetail = detail;
+                     });
+
+    auto asksAndFails = [&server](quint16 id, const char *name) {
+        Reply reply;
+        return parseReply(exchange(server.serverPort(),
+                                   DnsServer::buildQuery(QString::fromLatin1(name),
+                                                         DnsServer::TypeA, id)),
+                          &reply)
+               && reply.rcode == 2; // SERVFAIL
+    };
+
+    QVERIFY(asksAndFails(0x5401, "one.example.org"));
+    QVERIFY(asksAndFails(0x5402, "two.example.org"));
+    QCOMPARE(reports, 1);
+
+    server.setForwarders({QStringLiteral("still-not-an-address")});
+    QVERIFY(asksAndFails(0x5403, "three.example.org"));
+    QCOMPARE(reports, 2);
+    QVERIFY(lastDetail.contains(QStringLiteral("still-not-an-address")));
 }
 
 void DnsTest::appliesDynamicUpdates()

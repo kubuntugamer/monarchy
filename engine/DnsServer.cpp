@@ -453,6 +453,10 @@ bool DnsServer::forwardingEnabled() const
 
 void DnsServer::setForwarders(const QStringList &forwarders)
 {
+    // The caller is (re)applying configuration, so a still-broken state deserves
+    // a fresh report: `systemctl reload` on a DC that still has no upstream
+    // should say so again rather than go quiet because start-up already did.
+    m_reportedNoForwarder = false;
     m_forwarders.clear();
     for (const QString &forwarder : forwarders) {
         if (!forwarder.trimmed().isEmpty())

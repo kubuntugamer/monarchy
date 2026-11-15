@@ -88,6 +88,54 @@ QString DcService::dnsZone() const
     return m_dnsServer ? m_dnsServer->zone() : QString();
 }
 
+void DcService::reportForwarders()
+{
+    if (!m_dnsServer)
+        return;
+    if (!m_dnsServer->forwardingEnabled()) {
+        emit statusMessage(tr("DNS forwarding is off, so names outside %1 are answered REFUSED.")
+                               .arg(m_dnsServer->zone()));
+        return;
+    }
+    const QStringList effective = m_dnsServer->effectiveForwarders();
+    // Which list is in effect matters: a recorded key keeps working when the
+    // host has nothing left to read, and a host list changes under the process.
+    // Saying "to 192.168.1.1" without saying where it came from is what made a
+    // correct log line look like proof the configuration was doing the work.
+    const QString source = m_dnsServer->forwarders().isEmpty()
+                               ? tr("this host's nameservers")
+                               : tr("dc.conf");
+    if (effective.isEmpty()) {
+        emit statusMessage(tr("No usable DNS forwarder in %1: %2 are loopback or this DC "
+                              "itself, so names outside %3 will not resolve. Set forwarders= "
+                              "in %4.")
+                               .arg(source)
+                               .arg(source)
+                               .arg(m_dnsServer->zone())
+                               .arg(m_dcDir + QStringLiteral("/dc.conf")));
+        return;
+    }
+    emit statusMessage(tr("Forwarding names outside %1 to %2 (from %3).")
+                           .arg(m_dnsServer->zone())
+                           .arg(effective.join(QStringLiteral(", ")))
+                           .arg(source));
+}
+
+void DcService::reloadForwarders()
+{
+    if (!m_dnsServer)
+        return;
+    const QString path = m_dcDir + QStringLiteral("/dc.conf");
+    const QSettings dcConfig(path, QSettings::IniFormat);
+    const QStringList forwarders =
+        dcConfig.value(QStringLiteral("forwarders")).toString()
+            .split(QRegularExpression(QStringLiteral("[,;\\s]+")), Qt::SkipEmptyParts);
+    m_dnsServer->setForwarders(forwarders);
+    m_dnsServer->setForwardingEnabled(dcConfig.value(QStringLiteral("forwarding"), true).toBool());
+    emit statusMessage(tr("Re-read the DNS forwarder configuration from %1 on SIGHUP.").arg(path));
+    reportForwarders();
+}
+
 void DcService::stop()
 {
     if (!m_started)
@@ -112,6 +160,7 @@ bool DcService::start(const QString &dcDir)
     const QString resolvedDcDir =
         dcDir.isEmpty() ? QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) : dcDir;
     QDir().mkpath(resolvedDcDir);
+    m_dcDir = resolvedDcDir;
 
     // `monarchy-provision` writes its store and `dc.conf` here; without a
     // provisioned domain the service either falls back to the sample
@@ -988,18 +1037,7 @@ bool DcService::start(const QString &dcDir)
         // are the DC's own address — which is dropped as a loop, leaving
         // nothing to forward to. Report which upstreams are in effect so an
         // empty set is visible at startup rather than as a silent SERVFAIL.
-        if (m_dnsServer->forwardingEnabled()) {
-            const QStringList effective = m_dnsServer->effectiveForwarders();
-            emit statusMessage(effective.isEmpty()
-                                   ? tr("No usable DNS forwarder: this host's nameservers are "
-                                        "loopback or this DC itself, so names outside %1 will "
-                                        "not resolve. Set forwarders= in %2.")
-                                         .arg(m_dnsServer->zone())
-                                         .arg(resolvedDcDir + QStringLiteral("/dc.conf"))
-                                   : tr("Forwarding names outside %1 to %2.")
-                                         .arg(m_dnsServer->zone())
-                                         .arg(effective.join(QStringLiteral(", "))));
-        }
+        reportForwarders();
     }
 
     m_started = true;

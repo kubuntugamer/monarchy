@@ -335,7 +335,14 @@ second file still carries an upstream; when it is absent or also loopback-only
 there is none left to ask and names outside the domain are answered `SERVFAIL`.
 The recorded `forwarders=` is what keeps that from happening, and if it is
 missing the daemon says so — at startup and on the first query it cannot
-forward — instead of failing quietly. Set `forwarding=false` in `dc.conf` to answer out-of-zone
+forward — instead of failing quietly.
+
+Neither case needs a restart to change: `systemctl reload monarchy-dcd` (or
+`kill -HUP`) re-reads `forwarders=` and `forwarding=` from `dc.conf` and logs
+the list it is now using, naming whether it came from `dc.conf` or from the
+host's nameservers. A reload that still leaves nothing usable re-reports the
+warning, so a wrong edit is not silent either. Only SIGHUP is a reload; it used
+to terminate the daemon. Set `forwarding=false` in `dc.conf` to answer out-of-zone
 queries with REFUSED instead, which is the standalone engine's default.
 
 The daemon serves the provisioned domain on **LDAP 389**, the Global Catalog

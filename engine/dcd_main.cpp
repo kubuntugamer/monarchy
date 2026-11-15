@@ -56,7 +56,12 @@ void onTerminationSignal(int signalNumber)
 // SIGTERM is what `systemctl stop` and `systemctl restart` send. Turning it
 // into QCoreApplication::quit() runs DcService::stop(), which flushes the
 // directory and DNS zone, instead of letting the process die mid-write.
-bool installTerminationHandlers()
+//
+// SIGHUP used to be left at its default action, which kills the process: a
+// `systemctl reload` or a stray `kill -HUP` took the whole DC down without the
+// flush SIGTERM gets, and a long-running service being unable to re-read its
+// configuration without restarting every listener is the reason it exists.
+bool installSignalHandlers()
 {
     if (::socketpair(AF_UNIX, SOCK_STREAM, 0, g_signalPipe) != 0)
         return false;
@@ -66,6 +71,7 @@ bool installTerminationHandlers()
     action.sa_flags = SA_RESTART;
     ::sigaction(SIGTERM, &action, nullptr);
     ::sigaction(SIGINT, &action, nullptr);
+    ::sigaction(SIGHUP, &action, nullptr);
     return true;
 }
 
@@ -98,7 +104,8 @@ int main(int argc, char *argv[])
                         "Usage: monarchy-dcd [--dcdir DIR]\n"
                         "Runs the Monarchy domain controller as a headless service:\n"
                         "LDAP, KDC, DNS, SAMR, LSAD, Netlogon, DRSUAPI, EPM and SMB2,\n"
-                        "configured from the dc.conf the provisioner wrote.\n");
+                        "configured from the dc.conf the provisioner wrote.\n"
+                        "SIGHUP re-reads forwarders=/forwarding= from dc.conf.\n");
             return 0;
         }
     }
@@ -116,22 +123,35 @@ int main(int argc, char *argv[])
         return kExitConfig;
     }
 
-    if (!installTerminationHandlers()) {
-        std::fprintf(stderr, "monarchy-dcd: could not install termination handlers.\n");
+    if (!installSignalHandlers()) {
+        std::fprintf(stderr, "monarchy-dcd: could not install signal handlers.\n");
         return 1;
     }
-    auto *termination = new QSocketNotifier(g_signalPipe[0], QSocketNotifier::Read, &app);
-    QObject::connect(termination, &QSocketNotifier::activated, &app,
-                     [&app, termination]() {
+
+    // Constructed before the notifier so a SIGHUP delivered immediately after
+    // start-up still has a service to reload.
+    DcService service;
+
+    auto *signalNotifier = new QSocketNotifier(g_signalPipe[0], QSocketNotifier::Read, &app);
+    QObject::connect(signalNotifier, &QSocketNotifier::activated, &app,
+                     [&app, &service, signalNotifier]() {
                          unsigned char signalNumber = 0;
                          if (::read(g_signalPipe[0], &signalNumber, 1) <= 0)
                              return;
-                         termination->setEnabled(false);
+                         // SIGHUP re-reads the configuration and keeps serving;
+                         // the pipe stays armed for the next signal. A bad edit
+                         // is reported and leaves the previous list in place,
+                         // so a reload cannot take the resolver down.
+                         if (signalNumber == SIGHUP) {
+                             std::printf("Received SIGHUP; re-reading the DNS forwarders.\n");
+                             service.reloadForwarders();
+                             return;
+                         }
+                         signalNotifier->setEnabled(false);
                          std::printf("Received signal %d; stopping.\n", int(signalNumber));
                          app.quit();
                      });
 
-    DcService service;
     QObject::connect(&service, &DcService::statusMessage,
                      [](const QString &message) { std::printf("%s\n", qPrintable(message)); });
     QObject::connect(&app, &QCoreApplication::aboutToQuit, &service, &DcService::stop);

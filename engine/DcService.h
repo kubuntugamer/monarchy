@@ -46,6 +46,16 @@ public:
     // disk, so this is the last flush for uncommitted session edits.
     void stop();
 
+    // Re-read forwarders= and forwarding= from dc.conf and apply them to the
+    // running DNS server. The daemon calls this on SIGHUP (`systemctl reload`):
+    // the forwarder list is otherwise fixed at start-up, and an operator who
+    // edits dc.conf should not have to restart the whole DC — LDAP, the KDC and
+    // every open SMB session — to change which upstream the zone forwards to.
+    // When dc.conf names no forwarders the list is whichever nameservers the
+    // host has now, resolved per query, and the message says which of the two
+    // is in effect.
+    void reloadForwarders();
+
     // Naming context of the provisioned domain.
     QString baseDn() const { return m_baseDn; }
 
@@ -62,6 +72,9 @@ private:
     // timer after each cycle and after a link is added, changed or retired.
     void runReplicaCycle();
     void armReplicaTimer();
+    // One place reports which upstreams are in effect, at start-up and on
+    // reload, so the line an operator reads is the same in both cases.
+    void reportForwarders();
 
     LdapServer *m_ldapServer = nullptr;
     DnsServer *m_dnsServer = nullptr;
@@ -81,6 +94,7 @@ private:
 
     bool m_started = false;
     // Store and zone locations resolved from dc.conf at start-up.
+    QString m_dcDir;
     QString m_storePath;
     QString m_zonePath;
     QString m_baseDn;

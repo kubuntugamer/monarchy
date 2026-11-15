@@ -41,6 +41,10 @@ RestartSec=2
 RestartPreventExitStatus=78
 # SIGTERM makes the daemon flush its store and DNS zone before exiting.
 KillSignal=SIGTERM
+# `systemctl reload` re-reads forwarders=/forwarding= from dc.conf without
+# dropping LDAP, the KDC or any open SMB session. Without this, SIGHUP reaches
+# the daemon's default disposition, which is to terminate it.
+ExecReload=/bin/kill -HUP $MAINPID
 TimeoutStopSec=30
 
 # A domain controller is written to be long-running; log to the journal the
