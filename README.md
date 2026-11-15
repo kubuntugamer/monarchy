@@ -758,9 +758,11 @@ of replication is not implemented, nor is SMB 3.x, so there is no SMB
 encryption or preauth integrity. `IPC$` carries the named pipes
 `\pipe\samr`, `\pipe\lsarpc`, `\pipe\netlogon` and `\pipe\epmapper`, and
 `SYSVOL` and `NETLOGON` are read-only disk shares over both SMB2 and SMB1 (see
-below). Netlogon now serves the
-secure-channel calls, but no real member has been driven through a domain join
-against it here, and LSAD trusts are stored and queryable but their secure
+below). Netlogon serves the
+secure-channel calls and its own DCE/RPC security provider, and a real Samba
+member has been driven through `net ads join` against it — challenge,
+authenticate, capabilities, a sealed pipe and the machine account written over
+LDAP — and exits 0. LSAD trusts are stored and queryable but their secure
 channel and password rollover are not served. A logon week written over SAMR is
 enforced at logon — by the KDC, by LDAP binds and by Netlogon — and so is the
 account's `userWorkstations` list, which Netlogon checks against the workstation

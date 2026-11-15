@@ -85,12 +85,10 @@ constexpr quint32 kNegGetDomainInfo = 0x00040000u;
 constexpr quint32 kNegSupportsAes = 0x01000000u;
 // MS-NRPC 2.2.1.4.1: the server accepts Netlogon calls over a DCE/RPC
 // connection sealed by the Netlogon security provider (auth type 0x44) with the
-// channel's session key. It is defined here so the flag has a name, but it is
-// deliberately not negotiated yet: this endpoint does not serve auth type 0x44,
-// and promising it would make every client rebind the pipe into something it
-// cannot answer. A client that requires it (Samba's "require strong key", the
-// default) therefore refuses the channel after a successful
-// NetrServerAuthenticate3 — the measured state until schannel RPC exists.
+// channel's session key. The endpoint serves it (engine/Schannel.cpp), so the
+// flag is negotiated: a client that takes it up rebinds `\pipe\netlogon` with
+// auth type 0x44 and names its channel in the bind, and the channel's key is
+// what seals every call after that.
 constexpr quint32 kNegAuthenticatedRpc = 0x40000000u;
 
 Rpc::Interface interface();
@@ -116,6 +114,13 @@ public:
     bool isListening() const;
     quint16 serverPort() const;
     RpcServer *rpc() const { return m_rpc; }
+
+    // The channel `computer` established, for the pipe that channel now
+    // authenticates: the session key its PDUs are sealed with, the flags that
+    // decide the algorithms, and the account it belongs to. A channel of
+    // another domain is declined.
+    bool schannelCredentials(const QString &domain, const QString &computer,
+                             Rpc::SchannelCredentials *credentials) const;
 
     // One NDR request in, one response out, for the endpoint and the tests.
     QByteArray handleCall(quint16 opnum, const QByteArray &stub,

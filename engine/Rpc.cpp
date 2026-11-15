@@ -5,6 +5,7 @@
 
 #include "Asn1.h"
 #include "Gss.h"
+#include "Schannel.h"
 
 #include <QStringList>
 
@@ -53,7 +54,8 @@ enum : quint32 {
 enum : quint8 {
     AuthTypeSpnego = 9,
     AuthTypeNtlm = 10,
-    AuthTypeKerberos = 16
+    AuthTypeKerberos = 16,
+    AuthTypeNetworkLogon = Schannel::AuthType
 };
 
 constexpr quint16 kMaxFrag = 4280;
@@ -192,6 +194,11 @@ void RpcServer::setKerberosAcceptor(Rpc::KerberosAcceptor acceptor, Rpc::Kerbero
 {
     m_kerberosAcceptor = std::move(acceptor);
     m_kerberosFinisher = std::move(finisher);
+}
+
+void RpcServer::setSchannelAcceptor(Rpc::SchannelAcceptor acceptor)
+{
+    m_schannelAcceptor = std::move(acceptor);
 }
 
 void RpcServer::setDomainNames(const QString &domain, const QString &serverName,
@@ -496,7 +503,14 @@ void RpcServer::handlePdu(Client *client, const QByteArray &pdu)
                     client->write(faultPdu(callId, FaultProtoError));
                 return;
             }
-            if (client->security.kerberos) {
+            if (client->security.schannel) {
+                if (!verifySchannelRequest(client, verifier, &stub)) {
+                    emit requestReceived(
+                        QStringLiteral("%1 refused: bad Netlogon signature").arg(m_interface.name));
+                    return;
+                }
+                stub.truncate(stub.size() - int(verifier.padLength));
+            } else if (client->security.kerberos) {
                 if (!verifyKerberosRequest(client, verifier, &stub)) {
                     emit requestReceived(
                         QStringLiteral("%1 refused: bad Kerberos token").arg(m_interface.name));
@@ -602,10 +616,17 @@ void RpcServer::handlePdu(Client *client, const QByteArray &pdu)
             payload.append(QByteArray(pad, '\0'));
         }
 
+        // Netlogon's provider signs the stub and its padding, and seals that
+        // whole region under the channel key (MS-NRPC 3.1.4.2.1).
+        const int signatureLength =
+            client->security.schannel && tokenReply
+                ? Schannel::signatureSize(client->security.schannelFlags)
+                : 16;
+
         QByteArray response;
         appendHeader(response, PduResponse, callId,
                      quint16(kerberosReply ? kerberosToken.size()
-                                           : (tokenReply ? 16 : 0)));
+                                           : (tokenReply ? signatureLength : 0)));
         putLe32(response, quint32(replyStub.size())); // alloc_hint
         putLe16(response, contextId);
         response.append(char(0)); // cancel_count
@@ -614,6 +635,17 @@ void RpcServer::handlePdu(Client *client, const QByteArray &pdu)
         response.append(payload);
         if (kerberosReply) {
             appendVerifier(response, client->security, quint8(pad), kerberosToken);
+        } else if (tokenReply && client->security.schannel) {
+            QByteArray sealedPayload;
+            const QByteArray signature =
+                Schannel::sign(client->security.schannelFlags, client->security.schannelKey,
+                               client->security.schannelSeq, false /* the server is not the
+                                                                    initiator */
+                               ,
+                               payload, client->security.privacy, &sealedPayload);
+            response.replace(payloadStart, payload.size(), sealedPayload);
+            appendVerifier(response, client->security, quint8(pad), signature);
+            ++client->security.schannelSeq;
         } else if (tokenReply) {
             appendVerifier(response, client->security, quint8(pad), QByteArray(16, '\0'));
             const int signatureOffset = response.size() - 16;
@@ -781,7 +813,12 @@ QByteArray RpcServer::handleBind(Client *client, const QByteArray &pdu, bool alt
     // Kerberos mechanism inside) and the AP-REP goes back in the ack. A client
     // that already holds a context sends its closing AP-REP in an
     // alter_context, which completes mutual authentication.
-    if (verifier.present && verifier.level != 0 && !client->security.active)
+    // A pipe the transport already authenticated can take up Netlogon's own
+    // provider on top: that is exactly what a join does once its channel exists.
+    if (verifier.present && verifier.type == AuthTypeNetworkLogon && !client->security.schannel
+        && !client->security.kerberos)
+        authToken = acceptSchannelBind(client, verifier);
+    else if (verifier.present && verifier.level != 0 && !client->security.active)
         authToken = acceptKerberosBind(client, verifier);
     else if (verifier.present && client->security.kerberos
              && client->security.awaitingFinal) {
@@ -834,6 +871,76 @@ QByteArray RpcServer::handleBind(Client *client, const QByteArray &pdu, bool alt
     else
         patchFragLength(reply);
     return reply;
+}
+
+QByteArray RpcServer::acceptSchannelBind(Client *client, const Verifier &verifier)
+{
+    if (!m_schannelAcceptor || !verifier.present || verifier.level < 2)
+        return {};
+
+    const Schannel::BindMessage message = Schannel::parseBind(verifier.token);
+    if (!message.parsed) {
+        emit requestReceived(QStringLiteral("%1 bind refused: not an NL_AUTH_MESSAGE")
+                                 .arg(m_interface.name));
+        return {};
+    }
+
+    // A message that carries only the UTF-8 names still names its channel
+    // through the identity the transport authenticated.
+    const QString computer =
+        message.computer.isEmpty() ? client->security.user : message.computer;
+
+    Rpc::SchannelCredentials credentials;
+    if (!m_schannelAcceptor(message.domain, computer, &credentials)) {
+        // Without an established channel there is no key to seal with, so the
+        // bind is declined rather than accepted unauthenticated: a client that
+        // asks for authenticated RPC and does not get it must fail here.
+        client->security.rejected = true;
+        emit requestReceived(QStringLiteral("%1 Netlogon bind refused for %2")
+                                 .arg(m_interface.name, computer));
+        return {};
+    }
+
+    client->security.type = verifier.type;
+    client->security.level = verifier.level;
+    client->security.contextId = verifier.contextId;
+    client->security.schannel = true;
+    client->security.active = true;
+    // The channel replaces the transport's blanket identity: from here every
+    // call has to carry a signature made with the channel's key.
+    client->security.transportOnly = false;
+    client->security.keys.sessionBaseKey = credentials.sessionKey;
+    client->security.privacy = verifier.level >= 6;
+    client->security.schannelKey = credentials.sessionKey;
+    client->security.schannelFlags = credentials.negotiateFlags;
+    client->security.schannelSeq = 0;
+    if (!credentials.account.isEmpty())
+        client->security.user = credentials.account;
+    else if (!computer.isEmpty() && client->security.user.isEmpty())
+        client->security.user = computer;
+    emit requestReceived(
+        QStringLiteral("%1 authenticated as %2 (Netlogon channel, level %3)")
+            .arg(m_interface.name, client->security.user)
+            .arg(verifier.level));
+    return Schannel::bindResponse();
+}
+
+bool RpcServer::verifySchannelRequest(Client *client, const Verifier &verifier, QByteArray *stub)
+{
+    if (!client->security.schannel || client->security.level < 2)
+        return true;
+    if (!verifier.present || verifier.token.isEmpty())
+        return false;
+    if (!Schannel::open(client->security.schannelFlags, client->security.schannelKey,
+                        client->security.schannelSeq, true /* the client is the initiator */,
+                        verifier.token, stub)) {
+        if (!qEnvironmentVariableIsEmpty("MONARCHY_RPC_TRACE"))
+            qWarning("RPC Netlogon signature refused at seq %llu",
+                     static_cast<unsigned long long>(client->security.schannelSeq));
+        return false;
+    }
+    ++client->security.schannelSeq;
+    return true;
 }
 
 QByteArray RpcServer::acceptKerberosBind(Client *client, const Verifier &verifier)

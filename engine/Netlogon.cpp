@@ -68,7 +68,8 @@ constexpr quint64 kNtTimeEpoch = 11644473600ull;
 // that would then be refused.
 constexpr quint32 kSupportedFlags =
     Netlogon::kNegArcFour | Netlogon::kNegStrongKeys | Netlogon::kNegDnsDomainTrusts
-    | Netlogon::kNegPasswordSet2 | Netlogon::kNegGetDomainInfo | Netlogon::kNegSupportsAes;
+    | Netlogon::kNegPasswordSet2 | Netlogon::kNegGetDomainInfo | Netlogon::kNegSupportsAes
+    | Netlogon::kNegAuthenticatedRpc;
 
 quint64 ntTimeNow()
 {
@@ -728,12 +729,37 @@ NetlogonServer::NetlogonServer(QObject *parent) : QObject(parent)
     m_rpc->setInterface(Netlogon::interface(), [this](const Rpc::Call &call) {
         return handleCall(call.opnum, call.stub, call.user);
     });
+    m_rpc->setSchannelAcceptor([this](const QString &domain, const QString &computer,
+                                      Rpc::SchannelCredentials *credentials) {
+        return schannelCredentials(domain, computer, credentials);
+    });
     connect(m_rpc, &RpcServer::requestReceived, this, &NetlogonServer::requestReceived);
 }
 
 void NetlogonServer::setConfig(const Netlogon::Config &config)
 {
     m_config = config;
+}
+
+bool NetlogonServer::schannelCredentials(const QString &domain, const QString &computer,
+                                         Rpc::SchannelCredentials *credentials) const
+{
+    if (!credentials || computer.isEmpty())
+        return false;
+    if (!domain.isEmpty() && domain.compare(m_config.netbios, Qt::CaseInsensitive) != 0
+        && domain.compare(m_config.realm, Qt::CaseInsensitive) != 0
+        && domain.compare(m_config.dnsDomain, Qt::CaseInsensitive) != 0) {
+        return false;
+    }
+
+    const auto channel = m_channels.constFind(computer.toLower());
+    if (channel == m_channels.constEnd() || channel->sessionKey.isEmpty())
+        return false;
+
+    credentials->sessionKey = channel->sessionKey;
+    credentials->negotiateFlags = channel->flags;
+    credentials->account = channel->accountName;
+    return true;
 }
 
 void NetlogonServer::setObjectProvider(std::function<QList<DirectoryObject>()> provider)
@@ -884,7 +910,13 @@ bool NetlogonServer::stepAuthenticator(Channel *channel, quint32 timestamp,
         return false;
     channel->client = client;
     channel->server = server;
-    channel->seed = server;
+    // The chain advances on the *input* of the reply credential, not on the
+    // credential itself: `netlogon_creds_step` in Samba's credentials.c ends by
+    // storing seed + sequence + 1, and the next call derives from that. Storing
+    // the encrypted credential here makes this server and its client disagree
+    // about the seed from the second call onwards, which is exactly what a
+    // LogonGetCapabilities over the seal reported.
+    channel->seed = serverInput;
     *reply = server;
     return true;
 }
@@ -999,7 +1031,10 @@ QByteArray NetlogonServer::serverAuthenticate(const QByteArray &stub, quint16 op
     channel.sessionKey = sessionKey;
     channel.client = expected;
     channel.server = stepCredential(challenge.server, sessionKey, negotiated);
-    channel.seed = channel.server;
+    // The seed a channel starts from is the client credential the challenge
+    // produced - `netlogon_creds_first_step` sets exactly that - and the first
+    // step of the chain is the one that turns it into the input for the next.
+    channel.seed = channel.client;
     channel.sequence = 0;
     channel.flags = negotiated;
     channel.requestedFlags = requested;
@@ -1034,7 +1069,11 @@ QByteArray NetlogonServer::logonGetCapabilities(const QByteArray &stub)
     Ndr::Reader reader(stub);
     QString serverName;
     QString computerName;
-    if (!readUniqueString(reader, &serverName) || !readUniqueString(reader, &computerName))
+    // server_name is a `[in] [string]` and therefore in place, while
+    // computer_name is `[in,unique] [string]` and carries a referent of its own
+    // (MS-NRPC 3.5.4.4.1 as Samba's netlogon.idl declares it, and as the client
+    // sends it).
+    if (!readStringArray(reader, &serverName) || !readUniqueString(reader, &computerName))
         return statusOnly(kStatusInvalidParameter);
     QByteArray credential;
     quint32 timestamp = 0;
@@ -1058,9 +1097,13 @@ QByteArray NetlogonServer::logonGetCapabilities(const QByteArray &stub)
     if (!stepAuthenticator(&channel.value(), timestamp, credential, &reply))
         return statusOnly(kStatusAccessDenied);
 
-    // The capability arm follows the return authenticator, then the status.
+    // The capability arm follows the return authenticator, then the status. The
+    // union is declared with switch_is(query_level) and is not nodiscriminant, so
+    // the discriminant travels too: a reply without it leaves the client reading
+    // the flags as the switch value (`Bad switch value 0x41074004`).
     QByteArray out = reply;
     putLe32(out, timestamp);
+    putLe32(out, queryLevel);
     putLe32(out, queryLevel == 2 ? channel->requestedFlags : channel->flags);
     putLe32(out, kStatusSuccess);
     emit requestReceived(

@@ -78,6 +78,8 @@ add_library(monarchy-ui-core STATIC
     ../engine/Lsad.cpp
     ../engine/Netlogon.h
     ../engine/Netlogon.cpp
+    ../engine/Schannel.h
+    ../engine/Schannel.cpp
     ../engine/Epm.h
     ../engine/Epm.cpp
     ../engine/Smb1.h

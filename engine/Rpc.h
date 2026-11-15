@@ -96,6 +96,21 @@ using KerberosAcceptor =
 using KerberosFinisher =
     std::function<bool(const QByteArray &token, const KerberosContext &context, QString *error)>;
 
+// The Netlogon security provider (auth_type 0x44, MS-NRPC 3.1.4.2): what an
+// established secure channel hands the pipe it now authenticates — the session
+// key every PDU is signed and sealed with, the flags that decide which
+// algorithms, and the account the channel belongs to.
+struct SchannelCredentials {
+    QByteArray sessionKey;
+    quint32 negotiateFlags = 0;
+    QString account;
+};
+
+// Resolves the channel a bind names. Returning false declines the bind: a pipe
+// is only authenticated by a channel that was established on it.
+using SchannelAcceptor = std::function<bool(const QString &domain, const QString &computer,
+                                            SchannelCredentials *credentials)>;
+
 } // namespace Rpc
 
 // A single-interface RPC endpoint. Only one abstract syntax is served, which is
@@ -129,6 +144,12 @@ public:
     // GSS-API per-message token sealed under the acceptor subkey. DCE/RPC's
     // profile (RFC 4121 §7.1) is used, which is what a Windows DC speaks.
     void setKerberosAcceptor(Rpc::KerberosAcceptor acceptor, Rpc::KerberosFinisher finisher);
+
+    // Netlogon's own provider (auth_type 0x44), which is what
+    // NETLOGON_NEG_AUTHENTICATED_RPC promises: the bind carries an
+    // NL_AUTH_MESSAGE naming the domain and computer, and every PDU after it an
+    // NL_AUTH_SIGNATURE sealed under the channel's session key.
+    void setSchannelAcceptor(Rpc::SchannelAcceptor acceptor);
     // Names the CHALLENGE publishes: the NetBIOS domain and the DC's host name.
     void setDomainNames(const QString &domain, const QString &serverName,
                         const QString &dnsDomain = QString());
@@ -222,6 +243,14 @@ private:
             bool kerberos = false;
             Rpc::KerberosContext gss;
             bool awaitingFinal = false;
+
+            // Netlogon's own state (auth_type 0x44): the channel the bind
+            // named, the key its PDUs are sealed with, and the counter both
+            // sides advance on every PDU (MS-NRPC 3.1.4.2.1).
+            bool schannel = false;
+            QByteArray schannelKey;
+            quint32 schannelFlags = 0;
+            quint64 schannelSeq = 0;
         } security;
     };
 
@@ -236,6 +265,13 @@ private:
         QByteArray token;
         int bodyEnd = 0; // end of the body/stub, padding excluded
     };
+
+    // Accepts the NL_AUTH_MESSAGE a bind carries and answers with the
+    // NL_AUTH_MESSAGE a bind_ack returns, or nothing when the channel it names
+    // is not established.
+    QByteArray acceptSchannelBind(Client *client, const Verifier &verifier);
+    // Verifies one sealed PDU against the channel key and opens its stub.
+    bool verifySchannelRequest(Client *client, const Verifier &verifier, QByteArray *stub);
 
     void handlePdu(Client *client, const QByteArray &pdu);
     QByteArray handleBind(Client *client, const QByteArray &pdu, bool alterContext);
@@ -264,6 +300,7 @@ private:
     Rpc::Authenticator m_authenticator;
     Rpc::KerberosAcceptor m_kerberosAcceptor;
     Rpc::KerberosFinisher m_kerberosFinisher;
+    Rpc::SchannelAcceptor m_schannelAcceptor;
     QString m_domain;
     QString m_serverName;
     QString m_dnsDomain;

@@ -11,6 +11,7 @@
 #include "Ndr.h"
 #include "Krb5.h"
 #include "Ntlm.h"
+#include "Schannel.h"
 
 namespace {
 
@@ -308,6 +309,8 @@ struct ChannelFixture {
     QByteArray sessionKey;
     QByteArray seed;
     quint32 flags = 0;
+    // What the client asked with, which NetrLogonGetCapabilities level 2 answers.
+    quint32 requestedFlags = 0;
 };
 
 // The client half of MS-NRPC 3.1.4.4.1-3.1.4.4.3, computed independently of
@@ -318,6 +321,7 @@ ChannelFixture openChannel(NetlogonServer &server, const QByteArray &machineHash
 {
     ChannelFixture out;
     out.flags = flags;
+    out.requestedFlags = flags;
     const QByteArray clientChallenge = QByteArray::fromHex("1112131415161718");
     const QByteArray challengeReply = server.handleCall(
         Netlogon::OpServerReqChallenge,
@@ -332,7 +336,10 @@ ChannelFixture openChannel(NetlogonServer &server, const QByteArray &machineHash
                             expectedCredential(clientChallenge, out.sessionKey, flags), flags));
     if (authReply.size() != 20 || readLe32(authReply, 16) != 0)
         return out;
-    out.seed = authReply.left(8);
+    // The chain starts from the credential the challenge produced — the one the
+    // client sent — because that is what `netlogon_creds_first_step` stores as
+    // the seed. The reply credential is what the next step derives from it.
+    out.seed = expectedCredential(clientChallenge, out.sessionKey, flags);
     out.ok = true;
     return out;
 }
@@ -447,6 +454,7 @@ private slots:
     void secureChannelNegotiatesCrypto_data();
     void secureChannelNegotiatesCrypto();
     void logonGetCapabilitiesReportsTheChannelFlags();
+    void sealsThePipeWithTheChannelKey();
     void legacySamLogonAuthenticatesSecureChannel_data();
     void legacySamLogonAuthenticatesSecureChannel();
     void refusesALogonOutsideLogonHours();
@@ -543,7 +551,10 @@ void NetlogonTest::legacySamLogonAuthenticatesSecureChannel()
         authenticateRequest(QStringLiteral("DC1$"), QStringLiteral("DC1"),
                             expectedCredential(clientChallenge, sessionKey, flags), flags));
     QCOMPARE(readLe32(authenticateReply, 16), quint32(0));
-    const QByteArray channelSeed = expectedCredential(serverChallenge, sessionKey, flags);
+    // The seed the chain continues from is the client credential the challenge
+    // produced, not the server's reply to it: `netlogon_creds_first_step` stores
+    // exactly that, and the next call derives from seed + timestamp.
+    const QByteArray channelSeed = expectedCredential(clientChallenge, sessionKey, flags);
     const quint32 timestamp = 42;
     const QByteArray requestCredential = nextCredential(channelSeed, timestamp, sessionKey, flags, false);
     const QByteArray userChallenge = QByteArray::fromHex("0102030405060708");
@@ -645,7 +656,10 @@ void NetlogonTest::refusesALogonOutsideLogonHours()
                             expectedCredential(clientChallenge, sessionKey, flags), flags));
     QCOMPARE(readLe32(authenticateReply, 16), quint32(0));
 
-    const QByteArray channelSeed = expectedCredential(serverChallenge, sessionKey, flags);
+    // The seed the chain continues from is the client credential the challenge
+    // produced, not the server's reply to it: `netlogon_creds_first_step` stores
+    // exactly that, and the next call derives from seed + timestamp.
+    const QByteArray channelSeed = expectedCredential(clientChallenge, sessionKey, flags);
     const quint32 timestamp = 43;
     const QByteArray requestCredential = nextCredential(channelSeed, timestamp, sessionKey, flags, false);
     // appendNetworkLogon() marshals a fixed client challenge; the response has
@@ -1144,19 +1158,30 @@ void NetlogonTest::secureChannelNegotiatesCrypto()
 // negotiated a weaker channel sees the difference. Samba calls it right after
 // NetrServerAuthenticate3 and treats "procedure not found" as a downgrade
 // whenever NETLOGON_NEG_SUPPORTS_AES is on the channel.
-QByteArray capabilitiesRequest(const QString &computer, const QByteArray &credential,
-                               quint32 timestamp, quint32 queryLevel)
+QByteArray capabilitiesRequest(const QString &serverName, const QString &computer,
+                               const QByteArray &credential, quint32 timestamp, quint32 queryLevel)
 {
     QByteArray stub;
-    appendLe32(stub, 0); // NULL server_name
-    // computer_name is [unique], so it carries a referent of its own; the
-    // characters follow it, as `net ads join` writes them.
-    appendPointerString(stub, computer, 0x00020004u);
+    // server_name is a `[in] [string]` and travels in place; computer_name is
+    // `[in,unique] [string]` and carries a referent. This is the order and the
+    // padding `net ads join` puts on the wire (captured from the sealed call).
+    appendStringArray(stub, serverName);
+    appendPointerString(stub, computer, 0x00020000u + quint32(stub.size()));
     stub.append(credential);
     appendLe32(stub, timestamp);
     stub.append(QByteArray(12, '\0')); // the client's own return_authenticator
     appendLe32(stub, queryLevel);
     return stub;
+}
+
+// The seed the next call derives from: the input of the reply credential, which
+// `netlogon_creds_step` stores as the new seed.
+QByteArray advanceSeed(const QByteArray &seed, quint32 timestamp)
+{
+    QByteArray out;
+    appendLe32(out, readLe32(seed, 0) + timestamp + 1);
+    out.append(seed.mid(4, 4));
+    return out;
 }
 
 void NetlogonTest::logonGetCapabilitiesReportsTheChannelFlags()
@@ -1179,32 +1204,227 @@ void NetlogonTest::logonGetCapabilitiesReportsTheChannelFlags()
     const ChannelFixture channel = openChannel(server, ntHash, flags);
     QVERIFY(channel.ok);
 
-    const quint32 timestamp = 41;
-    const QByteArray reply = server.handleCall(
-        Netlogon::OpLogonGetCapabilities,
-        capabilitiesRequest(QStringLiteral("DC1"),
-                            nextCredential(channel.seed, timestamp, channel.sessionKey,
-                                           channel.flags, false),
-                            timestamp, 1));
-    QCOMPARE(reply.size(), 20);
-    QCOMPARE(readLe32(reply, 8), timestamp);
-    QCOMPARE(readLe32(reply, 12), flags);
-    QCOMPARE(readLe32(reply, 16), quint32(0));
+    // Level 1 answers the flags the channel negotiated, level 2 the flags the
+    // client asked with; the client compares both against what it holds and
+    // reads the discriminant in front of the arm (`Bad switch value` otherwise).
+    quint32 timestamp = 41;
+    QByteArray seed = channel.seed;
+    for (const quint32 level : {1u, 2u}) {
+        const QByteArray request = capabilitiesRequest(
+            QStringLiteral("\\\\DC1"), QStringLiteral("DC1"),
+            nextCredential(seed, timestamp, channel.sessionKey, channel.flags, false), timestamp,
+            level);
+        const QByteArray reply = server.handleCall(Netlogon::OpLogonGetCapabilities, request);
+        QCOMPARE(reply.size(), 24);
+        QCOMPARE(readLe32(reply, 8), timestamp);
+        QCOMPARE(readLe32(reply, 12), level);
+        QCOMPARE(readLe32(reply, 16), level == 2 ? channel.requestedFlags : flags);
+        QCOMPARE(readLe32(reply, 20), quint32(0));
+        seed = advanceSeed(seed, timestamp);
+        timestamp += 2; // what `netlogon_creds_client_authenticator` does
+    }
 
     // A credential the channel did not produce is refused, and the channel is
     // not stepped: the refusal answers before anything is derived.
     const QByteArray wrong = server.handleCall(
         Netlogon::OpLogonGetCapabilities,
-        capabilitiesRequest(QStringLiteral("DC1"), QByteArray(8, '\0'), timestamp, 1));
+        capabilitiesRequest(QStringLiteral("\\\\DC1"), QStringLiteral("DC1"), QByteArray(8, '\0'),
+                            timestamp, 1));
     QCOMPARE(wrong.size(), 4);
     QCOMPARE(readLe32(wrong, 0), quint32(0xc0000022u)); // STATUS_ACCESS_DENIED
 
     // Query levels are 1 and 2; anything else would have no arm to return.
     const QByteArray unknownLevel = server.handleCall(
         Netlogon::OpLogonGetCapabilities,
-        capabilitiesRequest(QStringLiteral("DC1"), QByteArray(8, '\0'), timestamp, 3));
+        capabilitiesRequest(QStringLiteral("\\\\DC1"), QStringLiteral("DC1"), QByteArray(8, '\0'),
+                            timestamp, 3));
     QCOMPARE(unknownLevel.size(), 4);
     QCOMPARE(readLe32(unknownLevel, 0), quint32(0xc000000du)); // STATUS_INVALID_PARAMETER
+}
+
+// The DCE/RPC framing a Netlogon client uses once its channel exists: a bind
+// that carries an NL_AUTH_MESSAGE, then requests whose stub is sealed under the
+// channel key and whose signature is an NL_AUTH_SIGNATURE.
+QByteArray rpcBindPdu(const QByteArray &token, quint8 authType, quint8 authLevel,
+                      quint32 contextId)
+{
+    QByteArray body;
+    appendLe16(body, 4280); // max_xmit
+    appendLe16(body, 4280); // max_recv
+    appendLe32(body, 1);    // assoc_group
+    body.append(char(1));   // one presentation context
+    body.append(QByteArray(3, '\0'));
+    appendLe16(body, 0);    // context id
+    body.append(char(1));   // one transfer syntax
+    body.append(char(0));
+    body.append(Netlogon::interface().uuid);
+    appendLe16(body, Netlogon::interface().major);
+    appendLe16(body, Netlogon::interface().minor);
+    body.append(Rpc::kNdrSyntaxUuid);
+    appendLe16(body, 2);
+    appendLe16(body, 0);
+    while (body.size() % 4 != 0)
+        body.append(char(0));
+
+    QByteArray pdu;
+    pdu.append(char(5)); // version
+    pdu.append(char(0));
+    pdu.append(char(11)); // MTYPE_BIND
+    pdu.append(char(3));  // first + last frag
+    appendLe32(pdu, 0x00000010u); // drep: little-endian, ASCII, IEEE float
+    appendLe16(pdu, quint16(16 + body.size() + (token.isEmpty() ? 0 : 8 + token.size())));
+    appendLe16(pdu, quint16(token.size()));
+    appendLe32(pdu, 1); // call id
+    pdu.append(body);
+    if (!token.isEmpty()) {
+        pdu.append(char(authType));
+        pdu.append(char(authLevel));
+        pdu.append(char(0)); // pad
+        pdu.append(char(0));
+        appendLe32(pdu, contextId);
+        pdu.append(token);
+    }
+    return pdu;
+}
+
+QByteArray rpcRequestPdu(quint16 opnum, const QByteArray &stub, const QByteArray &signature,
+                         bool sealed)
+{
+    QByteArray payload = stub;
+    const int pad = (4 - (payload.size() % 4)) % 4;
+    payload.append(QByteArray(pad, '\0'));
+
+    QByteArray pdu;
+    pdu.append(char(5));
+    pdu.append(char(0));
+    pdu.append(char(0)); // MTYPE_REQUEST
+    pdu.append(char(3));
+    appendLe32(pdu, 0x00000010u); // drep
+    appendLe16(pdu, quint16(24 + payload.size() + (signature.isEmpty() ? 0 : 8 + signature.size())));
+    appendLe16(pdu, quint16(signature.size()));
+    appendLe32(pdu, 2); // call id
+    appendLe32(pdu, quint32(stub.size())); // alloc_hint
+    appendLe16(pdu, 0);  // context id
+    appendLe16(pdu, opnum);
+    pdu.append(payload);
+    if (!signature.isEmpty()) {
+        pdu.append(char(Schannel::AuthType));
+        pdu.append(char(sealed ? 6 : 5));
+        pdu.append(char(pad));
+        pdu.append(char(0));
+        appendLe32(pdu, 7); // auth_context_id
+        pdu.append(signature);
+    }
+    return pdu;
+}
+
+// What the client's schannel provider sends as the bind's auth_value: the NDR
+// NL_AUTH_MESSAGE, whose strings are NUL-terminated and in place.
+QByteArray bindMessage(quint32 flags, const QString &domain, const QString &computer)
+{
+    QByteArray out;
+    appendLe32(out, Schannel::NegotiateRequest);
+    appendLe32(out, flags);
+    out.append(domain.toLatin1());
+    out.append(char(0));
+    out.append(computer.toLatin1());
+    out.append(char(0));
+    return out;
+}
+
+void NetlogonTest::sealsThePipeWithTheChannelKey()
+{
+    NetlogonServer server;
+    Netlogon::Config config;
+    config.netbios = QStringLiteral("CORP");
+    config.realm = QStringLiteral("CORP.EXAMPLE.COM");
+    config.dnsDomain = QStringLiteral("corp.example.com");
+    config.dcName = QStringLiteral("DC1");
+    config.domainSid = QStringLiteral("S-1-5-21-1-2-3");
+    server.setConfig(config);
+
+    const QByteArray ntHash = Ntlm::ntowfV1(QStringLiteral("Mach!neP@ss1"));
+    const DirectoryObject machine = machineAccount(ntHash);
+    server.setObjectProvider([machine]() { return QList<DirectoryObject>{machine}; });
+
+    // The flags a client that takes up authenticated RPC asks with.
+    const ChannelFixture channel =
+        openChannel(server, ntHash, Netlogon::kNegStrongKeys | Netlogon::kNegSupportsAes
+                                        | Netlogon::kNegAuthenticatedRpc);
+    QVERIFY(channel.ok);
+
+    // The endpoint resolves the channel a bind names, and it is the same key the
+    // authenticate exchange agreed on.
+    Rpc::SchannelCredentials credentials;
+    QVERIFY(server.schannelCredentials(QStringLiteral("CORP"), QStringLiteral("DC1"), &credentials));
+    QCOMPARE(credentials.sessionKey, channel.sessionKey);
+    QVERIFY(credentials.negotiateFlags & Netlogon::kNegAuthenticatedRpc);
+    QCOMPARE(credentials.account, QStringLiteral("DC1$"));
+    // A channel of another domain is not a credential for this one.
+    QVERIFY(!server.schannelCredentials(QStringLiteral("OTHER"), QStringLiteral("DC1"),
+                                        &credentials));
+
+    std::unique_ptr<RpcServer::Channel> pipe(server.rpc()->newChannel());
+    const QByteArray ack = pipe->feed(
+        rpcBindPdu(bindMessage(Schannel::FlagNetbiosDomain | Schannel::FlagNetbiosComputer,
+                               QStringLiteral("CORP"), QStringLiteral("DC1")),
+                   Schannel::AuthType, 6, 7));
+    QCOMPARE(quint8(ack.at(2)), quint8(12)); // MTYPE_BIND_ACK
+    QCOMPARE(readLe16(ack, 10), quint16(12)); // the NL_AUTH_MESSAGE it answers with
+    const QByteArray answer = ack.right(12);
+    QCOMPARE(readLe32(answer, 0), quint32(Schannel::NegotiateResponse));
+    QCOMPARE(readLe32(answer, 4), quint32(0));
+
+    // A sealed request: the stub pads to four bytes, the signature seals it.
+    const quint32 timestamp = 77;
+    const QByteArray stub = capabilitiesRequest(
+        QStringLiteral("\\\\DC1"), QStringLiteral("DC1"),
+        nextCredential(channel.seed, timestamp, channel.sessionKey, channel.flags, false), timestamp,
+        1);
+    const auto sealedRequest = [&](quint64 seq, const QByteArray &key) {
+        QByteArray payload = stub;
+        while (payload.size() % 4 != 0)
+            payload.append(char(0));
+        QByteArray sealed;
+        const QByteArray signature =
+            Schannel::sign(channel.flags, key, seq, true, payload, true, &sealed);
+        return rpcRequestPdu(Netlogon::OpLogonGetCapabilities, stub, signature, true)
+            .replace(24, payload.size(), sealed);
+    };
+
+    const QByteArray reply = pipe->feed(sealedRequest(0, channel.sessionKey));
+    QVERIFY(!reply.isEmpty());
+    QCOMPARE(quint8(reply.at(2)), quint8(2)); // MTYPE_RESPONSE
+    const QByteArray signature = reply.right(Schannel::signatureSize(channel.flags));
+    QByteArray opened = reply.mid(24, reply.size() - 24 - 8 - signature.size());
+    QVERIFY(Schannel::open(channel.flags, channel.sessionKey, 1, false, signature, &opened));
+    QCOMPARE(readLe32(opened, 8), timestamp);
+    QCOMPARE(readLe32(opened, 12), quint32(1)); // the query_level discriminant
+    QCOMPARE(readLe32(opened, 16), channel.flags);
+    QCOMPARE(readLe32(opened, 20), quint32(0));
+
+    // Both sides advance one counter per PDU, so the next request is at 2 and
+    // its reply at 3: a receiver that did not advance them would refuse it.
+    const QByteArray second = pipe->feed(sealedRequest(2, channel.sessionKey));
+    QVERIFY(!second.isEmpty());
+    const QByteArray secondSignature = second.right(Schannel::signatureSize(channel.flags));
+    QByteArray secondOpened = second.mid(24, second.size() - 24 - 8 - secondSignature.size());
+    QVERIFY(Schannel::open(channel.flags, channel.sessionKey, 3, false, secondSignature,
+                           &secondOpened));
+
+    // A key the channel did not agree on is not a seal: the call is dropped, not
+    // served and not answered.
+    QVERIFY(pipe->feed(sealedRequest(4, QByteArray(16, '\x5a'))).isEmpty());
+
+    // And a bind naming a computer this DC holds no channel for is refused, not
+    // accepted unauthenticated.
+    std::unique_ptr<RpcServer::Channel> stranger(server.rpc()->newChannel());
+    const QByteArray refused = stranger->feed(
+        rpcBindPdu(bindMessage(Schannel::FlagNetbiosDomain | Schannel::FlagNetbiosComputer,
+                               QStringLiteral("CORP"), QStringLiteral("ELSEWHERE")),
+                   Schannel::AuthType, 6, 7));
+    QCOMPARE(quint8(refused.at(2)), quint8(12));
+    QCOMPARE(readLe16(refused, 10), quint16(0)); // no verifier: there is no key
 }
 
 void NetlogonTest::passwordSet2WritesTheMachineHash()

@@ -31,7 +31,7 @@ endpoint mapper (135) and SMB (445) stay native under `--dev-ports`.
 | kpasswd (RFC 3244) | 464 / 1464 | `monarchy-kpasswd-tests` | **MIT** `krb5_change_password` / `krb5_set_password` | same, against the daemon |
 | SAMR | 49152 / 1035 | `monarchy-samr-tests` | **impacket** NDR, **Samba** `dcerpc.samr` | `scripts/samr-conformance.py` |
 | LSAD | 49153 / 1036 | `monarchy-lsad-tests` | **impacket** NDR (Samba half needs pidl) | `scripts/lsad-conformance.py --skip-samba` |
-| Netlogon (MS-NRPC) | 1037 / 1037 | `monarchy-netlogon-tests` | **impacket** NDR | `scripts/netlogon-conformance.py` (creates its machine account over SAMR); **Samba** `net ads join` drives challenge → authenticate → capabilities on `\pipe\netlogon` |
+| Netlogon (MS-NRPC) | 1037 / 1037 | `monarchy-netlogon-tests` | **impacket** NDR | `scripts/netlogon-conformance.py` (creates its machine account over SAMR); **Samba** `net ads join` drives challenge → authenticate → capabilities on `\pipe\netlogon`, rebinds that pipe sealed (auth type 0x44) and finishes the join |
 | DRSUAPI | 1038 / 1038 | `monarchy-drs-tests`, `monarchy-drsclient-tests`, `monarchy-replication-tests` | **impacket** NDR | `scripts/drs-conformance.py` |
 | Endpoint mapper (C706) | 135 / 135 | `monarchy-epm-tests` | **impacket** `hept_lookup` / `hept_map`, C706 appendix L towers | `scripts/epm-conformance.py`: each tower's port is opened and bound for the interface it named |
 | The RPC endpoints from **another host's** address | `epmPort` and each RPC port, with `rpcAddress` set off loopback | `monarchy-epm-tests` | **impacket** over the LAN address rather than 127.0.0.1 | `scripts/epm-conformance.py --host <lan>`; `scripts/check-dc-health.sh` asks the same five ports from the host's routable address, and skips when `rpcAddress` is loopback, which is the default posture |
@@ -86,6 +86,7 @@ when you want the narrow loop first.
 | `Lsad.cpp` | `monarchy-lsad-tests` | `lsad-conformance.py --skip-samba` |
 | `Drs.cpp`, `DrsClient.cpp`, `ReplicationAgent.cpp` | `monarchy-drs-tests` `monarchy-drsclient-tests` `monarchy-replication-tests` | `drs-conformance.py` |
 | `Netlogon.cpp` | `monarchy-netlogon-tests` `monarchy-logonhours-tests` `monarchy-workstation-tests` | `netlogon-conformance.py` |
+| `Schannel.cpp`, the auth type it registers in `Rpc.cpp` | `monarchy-netlogon-tests` (`sealsThePipeWithTheChannelKey`) | **Samba** `net ads join` — impacket has no Netlogon security provider, so the independent client for this is the one that seals with it. The suite's bind verifier is the 17-byte one Samba sends, and every sealed byte is checked against Samba's own layout: header, sequence, HMAC, confounder, the CFB8 IV `seq‖seq`, and the AES key `sessionKey ^ 0xf0` |
 | `Epm.cpp` | `monarchy-epm-tests` | `epm-conformance.py` — a tower naming a dead port, or the wrong address, is the failure this catches |
 | `DcService.cpp` (which address a listener binds) | `monarchy-dcservice-tests` `monarchy-epm-tests` | `epm-conformance.py --host <lan>` — a loopback bind passes every probe made on this host |
 | `DnsServer.cpp` | `monarchy-dns-tests` | `scripts/check-dc-health.sh` — the locators *and* the two negative answers |

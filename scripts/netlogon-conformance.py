@@ -528,7 +528,14 @@ def main():
     def open_channel(account, password):
         """A fresh challenge and handshake, so a call that spends the channel
         (a refused logon steps it before the password is looked at) leaves the
-        next check a clean one."""
+        next check a clean one.
+
+        The value a later authenticator is computed from is the seed the
+        handshake leaves behind, and that is the *client* credential it sent --
+        MS-NRPC 3.1.4.4.1, and what `netlogon_creds_first_step` sets
+        `creds->seed` to on both sides. It is not the server credential the
+        reply carries, which is that seed ciphered.
+        """
         nonlocal server_challenge
         request = nrpc.NetrServerReqChallenge()
         request['PrimaryName'] = NULL
@@ -536,7 +543,8 @@ def main():
         request['ClientChallenge'] = client_challenge
         server_challenge = eight(dce.request(request)['ServerChallenge'])
         response, session_key = authenticate(account, password)
-        return session_key, eight(response['ServerCredential']), response['ErrorCode']
+        seed = nrpc.ComputeNetlogonCredential(client_challenge, session_key)
+        return session_key, seed, response['ErrorCode']
 
     if server_challenge:
         try:
@@ -599,9 +607,11 @@ def main():
             try:
                 response, session_key = authenticate(account, password)
                 expected = nrpc.ComputeNetlogonCredential(server_challenge, session_key)
-                # The channel's seed after the handshake is the server
-                # credential; every later authenticator is computed from it.
-                server_credential = eight(response['ServerCredential'])
+                # Every later authenticator is computed from the seed the
+                # handshake leaves: the client credential it sent, not the
+                # server credential the reply carries.
+                server_credential = nrpc.ComputeNetlogonCredential(
+                    client_challenge, session_key)
                 check(CHECKS[5],
                       response['ErrorCode'] == STATUS_SUCCESS
                       and eight(response['ServerCredential']) == expected,
