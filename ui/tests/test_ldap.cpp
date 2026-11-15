@@ -9,6 +9,7 @@
 
 #include "LdapServer.h"
 #include "ObjectGuid.h"
+#include "Ndr.h"
 #include "Ntlm.h"
 #include "SampleData.h"
 #include "ldap_wire_helpers.h"
@@ -184,6 +185,8 @@ private slots:
     void refusesAnExpiredPasswordAtBind();
     void pagesThroughSearchResults();
     void refusesUnknownCriticalControl();
+    void acceptsPermissiveModifyControl();
+    void objectSidIsBinaryOnTheWire();
     void ignoresUnknownOptionalControl();
     void rejectsCookieItDidNotIssue();
     void searchOnMissingBaseIsNoSuchObject();
@@ -423,6 +426,66 @@ void LdapTest::refusesUnknownCriticalControl()
     QVERIFY(!message.isEmpty());
     QCOMPARE(operationTag(message), 0x65);
     QCOMPARE(resultCode(message), 12); // unavailableCriticalExtension
+}
+
+// LDAP_SERVER_PERMISSIVE_MODIFY_OID is the one control besides paged results a
+// client may mark critical here: `net ads join` sends it when it writes the
+// machine account's servicePrincipalName, and refusing it stopped the join.
+void LdapTest::acceptsPermissiveModifyControl()
+{
+    LdapServer server;
+    server.setObjects(sampleObjects());
+    QVERIFY(server.listen(0));
+
+    QTcpSocket client;
+    client.connectToHost(QHostAddress::LocalHost, server.serverPort());
+    QVERIFY(client.waitForConnected(3000));
+    Reader reader(&client);
+    authenticate(client, reader, kSampleUserDn);
+
+    const QByteArray controls =
+        controlsField({control("1.2.840.113556.1.4.1413", QByteArray(), true)});
+    client.write(modifyRequest(2, kSampleUserDn, "description",
+                               {QByteArray("joined by a real client")}, controls));
+    const QByteArray message = reader.next();
+    QVERIFY(!message.isEmpty());
+    QCOMPARE(operationTag(message), 0x67);
+    QCOMPARE(resultCode(message), 0);
+}
+
+// AD defines objectSid as a binary SID and objectGUID as sixteen octets. Sending
+// the textual "S-1-5-..." made Samba's NDR reader read the '-' as a sub-authority
+// count and abandon the join, so the wire form is what this pins down.
+void LdapTest::objectSidIsBinaryOnTheWire()
+{
+    DirectoryObject user;
+    user.id = QString::fromLatin1(kSampleUserDn);
+    user.name = QStringLiteral("Alice Chen");
+    user.kind = ObjectKind::User;
+    user.attributes.insert(QStringLiteral("objectClass"), QStringLiteral("user"));
+    user.attributes.insert(QStringLiteral("sAMAccountName"), QStringLiteral("alice"));
+    const QString sidText = QStringLiteral("S-1-5-21-1-2-3-1001");
+    user.attributes.insert(QStringLiteral("objectSid"), sidText);
+
+    LdapServer server;
+    server.setObjects({user});
+    QVERIFY(server.listen(0));
+
+    QTcpSocket client;
+    client.connectToHost(QHostAddress::LocalHost, server.serverPort());
+    QVERIFY(client.waitForConnected(3000));
+    Reader reader(&client);
+    authenticate(client, reader, kSampleUserDn);
+
+    client.write(searchRequest(2, kSampleUserDn));
+    const QByteArray message = reader.next();
+    QVERIFY(!message.isEmpty());
+    QCOMPARE(operationTag(message), 0x64); // searchResEntry
+
+    const QList<QByteArray> values = entryAttribute(message, QByteArray("objectSid"));
+    QCOMPARE(values.size(), 1);
+    QCOMPARE(values.first(), Ndr::sidFromString(sidText));
+    QVERIFY(values.first().startsWith(QByteArray("\x01\x05", 2)));
 }
 
 // The same control without the critical flag is ignored, and the search runs.

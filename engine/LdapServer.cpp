@@ -10,6 +10,7 @@
 #include "LogonHours.h"
 #include "PasswordAge.h"
 #include "Ntlm.h"
+#include "Ndr.h"
 
 #include <QtNetwork/QTcpSocket>
 #include <QtNetwork/QUdpSocket>
@@ -189,6 +190,12 @@ namespace {
 
 // Paged results, RFC 2696.
 const char kPagedResultsOid[] = "1.2.840.113556.1.4.319";
+// LDAP_SERVER_PERMISSIVE_MODIFY_OID (MS-ADTS 3.1.1.3.4.1.9). Samba's join marks
+// it critical when it sets servicePrincipalName, so refusing it stopped the join
+// at unavailableCriticalExtension; the modify path here already ignores an added
+// value that is present and a deleted one that is not, which is what the control
+// asks for.
+const char kPermissiveModifyOid[] = "1.2.840.113556.1.4.1413";
 
 QString attributeValue(const DirectoryObject &o, const QString &attr)
 {
@@ -1825,7 +1832,8 @@ bool LdapServer::processMessage(ClientState *st, const QByteArray &msg) {
     // RFC 4511 §4.1.11: a control the server does not implement must be refused
     // when the client marks it critical; optional unknown ones are ignored.
     for (const Control &control : controls) {
-        if (control.criticality && control.oid != QLatin1String(kPagedResultsOid)) {
+        if (control.criticality && control.oid != QLatin1String(kPagedResultsOid)
+            && control.oid != QLatin1String(kPermissiveModifyOid)) {
             const int responseTag = opTag == 0x60 ? 0x61
                                     : opTag == 0x63 ? 0x65
                                     : opTag == 0x66 ? 0x67
@@ -2905,7 +2913,21 @@ QByteArray LdapServer::handleAdd(int msgId, const QByteArray &payload) {
             else if (val.contains(QStringLiteral("computer"), Qt::CaseInsensitive)) obj.kind = ObjectKind::Computer;
         }
     }
-    addObject(obj);
+    // An entry with an account name is a security principal and needs its
+    // objectSid, which is also the RID SAMR resolves names to. `addAccount`
+    // allocates it from the domain SID; adding the object directly left the
+    // machine account a `net ads join` creates invisible to SamrLookupNames,
+    // and the join stopped on NT_STATUS_NONE_MAPPED.
+    if (!obj.attributes.value(QStringLiteral("sAMAccountName")).isEmpty()
+        && !domainSidPrefix().isEmpty()) {
+        QString error;
+        if (!addAccount(&obj, &error)) {
+            emit requestReceived(QStringLiteral("Add refused: %1").arg(error));
+            return makeLdapResult(msgId, 0x69, 68); // entryAlreadyExists
+        }
+    } else {
+        addObject(obj);
+    }
     emit requestReceived(QStringLiteral("Add: %1").arg(dn));
     return makeLdapResult(msgId, 0x69, 0);
 }
@@ -3138,6 +3160,42 @@ QByteArray LdapServer::makeSearchEntry(int msgId, const DirectoryObject &o,
     };
 
     QByteArray attrs;
+    // AD defines some attributes as binary: objectSid is a SID and objectGUID a
+    // 16-byte GUID, never text. Sending the string form made Samba's NDR reader
+    // fail on the second octet of "S-1-5-..." (45 sub-authorities) and abort the
+    // join's servicePrincipalName step, so those two go out as their bytes.
+    auto addRawAttr = [&attrs](const QString &type, const QByteArray &value) {
+        QByteArray vals;
+        writeTLV(vals, 0x04, value);
+        QByteArray setVals;
+        writeTLV(setVals, 0x31, vals); // SET
+        QByteArray attrSeq;
+        writeString(attrSeq, 0x04, type);
+        attrSeq.append(setVals);
+        writeTLV(attrs, 0x30, attrSeq);
+    };
+    auto guidBytes = [](const QString &text) {
+        QString hex = text;
+        hex.remove(QLatin1Char('{'));
+        hex.remove(QLatin1Char('}'));
+        hex.remove(QLatin1Char('-'));
+        if (hex.size() != 32)
+            return QByteArray();
+        const QByteArray canonical = QByteArray::fromHex(hex.toLatin1());
+        if (canonical.size() != 16)
+            return QByteArray();
+        // The first three fields are little-endian on the wire (RFC 4122 §4.1.2
+        // as AD encodes it), the last eight octets stay as they are.
+        QByteArray out;
+        for (int i = 3; i >= 0; --i)
+            out.append(canonical.at(i));
+        out.append(canonical.at(5));
+        out.append(canonical.at(4));
+        out.append(canonical.at(7));
+        out.append(canonical.at(6));
+        out.append(canonical.mid(8, 8));
+        return out;
+    };
     auto addAttr = [&attrs](const QString &type, const QStringList &values) {
         if (type.isEmpty())
             return;
@@ -3177,6 +3235,22 @@ QByteArray LdapServer::makeSearchEntry(int msgId, const DirectoryObject &o,
             values = {QDateTime::currentDateTimeUtc().toString(Qt::ISODate)};
         if (key == QLatin1String("cn") && it.value().isEmpty())
             values = {o.name};
+        if (key == QLatin1String("objectsid")) {
+            const QByteArray sid = Ndr::sidFromString(it.value());
+            if (!sid.isEmpty()) {
+                addRawAttr(it.key(), sid);
+                emitted.append(key);
+                continue;
+            }
+        }
+        if (key == QLatin1String("objectguid")) {
+            const QByteArray guid = guidBytes(it.value());
+            if (!guid.isEmpty()) {
+                addRawAttr(it.key(), guid);
+                emitted.append(key);
+                continue;
+            }
+        }
         addAttr(it.key(), values);
         emitted.append(key);
     }

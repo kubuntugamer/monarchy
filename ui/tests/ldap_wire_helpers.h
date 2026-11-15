@@ -102,6 +102,21 @@ inline QByteArray control(const QByteArray &oid, const QByteArray &value,
     return tlv(0x30, body);
 }
 
+// ModifyRequest for one attribute, replacing its values (RFC 4511 §4.6).
+inline QByteArray modifyRequest(int id, const QByteArray &dn, const QByteArray &type,
+                                const QList<QByteArray> &values,
+                                const QByteArray &controls = QByteArray())
+{
+    QByteArray vals;
+    for (const QByteArray &value : values)
+        vals += tlv(0x04, value);
+    QByteArray change;
+    change += tlv(0x0a, QByteArray(1, 0x02)); // replace
+    change += tlv(0x30, tlv(0x04, type) + tlv(0x31, vals));
+    QByteArray inner = tlv(0x04, dn) + tlv(0x30, change);
+    return ldapMessage(id, char(0x66), inner, controls);
+}
+
 inline QByteArray controlsField(const QList<QByteArray> &controls)
 {
     QByteArray inner;
@@ -310,6 +325,55 @@ inline QString entryDn(const QByteArray &message)
     if (!nextElement(op, &pos, &nameTag, &dn))
         return QString();
     return QString::fromUtf8(dn);
+}
+
+// The raw values of one attribute in a SearchResultEntry, empty when the entry
+// does not carry it. Values stay as octets, since AD defines several attribute
+// syntaxes as binary.
+inline QList<QByteArray> entryAttribute(const QByteArray &message, const QByteArray &type)
+{
+    QList<QByteArray> out;
+    int tag = -1;
+    QByteArray op, ignored;
+    if (!splitMessage(message, &tag, &op, &ignored) || tag != 0x64)
+        return out;
+    int pos = 0, partTag = 0;
+    QByteArray dn;
+    if (!nextElement(op, &pos, &partTag, &dn))
+        return out;
+    if (pos >= op.size())
+        return out;
+    int attrsTag = 0;
+    QByteArray attrs;
+    if (!nextElement(op, &pos, &attrsTag, &attrs) || attrsTag != 0x30)
+        return out;
+    int attrPos = 0;
+    while (attrPos < attrs.size()) {
+        int itemTag = 0;
+        QByteArray item;
+        if (!nextElement(attrs, &attrPos, &itemTag, &item) || itemTag != 0x30)
+            break;
+        int itemPos = 0, nameTag = 0;
+        QByteArray name;
+        if (!nextElement(item, &itemPos, &nameTag, &name))
+            break;
+        if (QString::fromUtf8(name).compare(QString::fromUtf8(type), Qt::CaseInsensitive) != 0)
+            continue;
+        int setTag = 0;
+        QByteArray set;
+        if (!nextElement(item, &itemPos, &setTag, &set) || setTag != 0x31)
+            break;
+        int valuePos = 0;
+        while (valuePos < set.size()) {
+            int valueTag = 0;
+            QByteArray value;
+            if (!nextElement(set, &valuePos, &valueTag, &value))
+                break;
+            out.append(value);
+        }
+        return out;
+    }
+    return out;
 }
 
 // controlValue of the paged-results control in a SearchResultDone, or a null

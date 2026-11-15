@@ -202,12 +202,17 @@ bool cfxUnwrapToken(const QByteArray &token, QByteArray *data, int etype,
     const quint8 flags = quint8(token[2]);
     if (flags & 0x01) // sent by an acceptor; we are the acceptor
         return false;
-    quint16 rrc = readBe16(token, 6);
+    // RFC 4121 §4.2.5: the sender rotated the token's body to the right by RRC,
+    // so the last RRC octets of the assembled body are the first ones on the
+    // wire. Receiving it means moving those first RRC octets back to the end —
+    // rotating the other way leaves a body nothing can decrypt, which is how
+    // Samba's sealed LDAP PDU (RRC=28) failed here.
+    const quint16 rrc = readBe16(token, 6);
     QByteArray body = token.mid(16);
     if (!body.isEmpty() && rrc != 0) {
-        rrc = quint16(rrc % quint16(body.size()));
-        if (rrc != 0)
-            body = body.right(rrc) + body.left(body.size() - rrc);
+        const int rotate = int(rrc) % body.size();
+        if (rotate != 0)
+            body = body.mid(rotate) + body.left(rotate);
     }
 
     QByteArray header = token.left(16);

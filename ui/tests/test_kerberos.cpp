@@ -923,6 +923,7 @@ private slots:
     void aesEtypesRoundTrip();
     void aesStringToKeyVectors();
     void dceRpcFraming();
+    void cfxUnwrapsARotatedToken();
     void pacIsSignedAndVerifiable();
 #ifdef MONARCHY_WITH_KRB5
     void pacVerifiesWithMitKrb5();
@@ -1482,6 +1483,56 @@ void initiatorDceToken(const QByteArray &stub, quint64 seq, int etype, const QBy
 }
 
 } // namespace
+
+void KerberosTest::cfxUnwrapsARotatedToken()
+{
+    // RFC 4121 §4.2.5: a sender may rotate the token's body to the right by RRC
+    // so an in-place writer finds its trailer early, and the receiver has to move
+    // those first RRC octets back to the end. Heimdal seals Samba's LDAP PDUs
+    // that way (RRC=28); rotating the other way left a body no key could open,
+    // and the join stalled on a sealed Modify. MIT's gss_wrap, which the rest of
+    // this suite drives, always sends RRC=0, so only a case like this one covers
+    // the receiver's half.
+    const QByteArray key = QByteArray::fromHex(
+        "fe8574e5629c064d8de5103a1e2f6db042c7218981bb6858990a3d1606d716aa");
+    const QByteArray data(124, 'L');
+    const quint64 seq = 0x204b771b;
+
+    // An initiator's sealed token: header, then the confounder, the payload and
+    // the header again, encrypted under KG-USAGE-INITIATOR-SEAL (24).
+    QByteArray header = QByteArray::fromHex("050402ff00000000");
+    for (int shift = 56; shift >= 0; shift -= 8)
+        header.append(char((seq >> shift) & 0xff));
+    // Krb5::encrypt adds the confounder itself; the plaintext is the payload
+    // followed by the header copy the receiver compares against.
+    const QByteArray token = header + Krb5::encrypt(Krb5::kAes256, 24, key, data + header);
+    QVERIFY(!token.isEmpty());
+    QByteArray plain;
+    quint64 received = 0;
+    QVERIFY2(Gss::cfxUnwrapToken(token, &plain, Krb5::kAes256, key, &received),
+             "an unrotated token");
+    QCOMPARE(plain, data);
+
+    const int rrc = 28;
+    QByteArray rotated = token.left(16);
+    const QByteArray body = token.mid(16);
+    rotated.append(body.right(rrc) + body.left(body.size() - rrc));
+    rotated[6] = char((rrc >> 8) & 0xff);
+    rotated[7] = char(rrc & 0xff);
+
+    QVERIFY2(Gss::cfxUnwrapToken(rotated, &plain, Krb5::kAes256, key, &received),
+             "a token rotated the way RFC 4121 §4.2.5 describes");
+    QCOMPARE(plain, data);
+    QCOMPARE(received, seq);
+
+    // The rotation is not optional: the same body announced as RRC=0 does not
+    // open, so the passing case above is not passing by accident.
+    QByteArray mislabelled = rotated;
+    mislabelled[6] = 0;
+    mislabelled[7] = 0;
+    QByteArray ignored;
+    QVERIFY(!Gss::cfxUnwrapToken(mislabelled, &ignored, Krb5::kAes256, key, &received));
+}
 
 void KerberosTest::dceRpcFraming()
 {

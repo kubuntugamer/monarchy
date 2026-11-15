@@ -361,7 +361,9 @@ client selects a layer, every LDAP PDU
 after the bind is carried in length-prefixed GSS-API wrap tokens — RFC 4121
 Wrap tokens for AES contexts, RFC 1964/RFC 4757 sealing for RC4 ones — with the
 per-direction key usages, sequence numbers and checksums those documents
-define. `gss_unwrap` on the client side verifies each one.
+define, including the right-rotation (RRC) an RFC 4121 sender may apply to a
+token's body, which Heimdal does and MIT does not. `gss_unwrap` on the client
+side verifies each one.
 
 The local store is written on exit to the platform application-data directory.
 A provisioned domain stores its directory under `private/` and uses the realm
