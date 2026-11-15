@@ -88,13 +88,19 @@ QByteArray rc4Gss(const QByteArray &key, const QByteArray &state, const QByteArr
 namespace Gss {
 
 const QByteArray kKrb5MechOid = QByteArray::fromHex("2a864886f712010202");
+
+// Microsoft's spelling of it, 1.2.840.48018.1.2.2. A SPNEGO offer may name only
+// this one — impacket's does — so recognising only the IETF OID left a Kerberos
+// token looking like an NTLMSSP message that was neither NEGOTIATE nor
+// AUTHENTICATE, which is answered protocolError.
+const QByteArray kMsKrb5MechOid = QByteArray::fromHex("2a864882f712010202");
 const QByteArray kCfxWrapTokenId = QByteArray("\x05\x04", 2);
 const QByteArray kCfxMicTokenId = QByteArray("\x04\x04", 2);
 const QByteArray kLegacyWrapTokenId = QByteArray("\x02\x01", 2);
 
 bool carriesKerberos(const QByteArray &token)
 {
-    return token.contains(kKrb5MechOid);
+    return token.contains(kKrb5MechOid) || token.contains(kMsKrb5MechOid);
 }
 
 QByteArray kerberosToken(const QByteArray &token)
@@ -165,8 +171,12 @@ QByteArray spnegoResponse(quint8 negState, const QString &mech, const QByteArray
 
 QByteArray spnegoAcceptToken(const QByteArray &apRep)
 {
-    const QByteArray response = spnegoResponse(
-        0, QStringLiteral("1.2.840.113554.1.2.2"), apRep);
+    // accept-completed carries no supportedMech: RFC 4178 §4.2.2 says the field
+    // "MUST be present when the negState is not accept-completed", and Samba's
+    // SPNEGO parser enforces the other direction — naming the mechanism beside
+    // accept-completed is what turned its Kerberos session setup into
+    // NT_STATUS_INVALID_PARAMETER while the AP-REP behind it was well formed.
+    const QByteArray response = spnegoResponse(0, QString(), apRep);
     QByteArray content = Asn1::objectIdentifier(QStringLiteral("1.3.6.1.5.5.2"));
     content.append(response);
     return Asn1::tlv(0x60, content);

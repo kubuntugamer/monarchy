@@ -884,6 +884,20 @@ bool DcService::start(const QString &dcDir)
     // authenticator.
     m_smbServer = new Smb2Server(this);
     m_smbServer->setAuthenticator(authenticator);
+    // Kerberos session setup is plain GSS-API, not DCE/RPC: the AP-REP is sealed
+    // under the service ticket's session key instead of the initiator's subkey,
+    // so this is the acceptor the LDAP SASL bind uses, not the RPC one.
+    m_smbServer->setKerberosAcceptor(
+        [this](const QByteArray &apReq, Rpc::KerberosContext *context, QString *error) {
+            Kdc::ApResult result;
+            if (!m_kdc->acceptApReq(apReq, &result, error))
+                return false;
+            context->user = result.clientPrincipal;
+            context->key = result.contextKey;
+            context->etype = result.contextEtype;
+            context->replyToken = result.replyToken;
+            return true;
+        });
     m_smbServer->setDomainNames(krbRealm.netbios,
                                 dcHost.section(QLatin1Char('.'), 0, 0).toUpper(), dnsDomain);
     m_smbServer->addPipe(QStringLiteral("samr"), m_samrServer->rpc());

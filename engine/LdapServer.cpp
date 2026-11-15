@@ -1930,7 +1930,13 @@ QByteArray LdapServer::handleBind(ClientState *st, int msgId, const QByteArray &
     if (tag >= 0 && len >= 0 && pos + len <= payload.size())
         password = payload.mid(pos, len);
 
-    if (tag == 0x83) // SASL { mechanism, credentials }
+    // SASL { mechanism, credentials } is a SEQUENCE, so a client encodes it as
+    // [3] *constructed* — 0xA3 — and only a loose encoder writes the primitive
+    // 0x83 this server used to require. Accepting one form and not the other is
+    // what made `net ads join`'s LDAP bind fail as "Invalid credentials": the
+    // SASL request fell through to the simple-bind path with the mechanism name
+    // as the DN.
+    if (tag == 0xA3 || tag == 0x83)
         return handleSaslBind(st, msgId, password);
 
     emit requestReceived(QStringLiteral("Bind"));
@@ -2113,8 +2119,9 @@ QByteArray LdapServer::handleSaslBind(ClientState *st, int msgId, const QByteArr
 
     emit requestReceived(QStringLiteral("SASL bind: %1").arg(mechanism));
 
-    if (mechanism.compare(QLatin1String("GSSAPI"), Qt::CaseInsensitive) == 0)
+    if (mechanism.compare(QLatin1String("GSSAPI"), Qt::CaseInsensitive) == 0) {
         return handleGssapiBind(st, msgId, credentials, false);
+    }
 
     // NTLM is what AD uses for password authentication without Kerberos, and
     // GSS-SPNEGO carries either NTLM or a Kerberos AP-REQ wrapped in ASN.1.
@@ -2126,8 +2133,9 @@ QByteArray LdapServer::handleSaslBind(ClientState *st, int msgId, const QByteArr
                                           Qt::CaseInsensitive) == 0;
     // Once a Kerberos context is in progress the follow-up tokens are the
     // security-layer exchange, not new SPNEGO negotiations.
-    if (spnego && (st->saslStage != 0 || Gss::carriesKerberos(credentials)))
+    if (spnego && (st->saslStage != 0 || Gss::carriesKerberos(credentials))) {
         return handleGssapiBind(st, msgId, credentials, true);
+    }
 
     const QByteArray token = Ntlm::embeddedToken(credentials);
     const int type = Ntlm::messageType(token);

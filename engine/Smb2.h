@@ -93,6 +93,12 @@ public:
     // The same authenticator SAMR and LSAD use, so one directory credential
     // opens the pipes as well as the TCP endpoints.
     void setAuthenticator(Rpc::Authenticator authenticator);
+    // Kerberos session setup: the SPNEGO token a client sends carries an AP-REQ
+    // that the KDC accepts, and the same acceptor the RPC bind uses answers it.
+    // Without this a client that has a ticket — every Samba join, because
+    // `net ads join` kinits with its credentials first — is refused, and falls
+    // back to nothing, since a client that chose krb5 does not retry with NTLM.
+    void setKerberosAcceptor(Rpc::KerberosAcceptor acceptor);
     void setDomainNames(const QString &domain, const QString &serverName,
                         const QString &dnsDomain = QString());
 
@@ -149,6 +155,7 @@ private:
     };
     QHash<QString, Share> m_shares;
     Rpc::Authenticator m_authenticator;
+    Rpc::KerberosAcceptor m_kerberosAcceptor;
     QString m_domain;
     QString m_serverName;
     QString m_dnsDomain;

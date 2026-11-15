@@ -76,6 +76,7 @@ CHECKS = [
     'negotiate settles on SMB 2.1 (0x0210) when the client offers it',
     'negotiate settles on SMB 2.0.2 (0x0202) when the client offers only that',
     'an SMB 2.1 session opens SYSVOL and lists the domain directory',
+    'smbclient -k opens SYSVOL on a Kerberos ticket alone',
     'a file read over SMB 2.1 matches the bytes on disk',
     'NETLOGON refuses a write over SMB 2.1 and creates nothing',
     'an SMB1 client negotiates NT LM 0.12 and lists the domain directory',
@@ -93,6 +94,7 @@ CHECKS = [
     NEGOTIATE_21,
     NEGOTIATE_202,
     SESSION,
+    KERBEROS_SESSION,
     FILE_BYTES,
     WRITE_REFUSED,
     SMB1_LIST,
@@ -146,6 +148,23 @@ def smbclient(options, share, command):
         '-U', credential(options),
         '-c', command,
     ])
+
+
+def kerberos_smbclient(options, share, command):
+    """smbclient with -k: it must take a service ticket for cifs/<dc host> and
+    nothing else, so a server that silently falls back to NTLM fails here."""
+    environment = dict(os.environ)
+    environment['KRB5_CONFIG'] = options.krb5_conf
+    environment['KRB5CCNAME'] = options.ccache
+    return subprocess.run([
+        options.smbclient,
+        '//%s/%s' % (options.dc_host.lower(), share),
+        '-m', 'SMB2_10',
+        '-k',
+        '-I', options.host,
+        '-p', str(options.port),
+        '-c', command,
+    ], capture_output=True, text=True, timeout=60, env=environment)
 
 
 def smb1client(options, share, command):
@@ -218,6 +237,10 @@ def main():
     parser.add_argument('--domain', default='MONARCHY')
     parser.add_argument('--dns-domain', default='')
     parser.add_argument('--sysvol-root', default='')
+    parser.add_argument('--realm', default='')
+    parser.add_argument('--dc-host', default='')
+    parser.add_argument('--krb5-conf', default='')
+    parser.add_argument('--kinit', default='kinit')
     parser.add_argument('--smbclient', default='smbclient')
     parser.add_argument('--rpcclient', default='rpcclient')
     parser.add_argument('--list', action='store_true')
@@ -256,6 +279,42 @@ def main():
         check(SESSION, ok, (listed.splitlines()[0] if listed else 'no output') if not ok else '')
     except Exception as error:  # noqa: BLE001
         check(SESSION, False, '%s: %s' % (type(error).__name__, error))
+
+    # The same share over Kerberos. `smbclient -k` has no password to fall back
+    # on, so this only passes if the server accepted the AP-REQ in session setup
+    # and got the signing key out of it: the ticket key, truncated the way SSPI
+    # truncates it. The ticket is asked for by the DC's own name, which is the
+    # SPN the provisioner publishes (cifs/<dc>.<domain>).
+    if not (options.realm and options.dc_host and options.krb5_conf):
+        print('SKIP ' + KERBEROS_SESSION + ' :: --realm, --dc-host and --krb5-conf '
+              'are needed to get a ticket')
+    else:
+        options.ccache = os.path.join(tempfile.gettempdir(),
+                                      'smbconf-%s.cc' % os.urandom(4).hex())
+        environment = dict(os.environ)
+        environment['KRB5_CONFIG'] = options.krb5_conf
+        environment['KRB5CCNAME'] = options.ccache
+        try:
+            ticket = subprocess.run(
+                [options.kinit, '%s@%s' % (options.user, options.realm)],
+                input=options.password + '\n', capture_output=True, text=True,
+                timeout=60, env=environment)
+            if ticket.returncode != 0:
+                check(KERBEROS_SESSION, False, 'kinit: ' + output(ticket).strip())
+            else:
+                result = kerberos_smbclient(options, 'SYSVOL', 'ls')
+                listed = output(result)
+                ok = result.returncode == 0 and dns_domain.lower() in listed.lower()
+                check(KERBEROS_SESSION, ok,
+                      (listed.splitlines()[0] if listed else 'no output') if not ok else '')
+        except Exception as error:  # noqa: BLE001
+            check(KERBEROS_SESSION, False, '%s: %s' % (type(error).__name__, error))
+        finally:
+            for path in (options.ccache,):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
 
     # A file this script writes on disk, read back through the share: the bytes
     # a client sees have to be the bytes that are stored, which a listing alone

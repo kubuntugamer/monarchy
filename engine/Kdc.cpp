@@ -1223,15 +1223,18 @@ bool Kdc::verifyAuthenticator(const QByteArray &apReqDer, const OpenedTicket &ti
     if (!replyToken)
         return true;
 
-    const bool usableSubkey =
-        fields.subkeyEtype != 0 && fields.subkey.size() == Krb5::keySize(fields.subkeyEtype);
-    const QByteArray replyKey = usableSubkey ? fields.subkey : ticket.sessionKey;
-    const int replyEtype = usableSubkey ? fields.subkeyEtype : ticket.sessionEtype;
+    // The AP-REP's EncAPRepPart is encrypted in the service ticket's session key
+    // (RFC 4120 §5.5.2), and it does not carry a subkey of its own: when the
+    // authenticator proposed one, GSS-API keeps that as the context key, so an
+    // echo adds nothing. Both halves were measured against MIT's client — sealing
+    // the reply under the initiator's subkey made it report "Decrypt integrity
+    // check failed for ... aes256", and the context key it then exported was the
+    // subkey it had sent.
+    const QByteArray replyKey = ticket.sessionKey;
+    const int replyEtype = ticket.sessionEtype;
     QByteArray content;
     content.append(contextTag(0, Asn1::generalizedTime(0x18, fields.ctime)));
     content.append(explicitInteger(1, fields.usec));
-    if (usableSubkey)
-        content.append(contextTag(2, encryptionKey(fields.subkey, replyEtype)));
     const QByteArray encPart =
         Krb5::encrypt(replyEtype, 12, replyKey,
                       Asn1::tlv(kEncApRepPartTag, Asn1::sequence(content)));
@@ -1433,7 +1436,12 @@ bool Kdc::acceptDceApReq(const QByteArray &token, ApResult *out, QString *error)
 
     const bool usableSubkey =
         fields.subkeyEtype != 0 && fields.subkey.size() == Krb5::keySize(fields.subkeyEtype);
-    const QByteArray replyKey = usableSubkey ? fields.subkey : ticket.sessionKey;
+    // The AP-REP's EncAPRepPart is encrypted in the service ticket's session key
+    // (RFC 4120 5.5.2), never in the subkey it carries: the subkey is what the
+    // context goes on to use, and MIT's client — Samba's gse_krb5 among them —
+    // reported "Decrypt integrity check failed for ... aes256" when this side
+    // sealed it under the initiator's subkey instead.
+    const QByteArray replyKey = ticket.sessionKey;
     const int replyEtype = usableSubkey ? fields.subkeyEtype : ticket.sessionEtype;
 
     QByteArray content;

@@ -195,7 +195,11 @@ QByteArray saslBindRequest(int msgId, const QByteArray &token, const QByteArray 
     QByteArray inner;
     putInt(inner, 0x02, 3);
     putTLV(inner, 0x04, QByteArray());
-    putTLV(inner, 0x83, sasl); // authenticationChoice [3] SASL
+    // authenticationChoice [3] SASL, constructed, as a real client sends it.
+    // The tag byte is 0xa3 there and the server used to accept only the
+    // primitive 0x83 this helper happened to write, so every SASL bind a
+    // library sent was answered protocolError.
+    putTLV(inner, 0xa3, sasl);
 
     QByteArray msg;
     putInt(msg, 0x02, msgId);

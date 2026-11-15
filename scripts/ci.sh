@@ -343,6 +343,9 @@ PY
     python3 "$root/scripts/smb-conformance.py" --host 127.0.0.1 --port "$smb_port" \
         --user Administrator --password "$conformance_password" \
         --domain "$conformance_domain" --dns-domain "$conformance_dns" \
+        --realm "$conformance_realm" \
+        --dc-host "$(printf '%s' "$conformance_domain" | tr '[:upper:]' '[:lower:]')dc1.$conformance_dns" \
+        --krb5-conf "$dc_dir/krb5.conf" \
         --sysvol-root "$dc_dir/sysvol" || status=1
 
     if ((status != 0)); then

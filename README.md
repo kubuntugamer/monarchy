@@ -42,7 +42,10 @@ exactly as it would to a remote domain controller. Ordinary Kerberos clients
   `NTLM`, GSS-SPNEGO tokens accepted), with CHALLENGE/AUTHENTICATE verified
   against the stored NT hash; and **Kerberos** over SASL `GSSAPI`/`SPNEGO` — the
   same two providers DCE/RPC binds with — so a password never crosses the wire
-  on the two challenge-response paths. Group
+  on the two challenge-response paths. The SASL choice arrives as `[3]` encoded
+  *constructed* (`0xA3`), which is what every library sends; a server reading
+  only the primitive `0x83` sees the mechanism name as a distinguished name and
+  answers `invalidCredentials`, which is how `net ads join` used to fail. Group
   membership is a linked pair of attributes: `member` holds distinguished
   names and every `memberOf` is derived from the groups that list the object,
   so a forged `memberOf` is ignored and deleting an object removes it from

@@ -31,6 +31,9 @@ namespace {
 
 // The NTLMSSP mechanism OID, and the SPNEGO one, as SPNEGO carries them.
 const QString kNtlmMech = QStringLiteral("1.3.6.1.4.1.311.2.2.10");
+// The Kerberos V5 mechanism, as the SPNEGO mechTypes list and the accept
+// response name it.
+const QString kKrb5Mech = QStringLiteral("1.2.840.113554.1.2.2");
 
 void putLe16(QByteArray &out, quint16 value)
 {
@@ -224,6 +227,11 @@ void Smb2Server::addShare(const QString &name, const QString &path, bool readOnl
 void Smb2Server::setAuthenticator(Rpc::Authenticator authenticator)
 {
     m_authenticator = std::move(authenticator);
+}
+
+void Smb2Server::setKerberosAcceptor(Rpc::KerberosAcceptor acceptor)
+{
+    m_kerberosAcceptor = std::move(acceptor);
 }
 
 void Smb2Server::setDomainNames(const QString &domain, const QString &serverName,
@@ -581,9 +589,43 @@ QByteArray Smb2Server::sessionSetup(Connection *connection, const QByteArray &bo
         token = body.mid(at, securityLength);
     }
 
-    const int type = Ntlm::messageType(Ntlm::embeddedToken(token));
     QByteArray replyToken;
-    if (type == 1) {
+    // A session setup carries one of three things: a SPNEGO offer that is
+    // Kerberos (an AP-REQ inside the mechToken), an NTLMSSP NEGOTIATE, or an
+    // NTLMSSP AUTHENTICATE. Kerberos is tried first because its token is a
+    // SPNEGO wrapper rather than a bare NTLMSSP message.
+    if (m_kerberosAcceptor && Gss::carriesKerberos(token)) {
+        Rpc::KerberosContext context;
+        QString error;
+        const QByteArray apReq = Gss::kerberosToken(token);
+        if (!apReq.isEmpty() && m_kerberosAcceptor(apReq, &context, &error)) {
+            connection->sessionId = ++connection->nextSession;
+            connection->authenticated = true;
+            connection->user = context.user;
+            // SMB2 signs with the session key GSS hands the acceptor back, which
+            // is the key the AP-REP published — the context key, not the ticket's
+            // (MS-SMB2 3.2.5.3.1). The ticket key only protects the AP-REP itself.
+            // SMB2 signs with the SSPI session key, not the GSS context key:
+            // MIT's GSS_KRB5_INQ_SSPI_SESSION_KEY — the OID Samba's gse_krb5 asks
+            // for — truncates an AES-256 context key to 16 bytes, and a client
+            // signs with exactly that. Measured: with the full 32-byte subkey the
+            // tree-connect signature failed to verify, and its first 16 bytes
+            // reproduced the client's signature byte for byte.
+            connection->sessionKey = context.key.left(16);
+            // A Kerberos acceptor has nothing left to ask for, so the exchange
+            // finishes in one round trip: the AP-REP goes back and the client's
+            // GSS state machine completes.
+            // A negotiation response is a bare NegTokenResp, never inside the
+            // GSS-API wrapper: Samba's parser reads an APPLICATION 0 token only
+            // as a negTokenInit, and a wrapped response is rejected as
+            // "Invalid SPNEGO request" before any Kerberos code runs.
+            replyToken = Gss::spnegoResponse(0, QString(), context.replyToken);
+            *status = Smb2::StatusSuccess;
+        } else {
+            replyToken = Gss::spnegoResponse(2, kKrb5Mech, QByteArray()); // reject
+            *status = Smb2::StatusLogonFailure;
+        }
+    } else if (const int type = Ntlm::messageType(Ntlm::embeddedToken(token)); type == 1) {
         connection->sessionId = ++connection->nextSession;
         connection->challenge = QByteArray(8, '\0');
         for (int i = 0; i < 8; ++i)
