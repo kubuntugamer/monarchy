@@ -773,45 +773,86 @@ QByteArray Session::transact(const QByteArray &message)
 {
     const Header header = parseHeader(message);
     // WordCount 14 + SetupCount. Setup[0] is the subcommand, Setup[1] the pipe
-    // file id for TRANS_TRANSACT_NMPIPE (0x0026).
+    // file id.
     const quint8 setupCount = header.words.isEmpty() ? 0 : quint8(header.words.at(26));
     const quint16 parameterCount = readLe16(header.words, 18);
     const quint16 parameterOffset = readLe16(header.words, 20);
     if (setupCount < 2)
         return reply(message, kStatusNotSupported, QByteArray(20, '\0'), QByteArray());
     const quint16 subcommand = readLe16(header.words, 28);
-    if (subcommand != 0x0026)
-        return reply(message, kStatusNotSupported, QByteArray(20, '\0'), QByteArray());
-
     const quint16 fid = readLe16(header.words, 30);
     auto it = m_files.find(fid);
+
+    // TRANS_SET_NMPIPE_STATE (0x0001). A Windows 2000 client sets it on a pipe
+    // it has already opened, before it binds DCE/RPC on that handle: the
+    // transaction names `\PIPE\` with an empty pipe name and puts the handle in
+    // Setup[1], which is the same dispatch Samba's `handle_trans` does. The
+    // state asks the transport for message- or byte-mode delivery; every pipe
+    // here is a headless channel to an RPC endpoint that frames itself, so the
+    // state cannot change what a caller gets back and the answer is success with
+    // nothing to read back.
+    if (subcommand == 0x0001) {
+        if (it == m_files.end() || it->kind != OpenFile::Kind::Pipe)
+            return reply(message, kStatusInvalidHandle, QByteArray(20, '\0'), QByteArray());
+        if (parameterCount < 2)
+            return reply(message, kStatusInvalidParameter, QByteArray(20, '\0'),
+                         QByteArray());
+        return transactionReply(message, QByteArray(), false);
+    }
+    if (subcommand != 0x0026)
+        return reply(message, kStatusNotSupported, QByteArray(20, '\0'), QByteArray());
     if (it == m_files.end())
         return reply(message, kStatusInvalidHandle, QByteArray(20, '\0'), QByteArray());
 
+    // TRANS_TRANSACT_NMPIPE (0x0026) writes a PDU to the pipe and reads the
+    // answer back. MS-CIFS puts that input in Trans_Data and Samba's
+    // `api_dcerpc_cmd` reads it there, which is what Windows 2000 does; other
+    // clients put it in Trans_Parameters, which is where this server used to
+    // look and what an SMB1 bind from impacket sends. Both are fed, parameters
+    // first because that is the order they appear in the message, and the answer
+    // goes back in the field the PDU came in so each client reads it where it
+    // expects.
+    const quint16 dataCount = readLe16(header.words, 22);
+    const quint16 dataOffset = readLe16(header.words, 24);
     QByteArray parameters;
     if (parameterOffset < message.size())
-        parameters = message.mid(parameterOffset, parameterCount);
-    feedPipe(&it.value(), parameters);
+        parameters = message.mid(parameterOffset, int(parameterCount));
+    QByteArray data;
+    if (dataOffset < message.size())
+        data = message.mid(dataOffset, int(dataCount));
+    feedPipe(&it.value(), parameters + data);
     QByteArray out = it->pending;
     it->pending.clear();
+    return transactionReply(message, out, dataCount > 0);
+}
 
+QByteArray Session::transactionReply(const QByteArray &message, const QByteArray &out,
+                                     bool inData) const
+{
+    const quint16 size = quint16(out.size());
     QByteArray words;
-    putLe16(words, quint16(out.size())); // TotalParameterCount
-    putLe16(words, 0);                   // TotalDataCount
+    putLe16(words, inData ? 0 : size);   // TotalParameterCount
+    putLe16(words, inData ? size : 0);   // TotalDataCount
     putLe16(words, 0);                   // Reserved1
-    putLe16(words, quint16(out.size())); // ParameterCount
+    putLe16(words, inData ? 0 : size);   // ParameterCount
     putLe16(words, 56);                  // ParameterOffset
     putLe16(words, 0);                   // ParameterDisplacement
-    putLe16(words, 0);                   // DataCount
-    putLe16(words, quint16((out.size() % 2) ? 57 + out.size() : 56 + out.size()));
+    putLe16(words, inData ? size : 0);   // DataCount
+    putLe16(words, 56);                  // DataOffset: the pad byte is at 55
     putLe16(words, 0);                   // DataDisplacement
     words.append(char(0));               // SetupCount
     words.append(char(0));               // Reserved2
 
-    QByteArray data(1, '\0'); // pad so the pipe reply starts at offset 56
-    data.append(out);
-    if (data.size() % 2)
-        data.append(char(0));
+    // A subcommand that answers with nothing (SET_NMPIPE_STATE) sends no byte
+    // block at all, as Samba's `send_trans_reply` does; the offsets stay 56, the
+    // position the pad byte occupies when there is a parameter block.
+    QByteArray data;
+    if (!out.isEmpty()) {
+        data = QByteArray(1, '\0'); // pad so the pipe reply starts at offset 56
+        data.append(out);
+        if (data.size() % 2)
+            data.append(char(0));
+    }
     return reply(message, kStatusSuccess, words, data);
 }
 

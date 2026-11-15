@@ -46,6 +46,9 @@ constexpr quint32 kStatusBadNetworkName = 0xc00000ccu;
 constexpr quint32 kStatusObjectNameNotFound = 0xc0000034u;
 constexpr quint32 kStatusNotSupported = 0xc00000bbu;
 constexpr quint32 kStatusInvalidHandle = 0xc0000008u;
+// A pipe state request that carries no state value: Samba's api_SNPHS refuses
+// the same shape with INVALID_PARAMETER.
+constexpr quint32 kStatusInvalidParameter = 0xc000000du;
 // A FIND_FIRST2 whose pattern matches nothing is an error in SMB1, not an
 // empty success: clients parse the reply as a first record and answer NO_MEMORY
 // when the data block is empty.
@@ -96,6 +99,10 @@ private:
     QByteArray readAndX(const QByteArray &message);
     QByteArray writeAndX(const QByteArray &message);
     QByteArray transact(const QByteArray &message);
+    // The SMB_COM_TRANSACTION response block, shared by every subcommand that
+    // answers with parameters and no data.
+    QByteArray transactionReply(const QByteArray &message, const QByteArray &out,
+                               bool inData) const;
     QByteArray trans2(const QByteArray &message);
     // FIND_FIRST2 / FIND_NEXT2 / FIND_CLOSE2, the TRANS2 half a directory
     // listing needs. MS-CIFS 2.2.6.3.

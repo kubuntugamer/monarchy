@@ -125,6 +125,23 @@ DC believes it started.
 These are places where a change can pass everything and still be wrong. They are
 recorded, not hidden:
 
+- **G12 — a Windows 2000 client's pipe transactions stop at domain
+  discovery.** Two shapes were missing and are now answered: the
+  `TRANS_SET_NMPIPE_STATE` (0x0001) request a 2000 client sends on `\PIPE\`
+  before it binds, and `TRANS_TRANSACT_NMPIPE` (0x0026) with the PDU in
+  Trans_Data rather than Trans_Parameters. With both in place the client binds
+  `\pipe\NETLOGON` and the DC log reads `netlogon bind accepted`, where before
+  it logged the session off after the open. It still stops one call later, at
+  `NetrDsrEnumerateDomainTrusts` (opnum 40, the "domains in the forest" the
+  wizard reports), which answers `STATUS_NOT_SUPPORTED` and reads to that client
+  as `A remote procedure call (RPC) protocol error occurred`. The response —
+  WERROR plus a `NETLOGON_DOMAIN_TRUST_ARRAY` — was tried here in three
+  encodings and rejected by the client as `The array bounds are invalid` and by
+  `rpcclient -c dsr_enumtrustdom` as `HRES code 0xc000008c`, so the wire layout
+  is still unknown and none of the three was committed. Samba answers the call
+  `WERR_NOT_SUPPORTED` too. Nothing in the tree claims a 2000 replica can be
+  promoted; this entry is the reason it cannot yet.
+
 - **G11 — share enumeration is absent.** The probe that reaches the server is
   the pipe open: `rpcclient -c netshareenum` fails with
   `Could not initialise srvsvc. Error was NT_STATUS_OBJECT_NAME_NOT_FOUND`, while

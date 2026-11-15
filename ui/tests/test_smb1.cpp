@@ -207,6 +207,46 @@ QByteArray queryFileMessage(quint16 tid, quint16 fid, quint16 level)
     return smb(Smb1::CmdTrans2, tid, 0x1234, words, data);
 }
 
+// SMB_COM_TRANSACTION to a pipe the client has already opened, addressed the
+// way Windows 2000 addresses it: the name field is `\PIPE\` with the pipe name
+// left empty, Setup[0] is the subcommand, Setup[1] the handle, and the
+// parameters sit between the name and the data.
+// `inData` puts the payload in Trans_Data instead of Trans_Parameters, which is
+// where MS-CIFS and Windows 2000 carry a pipe PDU; the parameter field is where
+// this server used to look, and where an SMB1 bind from impacket arrives.
+QByteArray pipeTransactMessage(quint16 tid, quint16 fid, quint16 subcommand,
+                               const QByteArray &payload, bool inData = false)
+{
+    QByteArray words(28, '\0');
+    const char lo = char(payload.size() & 0xff);
+    const char hi = char((payload.size() >> 8) & 0xff);
+    if (inData) {
+        words[2] = lo;
+        words[3] = hi;  // TotalDataCount
+        words[22] = lo;
+        words[23] = hi; // DataCount
+    } else {
+        words[0] = lo;
+        words[1] = hi;  // TotalParameterCount
+        words[18] = lo;
+        words[19] = hi; // ParameterCount
+    }
+    words[20] = char(84); // ParameterOffset
+    words[21] = char(0);
+    words[24] = char(84); // DataOffset
+    words[25] = char(0);
+    words[26] = char(2);  // SetupCount
+    putLe16(words, subcommand);
+    putLe16(words, fid);
+
+    QByteArray data(1, '\0'); // Pad1
+    data.append(utf16le(QStringLiteral("\\PIPE\\")));
+    data.append(QByteArray(2, '\0')); // the empty pipe name's terminator
+    data.append(QByteArray(2, '\0')); // Pad2, so the payload starts at 84
+    data.append(payload);
+    return smb(Smb1::CmdTrans, tid, 0x1234, words, data);
+}
+
 QByteArray readMessage(quint16 tid, quint16 fid, quint32 offset, quint16 count)
 {
     QByteArray words(24, '\0');
@@ -269,13 +309,18 @@ private slots:
     void refusesTraversalOutOfTheShare();
     void refusesWrites();
     void answersARawNtlmTokenWithoutSpnego();
+    void setsTheStateOfAnOpenPipe();
 
 private:
     QTemporaryDir m_root;
     QByteArray m_fileBytes;
     QString m_fileRelative;
+    // An RPC endpoint for the pipe cases. It is never bound: the state request
+    // is answered by the pipe layer and must not reach the endpoint at all.
+    RpcServer m_pipeEndpoint;
 
     Smb1::Session *plainSession();
+    Smb1::Session *pipeSession();
     Smb1::Session *authenticatedSession();
     quint16 connectShare(Smb1::Session *session, const QString &share);
 };
@@ -294,6 +339,23 @@ Smb1::Session *Smb1Test::plainSession()
         },
         QStringLiteral("MONARCHY"), QStringLiteral("DC1"), QStringLiteral("monarchy.test"),
         shares);
+}
+
+// The IPC$ share with `\pipe\netlogon` behind it, unauthenticated: a 2000
+// client opens its pipe through an anonymous IPC$ session for the browse path.
+Smb1::Session *Smb1Test::pipeSession()
+{
+    QHash<QString, RpcServer *> pipes;
+    pipes.insert(QStringLiteral("netlogon"), &m_pipeEndpoint);
+
+    return new Smb1::Session(
+        pipes,
+        [](const Rpc::AuthRequest &, Ntlm::SessionKeys *keys) {
+            *keys = Ntlm::SessionKeys();
+            return true;
+        },
+        QStringLiteral("MONARCHY"), QStringLiteral("DC1"), QStringLiteral("monarchy.test"),
+        QHash<QString, QString>());
 }
 
 // A GPO-shaped tree: SYSVOL\<domain>\Policies\{GUID}\Machine\Registry.pol.
@@ -522,6 +584,84 @@ void Smb1Test::answersARawNtlmTokenWithoutSpnego()
     const QByteArray wrappedBlob = payloadOf(wrappedReply);
     QVERIFY(readLe16(wrappedBlob, 33 + 6) > 32);
     QCOMPARE(wrappedBlob.at(43), char(0xa1)); // NegTokenResp
+}
+
+// Windows 2000 sets a named pipe's handle state on the handle it has already
+// opened, before it binds DCE/RPC on that pipe. The DC answered NOT_SUPPORTED,
+// and dcpromo stopped at "The RPC server is unavailable" having just opened
+// \pipe\NETLOGON: the bind it wanted to send next was never sent.
+void Smb1Test::setsTheStateOfAnOpenPipe()
+{
+    QScopedPointer<Smb1::Session> session(pipeSession());
+    QVERIFY(session);
+    const quint16 tid = connectShare(session.data(), QStringLiteral("IPC$"));
+    QVERIFY(tid != 0);
+    const QByteArray createReply =
+        session->feed(ntCreateMessage(tid, QStringLiteral("pipe\\NETLOGON")));
+    QCOMPARE(statusOf(createReply), quint32(0));
+    const quint16 fid = readLe16(payloadOf(createReply), 38);
+
+    // The state a 2000 client sets here is message mode, and the only thing the
+    // caller can observe is whether the request was accepted.
+    const QByteArray stateReply =
+        session->feed(pipeTransactMessage(tid, fid, 0x0001, QByteArray("\0\1", 2)));
+    QCOMPARE(statusOf(stateReply), quint32(0));
+    // The reply is the transaction block and nothing else: ten words, zero
+    // counts, an empty byte block. An unexpected byte block would show up here.
+    QCOMPARE(stateReply.size(), 4 + 32 + 1 + 20 + 2);
+    const QByteArray message = payloadOf(stateReply);
+    QCOMPARE(quint8(message.at(32)), quint8(10));     // WordCount
+    QCOMPARE(readLe16(message, 33), quint16(0));      // TotalParameterCount
+    QCOMPARE(readLe16(message, 39), quint16(0));      // ParameterCount
+    QCOMPARE(readLe16(message, 53), quint16(0));      // ByteCount
+
+    // A pipe subcommand that is not implemented is still refused, so the answer
+    // above is this one shape and not a blanket reply to every transaction.
+    QCOMPARE(statusOf(session->feed(pipeTransactMessage(tid, fid, 0x0021,
+                                                       QByteArray("\0\1", 2)))),
+             Smb1::kStatusNotSupported);
+
+    // A state request that carries no state value is refused the way Samba's
+    // api_SNPHS refuses the same shape.
+    QCOMPARE(statusOf(session->feed(pipeTransactMessage(tid, fid, 0x0001, QByteArray()))),
+             Smb1::kStatusInvalidParameter);
+
+    // The handle has to be one this session opened, or the state would be set
+    // on nothing in particular.
+    QCOMPARE(statusOf(session->feed(pipeTransactMessage(tid, 0x7777, 0x0001,
+                                                       QByteArray("\0\1", 2)))),
+             Smb1::kStatusInvalidHandle);
+
+    // The bind this client sends next, byte for byte as it went on the wire: a
+    // DCE/RPC bind for NETLOGON carried in Trans_Data. The answer has to come
+    // back in Trans_Data, which is where the client reads it, and it has to be
+    // the DCE/RPC reply rather than an empty block.
+    const QByteArray bind = QByteArray::fromHex(
+        "05000b03100000004800000001000000b810b810000000000100000000000100"
+        "785634123412cdabef0001234567cffb01000000045d888aeb1cc9119fe808002b104860"
+        "02000000");
+    const QByteArray bindReply =
+        session->feed(pipeTransactMessage(tid, fid, 0x0026, bind, true));
+    QCOMPARE(statusOf(bindReply), quint32(0));
+    const QByteArray answer = payloadOf(bindReply);
+    const quint16 dataCount = readLe16(answer, 35); // TotalDataCount
+    QVERIFY(dataCount > 0);
+    QCOMPARE(readLe16(answer, 39), quint16(0)); // ParameterCount
+    QCOMPARE(readLe16(answer, 45), dataCount);  // DataCount
+    // The offset the reply names has to be where the PDU actually starts.
+    const quint16 dataOffset = readLe16(answer, 47);
+    QCOMPARE(answer.mid(int(dataOffset), 2), QByteArray("\x05\x00", 2));
+
+    // A client that sent the PDU in the parameter field still reads its answer
+    // there, so the field it used is the field that carries the reply.
+    const QByteArray paramReply =
+        session->feed(pipeTransactMessage(tid, fid, 0x0026, bind));
+    QCOMPARE(statusOf(paramReply), quint32(0));
+    const QByteArray paramMessage = payloadOf(paramReply);
+    QVERIFY(readLe16(paramMessage, 39) > 0);                   // ParameterCount
+    QCOMPARE(readLe16(paramMessage, 45), quint16(0));          // DataCount
+    QCOMPARE(paramMessage.mid(int(readLe16(paramMessage, 41)), 2),
+             QByteArray("\x05\x00", 2)); // a DCE/RPC 5.0 PDU at ParameterOffset
 }
 
 QTEST_GUILESS_MAIN(Smb1Test)
