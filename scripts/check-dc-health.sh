@@ -135,11 +135,33 @@ if ! command -v python3 >/dev/null 2>&1; then
 else
     LOCATOR="$(python3 - "$DC_IP" "$LDAP_PORT" <<'PY'
 import socket, sys
+# Samba's own ping, and the answer has to carry the binary Netlogon blob: the
+# named attributes are not what `net ads lookup` reads, so a DC that answers
+# without the blob is a DC Samba still cannot find.
 ping = bytes.fromhex(
     "3035020300fb3d632e0400"
     "0a01000a0100020100020100010100"
     "a00fa30d04054e74566572040406000000"
     "300a04084e65744c6f676f6e")
+
+def messages(data):
+    """Split a datagram into its LDAPMessages, as a client does."""
+    out, at = [], 0
+    while at < len(data):
+        start = at + 1
+        length = data[start]
+        start += 1
+        if length & 0x80:
+            count = length & 0x7F
+            length = int.from_bytes(data[start:start + count], "big")
+            start += count
+        end = start + length
+        if end > len(data):
+            raise ValueError("message overruns the datagram")
+        out.append(data[at:end])
+        at = end
+    return out
+
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.settimeout(2.0)
 try:
@@ -148,7 +170,17 @@ try:
 except OSError:
     print("no answer")
 else:
-    print("answered" if b"DnsDomain" in data else "answered without a domain")
+    try:
+        split = messages(data)
+    except ValueError as error:
+        print("answer does not split into LDAPMessages: %s" % error)
+    else:
+        if len(split) != 2:
+            print("answer is %d LDAPMessages, not the entry and the result" % len(split))
+        elif b"Netlogon" not in split[0] or b"\x17\x00" not in split[0]:
+            print("answer carries no Netlogon response")
+        else:
+            print("answered")
 finally:
     sock.close()
 PY

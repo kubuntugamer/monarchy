@@ -97,6 +97,26 @@ QByteArray locatorPing(const QByteArray &domain, int id = 7)
     return ldapMessage(id, char(0x63), inner);
 }
 
+// Samba's locator ping, as `net ads lookup` puts it on the wire: the filter
+// asserts NtVer alone and the attribute list names one attribute, NetLogon. A
+// client that sends this reads the binary blob in the answer and nothing else,
+// so it is the shape that decides whether the DC is findable at all.
+QByteArray sambaLocatorPing(int id = 0x0000FB3D)
+{
+    QByteArray filter = tlv(char(0xa0),
+                            tlv(char(0xa3), tlv(0x04, "NtVer")
+                                                + tlv(0x04, QByteArray("\x06\x00\x00\x00", 4))));
+    QByteArray inner = tlv(0x04, QByteArray());        // base: the root DSE
+    inner += tlv(char(0x0a), QByteArray(1, char(0)));   // scope: baseObject
+    inner += tlv(char(0x0a), QByteArray(1, char(0)));   // derefAliases: never
+    inner += tlv(char(0x02), QByteArray(1, char(0)));   // sizeLimit
+    inner += tlv(char(0x02), QByteArray(1, char(0)));   // timeLimit
+    inner += tlv(char(0x01), QByteArray(1, char(0)));   // typesOnly: FALSE
+    inner += filter;
+    inner += tlv(char(0x30), tlv(0x04, "NetLogon"));    // one attribute named
+    return ldapMessage(id, char(0x63), inner);
+}
+
 // The GUID a Windows client is told and then matches against the directory, in
 // the byte order a GUID wears on the wire.
 QByteArray wireGuid(const QUuid &guid)
@@ -829,6 +849,27 @@ void LdapTest::answersTheDcLocatorPingOverUdp()
     QCOMPARE(operationTag(reply), 0x64); // searchResEntry
     QCOMPARE(messageId(reply), 7);
 
+    // The answer is two LDAPMessages back to back — the entry, then the result —
+    // each its own SEQUENCE. Wrapping both in one SEQUENCE is not an LDAPMessage:
+    // a client decodes the message id, finds no searchResDone after it, and drops
+    // the answer. This server did exactly that until `net ads lookup` was driven
+    // against it, because the only decoder reading the answer was its own.
+    QList<QByteArray> messages;
+    int pos = 0;
+    while (pos < reply.size()) {
+        const int start = pos;
+        int tag = 0;
+        QByteArray body;
+        QVERIFY2(nextElement(reply, &pos, &tag, &body), "a message did not parse");
+        QCOMPARE(tag, 0x30);
+        messages.append(reply.mid(start, pos - start));
+    }
+    QCOMPARE(messages.size(), 2);
+    QCOMPARE(operationTag(messages.at(0)), 0x64);
+    QCOMPARE(operationTag(messages.at(1)), 0x65);
+    QCOMPARE(messageId(messages.at(1)), 7);
+    QCOMPARE(messages.at(0) + messages.at(1), reply);
+
     // What the client reads to decide this DC hosts the domain.
     QVERIFY(reply.contains("DnsDomain"));
     QVERIFY(reply.contains("corp.example.com"));
@@ -845,6 +886,29 @@ void LdapTest::answersTheDcLocatorPingOverUdp()
     // the same object, so a join can match them up.
     QVERIFY(reply.contains("DomainGuid"));
     QVERIFY(reply.contains(wireGuid(objectGuidFor(QStringLiteral("DC=corp,DC=example,DC=com")))));
+
+    // Samba's ping asks for one attribute, so the entry carries one: its client
+    // rejects any answer whose entry is not exactly one attribute called
+    // netlogon, and the blob below is what it then reads.
+    const QByteArray strict = udpQuery(server.cldapPort(), sambaLocatorPing());
+    QVERIFY2(!strict.isEmpty(), "Samba's ping went unanswered");
+    QVERIFY(strict.contains("Netlogon"));
+    QVERIFY2(!strict.contains("DnsDomain"),
+             "the answer carried an attribute the ping did not ask for");
+
+    // NETLOGON_SAM_LOGON_RESPONSE_EX, as Samba's nbt.idl defines it with
+    // NDR_NOALIGN. The command word, then the capability word with no 2008+ bits
+    // (the domain records no functional level), and the two legacy tokens at the
+    // end, which a client checks before it reads anything above them.
+    QVERIFY(strict.contains(QByteArray("\x17\x00" "\x00\x00" "\xbd\x01\x00\x00", 8)));
+    QVERIFY(strict.contains(QByteArray("\x05\x00\x00\x00\xff\xff\xff\xff", 8)));
+    // The strings are DNS label lists — a length byte per label and a closing
+    // NUL — not UTF-16 and not NUL-terminated text, which is the part the wire
+    // documentation does not say out loud.
+    QVERIFY(strict.contains(QByteArray("\x04" "corp" "\x07" "example" "\x03" "com" "\x00", 18)));
+    QVERIFY(strict.contains(QByteArray("\x03" "dc1" "\x04" "corp" "\x07" "example" "\x03" "com\x00", 22)));
+    QVERIFY(strict.contains(QByteArray("\x04" "CORP" "\x00", 6)));
+    QVERIFY(strict.contains(QByteArray("\x03" "DC1" "\x00", 5)));
 }
 
 // The ping names the domain it is looking for. Answering a different name

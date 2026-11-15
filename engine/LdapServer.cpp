@@ -459,6 +459,7 @@ QByteArray LdapServer::cldapResponse(const QByteArray &request) const {
     // so it is answered — refusing it looked exactly like a DC being absent,
     // which is the failure this reply exists to prevent.
     int domainIndex = -1;
+    int userIndex = -1;
     bool asksAboutDomain = false;
     for (int i = 0; i < assertions.size(); ++i) {
         const QString &assertion = assertions.at(i);
@@ -467,6 +468,8 @@ QByteArray LdapServer::cldapResponse(const QByteArray &request) const {
             asksAboutDomain = true;
         } else if (assertion.compare(QStringLiteral("NtVer"), Qt::CaseInsensitive) == 0) {
             asksAboutDomain = true;
+        } else if (assertion.compare(QStringLiteral("User"), Qt::CaseInsensitive) == 0) {
+            userIndex = i + 1;
         }
     }
     if (!asksAboutDomain) return {};
@@ -514,6 +517,30 @@ QByteArray LdapServer::cldapResponse(const QByteArray &request) const {
         break;
     }
 
+    // The search names the attributes it wants back, and the entry carries those
+    // and no others: an absent list means every attribute, a list means the ones
+    // named. This is load-bearing rather than tidy. Samba's locator client
+    // refuses any answer whose entry is not exactly one attribute called
+    // netlogon (`num_attributes != 1` in libads/netlogon_ping.c), so a DC that
+    // answers every ping with its whole attribute set cannot be found by
+    // `net ads lookup` however good its Netlogon blob is.
+    QList<QByteArray> requested;
+    bool allAttributes = true;
+    if (const Asn1::Element *attributeList = Asn1::child(*search, 0x30)) {
+        for (const Asn1::Element &item : attributeList->children) requested.append(item.value);
+        // An empty list is not "no attributes": RFC 4511 4.5.1.8 makes it mean
+        // all user attributes, the same as no list at all.
+        allAttributes = requested.isEmpty();
+    }
+    auto wants = [&requested, allAttributes](const char *name) {
+        if (allAttributes) return true;
+        for (const QByteArray &asked : requested) {
+            if (asked == "*") return true;
+            if (asked.compare(name, Qt::CaseInsensitive) == 0) return true;
+        }
+        return false;
+    };
+
     auto attribute = [](const QString &type, const QByteArray &value) {
         QByteArray set;
         writeTLV(set, 0x04, value);
@@ -526,22 +553,104 @@ QByteArray LdapServer::cldapResponse(const QByteArray &request) const {
     };
 
     QByteArray attributes;
-    attributes.append(attribute(QStringLiteral("DnsDomain"), m_identity.dnsDomain.toUtf8()));
+    if (wants("DnsDomain"))
+        attributes.append(attribute(QStringLiteral("DnsDomain"), m_identity.dnsDomain.toUtf8()));
     // One namespace here: the domain is its own forest root.
-    attributes.append(attribute(QStringLiteral("DnsForestName"), m_identity.dnsDomain.toUtf8()));
-    attributes.append(attribute(QStringLiteral("DcSiteName"), site.toUtf8()));
-    attributes.append(attribute(QStringLiteral("NetbiosDomainName"), m_identity.netbios.toUtf8()));
-    attributes.append(attribute(QStringLiteral("NetbiosComputerName"), netbiosHost.toUtf8()));
+    if (wants("DnsForestName"))
+        attributes.append(
+            attribute(QStringLiteral("DnsForestName"), m_identity.dnsDomain.toUtf8()));
+    if (wants("DcSiteName"))
+        attributes.append(attribute(QStringLiteral("DcSiteName"), site.toUtf8()));
+    if (wants("NetbiosDomainName"))
+        attributes.append(attribute(QStringLiteral("NetbiosDomainName"), m_identity.netbios.toUtf8()));
+    if (wants("NetbiosComputerName"))
+        attributes.append(
+            attribute(QStringLiteral("NetbiosComputerName"), netbiosHost.toUtf8()));
     // DnsHostName is the name a client puts in its DC list; HostName is what a
     // Windows DC also publishes, so both are here.
-    attributes.append(attribute(QStringLiteral("DnsHostName"), host.toUtf8()));
-    attributes.append(attribute(QStringLiteral("HostName"), host.toUtf8()));
+    if (wants("DnsHostName"))
+        attributes.append(attribute(QStringLiteral("DnsHostName"), host.toUtf8()));
+    if (wants("HostName"))
+        attributes.append(attribute(QStringLiteral("HostName"), host.toUtf8()));
     // NT_VERSION_5 | NT_VERSION_5EX: the capabilities mask a Windows DC
     // publishes, and the value the locator's own filter asks for.
-    attributes.append(attribute(QStringLiteral("NtVer"), QByteArray("\x06\x00\x00\x00", 4)));
-    if (!domainGuid.isEmpty())
+    if (wants("NtVer"))
+        attributes.append(attribute(QStringLiteral("NtVer"), QByteArray("\x06\x00\x00\x00", 4)));
+    if (!domainGuid.isEmpty() && wants("DomainGuid"))
         attributes.append(attribute(QStringLiteral("DomainGuid"), domainGuid));
-    attributes.append(attribute(QStringLiteral("LdapService"), QByteArray("LDAP")));
+    if (wants("LdapService"))
+        attributes.append(attribute(QStringLiteral("LdapService"), QByteArray("LDAP")));
+
+    if (wants("NetLogon")) {
+        // The locator's second answer, the binary blob `net ads lookup` and
+        // Windows both parse: NETLOGON_SAM_LOGON_RESPONSE_EX as Samba's
+        // librpc/idl/nbt.idl defines it, pushed with NDR_NOALIGN. Two things
+        // about that encoding are easy to get wrong from the docs alone. The
+        // strings are DNS label lists — a length byte per label and a closing
+        // NUL — not UTF-16 and not NUL-terminated text. And the last eight
+        // bytes are load-bearing: a client reads nt_version from length-8 and
+        // rejects the blob unless 0xffff follows it twice, as the two legacy
+        // tokens. Nothing here is declared by the LDAP attribute layer, so a
+        // wrong layout is silent: the client simply says it found no DC.
+        QByteArray blob;
+        blob.append(char(23));
+        blob.append(char(0)); // LOGON_SAM_LOGON_RESPONSE_EX
+        blob.append(char(0));
+        blob.append(char(0)); // sbz
+        // What this server actually is: a writable AD DC that hosts LDAP, the
+        // GC and the KDC, and answers the PDC query. No time service (there is
+        // no NTP server here), and no 2008/2012 bits: the domain records
+        // domainFunctionality 0, so a client must not be told otherwise.
+        const quint32 serverType = 0x00000001 // PDC emulator
+                                   | 0x00000004 // GC
+                                   | 0x00000008 // LDAP
+                                   | 0x00000010 // DS
+                                   | 0x00000020 // KDC
+                                   | 0x00000080 // closest site
+                                   | 0x00000100; // writable
+        for (int i = 0; i < 4; ++i) blob.append(char((serverType >> (8 * i)) & 0xff));
+        blob.append(domainGuid.leftJustified(16, '\0', true));
+        // NBT strings: one length-prefixed label at a time, then a NUL. An empty
+        // string is that NUL alone, which is why the guard is on the whole name
+        // rather than on each label.
+        auto labelList = [](const QString &name) {
+            QByteArray out;
+            if (!name.isEmpty()) {
+                for (const QByteArray &label : name.toUtf8().split('.')) {
+                    out.append(char(label.size()));
+                    out.append(label);
+                }
+            }
+            out.append('\0');
+            return out;
+        };
+        const QString user = (userIndex > 0 && userIndex < assertions.size())
+                                 ? assertions.at(userIndex)
+                                 : QString();
+        blob.append(labelList(m_identity.dnsDomain)); // forest
+        blob.append(labelList(m_identity.dnsDomain)); // dns_domain
+        blob.append(labelList(host.toLower()));       // pdc_dns_name
+        blob.append(labelList(m_identity.netbios));   // domain_name (pre-2000)
+        blob.append(labelList(netbiosHost));          // pdc_name
+        blob.append(labelList(user));                 // user_name
+        blob.append(labelList(site));                 // server_site
+        // One site: every client computes into it, so the client's site is this
+        // DC's site and the CLOSEST bit above says so.
+        blob.append(labelList(site)); // client_site
+        // NT_VERSION_1 | NT_VERSION_5EX, which is what selects the EX layout in
+        // a client's parser — the same choice Samba's own CLDAP server makes.
+        // The IP address and closest-site fields are absent with these bits, so
+        // the blob stays the same whatever mask the client asked with.
+        blob.append(char(0x05));
+        blob.append(char(0x00));
+        blob.append(char(0x00));
+        blob.append(char(0x00));
+        blob.append(char(0xff));
+        blob.append(char(0xff)); // lmnt_token
+        blob.append(char(0xff));
+        blob.append(char(0xff)); // lm20_token
+        attributes.append(attribute(QStringLiteral("Netlogon"), blob));
+    }
 
     QByteArray entry;
     writeString(entry, 0x04, QString()); // objectName: the root DSE
@@ -554,13 +663,22 @@ QByteArray LdapServer::cldapResponse(const QByteArray &request) const {
     writeString(done, 0x04, QString());
     writeString(done, 0x04, QString());
 
-    QByteArray body;
-    writeInt(body, 0x02, msgId);
-    writeTLV(body, 0x64, entry); // searchResEntry
-    writeTLV(body, 0x65, done);  // searchResDone
-    QByteArray response;
-    writeTLV(response, 0x30, body);
-    return response;
+    // A CLDAP answer is *two* LDAPMessages back to back — the entry, then the
+    // result — each its own SEQUENCE with its own copy of the message id. Not
+    // one SEQUENCE holding both: that is not an LDAPMessage at all, and a
+    // client that decodes an LDAPMessage per SEQUENCE stops after the id and
+    // finds no result. This server shipped the single-SEQUENCE form for a
+    // while because nothing on the asking side checked; Samba's locator client
+    // rejects it outright, which is what `CLDAP query failed` meant.
+    auto ldapMessage = [](int id, int op, const QByteArray &body) {
+        QByteArray inner;
+        writeInt(inner, 0x02, id);
+        writeTLV(inner, op, body);
+        QByteArray message;
+        writeTLV(message, 0x30, inner);
+        return message;
+    };
+    return ldapMessage(msgId, 0x64, entry) + ldapMessage(msgId, 0x65, done);
 }
 
 void LdapServer::setIdentity(const Identity &identity) {

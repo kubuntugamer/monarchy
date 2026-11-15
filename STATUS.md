@@ -219,12 +219,19 @@ The gaps above are not independent. Working outward from what exists:
    **CLDAP ping over UDP** is answered too: both shapes real clients send —
    Samba's `NtVer`-only ping and the `DsGetDcName` ping that names the domain —
    are served and driven by `scripts/cldap-conformance.py`, which pins Samba's
-   own datagram from a capture. **Not answered**: the binary `Netlogon`
-   attribute (`NETLOGON_SAM_LOGON_RESPONSE_EX`). Samba's `net ads lookup`
-   parses only that blob, so it still reports `NOT_FOUND` against this DC — the
-   named attributes this server sends are for clients that read them, and
-   Samba is not one. Remaining here: that blob, a real member's join flow,
-   RPC-layer schannel, and trust creation over the channel.
+   own datagram from a capture. The binary `Netlogon` attribute
+   (`NETLOGON_SAM_LOGON_RESPONSE_EX`) is answered too, which is the only thing
+   Samba's `net ads lookup` reads: it now prints this DC's record — the domain
+   GUID, the PDC/GC/LDAP/DS/KDC/writable/closest flags with no time service
+   claimed, forest and domain names, both site names, `NT 5` and the two
+   `0xffff` tokens. The blob is mask-independent (nt_version `5` inside it says
+   there is no address field, so no mask can make one appear), the entry carries
+   exactly the attributes the ping named — Samba asks one and rejects any answer
+   that is not one — and the reply is two LDAPMessages, not one SEQUENCE
+   wrapping both, which is how a client reads an id followed by a result. That
+   framing bug was invisible until a real client was driven against the server:
+   its own driver read the wrong shape happily. Remaining here: a real member's
+   join flow, RPC-layer schannel, and trust creation over the channel.
 7. ~~DRSR~~ — `DsBind`/`DsGetNCChanges`/`DsReplicaSync` plus `DsCrackNames`
    and `DsGetDomainControllerInfo` are served and verified (§1). A pull side now exists — `ReplicationAgent` takes a partner from
    `dc.conf` or a wire `DsReplicaAdd` on a timer and applies what it fetches —

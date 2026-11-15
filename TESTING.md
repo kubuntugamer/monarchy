@@ -38,11 +38,20 @@ endpoint mapper (135) and SMB (445) stay native under `--dev-ports`.
 | SMB1 (NT LM 0.12) | 445 / 445 | `monarchy-smb1-tests` | **Samba** `smbclient -m NT1` (live only) | fetch `GPT.INI` byte for byte, anonymous refused |
 | The endpoint set as a whole | every port `dc.conf` declares | `monarchy-dcservice-tests` | a TCP connection to each declared port, made by the kernel | `scripts/check-dc-health.sh` |
 | RPC auth (NTLMSSP + SPNEGO + Kerberos) | all RPC | `monarchy-samr-tests`, `monarchy-kerberos-tests` | **impacket** and **Samba** with credentials | every conformance script binds at `PKT_PRIVACY` |
-| **DC locator over UDP** (CLDAP, RFC 1798) | the LDAP port over UDP — the ping a client sends before it joins | `monarchy-ldap-tests` (`cldap*` cases) | a datagram built in the driver, with **Samba's own real ping pinned byte for byte**, and the reply decoded as BER rather than by this tree's parser | `scripts/cldap-conformance.py`: the `NtVer`-only ping Samba sends, the `DsGetDcName` ping that names the domain, the attribute set a client reads, a foreign domain answered `noSuchObject`, and a subtree search left unanswered. The reply's outer
-SEQUENCE must also account for the whole datagram, and an answer must be the **same bytes** whatever
-`NtVer` mask was asked — the echoed message id widens with the id's value, so a 1-byte id gives a
-357-byte answer and Samba's 3-byte `0x00fb3d` gives 359, which is length arithmetic rather than a
-different reply. **Absent**: the binary `Netlogon` attribute, so Samba's `net ads lookup` reports `NOT_FOUND` — see `STATUS.md` §3 item 6 |
+| **DC locator over UDP** (CLDAP, RFC 1798) | the LDAP port over UDP — the ping a client sends before it joins | `monarchy-ldap-tests` (`cldap*` cases) | a datagram built in the driver, with **Samba's own real ping pinned byte for byte**, and the reply decoded as BER rather than by this tree's parser | `scripts/cldap-conformance.py`: the `NtVer`-only ping Samba sends, the `DsGetDcName` ping that names the domain, the attribute set a client reads, a foreign domain answered `noSuchObject`, and a subtree search left unanswered. The answer must be **two LDAPMessages** — the entry then the
+result, each its own SEQUENCE — because a single SEQUENCE around both is not an LDAPMessage: a client
+decodes the id, finds no result after it, and drops the answer silently. The binary `Netlogon`
+attribute is decoded field by field against `nbt.idl` — command word, capability word, the DNS label
+lists, the GUID, both site names, and the two legacy tokens a client checks before anything above
+them — and the entry must carry **exactly the attributes the ping named**, since Samba's client reads
+an answer whose entry is not one attribute `netlogon` as no answer at all. An answer must also be the
+**same bytes** whatever `NtVer` mask was asked; the capability word inside the blob is what decides
+whether the optional address field is there, so the datagram cannot follow the mask. Its length does
+follow the echoed id — 207 bytes for a 1-byte id, 211 for Samba's 3-byte `0x00fb3d`, two ids at two
+bytes each — which is arithmetic rather than a different reply. `monarchy-ldap-tests`
+`answersTheDcLocatorPingOverUdp` asserts the same framing and blob on a served datagram, and both it
+and the driver's framing check were shown failing against a single-SEQUENCE answer before the fix. The
+live client is Samba's `net ads lookup`, which prints the record this DC publishes |
 
 `scripts/ci.sh --conformance` is the row-for-row proof of the RPC half: it
 provisions a throwaway domain, starts the daemon on free ports, and drives DRSR,
