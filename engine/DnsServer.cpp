@@ -1238,6 +1238,17 @@ QStringList DnsServer::systemForwarders()
     return servers;
 }
 
+bool DnsServer::anyForwarderUsable(const QStringList &specs)
+{
+    for (const QString &spec : specs) {
+        QHostAddress address;
+        quint16 port = 53;
+        if (parseForwarder(spec, &address, &port))
+            return true;
+    }
+    return false;
+}
+
 QStringList DnsServer::effectiveForwarders() const
 {
     if (!m_forwarders.isEmpty())

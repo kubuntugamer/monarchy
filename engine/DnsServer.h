@@ -134,6 +134,11 @@ public:
     // /etc/resolv.conf becoming a fixture.
     static QStringList usableForwarders(const QStringList &nameservers,
                                         const QStringList &localAddresses);
+    // Whether any entry of `specs` parses as address[:port]. A list that
+    // filters down to something real but unparseable is not a working
+    // configuration, and reporting it as one is how a reload line came to
+    // promise forwarding the next query answered SERVFAIL for.
+    static bool anyForwarderUsable(const QStringList &specs);
     // The `nameserver` entries of one resolv.conf-style file, in order.
     static QStringList nameserversIn(const QString &path);
     void clearCache();

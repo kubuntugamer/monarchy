@@ -115,6 +115,20 @@ void DcService::reportForwarders()
                                .arg(m_dcDir + QStringLiteral("/dc.conf")));
         return;
     }
+    // A recorded list that survives the loopback filter but parses as nothing
+    // is not a working configuration: the first out-of-zone query after this
+    // line would be answered SERVFAIL. Report the same reason the query path
+    // will, rather than a status line that reads like forwarding is set up.
+    if (!DnsServer::anyForwarderUsable(effective)) {
+        emit statusMessage(tr("No usable DNS forwarder in %1: no forwarder could be parsed "
+                              "from %2, so names outside %3 will not resolve. Set "
+                              "forwarders= in %4.")
+                               .arg(source)
+                               .arg(effective.join(QStringLiteral(", ")))
+                               .arg(m_dnsServer->zone())
+                               .arg(m_dcDir + QStringLiteral("/dc.conf")));
+        return;
+    }
     emit statusMessage(tr("Forwarding names outside %1 to %2 (from %3).")
                            .arg(m_dnsServer->zone())
                            .arg(effective.join(QStringLiteral(", ")))

@@ -952,6 +952,16 @@ void DnsTest::reportsMissingForwarderAgainAfterReconfiguration()
     QVERIFY(asksAndFails(0x5403, "three.example.org"));
     QCOMPARE(reports, 2);
     QVERIFY(lastDetail.contains(QStringLiteral("still-not-an-address")));
+
+    // The status line the daemon prints on start-up and on reload asks the same
+    // question, so a list that reads as configured but cannot be used is
+    // reported as unusable instead of "forwarding to ...".
+    QVERIFY(!DnsServer::anyForwarderUsable({QStringLiteral("not-an-address")}));
+    QVERIFY(!DnsServer::anyForwarderUsable({QStringLiteral("not-an-address"),
+                                           QStringLiteral("still-not-an-address")}));
+    QVERIFY(!DnsServer::anyForwarderUsable({}));
+    QVERIFY(DnsServer::anyForwarderUsable({QStringLiteral("not-an-address"),
+                                          QStringLiteral("127.0.0.1:53")}));
 }
 
 void DnsTest::appliesDynamicUpdates()
