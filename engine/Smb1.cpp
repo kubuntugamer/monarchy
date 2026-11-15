@@ -341,6 +341,11 @@ QByteArray Session::sessionSetup(const QByteArray &message)
     QByteArray token = header.data.left(blobLength);
 
     const int type = Ntlm::messageType(Ntlm::embeddedToken(token));
+    // A client that sent a raw NTLMSSP token gets a raw one back. Windows 2000
+    // speaks extended security without SPNEGO here and drops the session when
+    // the server answers with a NegTokenResp it never asked for; Samba's client
+    // sends the GSS wrapper, so both forms have to be answered in kind.
+    const bool spnegoWrapped = !token.startsWith("NTLMSSP");
     QByteArray replyToken;
     quint32 status = kStatusSuccess;
     quint16 action = 0;
@@ -353,7 +358,7 @@ QByteArray Session::sessionSetup(const QByteArray &message)
             m_challenge[i] = char(QRandomGenerator::system()->generate() & 0xff);
         const QByteArray challenge = Ntlm::challengeToken(m_challenge, m_domain,
                                                           m_serverName, m_dnsDomain);
-        replyToken = Gss::spnegoResponse(1, kNtlmMech, challenge);
+        replyToken = spnegoWrapped ? Gss::spnegoResponse(1, kNtlmMech, challenge) : challenge;
         status = kStatusMoreProcessingRequired;
     } else if (type == 3) {
         Rpc::AuthRequest request;
@@ -375,12 +380,14 @@ QByteArray Session::sessionSetup(const QByteArray &message)
             m_user = request.domain.isEmpty()
                          ? request.user
                          : request.domain + QLatin1Char('\\') + request.user;
-            replyToken = Gss::spnegoResponse(0, kNtlmMech, QByteArray());
+            replyToken = spnegoWrapped ? Gss::spnegoResponse(0, kNtlmMech, QByteArray())
+                                       : QByteArray();
             action = 0;
             if (m_notifier)
                 m_notifier(QStringLiteral("SMB1 logon %1").arg(m_user));
         } else {
-            replyToken = Gss::spnegoResponse(2, kNtlmMech, QByteArray());
+            replyToken = spnegoWrapped ? Gss::spnegoResponse(2, kNtlmMech, QByteArray())
+                                       : QByteArray();
             status = kStatusLogonFailure;
         }
     } else {

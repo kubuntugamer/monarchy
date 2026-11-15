@@ -268,15 +268,33 @@ private slots:
     void refusesAnUnknownShare();
     void refusesTraversalOutOfTheShare();
     void refusesWrites();
+    void answersARawNtlmTokenWithoutSpnego();
 
 private:
     QTemporaryDir m_root;
     QByteArray m_fileBytes;
     QString m_fileRelative;
 
+    Smb1::Session *plainSession();
     Smb1::Session *authenticatedSession();
     quint16 connectShare(Smb1::Session *session, const QString &share);
 };
+
+Smb1::Session *Smb1Test::plainSession()
+{
+    QHash<QString, QString> shares;
+    shares.insert(QStringLiteral("sysvol"), m_root.path());
+    shares.insert(QStringLiteral("netlogon"), m_root.filePath(QStringLiteral("scripts")));
+
+    return new Smb1::Session(
+        QHash<QString, RpcServer *>(),
+        [](const Rpc::AuthRequest &, Ntlm::SessionKeys *keys) {
+            *keys = Ntlm::SessionKeys();
+            return true;
+        },
+        QStringLiteral("MONARCHY"), QStringLiteral("DC1"), QStringLiteral("monarchy.test"),
+        shares);
+}
 
 // A GPO-shaped tree: SYSVOL\<domain>\Policies\{GUID}\Machine\Registry.pol.
 Smb1::Session *Smb1Test::authenticatedSession()
@@ -460,6 +478,50 @@ void Smb1Test::refusesWrites()
     QFile after(path);
     QVERIFY(after.open(QIODevice::ReadOnly));
     QCOMPARE(after.readAll(), QByteArray("policy"));
+}
+
+// Windows 2000 sends the session-setup token as raw NTLMSSP with no GSS
+// wrapper, and drops the session when the reply comes back wrapped; Samba and
+// impacket send the wrapper and read a wrapped answer. Both have to be served
+// in the form they arrived in.
+void Smb1Test::answersARawNtlmTokenWithoutSpnego()
+{
+    QByteArray rawType1("NTLMSSP", 7);
+    rawType1.append(char(0));
+    putLe32(rawType1, 1);            // NEGOTIATE
+    putLe32(rawType1, 0x00008201u);  // UNICODE | NTLM
+
+    QScopedPointer<Smb1::Session> session(plainSession());
+    QVERIFY(session);
+    session->feed(negotiateMessage());
+
+    const QByteArray challengeReply = session->feed(sessionSetupMessage(rawType1));
+    QCOMPARE(statusOf(challengeReply), Smb1::kStatusMoreProcessingRequired);
+    const QByteArray challenge = payloadOf(challengeReply);
+    // Words: AndXCommand(2), AndXOffset(2), Action(2), SecurityBlobLength(2).
+    const quint16 challengeLength = readLe16(challenge, 33 + 6);
+    QVERIFY(challengeLength > 32);
+    QCOMPARE(challenge.mid(43, 8), QByteArray("NTLMSSP", 8));
+    QCOMPARE(readLe32(challenge, 43 + 8), quint32(2)); // CHALLENGE, not a NegTokenResp
+
+    // The authenticating message is answered with a raw, empty blob.
+    const QByteArray acceptReply = session->feed(sessionSetupMessage(
+        authenticateToken(QStringLiteral("alice"), QStringLiteral("MONARCHY"))));
+    QCOMPARE(statusOf(acceptReply), quint32(0));
+    QCOMPARE(readLe16(payloadOf(acceptReply), 33 + 6), quint16(0));
+
+    // A wrapped token still gets its SPNEGO answer, so the wrapper is not
+    // dropped for clients that do speak it.
+    QScopedPointer<Smb1::Session> wrapped(plainSession());
+    QVERIFY(wrapped);
+    wrapped->feed(negotiateMessage());
+    QByteArray wrappedToken("\x60\x81\x00", 3);
+    wrappedToken.append(rawType1);
+    const QByteArray wrappedReply = wrapped->feed(sessionSetupMessage(wrappedToken));
+    QCOMPARE(statusOf(wrappedReply), Smb1::kStatusMoreProcessingRequired);
+    const QByteArray wrappedBlob = payloadOf(wrappedReply);
+    QVERIFY(readLe16(wrappedBlob, 33 + 6) > 32);
+    QCOMPARE(wrappedBlob.at(43), char(0xa1)); // NegTokenResp
 }
 
 QTEST_GUILESS_MAIN(Smb1Test)
