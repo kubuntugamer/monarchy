@@ -308,6 +308,7 @@ private slots:
     void dropsNameserversThatWouldLoopBack();
     void followsForwarderChangesWhileRunning();
     void reportsMissingForwarderAgainAfterReconfiguration();
+    void dropsItsOwnListenerFromAConfiguredList();
     void appliesDynamicUpdates();
     void enforcesUpdatePolicy();
     void persistsZone();
@@ -962,6 +963,94 @@ void DnsTest::reportsMissingForwarderAgainAfterReconfiguration()
     QVERIFY(!DnsServer::anyForwarderUsable({}));
     QVERIFY(DnsServer::anyForwarderUsable({QStringLiteral("not-an-address"),
                                           QStringLiteral("127.0.0.1:53")}));
+}
+
+void DnsTest::dropsItsOwnListenerFromAConfiguredList()
+{
+    // A forwarders= line naming this daemon's own port is a loop with extra
+    // steps: the query arrives back here, lands outside the zone, and leaves as
+    // REFUSED, which the client sees as a bare SERVFAIL. It was reported as an
+    // upstream and nothing said otherwise, so the line read as a working
+    // configuration. A loopback stub on another port is a real upstream and has
+    // to survive the same filter.
+    DnsServer server;
+    server.setForwardingEnabled(true);
+    QVERIFY(server.listen(0));
+    server.loadDefaultZone(QStringLiteral("corp.example.com"));
+    const QString self = QStringLiteral("127.0.0.1:%1").arg(server.serverPort());
+
+    int reports = 0;
+    QString lastDetail;
+    QObject::connect(&server, &DnsServer::forwardingUnavailable, &server,
+                     [&reports, &lastDetail](const QString &detail) {
+                         ++reports;
+                         lastDetail = detail;
+                     });
+
+    server.setForwarders({self});
+    QVERIFY(server.forwarders().contains(self));
+    QCOMPARE(server.ignoredForwarders(), QStringList{self});
+    QVERIFY(server.effectiveForwarders().isEmpty());
+
+    // Measured against the real listener: the client gets SERVFAIL, not silence.
+    Reply reply;
+    QVERIFY(parseReply(exchange(server.serverPort(),
+                               DnsServer::buildQuery(QStringLiteral("outside.example.org"),
+                                                     DnsServer::TypeA, 0x5501)),
+                       &reply));
+    QCOMPARE(reply.rcode, 2);
+    QCOMPARE(reports, 1);
+    // The detail names the entry and the reason, so it cannot be confused with
+    // "nothing is configured" or "nothing parses".
+    QVERIFY(lastDetail.contains(self));
+    QVERIFY(lastDetail.contains(QStringLiteral("own listener")));
+
+    // A loopback upstream on a different port is kept, and answers.
+    auto *upstream = new QUdpSocket;
+    upstream->bind(QHostAddress::LocalHost, 0);
+    QObject::connect(upstream, &QUdpSocket::readyRead, upstream, [upstream]() {
+        while (upstream->hasPendingDatagrams()) {
+            QByteArray query;
+            query.resize(int(upstream->pendingDatagramSize()));
+            QHostAddress peer;
+            quint16 peerPort = 0;
+            const qint64 read =
+                upstream->readDatagram(query.data(), query.size(), &peer, &peerPort);
+            if (read < 12)
+                continue;
+            query.truncate(int(read));
+            QByteArray response;
+            put16(response, quint16((quint8(query[0]) << 8) | quint8(query[1])));
+            put16(response, 0x8180);
+            put16(response, 1);
+            put16(response, 1);
+            put16(response, 0);
+            put16(response, 0);
+            response += query.mid(12);
+            response.append(char(0xc0));
+            response.append(char(0x0c));
+            put16(response, DnsServer::TypeA);
+            put16(response, 1); // IN
+            put32(response, 60);
+            put16(response, 4);
+            response.append(QByteArray::fromHex("c0000201"));
+            upstream->writeDatagram(response, peer, peerPort);
+        }
+    });
+    const QString local = QStringLiteral("127.0.0.1:%1").arg(upstream->localPort());
+    server.setForwarders({self, local});
+    QCOMPARE(server.ignoredForwarders(), QStringList{self});
+    QCOMPARE(server.effectiveForwarders(), QStringList{local});
+
+    Reply forwarded;
+    QVERIFY(parseReply(exchange(server.serverPort(),
+                               DnsServer::buildQuery(QStringLiteral("kept.example.org"),
+                                                     DnsServer::TypeA, 0x5502)),
+                       &forwarded));
+    QCOMPARE(forwarded.rcode, 0);
+    QCOMPARE(forwarded.answers.size(), 1);
+
+    delete upstream;
 }
 
 void DnsTest::appliesDynamicUpdates()

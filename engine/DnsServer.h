@@ -121,10 +121,20 @@ public:
     void setForwarders(const QStringList &forwarders);
     QStringList forwarders() const;
     // The upstreams an out-of-zone name would actually be asked about: the
-    // configured list, or the host's nameservers once the ones that would loop
-    // back here are dropped. An empty result is why every out-of-zone query
-    // would be answered SERVFAIL, so forwardingUnavailable() reports it once.
+    // configured list minus this server's own listener, or the host's
+    // nameservers once the ones that would loop back here are dropped. An empty
+    // result is why every out-of-zone query would be answered SERVFAIL, so
+    // forwardingUnavailable() reports it once.
     QStringList effectiveForwarders() const;
+    // The configured entries effectiveForwarders() dropped for naming this
+    // server itself. A caller reports them rather than dropping them silently:
+    // a forwarders= line that lists a dead entry as an upstream reads like a
+    // working configuration right up until the first out-of-zone query.
+    QStringList ignoredForwarders() const;
+    // Whether `spec` asks this server: the port it is listening on, at a
+    // loopback or local address. A loopback address on any other port is a
+    // local stub resolver, which is a legitimate upstream and is kept.
+    bool isOwnListener(const QString &spec) const;
     // The same lookup and filter, for callers that seed dc.conf with what this
     // host can actually resolve through (the provisioner and the installer)
     // rather than serve queries.

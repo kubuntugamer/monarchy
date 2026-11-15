@@ -117,14 +117,25 @@ void DcService::reportForwarders()
     const QString source = m_dnsServer->forwarders().isEmpty()
                                ? tr("this host's nameservers")
                                : tr("dc.conf");
+    const QStringList ignored = m_dnsServer->ignoredForwarders();
     if (effective.isEmpty()) {
-        emit statusMessage(tr("No usable DNS forwarder in %1: %2 are loopback or this DC "
-                              "itself, so names outside %3 will not resolve. Set forwarders= "
-                              "in %4.")
-                               .arg(source)
-                               .arg(source)
-                               .arg(m_dnsServer->zone())
-                               .arg(m_dcDir + QStringLiteral("/dc.conf")));
+        // Naming the entry is the whole point: "are loopback" about a list the
+        // operator typed by hand reads as if the file were wrong somewhere else.
+        emit statusMessage(
+            ignored.isEmpty()
+                ? tr("No usable DNS forwarder in %1: %2 are loopback or this DC "
+                     "itself, so names outside %3 will not resolve. Set forwarders= "
+                     "in %4.")
+                      .arg(source)
+                      .arg(source)
+                      .arg(m_dnsServer->zone())
+                      .arg(m_dcDir + QStringLiteral("/dc.conf"))
+                : tr("No usable DNS forwarder in %1: %2 is this DC's own listener, so "
+                     "names outside %3 will not resolve. Set forwarders= in %4.")
+                      .arg(source)
+                      .arg(ignored.join(QStringLiteral(", ")))
+                      .arg(m_dnsServer->zone())
+                      .arg(m_dcDir + QStringLiteral("/dc.conf")));
         return;
     }
     // A recorded list that survives the loopback filter but parses as nothing
@@ -141,10 +152,19 @@ void DcService::reportForwarders()
                                .arg(m_dcDir + QStringLiteral("/dc.conf")));
         return;
     }
-    emit statusMessage(tr("Forwarding names outside %1 to %2 (from %3).")
-                           .arg(m_dnsServer->zone())
-                           .arg(effective.join(QStringLiteral(", ")))
-                           .arg(source));
+    QString line = tr("Forwarding names outside %1 to %2 (from %3).")
+                       .arg(m_dnsServer->zone())
+                       .arg(effective.join(QStringLiteral(", ")))
+                       .arg(source);
+    // Saying which entry is not in use, rather than only which are, is the
+    // difference between an operator seeing an upstream list they typed and
+    // understanding why one of them never answers.
+    if (!ignored.isEmpty()) {
+        line += QLatin1Char(' ')
+                + tr("Ignoring %1, which is this DC's own listener.")
+                      .arg(ignored.join(QStringLiteral(", ")));
+    }
+    emit statusMessage(line);
 }
 
 void DcService::reloadForwarders()

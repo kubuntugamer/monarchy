@@ -858,12 +858,23 @@ QByteArray DnsServer::forwardQuery(const Message &message, const QByteArray &pac
         // once, instead of answering in silence.
         if (!m_reportedNoForwarder) {
             m_reportedNoForwarder = true;
-            emit forwardingUnavailable(
-                servers.isEmpty()
-                    ? tr("no forwarder is configured, and this host's nameservers are "
-                         "loopback or this DC itself")
-                    : tr("no forwarder could be parsed from %1")
-                          .arg(servers.join(QStringLiteral(", "))));
+            // Three different reasons read the same to a client and must not
+            // read the same here: nothing configured, a configured list that
+            // names only this server, and a configured list nothing parses.
+            const QStringList configured = forwarders();
+            if (!configured.isEmpty() && servers.isEmpty())
+                emit forwardingUnavailable(
+                    tr("%1 is this DC's own listener, so names outside %2 cannot be "
+                       "resolved")
+                        .arg(configured.join(QStringLiteral(", ")))
+                        .arg(zone()));
+            else if (servers.isEmpty())
+                emit forwardingUnavailable(
+                    tr("no forwarder is configured, and this host's nameservers are "
+                       "loopback or this DC itself"));
+            else
+                emit forwardingUnavailable(tr("no forwarder could be parsed from %1")
+                                               .arg(servers.join(QStringLiteral(", "))));
         }
         return buildResponse(packet, {}, ServFail);
     }
@@ -1249,11 +1260,49 @@ bool DnsServer::anyForwarderUsable(const QStringList &specs)
     return false;
 }
 
+bool DnsServer::isOwnListener(const QString &spec) const
+{
+    QHostAddress address;
+    quint16 port = 53;
+    if (!parseForwarder(spec, &address, &port))
+        return false;
+    // The number is what makes it this server: a local stub resolver on its own
+    // port is a real upstream, and the loopback filter that keeps the host's
+    // nameserver list from looping back here would throw it away.
+    if (port != serverPort())
+        return false;
+    if (address.isLoopback())
+        return true;
+    for (const QHostAddress &local : QNetworkInterface::allAddresses()) {
+        if (local == address)
+            return true;
+    }
+    return false;
+}
+
+QStringList DnsServer::ignoredForwarders() const
+{
+    QStringList result;
+    for (const QString &spec : m_forwarders) {
+        if (isOwnListener(spec))
+            result.append(spec);
+    }
+    return result;
+}
+
 QStringList DnsServer::effectiveForwarders() const
 {
-    if (!m_forwarders.isEmpty())
-        return m_forwarders;
-    return systemForwarders();
+    if (m_forwarders.isEmpty())
+        return systemForwarders();
+    // Only the key's own entries are filtered here. A configured list is read
+    // as written, except for the one entry that cannot work: this server asking
+    // itself gets REFUSED back, which reaches the client as an empty SERVFAIL.
+    QStringList result;
+    for (const QString &spec : m_forwarders) {
+        if (!isOwnListener(spec))
+            result.append(spec);
+    }
+    return result;
 }
 
 int DnsServer::handleQuery(const Message &message, QList<Record> &answers) {
