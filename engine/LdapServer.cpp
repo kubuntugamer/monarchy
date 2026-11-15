@@ -845,19 +845,33 @@ QByteArray saltedPasswordHash(const QByteArray &salt, const QString &password)
 }
 
 // AD sends unicodePwd as a quoted UTF-16LE string; the console and the wire
-// client send UTF-8. Both are accepted, and the value is never stored as text.
+// client send UTF-8 under the same name. Which one arrived is decided by
+// reading it both ways: UTF-16 text decoded as UTF-8 is full of NULs, so the
+// form whose reading has none is the one that was written. The quotes come off
+// after decoding, never before: in the UTF-16 form the first byte is 0x22 but
+// the last is the top half of the closing quote, so testing the bytes finds no
+// pair and both quotes stay in the password. That is how a machine account a
+// join created ended up keyed one character off from the secret the machine had
+// derived its own keys from, and its kinit failed on preauthentication.
 QString decodePasswordValue(const QByteArray &raw, const QString &fallback)
 {
-    QByteArray bytes = raw;
-    if (bytes.size() >= 2 && bytes.startsWith('"') && bytes.endsWith('"'))
-        bytes = bytes.mid(1, bytes.size() - 2);
-    if (bytes.size() >= 2 && bytes.size() % 2 == 0 && bytes.contains('\0')) {
-        return QString::fromUtf16(reinterpret_cast<const char16_t *>(bytes.constData()),
-                                  qsizetype(bytes.size() / 2));
+    const auto unreadable = [](const QString &text) {
+        return text.contains(QChar(0)) || text.contains(QChar(0xfffd));
+    };
+    const QString narrow = QString::fromUtf8(raw);
+    QString wide;
+    bool wideUsable = false;
+    if (raw.size() >= 2 && raw.size() % 2 == 0) {
+        wide = QString::fromUtf16(reinterpret_cast<const char16_t *>(raw.constData()),
+                                  qsizetype(raw.size() / 2));
+        wideUsable = !unreadable(wide);
     }
-    if (bytes.isEmpty())
+    QString text = (!unreadable(narrow) || !wideUsable) ? narrow : wide;
+    if (text.size() >= 2 && text.startsWith(QLatin1Char('"')) && text.endsWith(QLatin1Char('"')))
+        text = text.mid(1, text.size() - 2);
+    if (text.isEmpty())
         return fallback;
-    return QString::fromUtf8(bytes);
+    return text;
 }
 
 // The remembered passwords, as the account object carries them: the NT hashes

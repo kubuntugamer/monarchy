@@ -1002,6 +1002,7 @@ QByteArray NetlogonServer::serverAuthenticate(const QByteArray &stub, quint16 op
     channel.seed = channel.server;
     channel.sequence = 0;
     channel.flags = negotiated;
+    channel.requestedFlags = requested;
     channel.accountName = accountName;
     channel.sid = account.attributes.value(QStringLiteral("objectSid"));
     m_channels.insert(accountName.toLower(), channel);
@@ -1016,6 +1017,54 @@ QByteArray NetlogonServer::serverAuthenticate(const QByteArray &stub, quint16 op
     putLe32(out, kStatusSuccess);
     emit requestReceived(
         QStringLiteral("ServerAuthenticate3(%1): channel established").arg(accountName));
+    return out;
+}
+
+// MS-NRPC 3.5.4.4.10 (opnum 21). A client that authenticated its channel runs
+// this before trusting it: the capabilities it reads back have to be byte for
+// byte the flags the ServerAuthenticate3 reply negotiated, so a machine
+// redirected to a server that negotiated a weaker channel than the real DC would
+// sees the difference. Samba calls it from netlogon_creds_cli_check and treats
+// "procedure not found" as NT_STATUS_DOWNGRADE_DETECTED as soon as
+// NETLOGON_NEG_SUPPORTS_AES is on the channel — which is why the whole join
+// stopped at the post-join verification until this answered. Query level 1 asks
+// for the server's flags, level 2 for the flags the client asked with.
+QByteArray NetlogonServer::logonGetCapabilities(const QByteArray &stub)
+{
+    Ndr::Reader reader(stub);
+    QString serverName;
+    QString computerName;
+    if (!readUniqueString(reader, &serverName) || !readUniqueString(reader, &computerName))
+        return statusOnly(kStatusInvalidParameter);
+    QByteArray credential;
+    quint32 timestamp = 0;
+    if (!reader.bytes(8, &credential) || !reader.u32(&timestamp))
+        return statusOnly(kStatusInvalidParameter);
+    // return_authenticator is [in,out,ref]: the client sends a zeroed one and
+    // reads ours back, so it occupies the same twelve octets on the way in.
+    if (!reader.skip(12))
+        return statusOnly(kStatusInvalidParameter);
+    quint32 queryLevel = 0;
+    if (!reader.u32(&queryLevel))
+        return statusOnly(kStatusInvalidParameter);
+    if (queryLevel != 1 && queryLevel != 2)
+        return statusOnly(kStatusInvalidParameter);
+
+    const QString key = computerName.isEmpty() ? serverName : computerName;
+    auto channel = m_channels.find(key.toLower());
+    if (channel == m_channels.end())
+        return statusOnly(kStatusNoTrustSamAccount);
+    QByteArray reply;
+    if (!stepAuthenticator(&channel.value(), timestamp, credential, &reply))
+        return statusOnly(kStatusAccessDenied);
+
+    // The capability arm follows the return authenticator, then the status.
+    QByteArray out = reply;
+    putLe32(out, timestamp);
+    putLe32(out, queryLevel == 2 ? channel->requestedFlags : channel->flags);
+    putLe32(out, kStatusSuccess);
+    emit requestReceived(
+        QStringLiteral("LogonGetCapabilities(%1): 0x%2").arg(key).arg(channel->flags, 8, 16, QLatin1Char('0')));
     return out;
 }
 
@@ -1627,6 +1676,8 @@ QByteArray NetlogonServer::handleCall(quint16 opnum, const QByteArray &stub,
         return serverAuthenticate(stub, opnum);
     case Netlogon::OpServerPasswordSet2:
         return serverPasswordSet2(stub);
+    case Netlogon::OpLogonGetCapabilities:
+        return logonGetCapabilities(stub);
     case Netlogon::OpLogonSamLogonEx:
         return samLogon(stub, false, true);
     case Netlogon::OpGetAnyDCName:

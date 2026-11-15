@@ -187,6 +187,7 @@ private slots:
     void refusesUnknownCriticalControl();
     void acceptsPermissiveModifyControl();
     void objectSidIsBinaryOnTheWire();
+    void storesAQuotedUtf16MachinePassword();
     void ignoresUnknownOptionalControl();
     void rejectsCookieItDidNotIssue();
     void searchOnMissingBaseIsNoSuchObject();
@@ -489,6 +490,64 @@ void LdapTest::objectSidIsBinaryOnTheWire()
 }
 
 // The same control without the critical flag is ignored, and the search runs.
+// AD writes unicodePwd as a quoted UTF-16LE string, and `net ads join` sets the
+// machine account's password that way in its LDAP add. The quotes have to come
+// off *after* decoding: in that form the first byte is 0x22 but the last byte is
+// the top half of the closing quote, so testing the bytes finds no pair and both
+// quotes stay in the password. The account then holds a secret one character
+// longer than the one the machine derived its keys from, and the kinit the join
+// runs seconds later fails on preauthentication — which is exactly how this was
+// found.
+void LdapTest::storesAQuotedUtf16MachinePassword()
+{
+    const QString domainDn = QStringLiteral("DC=corp,DC=example,DC=com");
+    const QString machineDn = QStringLiteral("CN=BOX,CN=Computers,%1").arg(domainDn);
+    const QString password = QStringLiteral("Mach!neP@ss1");
+
+    DirectoryObject domain;
+    domain.id = domainDn;
+    domain.name = QStringLiteral("CORP");
+    domain.type = QStringLiteral("domainDNS");
+    domain.kind = ObjectKind::Domain;
+    domain.attributes.insert(QStringLiteral("objectSid"), QStringLiteral("S-1-5-21-1-2-3"));
+
+    DirectoryObject machine;
+    machine.id = machineDn;
+    machine.name = QStringLiteral("BOX");
+    machine.type = QStringLiteral("Computer");
+    machine.kind = ObjectKind::Computer;
+    machine.attributes.insert(QStringLiteral("sAMAccountName"), QStringLiteral("BOX$"));
+    // The spelling `net ads join` uses: DnsHostName, not dNSHostName.
+    machine.attributes.insert(QStringLiteral("DnsHostName"),
+                              QStringLiteral("BOX.corp.example.com"));
+
+    LdapServer server;
+    server.setObjects({domain, machine});
+
+    // A quoted UTF-16LE value: 0x22 0x00, the characters, 0x22 0x00.
+    QByteArray quoted("\x22\x00", 2);
+    quoted.append(Ndr::utf16le(password));
+    quoted.append("\x22\x00", 2);
+
+    LdapServer::ModifyChange change;
+    change.operation = 2;
+    change.type = QStringLiteral("unicodePwd");
+    change.values = QStringList{password};
+    change.rawValue = quoted;
+    QCOMPARE(server.applyModify(machineDn, {change}), 0);
+
+    QString ntHash;
+    for (const DirectoryObject &object : server.objects()) {
+        if (object.id.compare(machineDn, Qt::CaseInsensitive) == 0)
+            ntHash = object.attributes.value(QStringLiteral("ntHash"));
+    }
+    // The hash of the password itself, which is what the machine knows. Had the
+    // quotes stayed in, this would be the hash of the quoted string instead.
+    QCOMPARE(ntHash, QString::fromLatin1(Ntlm::ntowfV1(password).toHex()));
+    const QString quotedPassword = QStringLiteral("\"") + password;
+    QVERIFY(ntHash != QString::fromLatin1(Ntlm::ntowfV1(quotedPassword).toHex()));
+}
+
 void LdapTest::ignoresUnknownOptionalControl()
 {
     LdapServer server;

@@ -68,6 +68,7 @@ enum Opnum : quint16 {
     OpServerAuthenticate3 = 26,
     OpServerPasswordSet2 = 30,
     OpGetAnyDCName = 13,
+    OpLogonGetCapabilities = 21,
     OpLogonGetTrustRid = 23,
     OpDsRGetSiteName = 28,
     OpDsRGetDcNameEx2 = 34,
@@ -82,6 +83,15 @@ constexpr quint32 kNegDnsDomainTrusts = 0x00010000u;
 constexpr quint32 kNegPasswordSet2 = 0x00020000u;
 constexpr quint32 kNegGetDomainInfo = 0x00040000u;
 constexpr quint32 kNegSupportsAes = 0x01000000u;
+// MS-NRPC 2.2.1.4.1: the server accepts Netlogon calls over a DCE/RPC
+// connection sealed by the Netlogon security provider (auth type 0x44) with the
+// channel's session key. It is defined here so the flag has a name, but it is
+// deliberately not negotiated yet: this endpoint does not serve auth type 0x44,
+// and promising it would make every client rebind the pipe into something it
+// cannot answer. A client that requires it (Samba's "require strong key", the
+// default) therefore refuses the channel after a successful
+// NetrServerAuthenticate3 — the measured state until schannel RPC exists.
+constexpr quint32 kNegAuthenticatedRpc = 0x40000000u;
 
 Rpc::Interface interface();
 
@@ -132,6 +142,9 @@ private:
         QByteArray seed;
         quint32 sequence = 0;
         quint32 flags = 0;
+        // The flags the client asked with, which NetrLogonGetCapabilities
+        // reports for its query level 2.
+        quint32 requestedFlags = 0;
         QString accountName;
         QString sid;
     };
@@ -156,6 +169,7 @@ private:
 
     // Applies the next authenticator in the chain to `channel` and returns the
     // server's reply credential, or an empty array when the proof is wrong.
+    QByteArray logonGetCapabilities(const QByteArray &stub);
     bool stepAuthenticator(Channel *channel, quint32 timestamp, const QByteArray &credential,
                            QByteArray *reply);
 

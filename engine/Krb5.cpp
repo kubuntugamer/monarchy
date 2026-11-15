@@ -302,6 +302,20 @@ QString principalSalt(const QString &realm, const QString &principal)
     return canonical + name;
 }
 
+// AD salts a computer account's key with `host/<fqdn>@<REALM>`, not `REALM` and
+// the account name, because nobody ever types a machine's password: the machine
+// derives its own key from the host name it was given. A client joining a
+// domain works that out before the KDC is ever asked — Samba stores
+// `host/joinbox.lab.example.org@LAB.EXAMPLE.ORG` in secrets.tdb — and the salt a
+// key is actually derived with drops the separators, so the file records
+// `LAB.EXAMPLE.ORGhostjoinbox.lab.example.org`. A KDC that salted with `REALM` +
+// `JOINBOX$` handed out keys the machine could not use, and kinit failed on
+// preauthentication. The realm stays upper case; only the host name is folded.
+QString machineSalt(const QString &realm, const QString &hostName)
+{
+    return canonicalRealm(realm) + QStringLiteral("host") + hostName.trimmed().toLower();
+}
+
 QStringList servicePrincipalNames(const DirectoryObject &object)
 {
     QStringList names;
@@ -488,7 +502,19 @@ void storePasswordKeys(DirectoryObject &object, const QString &password,
 {
     if (realm.isEmpty() || accountName.isEmpty())
         return;
-    const QString salt = principalSalt(realm, accountName);
+    // Attributes keep the client's spelling (`DnsHostName` from `net ads join`,
+    // `dNSHostName` from the provisioner), so the lookup ignores case.
+    QString hostName;
+    if (accountName.endsWith(QLatin1Char('$'))) {
+        for (auto it = object.attributes.constBegin(); it != object.attributes.constEnd(); ++it) {
+            if (it.key().compare(QLatin1String("dnshostname"), Qt::CaseInsensitive) == 0) {
+                hostName = it.value();
+                break;
+            }
+        }
+    }
+    const QString salt = hostName.isEmpty() ? principalSalt(realm, accountName)
+                                            : machineSalt(realm, hostName);
     const QByteArray aes128 = stringToKey(kAes128, password, salt);
     const QByteArray aes256 = stringToKey(kAes256, password, salt);
     if (aes128.isEmpty() || aes256.isEmpty())

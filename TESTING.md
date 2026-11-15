@@ -31,7 +31,7 @@ endpoint mapper (135) and SMB (445) stay native under `--dev-ports`.
 | kpasswd (RFC 3244) | 464 / 1464 | `monarchy-kpasswd-tests` | **MIT** `krb5_change_password` / `krb5_set_password` | same, against the daemon |
 | SAMR | 49152 / 1035 | `monarchy-samr-tests` | **impacket** NDR, **Samba** `dcerpc.samr` | `scripts/samr-conformance.py` |
 | LSAD | 49153 / 1036 | `monarchy-lsad-tests` | **impacket** NDR (Samba half needs pidl) | `scripts/lsad-conformance.py --skip-samba` |
-| Netlogon (MS-NRPC) | 1037 / 1037 | `monarchy-netlogon-tests` | **impacket** NDR | `scripts/netlogon-conformance.py` (creates its machine account over SAMR) |
+| Netlogon (MS-NRPC) | 1037 / 1037 | `monarchy-netlogon-tests` | **impacket** NDR | `scripts/netlogon-conformance.py` (creates its machine account over SAMR); **Samba** `net ads join` drives challenge → authenticate → capabilities on `\pipe\netlogon` |
 | DRSUAPI | 1038 / 1038 | `monarchy-drs-tests`, `monarchy-drsclient-tests`, `monarchy-replication-tests` | **impacket** NDR | `scripts/drs-conformance.py` |
 | Endpoint mapper (C706) | 135 / 135 | `monarchy-epm-tests` | **impacket** `hept_lookup` / `hept_map`, C706 appendix L towers | `scripts/epm-conformance.py`: each tower's port is opened and bound for the interface it named |
 | The RPC endpoints from **another host's** address | `epmPort` and each RPC port, with `rpcAddress` set off loopback | `monarchy-epm-tests` | **impacket** over the LAN address rather than 127.0.0.1 | `scripts/epm-conformance.py --host <lan>`; `scripts/check-dc-health.sh` asks the same five ports from the host's routable address, and skips when `rpcAddress` is loopback, which is the default posture |

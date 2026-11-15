@@ -446,6 +446,7 @@ class NetlogonTest : public QObject
 private slots:
     void secureChannelNegotiatesCrypto_data();
     void secureChannelNegotiatesCrypto();
+    void logonGetCapabilitiesReportsTheChannelFlags();
     void legacySamLogonAuthenticatesSecureChannel_data();
     void legacySamLogonAuthenticatesSecureChannel();
     void refusesALogonOutsideLogonHours();
@@ -1135,6 +1136,75 @@ void NetlogonTest::secureChannelNegotiatesCrypto()
         QCOMPARE(readLe32(flagsReply, 12), quint32(0));
     }
 
+}
+
+// MS-NRPC 3.5.4.4.10 (opnum 21). A client runs this before it trusts a channel:
+// the capabilities it reads back have to be the flags the authentication
+// negotiated, so a machine whose traffic was redirected to a server that
+// negotiated a weaker channel sees the difference. Samba calls it right after
+// NetrServerAuthenticate3 and treats "procedure not found" as a downgrade
+// whenever NETLOGON_NEG_SUPPORTS_AES is on the channel.
+QByteArray capabilitiesRequest(const QString &computer, const QByteArray &credential,
+                               quint32 timestamp, quint32 queryLevel)
+{
+    QByteArray stub;
+    appendLe32(stub, 0); // NULL server_name
+    // computer_name is [unique], so it carries a referent of its own; the
+    // characters follow it, as `net ads join` writes them.
+    appendPointerString(stub, computer, 0x00020004u);
+    stub.append(credential);
+    appendLe32(stub, timestamp);
+    stub.append(QByteArray(12, '\0')); // the client's own return_authenticator
+    appendLe32(stub, queryLevel);
+    return stub;
+}
+
+void NetlogonTest::logonGetCapabilitiesReportsTheChannelFlags()
+{
+    NetlogonServer server;
+    Netlogon::Config config;
+    config.netbios = QStringLiteral("CORP");
+    config.realm = QStringLiteral("CORP.EXAMPLE.COM");
+    config.dnsDomain = QStringLiteral("corp.example.com");
+    config.dcName = QStringLiteral("DC1");
+    config.domainSid = QStringLiteral("S-1-5-21-1-2-3");
+    server.setConfig(config);
+
+    const QByteArray ntHash = Ntlm::ntowfV1(QStringLiteral("Mach!neP@ss1"));
+    const DirectoryObject machine = machineAccount(ntHash);
+    server.setObjectProvider([machine]() { return QList<DirectoryObject>{machine}; });
+
+    const quint32 flags = Netlogon::kNegStrongKeys | Netlogon::kNegPasswordSet2
+                          | Netlogon::kNegSupportsAes;
+    const ChannelFixture channel = openChannel(server, ntHash, flags);
+    QVERIFY(channel.ok);
+
+    const quint32 timestamp = 41;
+    const QByteArray reply = server.handleCall(
+        Netlogon::OpLogonGetCapabilities,
+        capabilitiesRequest(QStringLiteral("DC1"),
+                            nextCredential(channel.seed, timestamp, channel.sessionKey,
+                                           channel.flags, false),
+                            timestamp, 1));
+    QCOMPARE(reply.size(), 20);
+    QCOMPARE(readLe32(reply, 8), timestamp);
+    QCOMPARE(readLe32(reply, 12), flags);
+    QCOMPARE(readLe32(reply, 16), quint32(0));
+
+    // A credential the channel did not produce is refused, and the channel is
+    // not stepped: the refusal answers before anything is derived.
+    const QByteArray wrong = server.handleCall(
+        Netlogon::OpLogonGetCapabilities,
+        capabilitiesRequest(QStringLiteral("DC1"), QByteArray(8, '\0'), timestamp, 1));
+    QCOMPARE(wrong.size(), 4);
+    QCOMPARE(readLe32(wrong, 0), quint32(0xc0000022u)); // STATUS_ACCESS_DENIED
+
+    // Query levels are 1 and 2; anything else would have no arm to return.
+    const QByteArray unknownLevel = server.handleCall(
+        Netlogon::OpLogonGetCapabilities,
+        capabilitiesRequest(QStringLiteral("DC1"), QByteArray(8, '\0'), timestamp, 3));
+    QCOMPARE(unknownLevel.size(), 4);
+    QCOMPARE(readLe32(unknownLevel, 0), quint32(0xc000000du)); // STATUS_INVALID_PARAMETER
 }
 
 void NetlogonTest::passwordSet2WritesTheMachineHash()

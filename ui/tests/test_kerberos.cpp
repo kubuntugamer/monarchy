@@ -924,6 +924,7 @@ private slots:
     void aesStringToKeyVectors();
     void dceRpcFraming();
     void cfxUnwrapsARotatedToken();
+    void saltsAComputerAccountByItsHostName();
     void pacIsSignedAndVerifiable();
 #ifdef MONARCHY_WITH_KRB5
     void pacVerifiesWithMitKrb5();
@@ -1483,6 +1484,40 @@ void initiatorDceToken(const QByteArray &stub, quint64 seq, int etype, const QBy
 }
 
 } // namespace
+
+// Nobody ever types a machine's password: the machine derives its own key from
+// the host name it was given, before the KDC is asked anything, and Samba keeps
+// the result in secrets.tdb as `host/<fqdn>@<REALM>` — which the salt a key is
+// actually derived with writes as `REALM` + `host` + the folded host name. A
+// domain that salted with `REALM` + `JOINBOX$` instead issued keys the machine
+// could not use, and the kinit the join runs right after it stopped on
+// preauthentication.
+void KerberosTest::saltsAComputerAccountByItsHostName()
+{
+    DirectoryObject computer;
+    computer.id = QStringLiteral("CN=BOX,CN=Computers,DC=corp,DC=example,DC=com");
+    computer.name = QStringLiteral("BOX");
+    computer.kind = ObjectKind::Computer;
+    computer.attributes.insert(QStringLiteral("sAMAccountName"), QStringLiteral("BOX$"));
+    // The spelling `net ads join` writes, which is not the one AD documents.
+    computer.attributes.insert(QStringLiteral("DnsHostName"),
+                               QStringLiteral("BOX.corp.example.com"));
+    Krb5::storePasswordKeys(computer, QStringLiteral("Mach!neP@ss1"),
+                            QStringLiteral("corp.example.com"), QStringLiteral("BOX$"));
+    QCOMPARE(computer.attributes.value(QStringLiteral("kerberosSalt")),
+             QStringLiteral("CORP.EXAMPLE.COMhostbox.corp.example.com"));
+
+    // A user account keeps AD's default salt: the realm and the account name.
+    DirectoryObject user;
+    user.id = QStringLiteral("CN=alice,CN=Users,DC=corp,DC=example,DC=com");
+    user.name = QStringLiteral("alice");
+    user.kind = ObjectKind::User;
+    user.attributes.insert(QStringLiteral("sAMAccountName"), QStringLiteral("alice"));
+    Krb5::storePasswordKeys(user, QStringLiteral("Alice!Password123"),
+                            QStringLiteral("corp.example.com"), QStringLiteral("alice"));
+    QCOMPARE(user.attributes.value(QStringLiteral("kerberosSalt")),
+             QStringLiteral("CORP.EXAMPLE.COMalice"));
+}
 
 void KerberosTest::cfxUnwrapsARotatedToken()
 {
