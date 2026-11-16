@@ -67,8 +67,10 @@ public:
         TypePtr = 12,
         TypeMx = 15,
         TypeTxt = 16,
-        TypeSrv = 33,
         TypeAaaa = 28,
+        TypeSrv = 33,
+        TypeIxfr = 251,
+        TypeAxfr = 252,
         TypeAny = 255
     };
 

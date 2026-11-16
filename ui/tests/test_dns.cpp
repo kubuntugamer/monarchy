@@ -312,6 +312,7 @@ private slots:
     void separatesAHostFilesForwardingFacts();
     void appliesDynamicUpdates();
     void enforcesUpdatePolicy();
+    void refusesZoneTransfers();
     void persistsZone();
 };
 
@@ -1287,6 +1288,39 @@ void DnsTest::enforcesUpdatePolicy()
                        &refusedReply));
     QCOMPARE(refusedReply.rcode, 5); // REFUSED
     QVERIFY(server.records(add.name, DnsServer::TypeA).isEmpty());
+}
+
+void DnsTest::refusesZoneTransfers()
+{
+    DnsServer server;
+    QVERIFY(server.listen(0));
+    server.loadDefaultZone(QStringLiteral("corp.example.com"));
+
+    // Zone transfers are not served. A transfer request must be refused
+    // explicitly, not answered as a partial AXFR (one SOA and then nothing),
+    // which is neither a transfer nor a refusal and leaves the client hanging.
+    const auto checkRefused = [&server](quint16 type, quint16 id) {
+        Reply reply;
+        QVERIFY(parseReply(exchange(server.serverPort(),
+                                    DnsServer::buildQuery(
+                                        QStringLiteral("corp.example.com"), type, id)),
+                           &reply));
+        QCOMPARE(reply.rcode, 5); // REFUSED
+        QVERIFY(reply.answers.isEmpty());
+        QVERIFY(reply.authority.isEmpty());
+    };
+    checkRefused(DnsServer::TypeAxfr, 0x5351);
+    checkRefused(DnsServer::TypeIxfr, 0x5352);
+
+    // Real transfer clients ask over TCP; the refusal must read the same there.
+    Reply tcp;
+    QVERIFY(parseReply(exchangeTcp(server.serverPort(),
+                                   DnsServer::buildQuery(
+                                       QStringLiteral("corp.example.com"),
+                                       DnsServer::TypeAxfr, 0x5353)),
+                       &tcp));
+    QCOMPARE(tcp.rcode, 5);
+    QVERIFY(tcp.answers.isEmpty());
 }
 
 void DnsTest::persistsZone()

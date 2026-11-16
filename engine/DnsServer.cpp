@@ -1373,6 +1373,12 @@ int DnsServer::handleQuery(const Message &message, QList<Record> &answers) {
 
     emit queryReceived(question.name, question.type);
 
+    // Zone transfers are not served. A transfer request must not produce a
+    // partial AXFR-style reply (one SOA and then nothing), so refuse it
+    // explicitly rather than answering it as an ordinary query.
+    if (question.type == TypeAxfr || question.type == TypeIxfr)
+        return Refused;
+
     QList<Record> found = records(question.name, question.type);
     if (found.isEmpty() && question.type != TypeCname) {
         // Follow a single CNAME so aliases resolve for the client.

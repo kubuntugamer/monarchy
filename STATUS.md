@@ -194,9 +194,12 @@ failure) |
   `+edns=1` is answered `NOERROR` instead of `BADVERS`; no **DNSSEC** — a `+dnssec`
   query gets the DO bit echoed and no `RRSIG`, so a validating resolver treats
   every answer as insecure; no **CHAOS** class (`version.bind` is refused, which
-  is a choice, and now refused cleanly); and no **AXFR** — a transfer request is
-  answered with a single SOA and then nothing, where a server that does not
-  transfer should refuse it. Zone data is served over UDP/TCP, from the store,
+  is a choice, and now refused cleanly); and no **AXFR**/IXFR — a transfer
+  request is refused with `REFUSED` and no records, over UDP and TCP alike,
+  rather than answered with a single SOA and then nothing, which is neither a
+  transfer nor a refusal and leaves the client waiting (measured with `dig
+  AXFR`: `; Transfer failed.` after one SOA before the fix). Serving transfers
+  at all requires per-zone ACLs. Zone data is served over UDP/TCP, from the store,
   with RFC 2136 updates and the forwarding resolver above; those four are
   absences, not partial implementations.
 - **PKINIT** (needs an X.509/CMS path and a CA), **S4U2Self/S4U2Proxy**.
