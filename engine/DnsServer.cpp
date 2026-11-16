@@ -858,20 +858,23 @@ QByteArray DnsServer::forwardQuery(const Message &message, const QByteArray &pac
         // once, instead of answering in silence.
         if (!m_reportedNoForwarder) {
             m_reportedNoForwarder = true;
-            // Three different reasons read the same to a client and must not
+            // Four different reasons read the same to a client and must not
             // read the same here: nothing configured, a configured list that
-            // names only this server, and a configured list nothing parses.
+            // names only this server, a host file with no `nameserver` line, a
+            // host file whose lines are not addresses, and a host file naming
+            // only loopback. The last three used to arrive as one sentence that
+            // named loopback for all of them.
             const QStringList configured = forwarders();
-            if (!configured.isEmpty() && servers.isEmpty())
+            if (servers.isEmpty() && (configured.isEmpty() || !anyForwarderUsable(configured)))
+                emit forwardingUnavailable(
+                    tr("no forwarder is configured, and %1")
+                        .arg(noForwarderReason(configured, zone(), hostForwarders())));
+            else if (servers.isEmpty())
                 emit forwardingUnavailable(
                     tr("%1 is this DC's own listener, so names outside %2 cannot be "
                        "resolved")
                         .arg(configured.join(QStringLiteral(", ")))
                         .arg(zone()));
-            else if (servers.isEmpty())
-                emit forwardingUnavailable(
-                    tr("no forwarder is configured, and this host's nameservers are "
-                       "loopback or this DC itself"));
             else
                 emit forwardingUnavailable(tr("no forwarder could be parsed from %1")
                                                .arg(servers.join(QStringLiteral(", "))));
@@ -1231,22 +1234,68 @@ QStringList DnsServer::usableForwarders(const QStringList &nameservers,
     return result;
 }
 
-QStringList DnsServer::systemForwarders()
+DnsServer::HostForwarders DnsServer::hostForwarders(const QStringList &paths)
 {
     QStringList localAddresses;
     for (const QHostAddress &address : QNetworkInterface::allAddresses())
         localAddresses.append(address.toString());
 
-    QStringList servers =
-        usableForwarders(nameserversIn(QStringLiteral("/etc/resolv.conf")), localAddresses);
     // systemd-resolved's stub file names only 127.0.0.53, so the addresses it
     // actually asks are in the file beside it. When /etc/resolv.conf has no
     // usable entry left, that is where the real upstream is.
-    if (servers.isEmpty()) {
-        servers = usableForwarders(
-            nameserversIn(QStringLiteral("/run/systemd/resolve/resolv.conf")), localAddresses);
+    const QStringList candidates = paths.isEmpty()
+        ? QStringList{QStringLiteral("/etc/resolv.conf"),
+                      QStringLiteral("/run/systemd/resolve/resolv.conf")}
+        : paths;
+
+    HostForwarders host;
+    for (const QString &path : candidates) {
+        const QStringList entries = nameserversIn(path);
+        // A file that does not exist contributes no facts at all, so "the host
+        // has no nameserver" cannot be claimed on the strength of a path this
+        // machine never had.
+        if (entries.isEmpty() && !QFile::exists(path))
+            continue;
+        host.files.append(path);
+        host.read += entries;
+        const QStringList usable = usableForwarders(entries, localAddresses);
+        for (const QString &spec : entries) {
+            QHostAddress address;
+            quint16 port = 53;
+            if (!parseForwarder(spec, &address, &port))
+                host.unparseable.append(spec);
+            else if (!usable.contains(spec))
+                host.loopbackOrSelf.append(spec);
+        }
+        if (host.usable.isEmpty())
+            host.usable = usable;
     }
-    return servers;
+    return host;
+}
+
+QStringList DnsServer::systemForwarders()
+{
+    return hostForwarders().usable;
+}
+
+QString DnsServer::noForwarderReason(const QStringList &configured,
+                                     const QString &zone,
+                                     const HostForwarders &host)
+{
+    if (!configured.isEmpty())
+        return tr("%1 is this DC's own listener, so names outside %2 cannot be "
+                  "resolved")
+            .arg(configured.join(QStringLiteral(", ")))
+            .arg(zone);
+    if (host.read.isEmpty())
+        return tr("this host has no nameserver line in %1")
+            .arg(host.files.isEmpty() ? QStringLiteral("/etc/resolv.conf")
+                                      : host.files.join(QStringLiteral(", ")));
+    if (!host.unparseable.isEmpty())
+        return tr("%1 in this host's nameservers could not be parsed as an address")
+            .arg(host.unparseable.join(QStringLiteral(", ")));
+    return tr("this host's nameservers (%1) are loopback or this DC itself")
+        .arg(host.loopbackOrSelf.join(QStringLiteral(", ")));
 }
 
 bool DnsServer::anyForwarderUsable(const QStringList &specs)

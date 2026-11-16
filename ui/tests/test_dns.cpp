@@ -309,6 +309,7 @@ private slots:
     void followsForwarderChangesWhileRunning();
     void reportsMissingForwarderAgainAfterReconfiguration();
     void dropsItsOwnListenerFromAConfiguredList();
+    void separatesAHostFilesForwardingFacts();
     void appliesDynamicUpdates();
     void enforcesUpdatePolicy();
     void persistsZone();
@@ -1079,6 +1080,82 @@ void DnsTest::dropsItsOwnListenerFromAConfiguredList()
     QCOMPARE(forwarded.answers.size(), 1);
 
     delete upstream;
+}
+
+void DnsTest::separatesAHostFilesForwardingFacts()
+{
+    // Three host shapes read the same to a client (SERVFAIL) and used to read
+    // the same to an operator: "this host's nameservers are loopback or this DC
+    // itself". Two of the three are not that, and the sentence sent the operator
+    // to look for a loopback instead of at the line that cannot be parsed.
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    auto write = [&dir](const QString &name, const QByteArray &body) {
+        const QString path = dir.path() + QLatin1Char('/') + name;
+        QFile file(path);
+        if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate))
+            return QString();
+        file.write(body);
+        file.close();
+        return path;
+    };
+
+    // No `nameserver` line at all: the host has nothing configured, which is
+    // not a loopback problem and not a parse problem.
+    const QString emptyPath = write(QStringLiteral("empty.conf"), "# nothing here\n");
+    const auto empty = DnsServer::hostForwarders({emptyPath});
+    QVERIFY(empty.usable.isEmpty());
+    QVERIFY(empty.read.isEmpty());
+    QVERIFY(empty.unparseable.isEmpty());
+    QCOMPARE(empty.files, QStringList{emptyPath});
+    const QString emptyReason = DnsServer::noForwarderReason({}, QStringLiteral("z.example"), empty);
+    QVERIFY(emptyReason.contains(QStringLiteral("no nameserver line")));
+    QVERIFY(emptyReason.contains(emptyPath));
+    QVERIFY(!emptyReason.contains(QStringLiteral("loopback")));
+
+    // Lines that are not addresses: `#53` is systemd-resolved's port syntax and
+    // a bare hostname is what an operator types. Both are dropped by the filter
+    // before this point, so the only trace of them is this list.
+    const QString badPath = write(QStringLiteral("unparseable.conf"),
+                                  "nameserver 192.0.2.1#53\nnameserver dns.example.org\n");
+    const auto bad = DnsServer::hostForwarders({badPath});
+    QVERIFY(bad.usable.isEmpty());
+    QCOMPARE(bad.unparseable,
+             QStringList({QStringLiteral("192.0.2.1#53"), QStringLiteral("dns.example.org")}));
+    QVERIFY(bad.loopbackOrSelf.isEmpty());
+    const QString badReason = DnsServer::noForwarderReason({}, QStringLiteral("z.example"), bad);
+    QVERIFY(badReason.contains(QStringLiteral("192.0.2.1#53")));
+    QVERIFY(badReason.contains(QStringLiteral("could not be parsed as an address")));
+    QVERIFY(!badReason.contains(QStringLiteral("loopback")));
+
+    // A loopback-only host is the one shape the old sentence described.
+    const QString loopPath = write(QStringLiteral("loopback.conf"), "nameserver 127.0.0.53\n");
+    const auto loop = DnsServer::hostForwarders({loopPath});
+    QVERIFY(loop.usable.isEmpty());
+    QVERIFY(loop.unparseable.isEmpty());
+    QCOMPARE(loop.loopbackOrSelf, QStringList{QStringLiteral("127.0.0.53")});
+    const QString loopReason = DnsServer::noForwarderReason({}, QStringLiteral("z.example"), loop);
+    QVERIFY(loopReason.contains(QStringLiteral("127.0.0.53")));
+    QVERIFY(loopReason.contains(QStringLiteral("loopback")));
+
+    // The fallback file is only consulted for a usable upstream; its entries
+    // still count as facts when neither file has one, and a path that does not
+    // exist is not the same as a file with no `nameserver` line.
+    const auto both = DnsServer::hostForwarders({emptyPath, badPath});
+    QVERIFY(both.usable.isEmpty());
+    QCOMPARE(both.unparseable.size(), 2);
+    const auto missing = DnsServer::hostForwarders({dir.path() + QStringLiteral("/absent.conf")});
+    QVERIFY(missing.read.isEmpty());
+    QVERIFY(missing.files.isEmpty());
+    QVERIFY(DnsServer::noForwarderReason({}, QStringLiteral("z.example"), missing)
+                .contains(QStringLiteral("/etc/resolv.conf")));
+
+    // A configured list keeps its own reason, so the new facts cannot swallow it.
+    const QString self = QStringLiteral("127.0.0.1:53");
+    const QString configured =
+        DnsServer::noForwarderReason({self}, QStringLiteral("z.example"), empty);
+    QVERIFY(configured.contains(self));
+    QVERIFY(configured.contains(QStringLiteral("own listener")));
 }
 
 void DnsTest::appliesDynamicUpdates()

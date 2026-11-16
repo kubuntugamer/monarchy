@@ -118,24 +118,50 @@ void DcService::reportForwarders()
                                ? tr("this host's nameservers")
                                : tr("dc.conf");
     const QStringList ignored = m_dnsServer->ignoredForwarders();
+    const QString confPath = m_dcDir + QStringLiteral("/dc.conf");
     if (effective.isEmpty()) {
         // Naming the entry is the whole point: "are loopback" about a list the
         // operator typed by hand reads as if the file were wrong somewhere else.
-        emit statusMessage(
-            ignored.isEmpty()
-                ? tr("No usable DNS forwarder in %1: %2 are loopback or this DC "
-                     "itself, so names outside %3 will not resolve. Set forwarders= "
-                     "in %4.")
-                      .arg(source)
-                      .arg(source)
-                      .arg(m_dnsServer->zone())
-                      .arg(m_dcDir + QStringLiteral("/dc.conf"))
-                : tr("No usable DNS forwarder in %1: %2 is this DC's own listener, so "
-                     "names outside %3 will not resolve. Set forwarders= in %4.")
-                      .arg(source)
-                      .arg(ignored.join(QStringLiteral(", ")))
-                      .arg(m_dnsServer->zone())
-                      .arg(m_dcDir + QStringLiteral("/dc.conf")));
+        if (!ignored.isEmpty()) {
+            emit statusMessage(tr("No usable DNS forwarder in %1: %2 is this DC's own "
+                                  "listener, so names outside %3 will not resolve. Set "
+                                  "forwarders= in %4.")
+                                   .arg(source)
+                                   .arg(ignored.join(QStringLiteral(", ")))
+                                   .arg(m_dnsServer->zone())
+                                   .arg(confPath));
+            return;
+        }
+        // Nothing was configured here, so the answer is in the host's files and
+        // it is one of three different things. "Loopback or this DC itself" is
+        // true for one of them; said about a `nameserver 192.0.2.1#53` line it
+        // tells an operator to look for a loopback that is not there, and the
+        // file that actually needs the edit is named nowhere.
+        const DnsServer::HostForwarders host = DnsServer::hostForwarders();
+        const QString where = host.files.isEmpty()
+            ? QStringLiteral("/etc/resolv.conf")
+            : host.files.join(QStringLiteral(", "));
+        if (host.read.isEmpty())
+            emit statusMessage(tr("No usable DNS forwarder: this host has no nameserver "
+                                  "line in %1, so names outside %2 will not resolve. Set "
+                                  "forwarders= in %3.")
+                                   .arg(where)
+                                   .arg(m_dnsServer->zone())
+                                   .arg(confPath));
+        else if (!host.unparseable.isEmpty())
+            emit statusMessage(tr("No usable DNS forwarder: %1 in this host's nameservers "
+                                  "could not be parsed as an address, so names outside "
+                                  "%2 will not resolve. Set forwarders= in %3.")
+                                   .arg(host.unparseable.join(QStringLiteral(", ")))
+                                   .arg(m_dnsServer->zone())
+                                   .arg(confPath));
+        else
+            emit statusMessage(tr("No usable DNS forwarder: this host's nameservers (%1) "
+                                  "are loopback or this DC itself, so names outside %2 "
+                                  "will not resolve. Set forwarders= in %3.")
+                                   .arg(host.loopbackOrSelf.join(QStringLiteral(", ")))
+                                   .arg(m_dnsServer->zone())
+                                   .arg(confPath));
         return;
     }
     // A recorded list that survives the loopback filter but parses as nothing
@@ -149,7 +175,7 @@ void DcService::reportForwarders()
                                .arg(source)
                                .arg(effective.join(QStringLiteral(", ")))
                                .arg(m_dnsServer->zone())
-                               .arg(m_dcDir + QStringLiteral("/dc.conf")));
+                               .arg(confPath));
         return;
     }
     QString line = tr("Forwarding names outside %1 to %2 (from %3).")

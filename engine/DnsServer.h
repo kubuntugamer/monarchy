@@ -135,10 +135,34 @@ public:
     // loopback or local address. A loopback address on any other port is a
     // local stub resolver, which is a legitimate upstream and is kept.
     bool isOwnListener(const QString &spec) const;
+    // What this host's resolver files say, kept as separate facts because they
+    // mean different things to an operator and read the same when collapsed:
+    // no `nameserver` line at all is a host with nothing configured, a line that
+    // is not an address is a broken host file, and a line naming loopback is a
+    // host that is its own resolver. Reporting the first two as the third sends
+    // an operator to edit a file that is already right.
+    struct HostForwarders {
+        QStringList usable;         // what an out-of-zone query would be sent to
+        QStringList unparseable;    // `nameserver` values that are not address[:port]
+        QStringList loopbackOrSelf; // dropped for naming loopback or this machine
+        QStringList read;           // every `nameserver` value read, in order
+        QStringList files;          // the resolver files those values came from
+    };
+    // Reads `paths` in order and stops at the first file with a usable entry, as
+    // systemForwarders() does. Defaults to /etc/resolv.conf and the file beside
+    // systemd-resolved's stub; the argument exists so a test can pin the
+    // classification without this host's resolv.conf becoming a fixture.
+    static HostForwarders hostForwarders(const QStringList &paths = QStringList());
     // The same lookup and filter, for callers that seed dc.conf with what this
     // host can actually resolve through (the provisioner and the installer)
     // rather than serve queries.
     static QStringList systemForwarders();
+    // Why an out-of-zone query would go unanswered, for the query path's
+    // once-only warning. One function so the two callers that report this
+    // cannot disagree about a host file that was never an address.
+    static QString noForwarderReason(const QStringList &configured,
+                                     const QString &zone,
+                                     const HostForwarders &host);
     // The filter on its own: `nameservers` minus loopback and this machine's
     // own addresses. Static so a test can pin it without this host's
     // /etc/resolv.conf becoming a fixture.
