@@ -247,6 +247,12 @@ if(BUILD_TESTING)
         Qt6::Test
     )
 
+    # The forwarders test drives `record_dc_conf_forwarders()` out of the install
+    # script rather than a copy of it, so it needs the script's real path.
+    target_compile_definitions(monarchy-dcservice-tests PRIVATE
+        MONARCHY_SCRIPT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../scripts"
+    )
+
     add_test(NAME monarchy-dcservice-tests COMMAND monarchy-dcservice-tests)
     set_tests_properties(monarchy-dcservice-tests PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen"

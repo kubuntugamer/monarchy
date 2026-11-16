@@ -99,6 +99,11 @@ Domain
                       without asking (interactive runs are prompted)
   --no-provision      Install without creating a domain
   --force             Re-provision an existing domain store
+  --resolv-conf PATH  File to read host nameservers from (default: /etc/resolv.conf,
+                      then /run/systemd/resolve/resolv.conf when that is empty). Set
+                      explicitly only for unattended or test hosts whose default files
+                      are not the right answer; the writer test hands the function a
+                      chosen file this way.
 
   -h, --help          Show this help
 EOF
@@ -418,14 +423,22 @@ record_dc_conf_forwarders() {
     [[ -f "$DCDIR/dc.conf" ]] || return 0
     grep -qE '^[[:space:]]*forwarders[[:space:]]*=' "$DCDIR/dc.conf" && return 0
 
+    # The name of the file to read is overridable so the writer test can hand
+    # this function a host it chose: which nameservers a machine happens to have
+    # decides whether the written value is one address or a comma list, and a
+    # test that can only ever see one of those cannot cover the other. Unset
+    # everywhere else, and the systemd fallback is skipped when it is set, so a
+    # chosen host does not silently inherit this one's resolvers.
+    local resolver_file="${MONARCHY_RESOLV_CONF:-/etc/resolv.conf}"
+
     local upstreams=() value
     while read -r key value _; do
         [[ "$key" == "nameserver" && -n "$value" ]] || continue
         [[ "$value" == 127.* || "$value" == "::1" ]] && continue
         upstreams+=("$value")
         [[ ${#upstreams[@]} -ge 2 ]] && break
-    done < /etc/resolv.conf
-    if [[ ${#upstreams[@]} -eq 0 && -r /run/systemd/resolve/resolv.conf ]]; then
+    done < "$resolver_file"
+    if [[ ${#upstreams[@]} -eq 0 && -z "${MONARCHY_RESOLV_CONF:-}" && -r /run/systemd/resolve/resolv.conf ]]; then
         while read -r key value _; do
             [[ "$key" == "nameserver" && -n "$value" ]] || continue
             [[ "$value" == 127.* || "$value" == "::1" ]] && continue

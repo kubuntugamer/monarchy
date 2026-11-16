@@ -4,7 +4,9 @@
 #include <QtTest>
 #include <QFile>
 #include <QMap>
+#include <QProcess>
 #include <QSettings>
+#include <QStandardPaths>
 #include <QSignalSpy>
 #include <QTcpServer>
 #include <QTcpSocket>
@@ -74,6 +76,7 @@ class DcServiceTest : public QObject
 private slots:
     void ownsEveryPortItAdvertises();
     void readsEveryShapeOfForwardersKey();
+    void writerAndReaderAgreeOnForwarders();
 };
 
 // The writer and the reader of `forwarders=` met nowhere in a test before this:
@@ -131,6 +134,160 @@ void DcServiceTest::readsEveryShapeOfForwardersKey()
     // No key and an empty key both mean "use the host's nameservers".
     QCOMPARE(read(QByteArray()), QStringList());
     QCOMPARE(read("forwarders="), QStringList());
+}
+
+// The rows above pin what the reader does with shapes a test author wrote by
+// hand. They cannot fail when the writer emits a shape nobody thought to write
+// down, and the writer here is not a C++ function that a test could call: it is
+// `record_dc_conf_forwarders()` in the install script, which builds the line
+// with shell word splitting and inserts it with sed. So this drives that
+// function itself, out of the script's own text, and hands the file it produced
+// to the reader the daemon uses. A change to how the installer joins its
+// upstreams is a change to what this asserts, without this file being edited.
+void DcServiceTest::writerAndReaderAgreeOnForwarders()
+{
+    const QString script = QStringLiteral(MONARCHY_SCRIPT_DIR "/install-monarchy.sh");
+    QVERIFY2(QFile::exists(script), qPrintable(script));
+    if (QStandardPaths::findExecutable(QStringLiteral("bash")).isEmpty())
+        QSKIP("bash is not installed");
+
+    // Lifted by its own boundaries, so the assertion follows the script rather
+    // than a copy of it. log()/warn() are the only helpers the function calls.
+    const QString runner = QStringLiteral(
+        "set -euo pipefail\n"
+        "log() { :; }\n"
+        "warn() { :; }\n"
+        "eval \"$(sed -n '/^record_dc_conf_forwarders()/,/^}/p' \"$1\")\"\n"
+        "DCDIR=$2\n"
+        "record_dc_conf_forwarders\n");
+
+    // The sed extract is what pins where the function starts and ends: a line
+    // that changes how the installer joins its upstreams has to touch that
+    // pattern, and this test is what notices when it does not.
+    QVERIFY2(extracted.contains("joined="),
+             "the install script still writes forwarders= as joined upstreams");
+
+    // The installer's own function, run against a dc.conf and a resolv.conf
+    // this test chose.
+    auto runWriter = [&script, &runner](const QString &dcDir, const QString &resolvPath) {
+        QProcess proc;
+        QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+        env.insert(QStringLiteral("MONARCHY_RESOLV_CONF"), resolvPath);
+        proc.setProcessEnvironment(env);
+        proc.start(QStringLiteral("bash"), {QStringLiteral("-c"), runner,
+                                            QStringLiteral("bash"), script, dcDir});
+        if (!proc.waitForFinished(30000))
+            return false;
+        if (proc.exitStatus() != QProcess::NormalExit || proc.exitCode() != 0) {
+            qWarning("writer failed: %s%s", qPrintable(proc.readAllStandardError()),
+                     qPrintable(proc.readAllStandardOutput()));
+            return false;
+        }
+        return true;
+    };
+
+    struct Written {
+        QString line;      // the value the installer put after `forwarders=`
+        QStringList read;  // what the daemon's reader makes of the same file
+        QByteArray bytes;
+    };
+
+    // One throwaway domain per host shape, with a resolv.conf this test chose.
+    // The host's own nameservers cannot be used: a machine with one upstream
+    // makes the installer write one address, and a one-address value reads
+    // correctly even through the comma bug this test exists to catch.
+    auto write = [&runWriter](const QString &nameservers, Written &out) {
+        QTemporaryDir dir;
+        if (!dir.isValid())
+            return false;
+        const QString conf = dir.path() + QStringLiteral("/dc.conf");
+        const QString resolvPath = dir.path() + QStringLiteral("/resolv.conf");
+        QFile resolv(resolvPath);
+        if (!resolv.open(QIODevice::WriteOnly | QIODevice::Truncate))
+            return false;
+        resolv.write(nameservers.toUtf8());
+        resolv.close();
+
+        QFile file(conf);
+        if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate))
+            return false;
+        // The file the installer meets on a host it provisioned earlier: no
+        // forwarders key yet, and an owner it will try to restore.
+        file.write("[General]\n"
+                   "realm=PROBE.EXAMPLE.ORG\n"
+                   "dnsDomain=probe.example.org\n"
+                   "dcIp=127.0.0.1\n");
+        file.close();
+
+        if (!runWriter(dir.path(), resolvPath))
+            return false;
+        if (QFile::exists(conf + QStringLiteral(".new")))
+            return false; // the installer left its scratch file behind
+
+        QFile written(conf);
+        if (!written.open(QIODevice::ReadOnly))
+            return false;
+        out.bytes = written.readAll();
+        written.close();
+        out.line.clear();
+        for (const QString &line : QString::fromUtf8(out.bytes).split(QLatin1Char('\n'))) {
+            if (line.startsWith(QStringLiteral("forwarders="))) {
+                if (!out.line.isEmpty())
+                    return false; // the key was written twice
+                out.line = line.mid(QStringLiteral("forwarders=").size());
+            }
+        }
+        const QSettings recordedConf(conf, QSettings::IniFormat);
+        out.read = DcService::forwardersFrom(recordedConf);
+        return true;
+    };
+
+    // Two upstreams plus the loopback resolver a host normally has: the value
+    // becomes a comma list, which is the shape that read as no forwarders at
+    // all before the reader asked for a list.
+    const QString twoHosts =
+        QStringLiteral("nameserver 127.0.0.53\nnameserver 192.0.2.1\nnameserver 192.0.2.2\n");
+    Written two;
+    QVERIFY(write(twoHosts, two));
+    QVERIFY2(!two.line.isEmpty(), qPrintable(QString::fromUtf8(two.bytes)));
+    QVERIFY2(!two.line.contains(QLatin1Char(';')),
+             qPrintable(two.line)); // a semicolon would lose an address silently
+    QCOMPARE(two.read, QStringList({"192.0.2.1", "192.0.2.2"}));
+
+    // One upstream: a plain string, which must still read as one address.
+    Written one;
+    QVERIFY(write(QStringLiteral("nameserver 127.0.0.53\nnameserver 192.0.2.1\n"), one));
+    QCOMPARE(one.read, QStringList({"192.0.2.1"}));
+
+    // Only loopback resolvers: the installer writes no key at all, and the
+    // daemon must fall back to the host's nameservers rather than to an empty
+    // list that would answer SERVFAIL for every name outside the zone.
+    Written none;
+    QVERIFY(write(QStringLiteral("nameserver 127.0.0.53\n"), none));
+    QVERIFY2(none.line.isEmpty(), qPrintable(QString::fromUtf8(none.bytes)));
+    QVERIFY(none.read.isEmpty());
+
+    // Re-running the installer is what an operator does after a failed first
+    // run: a key that is already there must be the one that stays, or the
+    // reload path reads a different upstream than the one that was in effect.
+    QTemporaryDir rerun;
+    QVERIFY(rerun.isValid());
+    const QString conf = rerun.path() + QStringLiteral("/dc.conf");
+    const QString resolvPath = rerun.path() + QStringLiteral("/resolv.conf");
+    QFile resolv(resolvPath);
+    QVERIFY(resolv.open(QIODevice::WriteOnly | QIODevice::Truncate));
+    resolv.write("nameserver 192.0.2.1\n");
+    resolv.close();
+    QFile seeded(conf);
+    QVERIFY(seeded.open(QIODevice::WriteOnly | QIODevice::Truncate));
+    seeded.write("[General]\nforwarders=192.0.2.9\n");
+    seeded.close();
+    QVERIFY(runWriter(rerun.path(), resolvPath));
+    QFile kept(conf);
+    QVERIFY(kept.open(QIODevice::ReadOnly));
+    const QSettings keptConf(conf, QSettings::IniFormat);
+    QCOMPARE(DcService::forwardersFrom(keptConf), QStringList({"192.0.2.9"}));
+    QCOMPARE(kept.readAll(), QByteArray("[General]\nforwarders=192.0.2.9\n"));
 }
 
 // The failure this catches is the one issue #3 was filed for: a DC that
