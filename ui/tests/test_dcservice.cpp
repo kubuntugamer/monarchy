@@ -86,9 +86,16 @@ void DcServiceTest::readsEveryShapeOfForwardersKey()
 {
     QTemporaryDir dir;
     QVERIFY(dir.isValid());
-    const QString path = dir.path() + QStringLiteral("/dc.conf");
 
-    auto read = [&path](const QByteArray &forwardersLine) {
+    // One file per shape, never one file rewritten. QSettings answers a rewrite
+    // that keeps the byte count from the values it already parsed: measured on
+    // this host, writing `192.0.2.1,192.0.2.2` and then `192.0.2.1;192.0.2.2`
+    // to one path returned the first value twice. A row asserted against that
+    // cache passes without the reader ever seeing the file, which is how a
+    // semicolon row passed here and failed in CI.
+    int shape = 0;
+    auto read = [&dir, &shape](const QByteArray &forwardersLine) {
+        const QString path = dir.path() + QStringLiteral("/dc-%1.conf").arg(++shape);
         QFile file(path);
         if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate))
             return QStringList{QStringLiteral("<write failed>")};
@@ -108,13 +115,19 @@ void DcServiceTest::readsEveryShapeOfForwardersKey()
     QCOMPARE(read("forwarders=\"192.0.2.53, 192.0.2.54:5353\""),
              QStringList({"192.0.2.53", "192.0.2.54:5353"}));
     // Space separated, and the single-upstream host. A semicolon inside an
-    // unquoted INI value is not asserted: this Qt 6.11 keeps it, an older Qt in
-    // CI reads it as a comment introducer and truncates the value, so the shape
-    // is not one the daemon can promise. The reader still splits on it, for a
-    // value that reaches it quoted.
+    // unquoted INI value is not asserted, and not because of a Qt version: the
+    // INI reader ends the value at `;` here too, so `192.0.2.1;192.0.2.2`
+    // reaches the daemon as `192.0.2.1` and the second address is gone before
+    // forwardersFrom() can split on it. The reader still splits on `;` for a
+    // value that arrives whole.
     QCOMPARE(read("forwarders=192.0.2.1 192.0.2.2"),
              QStringList({"192.0.2.1", "192.0.2.2"}));
     QCOMPARE(read("forwarders=192.168.1.1"), QStringList({"192.168.1.1"}));
+    // Pinned as it behaves, not as one might wish: the unquoted semicolon form
+    // loses the second address inside the INI reader, so the reader hands back
+    // one upstream and nothing downstream can report the loss. The README tells
+    // operators to use commas or spaces.
+    QCOMPARE(read("forwarders=192.0.2.1;192.0.2.2"), QStringList({"192.0.2.1"}));
     // No key and an empty key both mean "use the host's nameservers".
     QCOMPARE(read(QByteArray()), QStringList());
     QCOMPARE(read("forwarders="), QStringList());
