@@ -123,6 +123,7 @@ struct Reply {
     quint16 qdcount = 0;
     QList<Answer> answers;
     QList<Answer> authority;
+    QList<Answer> additional;
     bool parsed = false;
 };
 
@@ -134,10 +135,11 @@ bool parseReply(const QByteArray &packet, Reply *reply)
     quint16 qdcount = 0;
     quint16 ancount = 0;
     quint16 nscount = 0;
+    quint16 arcount = 0;
     quint16 ignored = 0;
     if (!take16(packet, pos, &id) || !take16(packet, pos, &flags) || !take16(packet, pos, &qdcount)
         || !take16(packet, pos, &ancount) || !take16(packet, pos, &nscount)
-        || !take16(packet, pos, &ignored))
+        || !take16(packet, pos, &arcount))
         return false;
     reply->id = id;
     reply->rcode = flags & 0x0f;
@@ -172,6 +174,19 @@ bool parseReply(const QByteArray &packet, Reply *reply)
         answer.rdata = packet.mid(pos, rdlength);
         pos += rdlength;
         reply->authority.append(answer);
+    }
+    for (int i = 0; i < arcount; ++i) {
+        Answer answer;
+        answer.name = readName(packet, pos);
+        quint16 rdlength = 0;
+        if (!take16(packet, pos, &answer.type) || !take16(packet, pos, &answer.rclass)
+            || !take32(packet, pos, &answer.ttl) || !take16(packet, pos, &rdlength))
+            return false;
+        if (pos + rdlength > packet.size())
+            return false;
+        answer.rdata = packet.mid(pos, rdlength);
+        pos += rdlength;
+        reply->additional.append(answer);
     }
     reply->parsed = true;
     return true;
@@ -313,6 +328,7 @@ private slots:
     void appliesDynamicUpdates();
     void enforcesUpdatePolicy();
     void refusesZoneTransfers();
+    void answersAnEdnsQuery();
     void persistsZone();
 };
 
@@ -1288,6 +1304,89 @@ void DnsTest::enforcesUpdatePolicy()
                        &refusedReply));
     QCOMPARE(refusedReply.rcode, 5); // REFUSED
     QVERIFY(server.records(add.name, DnsServer::TypeA).isEmpty());
+}
+
+namespace {
+
+// buildQuery() writes a pre-EDNS query. A client that speaks EDNS appends an
+// OPT to the additional section (RFC 6891 §6.1.1): root owner name, type 41,
+// the sender's UDP payload size in the class field, and extended rcode,
+// version and flags packed into what is a TTL on any other record.
+QByteArray withEdns(const QByteArray &query, quint16 udpSize, quint8 version, bool dnssecOk)
+{
+    QByteArray packet = query;
+    packet[11] = char(1); // ARCOUNT = 1
+    packet.append('\0');
+    put16(packet, 41);
+    put16(packet, udpSize);
+    put32(packet, (quint32(version) << 16) | (dnssecOk ? 0x8000u : 0u));
+    put16(packet, 0);
+    return packet;
+}
+
+} // namespace
+
+void DnsTest::answersAnEdnsQuery()
+{
+    DnsServer server;
+    QVERIFY(server.listen(0));
+    server.loadDefaultZone(QStringLiteral("corp.example.com"));
+
+    // A version-0 client gets an OPT back: this server's own payload size, its
+    // version, and its DO bit echoed. Answering with no OPT at all is what makes
+    // a modern resolver treat the server as pre-EDNS and cap it at 512 bytes.
+    Reply reply;
+    QVERIFY(parseReply(exchange(server.serverPort(),
+                                withEdns(DnsServer::buildQuery(
+                                             QStringLiteral("corp.example.com"),
+                                             DnsServer::TypeSoa, 0x71),
+                                         4096, 0, true)),
+                       &reply));
+    QCOMPARE(reply.rcode, 0);
+    QVERIFY(!reply.answers.isEmpty());
+    QCOMPARE(reply.additional.size(), 1);
+    const Answer &opt = reply.additional.first();
+    QCOMPARE(opt.type, quint16(41));
+    QCOMPARE(opt.rclass, quint16(1232)); // the size this server advertises
+    QCOMPARE(static_cast<quint8>((opt.ttl >> 24) & 0xff), quint8(0)); // extended rcode
+    QCOMPARE(static_cast<quint8>((opt.ttl >> 16) & 0xff), quint8(0)); // version
+    QVERIFY2((opt.ttl & 0x8000u) != 0, "the DO bit a client set must be echoed");
+
+    // DO unset: the reply must not claim DNSSEC data the zone does not have.
+    Reply plain;
+    QVERIFY(parseReply(exchange(server.serverPort(),
+                                withEdns(DnsServer::buildQuery(
+                                             QStringLiteral("corp.example.com"),
+                                             DnsServer::TypeSoa, 0x72),
+                                         1232, 0, false)),
+                       &plain));
+    QCOMPARE(plain.additional.size(), 1);
+    QCOMPARE(plain.additional.first().ttl & 0x8000u, 0u);
+
+    // A version this server does not implement is BADVERS (16), carried as
+    // extended rcode 1 in the OPT with a zero header rcode, and no answer.
+    Reply badvers;
+    QVERIFY(parseReply(exchange(server.serverPort(),
+                                withEdns(DnsServer::buildQuery(
+                                             QStringLiteral("corp.example.com"),
+                                             DnsServer::TypeSoa, 0x73),
+                                         4096, 1, false)),
+                       &badvers));
+    QCOMPARE(badvers.rcode, 0);
+    QVERIFY(badvers.answers.isEmpty());
+    QCOMPARE(badvers.additional.size(), 1);
+    QCOMPARE(badvers.additional.first().type, quint16(41));
+    QCOMPARE(static_cast<quint8>((badvers.additional.first().ttl >> 24) & 0xff), quint8(1));
+    QCOMPARE(static_cast<quint8>((badvers.additional.first().ttl >> 16) & 0xff), quint8(0));
+
+    // A query without an OPT is still answered without one.
+    Reply legacy;
+    QVERIFY(parseReply(exchange(server.serverPort(),
+                                DnsServer::buildQuery(QStringLiteral("corp.example.com"),
+                                                      DnsServer::TypeSoa, 0x74)),
+                       &legacy));
+    QCOMPARE(legacy.rcode, 0);
+    QVERIFY(legacy.additional.isEmpty());
 }
 
 void DnsTest::refusesZoneTransfers()

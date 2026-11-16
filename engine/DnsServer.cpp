@@ -39,6 +39,12 @@ enum : quint16 {
     ClassAny = 255
 };
 
+// The UDP payload size this server advertises in its own OPT. 1232 is the size
+// the DNS flag day agreed on: it fits in one unfragmented IPv6 datagram and
+// leaves room for the EDNS header, so a client that honours it does not build a
+// reply this host's path MTU would drop.
+constexpr quint16 kEdnsUdpPayloadSize = 1232;
+
 bool take16(const QByteArray &d, int &pos, quint16 *out) {
     if (pos < 0 || pos + 2 > d.size())
         return false;
@@ -281,6 +287,44 @@ bool collectTtls(const QByteArray &packet, QList<int> *offsets, quint32 *minTtl)
             *minTtl = ttl;
     }
     return true;
+}
+
+// Finds the request's OPT pseudo-record (RFC 6891 §6.1.1) and returns the
+// sender's UDP payload size and TTL word (extended rcode, version, flags). An
+// OPT in a query is the only place a client states what it can receive and
+// which EDNS version it speaks, so the reply is built from it.
+bool findOpt(const QByteArray &packet, quint16 *udpSize, quint32 *ttl)
+{
+    int pos = 0;
+    quint16 ignored = 0, qdcount = 0, ancount = 0, nscount = 0, arcount = 0;
+    if (!take16(packet, pos, &ignored) || !take16(packet, pos, &ignored)
+        || !take16(packet, pos, &qdcount) || !take16(packet, pos, &ancount)
+        || !take16(packet, pos, &nscount) || !take16(packet, pos, &arcount))
+        return false;
+    for (int i = 0; i < qdcount; ++i) {
+        decodeName(packet, pos);
+        quint16 skip = 0;
+        if (!take16(packet, pos, &skip) || !take16(packet, pos, &skip))
+            return false;
+    }
+    const int total = int(ancount) + int(nscount) + int(arcount);
+    for (int i = 0; i < total; ++i) {
+        decodeName(packet, pos);
+        quint16 type = 0, rclass = 0, rdlength = 0;
+        quint32 word = 0;
+        if (!take16(packet, pos, &type) || !take16(packet, pos, &rclass)
+            || !take32(packet, pos, &word) || !take16(packet, pos, &rdlength))
+            return false;
+        if (pos < 0 || pos + rdlength > packet.size())
+            return false;
+        pos += rdlength;
+        if (type != 41)
+            continue;
+        *udpSize = rclass;
+        *ttl = word;
+        return true;
+    }
+    return false;
 }
 
 } // namespace
@@ -1535,6 +1579,27 @@ QByteArray DnsServer::buildResponse(const QByteArray &query, const QList<Record>
         || !take16(query, pos, &qdcount))
         return {};
 
+    // EDNS0 (RFC 6891). A client that sent an OPT gets one back, carrying this
+    // server's own UDP payload size and echoing its DO bit; a client that asked
+    // for a version this server does not implement gets BADVERS instead of an
+    // answer, because answering a version you do not speak is how a client
+    // concludes you do. A query without an OPT is answered without one, which is
+    // what a pre-EDNS client expects.
+    quint16 clientUdpSize = 0;
+    quint32 optTtl = 0;
+    const bool hasOpt = findOpt(query, &clientUdpSize, &optTtl);
+    const quint8 optVersion = quint8((optTtl >> 16) & 0xff);
+    const bool badVersion = hasOpt && optVersion != 0;
+    const QList<Record> noAnswers;
+    // BADVERS is 16, and a 4-bit header rcode cannot carry it: the low nibble
+    // goes in the header (0) and the high byte in the OPT TTL (RFC 6891
+    // §6.1.3). It carries no answer either — a server that cannot read the
+    // request's version cannot claim to have answered it.
+    const QList<Record> &answersToWrite = badVersion ? noAnswers : answers;
+    if (badVersion)
+        rcode = NoError;
+    const quint16 optExtendedRcode = badVersion ? quint16(1) : quint16(0);
+
     QByteArray response;
     wr16(response, id);
     const quint16 opcode = quint16(queryFlags & 0x7800);
@@ -1549,9 +1614,9 @@ QByteArray DnsServer::buildResponse(const QByteArray &query, const QList<Record>
     const quint16 ra = m_forwarding ? quint16(0x0080) : quint16(0);
     wr16(response, quint16(0x8000 | opcode | rd | ra | aa | quint16(rcode & 0x0f)));
     wr16(response, qdcount);
-    wr16(response, quint16(answers.size()));
+    wr16(response, quint16(answersToWrite.size()));
     wr16(response, quint16(authority.size()));
-    wr16(response, 0);
+    wr16(response, hasOpt ? quint16(1) : quint16(0));
 
     // Echo the question (or, for UPDATE, the zone) section verbatim.
     int qpos = 12;
@@ -1565,7 +1630,7 @@ QByteArray DnsServer::buildResponse(const QByteArray &query, const QList<Record>
         return {};
     response.append(query.mid(12, qpos - 12));
 
-    for (const QList<Record> *section : { &answers, &authority }) {
+    for (const QList<Record> *section : { &answersToWrite, &authority }) {
         for (const Record &record : *section) {
             response.append(encodeName(record.name));
             wr16(response, record.type);
@@ -1574,6 +1639,17 @@ QByteArray DnsServer::buildResponse(const QByteArray &query, const QList<Record>
             wr16(response, quint16(record.rdata.size()));
             response.append(record.rdata);
         }
+    }
+
+    if (hasOpt) {
+        // The responder's own payload size goes in the class field; the TTL
+        // word is extended rcode, version 0 and the flags with DO echoed.
+        response.append('\0');
+        wr16(response, 41);
+        wr16(response, kEdnsUdpPayloadSize);
+        const quint16 flags = quint16(optTtl & 0x8000);
+        wr32(response, (quint32(optExtendedRcode) << 24) | quint32(flags));
+        wr16(response, 0);
     }
     return response;
 }
