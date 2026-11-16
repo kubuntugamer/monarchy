@@ -161,15 +161,28 @@ void DcServiceTest::writerAndReaderAgreeOnForwarders()
         "DCDIR=$2\n"
         "record_dc_conf_forwarders\n");
 
-    // The install script's record_dc_conf_forwarders() function builds the
-    // forwarders= line from a variable named joined. This assertion is temporarily
-    // disabled because the runner QStringLiteral source text does not literally
-    // contain 'joined=' at runtime (the variable is built inside the function
-    // extracted by the sed command inside the eval). The writer/reader agreement
-    // test below verifies the actual forwarders behavior.
-    // 
-    // Removing this assertion allows the writer/reader agreement test to run.
-    // 
+    // Pin the extracted writer text itself: record_dc_conf_forwarders() must
+    // build the forwarders= value via a joined variable (the installer's
+    // comma-joining logic). Assert on the sed-extracted function body, not on
+    // the runner source that evals it.
+    QProcess sed;
+    sed.start(QStringLiteral("sed"),
+              {QStringLiteral("-n"),
+               QStringLiteral("/^record_dc_conf_forwarders()/,/^}/p"),
+               script});
+    QVERIFY2(sed.waitForFinished(10000),
+             "sed could not extract record_dc_conf_forwarders()");
+    QCOMPARE(sed.exitStatus(), QProcess::NormalExit);
+    QCOMPARE(sed.exitCode(), 0);
+    const QString extracted = QString::fromUtf8(sed.readAllStandardOutput());
+    QVERIFY2(!extracted.isEmpty(),
+             qPrintable(QStringLiteral("no record_dc_conf_forwarders() found in %1")
+                            .arg(script)));
+    QVERIFY2(extracted.contains(QStringLiteral("joined=")),
+             qPrintable(QStringLiteral("extracted record_dc_conf_forwarders() does not "
+                                       "contain 'joined=':\n%1")
+                            .arg(extracted)));
+
     // The installer's own function, run against a dc.conf and a resolv.conf
     // this test chose.
     auto runWriter = [&script, &runner](const QString &dcDir, const QString &resolvPath) {
