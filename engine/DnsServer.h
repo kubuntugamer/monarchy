@@ -239,8 +239,10 @@ private:
     // Returns the rcode; fills `answers` for standard queries.
     int handleQuery(const Message &message, QList<Record> &answers);
     int handleUpdate(const Message &message);
+    // `udp` says the reply will be sent in one datagram, so it must fit what the
+    // client said it can receive; a TCP reply has no such limit.
     QByteArray buildResponse(const QByteArray &query, const QList<Record> &answers, int rcode,
-                             const QList<Record> &authority = {}) const;
+                             const QList<Record> &authority = {}, bool udp = false) const;
 
     void bumpSerial();
     bool inZone(const QString &name) const;

@@ -121,6 +121,7 @@ struct Reply {
     quint16 id = 0;
     int rcode = -1;
     quint16 qdcount = 0;
+    bool truncated = false;
     QList<Answer> answers;
     QList<Answer> authority;
     QList<Answer> additional;
@@ -143,6 +144,7 @@ bool parseReply(const QByteArray &packet, Reply *reply)
         return false;
     reply->id = id;
     reply->rcode = flags & 0x0f;
+    reply->truncated = (flags & 0x0200) != 0;
     reply->qdcount = qdcount;
     for (int i = 0; i < qdcount; ++i) {
         readName(packet, pos);
@@ -329,6 +331,7 @@ private slots:
     void enforcesUpdatePolicy();
     void refusesZoneTransfers();
     void answersAnEdnsQuery();
+    void truncatesADatagramReplyToWhatTheClientCanReceive();
     void persistsZone();
 };
 
@@ -1387,6 +1390,71 @@ void DnsTest::answersAnEdnsQuery()
                        &legacy));
     QCOMPARE(legacy.rcode, 0);
     QVERIFY(legacy.additional.isEmpty());
+}
+
+void DnsTest::truncatesADatagramReplyToWhatTheClientCanReceive()
+{
+    DnsServer server;
+    QVERIFY(server.listen(0));
+    server.loadDefaultZone(QStringLiteral("corp.example.com"));
+
+    // An RRset big enough not to fit in 512 bytes: 60 A records at one name.
+    // A name with this many addresses is ordinary in a lab (a round-robin
+    // service), and it is what makes a datagram reply overflow.
+    const QString big = QStringLiteral("big.corp.example.com");
+    for (int i = 0; i < 60; ++i) {
+        QByteArray rdata;
+        rdata.append(char(10));
+        rdata.append(char(1));
+        rdata.append(char(i / 256));
+        rdata.append(char(i % 256));
+        server.addRecord(big, DnsServer::TypeA, 60, rdata);
+    }
+
+    const QByteArray query = DnsServer::buildQuery(big, DnsServer::TypeAny, 0x81);
+
+    // A pre-EDNS client receives at most 512 bytes. The reply must say so with
+    // TC and carry only the records that fit: sending all 60 would produce a
+    // datagram the client's 512-byte buffer cuts in half.
+    const QByteArray legacy = exchange(server.serverPort(), query);
+    QVERIFY(!legacy.isEmpty());
+    QVERIFY2(legacy.size() <= 512, qPrintable(QStringLiteral("reply was %1 bytes").arg(legacy.size())));
+    Reply legacyReply;
+    QVERIFY(parseReply(legacy, &legacyReply));
+    QCOMPARE(legacyReply.rcode, 0);
+    QVERIFY2(legacyReply.truncated, "a reply that does not fit must set TC");
+    QVERIFY(!legacyReply.answers.isEmpty());
+    QVERIFY2(legacyReply.answers.size() < 60, "records that do not fit must be left out");
+
+    // A client that advertised a larger buffer gets the whole answer, untruncated.
+    Reply roomy;
+    QVERIFY(parseReply(exchange(server.serverPort(), withEdns(query, 4096, 0, false)), &roomy));
+    QVERIFY2(!roomy.truncated, "4096 bytes is enough for 60 A records");
+    QCOMPARE(roomy.answers.size(), 60);
+    QCOMPARE(roomy.additional.size(), 1);
+
+    // Advertising the minimum still bounds the reply, and still says TC.
+    const QByteArray tight = exchange(server.serverPort(), withEdns(query, 512, 0, false));
+    QVERIFY(tight.size() <= 512);
+    Reply tightReply;
+    QVERIFY(parseReply(tight, &tightReply));
+    QVERIFY(tightReply.truncated);
+    QVERIFY(tightReply.answers.size() < 60);
+
+    // A size below the 512 floor is treated as 512 (RFC 6891 §6.2.5), not as a
+    // reason to send less than the protocol guarantees every client can read.
+    const QByteArray tiny = exchange(server.serverPort(), withEdns(query, 200, 0, false));
+    QVERIFY(tiny.size() > 200 ? tiny.size() <= 512 : true);
+    Reply tinyReply;
+    QVERIFY(parseReply(tiny, &tinyReply));
+    QVERIFY(!tinyReply.answers.isEmpty());
+
+    // TCP has no size limit: the same query gets every record and no TC, which
+    // is what makes the truncated datagram's advice worth following.
+    Reply overTcp;
+    QVERIFY(parseReply(exchangeTcp(server.serverPort(), query), &overTcp));
+    QVERIFY2(!overTcp.truncated, "a length-prefixed reply is not truncated");
+    QCOMPARE(overTcp.answers.size(), 60);
 }
 
 void DnsTest::refusesZoneTransfers()

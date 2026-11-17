@@ -44,6 +44,9 @@ enum : quint16 {
 // leaves room for the EDNS header, so a client that honours it does not build a
 // reply this host's path MTU would drop.
 constexpr quint16 kEdnsUdpPayloadSize = 1232;
+// Root owner name, type, class, TTL and RDLENGTH: an OPT which carries no
+// option is 11 bytes on the wire.
+constexpr int kOptBytes = 11;
 
 bool take16(const QByteArray &d, int &pos, quint16 *out) {
     if (pos < 0 || pos + 2 > d.size())
@@ -818,17 +821,20 @@ void DnsServer::onReadyRead() {
 
 QByteArray DnsServer::handlePacket(const QByteArray &packet, const QHostAddress &from,
                                    quint16 fromPort, QTcpSocket *tcpClient) {
+    // A datagram reply is bounded by the client's receive size; a TCP reply is
+    // length-prefixed and bounded only by what the protocol allows.
+    const bool udp = tcpClient == nullptr;
     Message message;
     if (!parseMessage(packet, &message))
-        return buildResponse(packet, {}, FormErr);
+        return buildResponse(packet, {}, FormErr, {}, udp);
 
     const int opcode = (message.flags >> 11) & 0x0f;
     if (opcode == 5) {
         const int rcode = handleUpdate(message);
-        return buildResponse(packet, {}, rcode);
+        return buildResponse(packet, {}, rcode, {}, udp);
     }
     if (opcode != 0)
-        return buildResponse(packet, {}, NotImp);
+        return buildResponse(packet, {}, NotImp, {}, udp);
 
     // Anything outside our zone that asks for recursion goes upstream; the
     // reply may arrive later, so an empty return means "wait".
@@ -860,7 +866,7 @@ QByteArray DnsServer::handlePacket(const QByteArray &packet, const QHostAddress 
     }
     if (rcode != NoError)
         answers.clear();
-    return buildResponse(packet, answers, rcode, authority);
+    return buildResponse(packet, answers, rcode, authority, udp);
 }
 
 QByteArray DnsServer::forwardQuery(const Message &message, const QByteArray &packet,
@@ -886,7 +892,7 @@ QByteArray DnsServer::forwardQuery(const Message &message, const QByteArray &pac
 
     if (m_pending.size() >= 1024
         || m_upstreamSocket->state() != QAbstractSocket::BoundState)
-        return buildResponse(packet, {}, ServFail);
+        return buildResponse(packet, {}, ServFail, {}, tcpClient == nullptr);
 
     const QStringList servers = effectiveForwarders();
     QHostAddress upstream;
@@ -923,7 +929,7 @@ QByteArray DnsServer::forwardQuery(const Message &message, const QByteArray &pac
                 emit forwardingUnavailable(tr("no forwarder could be parsed from %1")
                                                .arg(servers.join(QStringLiteral(", "))));
         }
-        return buildResponse(packet, {}, ServFail);
+        return buildResponse(packet, {}, ServFail, {}, tcpClient == nullptr);
     }
 
     quint16 upstreamId = m_nextUpstreamId++;
@@ -947,7 +953,7 @@ QByteArray DnsServer::forwardQuery(const Message &message, const QByteArray &pac
     QByteArray upstreamQuery = packet;
     if (upstreamQuery.size() < 2 || upstreamQuery.size() > 65535) {
         m_pending.remove(upstreamId);
-        return buildResponse(packet, {}, FormErr);
+        return buildResponse(packet, {}, FormErr, {}, tcpClient == nullptr);
     }
     upstreamQuery[0] = char((upstreamId >> 8) & 0xff);
     upstreamQuery[1] = char(upstreamId & 0xff);
@@ -974,7 +980,7 @@ QByteArray DnsServer::forwardQuery(const Message &message, const QByteArray &pac
         upstreamSocket->connectToHost(upstream, upstreamPort);
     } else if (m_upstreamSocket->writeDatagram(upstreamQuery, upstream, upstreamPort) < 0) {
         m_pending.remove(upstreamId);
-        return buildResponse(packet, {}, ServFail);
+        return buildResponse(packet, {}, ServFail, {}, tcpClient == nullptr);
     }
 
     QTimer::singleShot(5000, this, [this, upstreamId]() { timeoutPending(upstreamId); });
@@ -1570,7 +1576,7 @@ int DnsServer::handleUpdate(const Message &message) {
 }
 
 QByteArray DnsServer::buildResponse(const QByteArray &query, const QList<Record> &answers,
-                                    int rcode, const QList<Record> &authority) const {
+                                    int rcode, const QList<Record> &authority, bool udp) const {
     int pos = 0;
     quint16 id = 0;
     quint16 queryFlags = 0;
@@ -1630,15 +1636,46 @@ QByteArray DnsServer::buildResponse(const QByteArray &query, const QList<Record>
         return {};
     response.append(query.mid(12, qpos - 12));
 
-    for (const QList<Record> *section : { &answersToWrite, &authority }) {
-        for (const Record &record : *section) {
-            response.append(encodeName(record.name));
-            wr16(response, record.type);
-            wr16(response, ClassIn);
-            wr32(response, record.ttl);
-            wr16(response, quint16(record.rdata.size()));
-            response.append(record.rdata);
+    // Truncation (RFC 1035 §4.2.1, RFC 6891 §6.2.5). A datagram reply must fit
+    // what the client said it can receive: 512 bytes unless it sent an OPT, in
+    // which case its advertised size, and never less than 512. Sending more
+    // instead produces a reply the client's buffer silently cuts — a mangled
+    // packet it cannot tell from a corrupt one. So the records that fit are
+    // written, the rest are dropped, and TC says to retry over TCP, where the
+    // same query gets the whole answer.
+    const int recordBudget = udp ? (hasOpt ? qMax<int>(clientUdpSize, 512) : 512)
+                                     - (hasOpt ? kOptBytes : 0)
+                               : 0;
+    bool truncated = false;
+    int writtenAnswers = 0;
+    int writtenAuthority = 0;
+    for (int section = 0; section < 2 && !truncated; ++section) {
+        const bool inAnswers = section == 0;
+        for (const Record &record : inAnswers ? answersToWrite : authority) {
+            QByteArray encoded;
+            encoded.append(encodeName(record.name));
+            wr16(encoded, record.type);
+            wr16(encoded, ClassIn);
+            wr32(encoded, record.ttl);
+            wr16(encoded, quint16(record.rdata.size()));
+            encoded.append(record.rdata);
+            if (udp && response.size() + encoded.size() > recordBudget) {
+                truncated = true;
+                break;
+            }
+            response.append(encoded);
+            if (inAnswers)
+                ++writtenAnswers;
+            else
+                ++writtenAuthority;
         }
+    }
+    if (truncated) {
+        response[2] = char(quint8(response.at(2)) | 0x02); // TC
+        response[6] = char((writtenAnswers >> 8) & 0xff);
+        response[7] = char(writtenAnswers & 0xff);
+        response[8] = char((writtenAuthority >> 8) & 0xff);
+        response[9] = char(writtenAuthority & 0xff);
     }
 
     if (hasOpt) {
