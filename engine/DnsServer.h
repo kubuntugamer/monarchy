@@ -104,6 +104,13 @@ public:
     // the zone changed.
     bool repairAdZoneAddresses(const QString &host, const QString &ip);
 
+    // The reverse zone AD provisions for a DC's address: /24 of the dotted
+    // quad, holding a PTR for the DC. The zone is derived from the address, not
+    // authored, so this both repairs it in place and withdraws the previous one
+    // when the DC moves. Returns true when the zone changed.
+    bool repairReverseZone(const QString &host, const QString &ip);
+    QString reverseZone() const;
+
     void addRecord(const QString &name, quint16 type, quint32 ttl, const QByteArray &rdata);
     void removeRecord(const QString &name, quint16 type);
     QList<Record> records(const QString &name, quint16 type) const;
@@ -245,6 +252,10 @@ private:
                              const QList<Record> &authority = {}, bool udp = false) const;
 
     void bumpSerial();
+    void bumpReverseSerial();
+    // The zone a name belongs to: the reverse zone when this DC is authoritative
+    // for it, otherwise the forward zone, or empty when the name is neither.
+    QString zoneFor(const QString &name) const;
     bool inZone(const QString &name) const;
     QByteArray srvRdata(quint16 port, const QString &target) const;
     QList<Record> &recordList(const QString &name);
@@ -256,6 +267,7 @@ private:
     QHash<QTcpSocket *, QByteArray> m_tcpClientBuffers;
     QHash<QTcpSocket *, quint16> m_upstreamTcpIds;
     QMap<QString, QList<Record>> m_records; // lower-case owner name -> records
+    QString m_reverseZone;                  // derived in-addr.arpa zone, if any
     QHash<quint16, PendingQuery> m_pending;
     QHash<QString, CacheEntry> m_cache;
     QStringList m_forwarders;

@@ -1077,7 +1077,10 @@ bool DcService::start(const QString &dcDir)
     const bool addressRepaired = m_dnsServer->repairAdZoneAddresses(dcHost, dcIp);
     const bool locatorsRepaired = m_dnsServer->repairAdZoneLocators(
         dcHost, boundLdapPort, boundGcPort, siteName, boundKpasswdPort, boundKdcPort);
-    if (addressRepaired || locatorsRepaired) {
+    // AD publishes a reverse zone for the DC's own address; `dig -x` against a
+    // domain controller is answered from it, so this DC holds one too.
+    const bool reverseRepaired = m_dnsServer->repairReverseZone(dcHost, dcIp);
+    if (addressRepaired || locatorsRepaired || reverseRepaired) {
         QString zoneError;
         if (!m_zonePath.isEmpty() && !m_dnsServer->saveZone(m_zonePath, &zoneError))
             emit statusMessage(tr("Could not persist the repaired zone: %1").arg(zoneError));

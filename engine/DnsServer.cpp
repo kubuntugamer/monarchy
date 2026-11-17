@@ -644,6 +644,44 @@ QList<AdSrvSpec> adSrvSpecs(const QString &zoneName, const QString &site, quint1
     };
 }
 
+// A dotted quad as four canonical decimal octets. "01" and "1x" are rejected:
+// they are not addresses an AD client could have been configured with, and
+// reading them as 1 would derive a reverse zone for a different host.
+bool ipv4Octets(const QString &ip, QStringList *octets)
+{
+    const QStringList parts = ip.split(QLatin1Char('.'));
+    if (parts.size() != 4)
+        return false;
+    for (const QString &part : parts) {
+        bool ok = false;
+        const int value = part.toInt(&ok);
+        if (!ok || value < 0 || value > 255 || QString::number(value) != part)
+            return false;
+        octets->append(part);
+    }
+    return true;
+}
+
+// AD provisions a /24 reverse zone for a DC's address; "" is not an address.
+QString reverseZoneFor(const QString &ip)
+{
+    QStringList octets;
+    if (!ipv4Octets(ip, &octets))
+        return {};
+    return octets[2] + QLatin1Char('.') + octets[1] + QLatin1Char('.') + octets[0]
+           + QStringLiteral(".in-addr.arpa");
+}
+
+// The owner name `dig -x` asks for.
+QString ptrOwnerFor(const QString &ip)
+{
+    QStringList octets;
+    if (!ipv4Octets(ip, &octets))
+        return {};
+    return octets[3] + QLatin1Char('.') + octets[2] + QLatin1Char('.') + octets[1]
+           + QLatin1Char('.') + octets[0] + QStringLiteral(".in-addr.arpa");
+}
+
 } // namespace
 
 void DnsServer::loadAdZone(const QString &zone, const QString &host, const QString &ip,
@@ -770,16 +808,92 @@ bool DnsServer::repairAdZoneAddresses(const QString &host, const QString &ip)
     return changed;
 }
 
+bool DnsServer::repairReverseZone(const QString &host, const QString &ip)
+{
+    if (m_zone.isEmpty())
+        return false;
+    const QString wanted = reverseZoneFor(ip);
+    if (wanted.isEmpty())
+        return false;
+    const QString owner = ptrOwnerFor(ip);
+    if (owner.isEmpty())
+        return false;
+
+    bool changed = false;
+    // The reverse zone is derived from dcIp, so an address that moved must take
+    // the old zone with it: a leftover PTR in the previous /24 points clients at
+    // a name whose address is no longer this DC's.
+    if (!m_reverseZone.isEmpty() && m_reverseZone != wanted) {
+        for (auto it = m_records.begin(); it != m_records.end();) {
+            if (it.key() == m_reverseZone
+                || it.key().endsWith(QLatin1Char('.') + m_reverseZone))
+                it = m_records.erase(it);
+            else
+                ++it;
+        }
+        changed = true;
+    }
+    m_reverseZone = wanted;
+
+    const QString hostName = host.toLower();
+    const QByteArray nameServer = encodeName(hostName.isEmpty() ? QStringLiteral("ns1.") + m_zone
+                                                               : hostName);
+    // The zone gets its own SOA and NS: a resolver asking for a name this DC does
+    // not hold in the /24 is answered authoritatively with this, and caches the
+    // absence against it.
+    if (records(m_reverseZone, TypeSoa).isEmpty()) {
+        QByteArray soa = nameServer;
+        soa += encodeName(QStringLiteral("hostmaster.") + m_zone);
+        wr32(soa, m_serial);
+        wr32(soa, 3600);  // refresh
+        wr32(soa, 600);   // retry
+        wr32(soa, 86400); // expire
+        wr32(soa, 3600);  // minimum
+        addRecord(m_reverseZone, TypeSoa, 3600, soa);
+        changed = true;
+    }
+    if (records(m_reverseZone, TypeNs).isEmpty()) {
+        addRecord(m_reverseZone, TypeNs, 3600, nameServer);
+        changed = true;
+    }
+
+    const QByteArray ptr = encodeName(hostName);
+    const QList<Record> existing = records(owner, TypePtr);
+    if (existing.size() != 1 || existing.first().rdata != ptr) {
+        if (!existing.isEmpty())
+            removeRecord(owner, TypePtr);
+        addRecord(owner, TypePtr, 1200, ptr);
+        changed = true;
+    }
+    if (changed)
+        bumpReverseSerial();
+    return changed;
+}
+
+QString DnsServer::reverseZone() const
+{
+    return m_reverseZone;
+}
+
 void DnsServer::loadDefaultZone(const QString &zone) {
     loadAdZone(zone, QStringLiteral("dc1.") + zone, QStringLiteral("127.0.0.1"), 389, 3268,
                QStringLiteral("Default-First-Site-Name"));
 }
 
-bool DnsServer::inZone(const QString &name) const {
+QString DnsServer::zoneFor(const QString &name) const {
     if (m_zone.isEmpty())
-        return false;
+        return {};
     const QString lower = name.toLower();
-    return lower == m_zone || lower.endsWith(QLatin1Char('.') + m_zone);
+    if (!m_reverseZone.isEmpty()
+        && (lower == m_reverseZone || lower.endsWith(QLatin1Char('.') + m_reverseZone)))
+        return m_reverseZone;
+    if (lower == m_zone || lower.endsWith(QLatin1Char('.') + m_zone))
+        return m_zone;
+    return {};
+}
+
+bool DnsServer::inZone(const QString &name) const {
+    return !zoneFor(name).isEmpty();
 }
 
 void DnsServer::bumpSerial() {
@@ -799,6 +913,32 @@ void DnsServer::bumpSerial() {
         soa[pos + 1] = char((m_serial >> 16) & 0xff);
         soa[pos + 2] = char((m_serial >> 8) & 0xff);
         soa[pos + 3] = char(m_serial & 0xff);
+        return;
+    }
+}
+
+void DnsServer::bumpReverseSerial() {
+    if (m_reverseZone.isEmpty())
+        return;
+    auto it = m_records.find(m_reverseZone);
+    if (it == m_records.end())
+        return;
+    for (Record &record : it.value()) {
+        if (record.type != TypeSoa)
+            continue;
+        QByteArray &soa = record.rdata;
+        int pos = 0;
+        if (!skipName(soa, pos) || !skipName(soa, pos) || pos + 4 > soa.size())
+            return;
+        const quint32 serial = (quint32(quint8(soa[pos])) << 24)
+                               | (quint32(quint8(soa[pos + 1])) << 16)
+                               | (quint32(quint8(soa[pos + 2])) << 8)
+                               | quint32(quint8(soa[pos + 3]));
+        const quint32 next = serial + 1;
+        soa[pos] = char((next >> 24) & 0xff);
+        soa[pos + 1] = char((next >> 16) & 0xff);
+        soa[pos + 2] = char((next >> 8) & 0xff);
+        soa[pos + 3] = char(next & 0xff);
         return;
     }
 }
@@ -860,7 +1000,7 @@ QByteArray DnsServer::handlePacket(const QByteArray &packet, const QHostAddress 
     if (answers.isEmpty() && (rcode == NoError || rcode == NxDomain)
         && message.questions.size() == 1 && message.questions.first().qclass == ClassIn
         && inZone(message.questions.first().name)) {
-        const QList<Record> soa = records(m_zone, TypeSoa);
+        const QList<Record> soa = records(zoneFor(message.questions.first().name), TypeSoa);
         if (!soa.isEmpty())
             authority.append(soa.first());
     }
@@ -1696,6 +1836,8 @@ bool DnsServer::saveZone(const QString &path, QString *error) const {
     root[QStringLiteral("version")] = 1;
     root[QStringLiteral("zone")] = m_zone;
     root[QStringLiteral("serial")] = double(m_serial);
+    if (!m_reverseZone.isEmpty())
+        root[QStringLiteral("reverseZone")] = m_reverseZone;
     QJsonArray recordsArray;
     for (auto it = m_records.constBegin(); it != m_records.constEnd(); ++it) {
         for (const Record &record : it.value()) {
@@ -1738,6 +1880,7 @@ bool DnsServer::loadZone(const QString &path, QString *error) {
     m_records.clear();
     m_zone = root.value(QStringLiteral("zone")).toString().toLower();
     m_serial = quint32(root.value(QStringLiteral("serial")).toDouble(1));
+    m_reverseZone = root.value(QStringLiteral("reverseZone")).toString().toLower();
     for (const QJsonValue &value : root.value(QStringLiteral("records")).toArray()) {
         const QJsonObject entry = value.toObject();
         const QString name = entry.value(QStringLiteral("name")).toString();

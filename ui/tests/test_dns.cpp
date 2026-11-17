@@ -122,6 +122,7 @@ struct Reply {
     int rcode = -1;
     quint16 qdcount = 0;
     bool truncated = false;
+    bool authoritative = false;
     QList<Answer> answers;
     QList<Answer> authority;
     QList<Answer> additional;
@@ -145,6 +146,7 @@ bool parseReply(const QByteArray &packet, Reply *reply)
     reply->id = id;
     reply->rcode = flags & 0x0f;
     reply->truncated = (flags & 0x0200) != 0;
+    reply->authoritative = (flags & 0x0400) != 0;
     reply->qdcount = qdcount;
     for (int i = 0; i < qdcount; ++i) {
         readName(packet, pos);
@@ -332,6 +334,7 @@ private slots:
     void refusesZoneTransfers();
     void answersAnEdnsQuery();
     void truncatesADatagramReplyToWhatTheClientCanReceive();
+    void answersReverseLookupsForItsOwnAddress();
     void persistsZone();
 };
 
@@ -1455,6 +1458,85 @@ void DnsTest::truncatesADatagramReplyToWhatTheClientCanReceive()
     QVERIFY(parseReply(exchangeTcp(server.serverPort(), query), &overTcp));
     QVERIFY2(!overTcp.truncated, "a length-prefixed reply is not truncated");
     QCOMPARE(overTcp.answers.size(), 60);
+}
+
+void DnsTest::answersReverseLookupsForItsOwnAddress()
+{
+    DnsServer server;
+    QVERIFY(server.listen(0));
+    server.loadAdZone(QStringLiteral("corp.example.com"),
+                      QStringLiteral("dc1.corp.example.com"), QStringLiteral("192.168.5.20"),
+                      389, 3268, QStringLiteral("Default-First-Site-Name"));
+    // `dig -x 192.168.5.20` against an AD DC: the DC is authoritative for the
+    // /24 of its own address and holds a PTR in it.
+    QVERIFY(server.repairReverseZone(QStringLiteral("dc1.corp.example.com"),
+                                     QStringLiteral("192.168.5.20")));
+    QCOMPARE(server.reverseZone(), QStringLiteral("5.168.192.in-addr.arpa"));
+
+    Reply ptr;
+    QVERIFY(parseReply(exchange(server.serverPort(),
+                                DnsServer::buildQuery(QStringLiteral("20.5.168.192.in-addr.arpa"),
+                                                      DnsServer::TypePtr, 0x91)),
+                       &ptr));
+    QCOMPARE(ptr.rcode, 0);
+    QVERIFY2(ptr.authoritative, "a PTR in this DC's own reverse zone is authoritative");
+    QCOMPARE(ptr.answers.size(), 1);
+    QCOMPARE(ptr.answers.first().type, DnsServer::TypePtr);
+    int pos = 0;
+    QCOMPARE(readName(ptr.answers.first().rdata, pos), QStringLiteral("dc1.corp.example.com"));
+
+    // The forward name the PTR points at still resolves.
+    Reply forward;
+    QVERIFY(parseReply(exchange(server.serverPort(),
+                                DnsServer::buildQuery(QStringLiteral("dc1.corp.example.com"),
+                                                      DnsServer::TypeA, 0x92)),
+                       &forward));
+    QCOMPARE(forward.answers.size(), 1);
+
+    // An address in the same /24 this DC does not hold: NXDOMAIN, authoritative,
+    // and carrying the reverse zone's own SOA so a resolver can cache the
+    // absence against it.
+    Reply absent;
+    QVERIFY(parseReply(exchange(server.serverPort(),
+                                DnsServer::buildQuery(QStringLiteral("21.5.168.192.in-addr.arpa"),
+                                                      DnsServer::TypePtr, 0x93)),
+                       &absent));
+    QCOMPARE(absent.rcode, 3);
+    QVERIFY(absent.authoritative);
+    QVERIFY(!absent.authority.isEmpty());
+    QCOMPARE(absent.authority.first().type, DnsServer::TypeSoa);
+    QCOMPARE(absent.authority.first().name, QStringLiteral("5.168.192.in-addr.arpa"));
+
+    // A neighbouring /24 belongs to someone else: it must not be answered as if
+    // this server were authoritative for it.
+    Reply elsewhere;
+    QVERIFY(parseReply(exchange(server.serverPort(),
+                                DnsServer::buildQuery(QStringLiteral("20.5.168.193.in-addr.arpa"),
+                                                      DnsServer::TypePtr, 0x94)),
+                       &elsewhere));
+    QVERIFY2(elsewhere.rcode != 0, "a name outside both zones is not answered here");
+
+    // Starting again on the same address rewrites nothing.
+    QVERIFY(!server.repairReverseZone(QStringLiteral("dc1.corp.example.com"),
+                                      QStringLiteral("192.168.5.20")));
+
+    // A DC that moves takes its PTR with it, and the abandoned /24 stops
+    // pointing at it.
+    QVERIFY(server.repairReverseZone(QStringLiteral("dc1.corp.example.com"),
+                                     QStringLiteral("192.168.9.20")));
+    QCOMPARE(server.reverseZone(), QStringLiteral("9.168.192.in-addr.arpa"));
+    Reply moved;
+    QVERIFY(parseReply(exchange(server.serverPort(),
+                                DnsServer::buildQuery(QStringLiteral("20.9.168.192.in-addr.arpa"),
+                                                      DnsServer::TypePtr, 0x95)),
+                       &moved));
+    QCOMPARE(moved.answers.size(), 1);
+    Reply stale;
+    QVERIFY(parseReply(exchange(server.serverPort(),
+                                DnsServer::buildQuery(QStringLiteral("20.5.168.192.in-addr.arpa"),
+                                                      DnsServer::TypePtr, 0x96)),
+                       &stale));
+    QVERIFY2(stale.answers.isEmpty(), "the abandoned /24 must not keep pointing at this DC");
 }
 
 void DnsTest::refusesZoneTransfers()
