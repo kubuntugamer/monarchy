@@ -256,6 +256,56 @@ QByteArray exchangeTcp(quint16 port, const QByteArray &request, int timeoutMs = 
     return {};
 }
 
+// Reads a zone transfer off one TCP connection until the message that closes it
+// arrives: one message for a zone that fits, several for one that does not. The
+// messages are returned in the order they were sent, without their framing.
+QList<QByteArray> exchangeTransfer(quint16 port, const QByteArray &request, int timeoutMs = 8000)
+{
+    QTcpSocket socket;
+    socket.connectToHost(QHostAddress::LocalHost, port);
+    QElapsedTimer timer;
+    timer.start();
+    while (timer.elapsed() < timeoutMs && socket.state() != QAbstractSocket::ConnectedState)
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 10);
+    if (socket.state() != QAbstractSocket::ConnectedState)
+        return {};
+
+    QByteArray frame;
+    put16(frame, quint16(request.size()));
+    frame += request;
+    socket.write(frame);
+
+    QList<QByteArray> messages;
+    QByteArray buffer;
+    int soas = 0;
+    while (timer.elapsed() < timeoutMs) {
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 10);
+        buffer += socket.readAll();
+        while (buffer.size() >= 2) {
+            const int length = (int(quint8(buffer[0])) << 8) | int(quint8(buffer[1]));
+            if (buffer.size() < 2 + length)
+                break;
+            const QByteArray message = buffer.mid(2, length);
+            buffer.remove(0, 2 + length);
+            messages.append(message);
+            Reply parsed;
+            if (!parseReply(message, &parsed))
+                return messages;
+            for (const Answer &answer : parsed.answers) {
+                if (answer.type == 6)
+                    ++soas;
+            }
+            // The second SOA is the end of the transfer; a refusal carries no
+            // records at all and is the end of the exchange too.
+            if (soas >= 2)
+                return messages;
+            if (parsed.answers.isEmpty() && parsed.rcode != 0)
+                return messages;
+        }
+    }
+    return messages;
+}
+
 // --- TSIG (RFC 8945) -------------------------------------------------------
 // The server speaks hmac-sha256, so the test computes the same MACs from the
 // same key: verifying the reply's MAC here is what proves the signature is over
@@ -463,6 +513,7 @@ private slots:
     void enforcesUpdatePolicy();
     void refusesZoneTransfers();
     void transfersTheZoneToASignedPeer();
+    void splitsALargeZoneAcrossMessages();
     void answersAnEdnsQuery();
     void truncatesADatagramReplyToWhatTheClientCanReceive();
     void answersReverseLookupsForItsOwnAddress();
@@ -1987,6 +2038,140 @@ void DnsTest::transfersTheZoneToASignedPeer()
                        &openReply));
     QCOMPARE(openReply.rcode, 5);
     QVERIFY(openReply.answers.isEmpty());
+}
+
+// A zone too large for one message is the case a real secondary hits first: the
+// 65535-byte framing limit used to turn every big zone into SERVFAIL, so the
+// transfer existed and could not be used. It is a stream of signed messages now,
+// and this pins the parts a secondary acts on: every message signed over the
+// message before it, the question only in the first, the SOA opening the first
+// and closing the last, and every record present exactly once.
+void DnsTest::splitsALargeZoneAcrossMessages()
+{
+    DnsServer server;
+    QVERIFY(server.listen(0));
+    server.loadAdZone(QStringLiteral("bulk.example.com"),
+                      QStringLiteral("dc1.bulk.example.com"), QStringLiteral("10.9.9.9"),
+                      389, 3268, QStringLiteral("Default-First-Site-Name"));
+    // Roughly 3000 records of forty-odd wire bytes each: several times what one
+    // 65535-byte message can hold.
+    for (int i = 0; i < 3000; ++i) {
+        QByteArray rdata;
+        rdata.append(char(10));
+        rdata.append(char(1));
+        rdata.append(char((i >> 8) & 0xff));
+        rdata.append(char(i & 0xff));
+        server.addRecord(QStringLiteral("record%1.bulk.example.com").arg(i),
+                         DnsServer::TypeA, 300, rdata);
+    }
+    const int zoneRecords = server.zoneContents().size();
+    QVERIFY2(zoneRecords > 2900, qPrintable(QString::number(zoneRecords)));
+
+    const QString keyName = QStringLiteral("bulk-key");
+    const QString algorithm = QStringLiteral("hmac-sha256.");
+    const QByteArray secret = QByteArray("fedcba9876543210fedcba9876543210");
+    server.setUpdateTsig(keyName, QStringLiteral("hmac-sha256"), secret.toBase64());
+
+    const quint64 now = quint64(QDateTime::currentSecsSinceEpoch());
+    QByteArray requestMac;
+    const QByteArray request =
+        withTsig(DnsServer::buildQuery(QStringLiteral("bulk.example.com"),
+                                       DnsServer::TypeAxfr, 0x7201),
+                 keyName, algorithm, secret, now, 300, &requestMac);
+    const QList<QByteArray> messages = exchangeTransfer(server.serverPort(), request);
+    QVERIFY2(messages.size() >= 2, "a zone larger than one message has to be split");
+
+    QList<Answer> travelled;
+    QByteArray chain = requestMac;
+    for (int i = 0; i < messages.size(); ++i) {
+        const QByteArray &raw = messages.at(i);
+        QVERIFY2(raw.size() <= 65535, "no message may exceed the TCP length prefix");
+        Reply part;
+        QVERIFY(parseReply(raw, &part));
+        QCOMPARE(part.rcode, 0);
+        QVERIFY2(part.authoritative, "every message of a transfer is authoritative");
+        QVERIFY(!part.truncated);
+        // The question section belongs to the first message; a stream repeating
+        // it would make a client that keys on QDCOUNT read a new exchange.
+        QCOMPARE(part.qdcount, i == 0 ? quint16(1) : quint16(0));
+        QVERIFY2(!part.answers.isEmpty(), "a message with no records is a stall");
+
+        // Each message is signed, and each signature covers the MAC of the one
+        // before it (RFC 8945 §5.3.1), so a message cannot be replayed from
+        // another transfer or dropped from this one without the chain breaking.
+        const Answer *tsig = replyTsig(part);
+        QVERIFY2(tsig != nullptr, "every message of a transfer is signed");
+        TsigReply signature;
+        QVERIFY(parseTsigRdata(tsig->rdata, &signature));
+        QCOMPARE(signature.error, quint16(0));
+        QCOMPARE(signature.mac.size(), 32);
+        QCOMPARE(signature.originalId, quint16(0x7201));
+        const int tsigStart = raw.size() - (nameBytes(keyName).size() + 10 + tsig->rdata.size());
+        QVERIFY(tsigStart > 12);
+        QByteArray withoutTsig = raw.left(tsigStart);
+        const quint16 arcount =
+            quint16((quint8(withoutTsig[10]) << 8) | quint8(withoutTsig[11]));
+        const quint16 fewer = quint16(arcount - 1);
+        withoutTsig[10] = char((fewer >> 8) & 0xff);
+        withoutTsig[11] = char(fewer & 0xff);
+        // The first message covers the request MAC and the whole TSIG variables
+        // block; every message after it covers the prior MAC and only its own
+        // timers (RFC 8945 §5.3.1). Getting that wrong is invisible here unless
+        // it is written this way — a server and a test that share the mistake
+        // agree with each other, which is why dig was the check that settled it.
+        QByteArray prefix;
+        put16(prefix, quint16(chain.size()));
+        prefix += chain;
+        QByteArray digest = prefix + withoutTsig;
+        if (i == 0) {
+            digest += tsigVariables(keyName, algorithm, signature.timeSigned, signature.fudge,
+                                    signature.error, signature.other);
+        } else {
+            for (int shift = 40; shift >= 0; shift -= 8)
+                digest.append(char((signature.timeSigned >> shift) & 0xff));
+            put16(digest, signature.fudge);
+        }
+        QCOMPARE(hmacSha256(secret, digest), signature.mac);
+        chain = signature.mac;
+        travelled += part.answers;
+    }
+
+    // Everything arrives, in the order a secondary commits it.
+    QCOMPARE(travelled.size(), zoneRecords);
+    QCOMPARE(travelled.first().type, DnsServer::TypeSoa);
+    QCOMPARE(travelled.last().type, DnsServer::TypeSoa);
+    QCOMPARE(travelled.first().rdata, travelled.last().rdata);
+    int soaCount = 0;
+    QList<int> seen(3000, 0);
+    for (const Answer &answer : travelled) {
+        if (answer.type == DnsServer::TypeSoa) {
+            ++soaCount;
+            continue;
+        }
+        if (answer.type != DnsServer::TypeA)
+            continue;
+        const QString name = answer.name.toLower();
+        if (!name.startsWith(QStringLiteral("record")))
+            continue;
+        const int dot = name.indexOf(QLatin1Char('.'), 6);
+        const int index = name.mid(6, dot - 6).toInt();
+        if (index >= 0 && index < seen.size())
+            ++seen[index];
+    }
+    QCOMPARE(soaCount, 2);
+    for (int i = 0; i < seen.size(); ++i)
+        QCOMPARE(seen.at(i), 1); // each record once, none dropped between messages
+
+    // The size of the zone changes nothing about who may pull it: the same zone
+    // unsigned is refused, in one message and with no records.
+    const QList<QByteArray> refused = exchangeTransfer(
+        server.serverPort(),
+        DnsServer::buildQuery(QStringLiteral("bulk.example.com"), DnsServer::TypeAxfr, 0x7202));
+    QCOMPARE(refused.size(), 1);
+    Reply denied;
+    QVERIFY(parseReply(refused.first(), &denied));
+    QCOMPARE(denied.rcode, 9); // NOTAUTH
+    QVERIFY(denied.answers.isEmpty());
 }
 
 void DnsTest::persistsZone()

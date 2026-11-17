@@ -1024,12 +1024,18 @@ int DnsServer::verifyTsig(const QByteArray &packet, QByteArray *requestMac,
 }
 
 QByteArray DnsServer::signTsigResponse(const QByteArray &response, const QByteArray &requestMac,
-                                       quint16 error, const QByteArray &other) const
+                                       quint16 error, const QByteArray &other,
+                                       quint64 timeSigned, quint16 fudge,
+                                       bool continuedMessage, QByteArray *macOut) const
 {
+    if (macOut)
+        macOut->clear();
     if (m_tsigName.isEmpty() || response.size() < 12)
         return response;
-    const quint64 now = quint64(QDateTime::currentSecsSinceEpoch());
-    const quint16 fudge = 300;
+    const quint64 now = timeSigned != 0 ? timeSigned
+                                        : quint64(QDateTime::currentSecsSinceEpoch());
+    if (fudge == 0)
+        fudge = 300;
 
     // A response MAC also covers the request's MAC, so a reply cannot be
     // replayed against a different request. An empty request MAC means the MAC
@@ -1041,10 +1047,26 @@ QByteArray DnsServer::signTsigResponse(const QByteArray &response, const QByteAr
         QByteArray prefix;
         wr16(prefix, quint16(requestMac.size()));
         prefix += requestMac;
-        mac = hmacSha256(m_tsigSecret,
-                         prefix + response
-                             + tsigVariables(m_tsigName, m_tsigAlgorithm, now, fudge, error, other));
+        // A later message of a transfer covers the prior MAC, the message and
+        // only this message's timers: "only the timers are included in the
+        // second and subsequent messages, not all the TSIG variables"
+        // (RFC 8945 §5.3.1). Signing the whole variables block there is what
+        // made BIND validate the first message of a transfer and warn that the
+        // rest could not be validated, while a receiver checking by this tree's
+        // own formula liked it fine.
+        QByteArray digest = prefix + response;
+        if (continuedMessage) {
+            for (int shift = 40; shift >= 0; shift -= 8)
+                digest.append(char((now >> shift) & 0xff));
+            wr16(digest, fudge);
+        } else {
+            digest += tsigVariables(m_tsigName, m_tsigAlgorithm, now, fudge, error, other);
+        }
+        mac = hmacSha256(m_tsigSecret, digest);
     }
+
+    if (macOut)
+        *macOut = mac;
 
     QByteArray signedResponse = response;
     const quint16 arcount =
@@ -1271,7 +1293,7 @@ QByteArray DnsServer::handlePacket(const QByteArray &packet, const QHostAddress 
     if (message.questions.size() == 1) {
         const Message::Question &question = message.questions.first();
         if (question.type == TypeAxfr || question.type == TypeIxfr)
-            return handleTransferRequest(packet, message, udp);
+            return handleTransferRequest(packet, message, udp, tcpClient);
     }
 
     // Anything outside our zone that asks for recursion goes upstream; the
@@ -1888,7 +1910,7 @@ QList<DnsServer::Record> DnsServer::zoneContents() const
 }
 
 QByteArray DnsServer::handleTransferRequest(const QByteArray &packet, const Message &message,
-                                            bool udp)
+                                            bool udp, QTcpSocket *tcpClient)
 {
     const Message::Question question = message.questions.first();
     if (question.qclass != ClassIn || !inZone(question.name))
@@ -1924,14 +1946,61 @@ QByteArray DnsServer::handleTransferRequest(const QByteArray &packet, const Mess
     const QList<Record> answers = zoneContents();
     if (answers.isEmpty())
         return buildResponse(packet, {}, ServFail, {}, udp);
-    QByteArray response = buildResponse(packet, answers, NoError, {}, udp);
-    // One TCP message is capped at 65535 bytes by the length prefix. A zone that
-    // does not fit must fail visibly: handing the framer a longer message gets
-    // it dropped, which reaches the client as a hang, and a single message with
-    // TC set is not a valid transfer either.
-    if (response.size() > 65535)
-        response = buildResponse(packet, {}, ServFail, {}, udp);
-    return signTsigResponse(response, requestMac, 0, {});
+
+    // One TCP message is capped at 65535 bytes by its length prefix. A zone that
+    // does not fit used to be answered SERVFAIL, which meant no zone larger than
+    // about 64 KiB could ever be secondaried. It is sent as a stream instead:
+    // as many messages as the records need, each signed over the one before it,
+    // with the question section in the first message only.
+    const quint64 stamp = quint64(QDateTime::currentSecsSinceEpoch());
+    const quint16 fudge = 300;
+    // The room a message has is what is left after the envelope (header, question
+    // and any OPT) and the TSIG RR that follows every message. Measured from the
+    // bytes rather than assumed, so a client that sends a long question or an OPT
+    // cannot produce a message the framer would drop.
+    const QByteArray envelope = buildResponse(packet, {}, NoError, {}, false);
+    if (envelope.size() < 12)
+        return buildResponse(packet, {}, ServFail, {}, udp);
+    const int tsigBytes =
+        signTsigResponse(envelope, requestMac, 0, {}, stamp, fudge).size() - envelope.size();
+    const int budget = 65535 - envelope.size() - tsigBytes;
+    if (budget <= 0)
+        return buildResponse(packet, {}, ServFail, {}, udp);
+
+    // Records are packed in the order the transfer promises them, so the SOA that
+    // opens the zone stays first and the one that closes it stays last.
+    QList<QList<Record>> batches;
+    int used = 0;
+    for (const Record &record : answers) {
+        const int size = encodeName(record.name).size() + 10 + record.rdata.size();
+        // A record that cannot fit in a message of its own is not something this
+        // framing can carry; failing here is visible, where a message over the
+        // limit would be dropped and reach the client as a hang.
+        if (size > budget)
+            return buildResponse(packet, {}, ServFail, {}, udp);
+        if (batches.isEmpty() || used + size > budget) {
+            batches.append(QList<Record>());
+            used = 0;
+        }
+        batches.last().append(record);
+        used += size;
+    }
+    // Without a socket there is nothing to send the first messages on, and a
+    // truncated stream is worse than a refusal.
+    if (batches.size() > 1 && !tcpClient)
+        return buildResponse(packet, {}, ServFail, {}, udp);
+
+    QByteArray chain = requestMac;
+    for (int i = 0; i < batches.size(); ++i) {
+        QByteArray message = buildResponse(packet, batches.at(i), NoError, {}, false, i == 0);
+        QByteArray mac;
+        message = signTsigResponse(message, chain, 0, {}, stamp, fudge, i > 0, &mac);
+        chain = mac;
+        if (i + 1 == batches.size())
+            return message;
+        sendTcpResponse(tcpClient, message);
+    }
+    return {};
 }
 
 int DnsServer::handleQuery(const Message &message, QList<Record> &answers) {
@@ -2096,7 +2165,8 @@ int DnsServer::handleUpdate(const Message &message) {
 }
 
 QByteArray DnsServer::buildResponse(const QByteArray &query, const QList<Record> &answers,
-                                    int rcode, const QList<Record> &authority, bool udp) const {
+                                    int rcode, const QList<Record> &authority, bool udp,
+                                    bool includeQuestion) const {
     int pos = 0;
     quint16 id = 0;
     quint16 queryFlags = 0;
@@ -2139,7 +2209,7 @@ QByteArray DnsServer::buildResponse(const QByteArray &query, const QList<Record>
                                                               : quint16(0);
     const quint16 ra = m_forwarding ? quint16(0x0080) : quint16(0);
     wr16(response, quint16(0x8000 | opcode | rd | ra | aa | quint16(rcode & 0x0f)));
-    wr16(response, qdcount);
+    wr16(response, includeQuestion ? qdcount : quint16(0));
     wr16(response, quint16(answersToWrite.size()));
     wr16(response, quint16(authority.size()));
     wr16(response, hasOpt ? quint16(1) : quint16(0));
@@ -2154,7 +2224,10 @@ QByteArray DnsServer::buildResponse(const QByteArray &query, const QList<Record>
     }
     if (qpos > query.size())
         return {};
-    response.append(query.mid(12, qpos - 12));
+    // Parsed either way — the question is where the answer section starts — but
+    // written only when this message is meant to carry it.
+    if (includeQuestion)
+        response.append(query.mid(12, qpos - 12));
 
     // Truncation (RFC 1035 §4.2.1, RFC 6891 §6.2.5). A datagram reply must fit
     // what the client said it can receive: 512 bytes unless it sent an OPT, in

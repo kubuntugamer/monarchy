@@ -203,8 +203,12 @@ public:
     // names outside `zone()` are filtered out rather than transferred.
     QList<Record> zoneContents() const;
     // Answers one AXFR/IXFR request: the whole zone to a peer that proves it
-    // holds the configured TSIG key, over TCP; a refusal otherwise.
-    QByteArray handleTransferRequest(const QByteArray &packet, const Message &message, bool udp);
+    // holds the configured TSIG key, over TCP; a refusal otherwise. A zone too
+    // large for one message is sent as several messages (RFC 5936 §2.2), each
+    // signed over the one before it: every message but the last goes to
+    // `tcpClient` here, and the last is returned for the caller to write.
+    QByteArray handleTransferRequest(const QByteArray &packet, const Message &message, bool udp,
+                                     QTcpSocket *tcpClient);
 
     // Zone persistence. `saveZone` writes the zone as JSON, `loadZone` reads
     // it back and restores the zone name and SOA serial.
@@ -267,16 +271,28 @@ private:
     int handleUpdate(const Message &message);
     // `udp` says the reply will be sent in one datagram, so it must fit what the
     // client said it can receive; a TCP reply has no such limit.
+    // `includeQuestion` is false for the second and later messages of a zone
+    // transfer: the question section belongs to the first message only, and
+    // repeating it makes a client read the stream as a new exchange.
     QByteArray buildResponse(const QByteArray &query, const QList<Record> &answers, int rcode,
-                             const QList<Record> &authority = {}, bool udp = false) const;
+                             const QList<Record> &authority = {}, bool udp = false,
+                             bool includeQuestion = true) const;
 
     // 0 when the request's TSIG verifies, otherwise the rcode to answer with.
     // A verified request leaves its MAC in `requestMac`; `error` is the TSIG
     // error field the reply must carry, `other` its other-data.
     int verifyTsig(const QByteArray &packet, QByteArray *requestMac, quint16 *error,
                          QByteArray *other, bool *signRefusal) const;
+    // `timeSigned` and `fudge` of 0 mean this server's clock now and 300.
+    // `continuedMessage` marks the second and later messages of a transfer,
+    // whose MAC covers the prior MAC and this message's timers but not the TSIG
+    // variables block (RFC 8945 §5.3.1). `macOut` receives the MAC the message
+    // carried, which is what the next message in the stream signs over.
     QByteArray signTsigResponse(const QByteArray &response, const QByteArray &requestMac,
-                                quint16 error, const QByteArray &other) const;
+                                quint16 error, const QByteArray &other,
+                                quint64 timeSigned = 0, quint16 fudge = 0,
+                                bool continuedMessage = false,
+                                QByteArray *macOut = nullptr) const;
 
     void bumpSerial();
     void bumpReverseSerial();
