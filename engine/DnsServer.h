@@ -126,7 +126,9 @@ public:
     // with, given as the base64 secret from the key file. With a key set, an
     // update that is unsigned, signed by another key, or carrying a MAC that
     // does not verify is refused; without one, updates stay unauthenticated.
-    // hmac-sha256 is the algorithm this server speaks.
+    // The same key is the only way to be served a zone transfer: unsigned, or
+    // signed with the wrong secret, gets no zone. hmac-sha256 is the algorithm
+    // this server speaks.
     void setUpdateTsig(const QString &name, const QString &algorithm, const QByteArray &base64Secret);
     QString updateTsigName() const;
 
@@ -196,6 +198,14 @@ public:
     void clearCache();
     int cachedResponseCount() const;
 
+    // Every record of the forward zone, opened and closed by its SOA, in the
+    // form an AXFR reply carries. The reverse zone lives in the same store, so
+    // names outside `zone()` are filtered out rather than transferred.
+    QList<Record> zoneContents() const;
+    // Answers one AXFR/IXFR request: the whole zone to a peer that proves it
+    // holds the configured TSIG key, over TCP; a refusal otherwise.
+    QByteArray handleTransferRequest(const QByteArray &packet, const Message &message, bool udp);
+
     // Zone persistence. `saveZone` writes the zone as JSON, `loadZone` reads
     // it back and restores the zone name and SOA serial.
     bool saveZone(const QString &path, QString *error = nullptr) const;
@@ -263,7 +273,7 @@ private:
     // 0 when the request's TSIG verifies, otherwise the rcode to answer with.
     // A verified request leaves its MAC in `requestMac`; `error` is the TSIG
     // error field the reply must carry, `other` its other-data.
-    int verifyUpdateTsig(const QByteArray &packet, QByteArray *requestMac, quint16 *error,
+    int verifyTsig(const QByteArray &packet, QByteArray *requestMac, quint16 *error,
                          QByteArray *other, bool *signRefusal) const;
     QByteArray signTsigResponse(const QByteArray &response, const QByteArray &requestMac,
                                 quint16 error, const QByteArray &other) const;

@@ -462,6 +462,7 @@ private slots:
     void appliesDynamicUpdates();
     void enforcesUpdatePolicy();
     void refusesZoneTransfers();
+    void transfersTheZoneToASignedPeer();
     void answersAnEdnsQuery();
     void truncatesADatagramReplyToWhatTheClientCanReceive();
     void answersReverseLookupsForItsOwnAddress();
@@ -1837,6 +1838,155 @@ void DnsTest::refusesZoneTransfers()
                        &tcp));
     QCOMPARE(tcp.rcode, 5);
     QVERIFY(tcp.answers.isEmpty());
+}
+
+void DnsTest::transfersTheZoneToASignedPeer()
+{
+    DnsServer server;
+    QVERIFY(server.listen(0));
+    server.loadAdZone(QStringLiteral("corp.example.com"),
+                      QStringLiteral("dc1.corp.example.com"), QStringLiteral("192.168.5.20"),
+                      389, 3268, QStringLiteral("Default-First-Site-Name"));
+    // The same store holds the reverse zone this DC answers for; it is not part
+    // of the forward zone and must not travel with a transfer of it.
+    QVERIFY(server.repairReverseZone(QStringLiteral("dc1.corp.example.com"),
+                                     QStringLiteral("192.168.5.20")));
+    for (int i = 0; i < 40; ++i) {
+        QByteArray rdata;
+        rdata.append(char(10));
+        rdata.append(char(0));
+        rdata.append(char(0));
+        rdata.append(char(1 + i));
+        server.addRecord(QStringLiteral("host%1.corp.example.com").arg(i), DnsServer::TypeA, 300,
+                         rdata);
+    }
+
+    const QString keyName = QStringLiteral("transfer-key");
+    const QString algorithm = QStringLiteral("hmac-sha256.");
+    const QByteArray secret = QByteArray("0123456789abcdef0123456789abcdef");
+    server.setUpdateTsig(keyName, QStringLiteral("hmac-sha256"), secret.toBase64());
+
+    const auto axfr = [](quint16 id) {
+        return DnsServer::buildQuery(QStringLiteral("corp.example.com"), DnsServer::TypeAxfr, id);
+    };
+
+    // Unsigned over TCP: the transfer proves nothing, so no zone is handed over.
+    Reply unsignedReply;
+    QVERIFY(parseReply(exchangeTcp(server.serverPort(), axfr(0x7101)), &unsignedReply));
+    QCOMPARE(unsignedReply.rcode, 9); // NOTAUTH
+    QVERIFY(unsignedReply.answers.isEmpty());
+
+    // Signed: the whole zone, opened and closed by the SOA.
+    const quint64 now = quint64(QDateTime::currentSecsSinceEpoch());
+    QByteArray requestMac;
+    const QByteArray request =
+        withTsig(axfr(0x7102), keyName, algorithm, secret, now, 300, &requestMac);
+    const QByteArray raw = exchangeTcp(server.serverPort(), request);
+    Reply transferred;
+    QVERIFY(parseReply(raw, &transferred));
+    QCOMPARE(transferred.rcode, 0);
+    QVERIFY2(transferred.authoritative, "a transfer is answered authoritatively");
+    QVERIFY(!transferred.truncated);
+    QCOMPARE(transferred.answers.first().type, DnsServer::TypeSoa);
+    QCOMPARE(transferred.answers.first().name.toLower(), QStringLiteral("corp.example.com"));
+    QCOMPARE(transferred.answers.last().type, DnsServer::TypeSoa);
+    QCOMPARE(transferred.answers.first().rdata, transferred.answers.last().rdata);
+
+    QStringList names;
+    for (const Answer &answer : transferred.answers)
+        names.append(answer.name.toLower());
+    for (int i = 0; i < 40; ++i) {
+        QVERIFY2(names.contains(QStringLiteral("host%1.corp.example.com").arg(i)),
+                 "every record of the zone travels");
+    }
+    QVERIFY2(names.contains(QStringLiteral("_ldap._tcp.corp.example.com")),
+             "the zone's own locator records travel too");
+    QVERIFY2(!names.contains(QStringLiteral("20.5.168.192.in-addr.arpa")),
+             "the reverse zone in the same store is not part of this zone");
+    // The SOA is the only record that appears twice, and the apex keeps the NS
+    // and A records a secondary expects to receive with it.
+    int soaCount = 0;
+    int apexCount = 0;
+    for (const Answer &answer : transferred.answers) {
+        if (answer.type == DnsServer::TypeSoa)
+            ++soaCount;
+        if (answer.name.toLower() == QStringLiteral("corp.example.com"))
+            ++apexCount;
+    }
+    QCOMPARE(soaCount, 2);
+    QVERIFY(apexCount >= 3);
+
+    // The reply is signed, over a MAC that covers the request MAC and the reply
+    // as sent, so a transfer cannot be replayed against a different request.
+    const Answer *signedReply = replyTsig(transferred);
+    QVERIFY2(signedReply != nullptr, "an authenticated transfer must be answered signed");
+    TsigReply signature;
+    QVERIFY(parseTsigRdata(signedReply->rdata, &signature));
+    QCOMPARE(signature.error, quint16(0));
+    QCOMPARE(signature.mac.size(), 32);
+    QCOMPARE(signature.originalId, quint16(0x7102));
+
+    const int tsigStart = raw.size() - (nameBytes(keyName).size() + 10 + signedReply->rdata.size());
+    QVERIFY(tsigStart > 12);
+    QByteArray withoutTsig = raw.left(tsigStart);
+    const quint16 arcount = quint16((quint8(withoutTsig[10]) << 8) | quint8(withoutTsig[11]));
+    const quint16 fewer = quint16(arcount - 1);
+    withoutTsig[10] = char((fewer >> 8) & 0xff);
+    withoutTsig[11] = char(fewer & 0xff);
+    QByteArray prefix;
+    put16(prefix, quint16(requestMac.size()));
+    prefix += requestMac;
+    QCOMPARE(hmacSha256(secret,
+                        prefix + withoutTsig
+                            + tsigVariables(keyName, algorithm, signature.timeSigned,
+                                            signature.fudge, signature.error, signature.other)),
+             signature.mac);
+
+    // Wrong secret: the key name is right and the MAC is not, so the client is
+    // told BADSIG and receives no records.
+    const QByteArray badSignature =
+        withTsig(axfr(0x7103), keyName, algorithm,
+                 QByteArray("ffffffffffffffffffffffffffffffff"), now, 300);
+    Reply badReply;
+    QVERIFY(parseReply(exchangeTcp(server.serverPort(), badSignature), &badReply));
+    QCOMPARE(badReply.rcode, 9);
+    QVERIFY(badReply.answers.isEmpty());
+    const Answer *badTsig = replyTsig(badReply);
+    QVERIFY(badTsig != nullptr);
+    TsigReply badParsed;
+    QVERIFY(parseTsigRdata(badTsig->rdata, &badParsed));
+    QCOMPARE(badParsed.error, quint16(16)); // BADSIG
+    QCOMPARE(badParsed.mac.size(), 0);
+
+    // A transfer is a stream. The same signed request over UDP is refused, not
+    // answered with as much of the zone as one datagram holds.
+    Reply udpReply;
+    QVERIFY(parseReply(exchange(server.serverPort(),
+                                withTsig(axfr(0x7104), keyName, algorithm, secret, now, 300)),
+                       &udpReply));
+    QCOMPARE(udpReply.rcode, 5); // REFUSED
+    QVERIFY(udpReply.answers.isEmpty());
+
+    // IXFR still has no change journal behind it, signed or not.
+    Reply ixfr;
+    QVERIFY(parseReply(exchangeTcp(server.serverPort(),
+                                   withTsig(DnsServer::buildQuery(
+                                                QStringLiteral("corp.example.com"),
+                                                DnsServer::TypeIxfr, 0x7105),
+                                            keyName, algorithm, secret, now, 300)),
+                       &ixfr));
+    QCOMPARE(ixfr.rcode, 5);
+    QVERIFY(ixfr.answers.isEmpty());
+
+    // With the key cleared there is no peer that could authenticate, so the
+    // transfer goes back to being refused rather than open — the default.
+    server.setUpdateTsig(QString(), QString(), QByteArray());
+    Reply openReply;
+    QVERIFY(parseReply(exchangeTcp(server.serverPort(),
+                                   withTsig(axfr(0x7106), keyName, algorithm, secret, now, 300)),
+                       &openReply));
+    QCOMPARE(openReply.rcode, 5);
+    QVERIFY(openReply.answers.isEmpty());
 }
 
 void DnsTest::persistsZone()

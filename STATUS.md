@@ -37,6 +37,7 @@ clients, so a reply only this tree's encoder understands fails the check.
 | **Truncation to the client's advertised size** (RFC 1035 §4.2.1, RFC 6891 §6.2.5): a datagram reply carries only the records that fit the room the client declared — 512 bytes for a client that sent no OPT, the OPT's advertised size otherwise, and never less than 512, so a client that advertises less than the protocol guarantees is not sent a packet it cannot parse — and sets TC on any reply it shortened, with the header's counts describing what was written rather than what was intended. The client then retries over TCP, where the same query is answered in full and never truncated. Without this a reply larger than the client's buffer is silently cut by the client, which cannot tell a mangled packet from a corrupt one | `engine/DnsServer.cpp` (`buildResponse()`) | `truncatesADatagramReplyToWhatTheClientCanReceive` in `monarchy-dns-tests`: a 60-address RRset queried over UDP is answered in ≤512 bytes with TC set and fewer than 60 records, advertising 4096 returns all 60 without TC, advertising 512 still truncates, advertising 200 is treated as 512, and the same query over TCP returns all 60 and no TC; live, a provisioned domain holding 60 A records at one name: `dig +notcp` prints `;; Truncated, retrying in TCP mode.` and the TCP reply carries all 60, while `+bufsize=4096` returns all 60 in one datagram |
 | **Reverse lookup zone for the DC's own address**: `dig -x` against the DC is answered from a `/24` reverse zone derived from `dcIp` — SOA and NS at the zone apex, and a PTR for the DC's address pointing at its host name. The zone is derived rather than authored, so a DC whose address moved withdraws the old `/24` instead of leaving a PTR there pointing at a name that has moved, and a start that finds the zone already right rewrites nothing. A name in that `/24` this DC does not hold is `NXDOMAIN`, authoritative, carrying the reverse zone's SOA so a resolver can cache the absence; a neighbouring `/24` is not answered here at all. What is absent: reverse zones an administrator adds by hand (only the DC's own `/24` is derived), and PTRs for other hosts — those would come from a client registering its own address, which is the dynamic-update path | `engine/DnsServer.cpp` (`repairReverseZone()`, `zoneFor()`, `bumpReverseSerial()`), `engine/DcService.cpp` | `answersReverseLookupsForItsOwnAddress` in `monarchy-dns-tests` (PTR in the zone with AA, the forward name still resolving, `NXDOMAIN` with the reverse SOA for a free address, a neighbouring `/24` unanswered, a repeat start changing nothing, and a moved address repointing its PTR and dropping the old `/24`); live, `dig -x 192.168.1.101 @127.0.0.1` returns the DC's PTR with `aa` where it previously answered `NOERROR` with no answer and no authority |
 | **TSIG-authenticated dynamic updates** (RFC 8945, `hmac-sha256`): when `dc.conf` carries `dnsTsigName` and `dnsTsigSecret` (the base64 secret from a key file), an UPDATE must be signed with that key. An update with no TSIG is answered `NOTAUTH` and changes nothing; another key's name or another algorithm is `NOTAUTH` with TSIG error `BADKEY` (17); the right name with a MAC that does not verify is `NOTAUTH` with `BADSIG` (16); a MAC that verifies but a clock outside the request's fudge is `NOTAUTH` with `BADTIME` (18), signed, carrying the server's own time for the client to correct against. An accepted update is answered signed, over a MAC that also covers the request's MAC so a reply cannot be replayed against a different request. Clearing the key restores unauthenticated updates, which is the default. What is absent: GSS-TSIG (Kerberos-authenticated updates, which is what a Windows client uses), any algorithm other than `hmac-sha256`, and per-name ACLs — a valid key may write anywhere in the zone | `engine/DnsServer.cpp` (`verifyUpdateTsig()`, `signTsigResponse()`, `findTsig()`), `engine/DcService.cpp` | `requiresTsigForDynamicUpdates` in `monarchy-dns-tests` (unsigned refused, correctly signed accepted with the reply's MAC recomputed from the same secret, wrong secret `BADSIG`, wrong key name `BADKEY`, an hour of skew `BADTIME` with the server's time, and updates open again once the key is cleared); live, `nsupdate -y hmac-sha256:update-key:<secret>` against a provisioned domain adds the record and exits 0, while the same script without `-y` fails `NOTAUTH` and leaves the zone unchanged |
+| **Authenticated zone transfer** (RFC 5936): an AXFR is answered only over TCP and only to a peer that proves it holds the configured TSIG key — the reply is the zone's SOA, every record of the forward zone, and the same SOA again, signed with a MAC over the request's MAC so a transfer cannot be replayed. An unsigned transfer is `NOTAUTH`; another key's name is `NOTAUTH` with TSIG error `BADKEY`; a MAC that does not verify is `NOTAUTH` with `BADSIG` and carries no records; with no key configured every transfer is `REFUSED`, which is the default and what it was before this existed. The reverse zone this DC also answers for sits in the same store and is not part of a transfer of the forward zone, and a UDP transfer request is `REFUSED` rather than answered with as much of the zone as one datagram holds. What is absent: IXFR (there is no change journal, so an incremental request is refused rather than answered with a full zone a client would read as a delta), multi-message transfers (the zone must fit one 65535-byte message; one that does not is answered `SERVFAIL` instead of being dropped by the framer and looking like a hang), and per-zone ACLs — one key may transfer any zone this server holds | `engine/DnsServer.cpp` (`zoneContents()`, `handleTransferRequest()`) | `transfersTheZoneToASignedPeer` in `monarchy-dns-tests` (unsigned `NOTAUTH` with no records, the signed transfer opened and closed by the same SOA with every A record and locator present and the reverse zone absent, the reply's MAC recomputed from the same secret, wrong secret `BADSIG` with no records, UDP refused, IXFR refused, and refusal again once the key is cleared); live, `dig AXFR axfr.example.com -y hmac-sha256:update-key:<key>` against a provisioned domain reports `;; XFR size: 81 records (messages 1, bytes 3746)` with 2 SOAs, all 60 address records and no `in-addr.arpa` record, `dig` validating the reply's TSIG, while the same command without `-y` prints `; Transfer failed.` and one with another secret prints `BADSIG` |
 | DNS server: DC locator records, SRV/A/ANY, RFC 2136 updates, persistence, and locator self-repair on start (a zone that predates a served endpoint gets its locator back, at the port the daemon actually binds); UDP/TCP with a caching forwarding resolver for out-of-zone names; and the two negative answers a client caches apart — a name the zone does not hold is `NXDOMAIN`, a name it holds without the type asked for is an empty `NOERROR`, and both carry the zone's SOA in AUTHORITY with AA so a resolver keeps them (RFC 2308) | `engine/DnsServer.cpp`, `engine/DcService.cpp` | `monarchy-dns-tests` (`publishesAdServiceRecords`, `repairsAdZoneLocators`) |
 | Monarchy Management Console (MMC-style): tree, results views, property sheets, membership editing, CSV export, and the sign-in prompt a refused read raises | `ui/src/` | `monarchy-ui-tests`, `monarchy-mainwindow-tests` |
 | **DCE/RPC over ncacn_ip_tcp** + NDR marshalling | `engine/Rpc.cpp`, `engine/Ndr.cpp` | `monarchy-samr-tests`, live impacket client |
@@ -193,19 +194,22 @@ failure) |
   time; Samba's pidl decoder has not been driven through a lookup here (its
   python binding cannot construct the call's `policy_handle`), so an interop
   report from a pidl client would be worth having.
-- **DNS, what a server that answers queries does not do here**: EDNS0 and
-  reverse lookups for the DC's own address are answered (§1), but there is no
+- **DNS, what a server that answers queries does not do here**: EDNS0, reverse
+  lookups for the DC's own address and a key-authenticated AXFR are answered
+  (§1), but there is no
   **DNSSEC** — a `+dnssec`
   query gets the DO bit echoed and no `RRSIG`, so a validating resolver treats
   every answer as insecure; no **CHAOS** class (`version.bind` is refused, which
-  is a choice, and now refused cleanly); and no **AXFR**/IXFR — a transfer
-  request is refused with `REFUSED` and no records, over UDP and TCP alike,
-  rather than answered with a single SOA and then nothing, which is neither a
-  transfer nor a refusal and leaves the client waiting (measured with `dig
-  AXFR`: `; Transfer failed.` after one SOA before the fix). Serving transfers
-  at all requires per-zone ACLs. Zone data is served over UDP/TCP, from the store,
-  with RFC 2136 updates and the forwarding resolver above; those four are
-  absences, not partial implementations.
+  is a choice, and now refused cleanly); and no **IXFR** — a transfer that names
+  a serial is refused, because there is no change journal to answer it from and a
+  full zone in reply to an incremental request would read as a delta the client
+  never received. A transfer is also single-message (the zone has to fit one
+  65535-byte message) and gated on the one configured key rather than a per-zone
+  ACL, so a key that may read one zone may read any zone this server holds;
+  nothing sends NOTIFY, and nothing accepts the secondary side of a transfer.
+  Zone data is served over UDP/TCP, from the store, with RFC 2136 updates and
+  the forwarding resolver above; those are absences, not partial
+  implementations.
 - **PKINIT** (needs an X.509/CMS path and a CA), **S4U2Self/S4U2Proxy**.
 - **Multi-hop/transitive trusts**, transited-realm encoding beyond one hop, SID
   filtering, selective authentication, trust-password rotation.
@@ -276,11 +280,13 @@ client asks for StartTLS (there is no dedicated LDAPS port, and no client
 certificate is requested), and an unbound session may read only the root DSE:
 a search with a non-empty base answers `insufficientAccessRights(50)`, a failed
 bind leaves the connection anonymous, and StartTLS resets it (RFC 4511 §4.14.1).
-DNS updates can be authenticated with a TSIG key (RFC 8945, hmac-sha256) when
-`dnsTsigName`/`dnsTsigSecret` are set in `dc.conf` — an unsigned, wrong-key or
-wrong-MAC update is then refused `NOTAUTH` with the matching TSIG error, and an
-accepted one is answered signed — but without a key they stay open, and there is
-no per-name ACL either way; RPC has no
+DNS updates and zone transfers can be authenticated with a TSIG key (RFC 8945,
+hmac-sha256) when `dnsTsigName`/`dnsTsigSecret` are set in `dc.conf` — an
+unsigned, wrong-key or wrong-MAC message is then refused `NOTAUTH` with the
+matching TSIG error, an accepted update is answered signed, and an AXFR is
+answered with the zone only once the MAC verifies — but without a key updates
+stay open while every transfer is refused, and there is no per-name or per-zone
+ACL either way, so one key both writes and reads the whole zone; RPC has no
 authorization model beyond "the bind authenticated": any account that
 authenticates can administer. The RPC endpoints therefore bind `127.0.0.1`
 only (`samrPort` 1035, `lsadPort` 1036 and `drsPort` 1038 by default). Do not

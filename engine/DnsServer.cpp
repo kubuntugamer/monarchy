@@ -967,7 +967,7 @@ QString DnsServer::updateTsigName() const
     return m_tsigName;
 }
 
-int DnsServer::verifyUpdateTsig(const QByteArray &packet, QByteArray *requestMac,
+int DnsServer::verifyTsig(const QByteArray &packet, QByteArray *requestMac,
                                 quint16 *error, QByteArray *other, bool *signRefusal) const
 {
     *error = 0;
@@ -1245,7 +1245,7 @@ QByteArray DnsServer::handlePacket(const QByteArray &packet, const QHostAddress 
         bool signRefusal = false;
         if (!m_tsigName.isEmpty()) {
             const int verdict =
-                verifyUpdateTsig(packet, &requestMac, &tsigError, &other, &signRefusal);
+                verifyTsig(packet, &requestMac, &tsigError, &other, &signRefusal);
             if (verdict != 0) {
                 QByteArray refusal = buildResponse(packet, {}, verdict, {}, udp);
                 // A refusal to something that carried a TSIG is answered with a
@@ -1264,6 +1264,15 @@ QByteArray DnsServer::handlePacket(const QByteArray &packet, const QHostAddress 
     }
     if (opcode != 0)
         return buildResponse(packet, {}, NotImp, {}, udp);
+
+    // Zone transfers (RFC 5936) are answered here rather than by handleQuery():
+    // a transfer's answer is the whole zone, not the records at one name, and
+    // it is gated on authentication the query path knows nothing about.
+    if (message.questions.size() == 1) {
+        const Message::Question &question = message.questions.first();
+        if (question.type == TypeAxfr || question.type == TypeIxfr)
+            return handleTransferRequest(packet, message, udp);
+    }
 
     // Anything outside our zone that asks for recursion goes upstream; the
     // reply may arrive later, so an empty return means "wait".
@@ -1841,6 +1850,88 @@ QStringList DnsServer::effectiveForwarders() const
             result.append(spec);
     }
     return result;
+}
+
+QList<DnsServer::Record> DnsServer::zoneContents() const
+{
+    QList<Record> result;
+    if (m_zone.isEmpty())
+        return result;
+    const QList<Record> soa = records(m_zone, TypeSoa);
+    if (soa.isEmpty())
+        return result;
+    // A transfer opens and closes with the same SOA: the first record tells the
+    // client the serial it is about to receive, the last one says the transfer
+    // is complete and may be committed.
+    result.append(soa.first());
+    QString apex = m_zone.toLower();
+    if (apex.endsWith(QLatin1Char('.')))
+        apex.chop(1);
+    const QString suffix = QLatin1Char('.') + apex;
+    for (auto it = m_records.constBegin(); it != m_records.constEnd(); ++it) {
+        QString name = it.key();
+        if (name.endsWith(QLatin1Char('.')))
+            name.chop(1);
+        // The reverse zone this DC also answers for is in the same store, and is
+        // not part of this zone: a secondary that asked for the forward zone
+        // must not be handed PTR records for names it did not ask about.
+        if (name != apex && !name.endsWith(suffix))
+            continue;
+        for (const Record &record : it.value()) {
+            if (name == apex && record.type == TypeSoa)
+                continue; // already written first, and again at the end
+            result.append(record);
+        }
+    }
+    result.append(soa.first());
+    return result;
+}
+
+QByteArray DnsServer::handleTransferRequest(const QByteArray &packet, const Message &message,
+                                            bool udp)
+{
+    const Message::Question question = message.questions.first();
+    if (question.qclass != ClassIn || !inZone(question.name))
+        return buildResponse(packet, {}, Refused, {}, udp);
+    // IXFR is answered from a change journal, which this store does not keep.
+    // Replying to it with a full zone would tell a secondary it was brought up
+    // to date by a delta it never received.
+    if (question.type == TypeIxfr)
+        return buildResponse(packet, {}, Refused, {}, udp);
+    // A transfer is a sequence of messages over a stream, not a datagram
+    // (RFC 5936 §4.2): a UDP request cannot be answered with a zone, and part of
+    // one is worse than a refusal because the client may commit it.
+    if (udp)
+        return buildResponse(packet, {}, Refused, {}, udp);
+    // With no key configured there is no peer that could prove anything, and an
+    // open transfer would hand the whole directory's DNS data to any address
+    // that can reach the port. Refused is the default posture.
+    if (m_tsigName.isEmpty())
+        return buildResponse(packet, {}, Refused, {}, udp);
+
+    QByteArray requestMac;
+    quint16 tsigError = 0;
+    QByteArray other;
+    bool signRefusal = false;
+    const int verdict = verifyTsig(packet, &requestMac, &tsigError, &other, &signRefusal);
+    if (verdict != 0) {
+        QByteArray refusal = buildResponse(packet, {}, verdict, {}, udp);
+        if (signRefusal)
+            refusal = signTsigResponse(refusal, requestMac, tsigError, other);
+        return refusal;
+    }
+
+    const QList<Record> answers = zoneContents();
+    if (answers.isEmpty())
+        return buildResponse(packet, {}, ServFail, {}, udp);
+    QByteArray response = buildResponse(packet, answers, NoError, {}, udp);
+    // One TCP message is capped at 65535 bytes by the length prefix. A zone that
+    // does not fit must fail visibly: handing the framer a longer message gets
+    // it dropped, which reaches the client as a hang, and a single message with
+    // TC set is not a valid transfer either.
+    if (response.size() > 65535)
+        response = buildResponse(packet, {}, ServFail, {}, udp);
+    return signTsigResponse(response, requestMac, 0, {});
 }
 
 int DnsServer::handleQuery(const Message &message, QList<Record> &answers) {
