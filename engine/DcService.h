@@ -85,6 +85,9 @@ private:
     // One place reports which upstreams are in effect, at start-up and on
     // reload, so the line an operator reads is the same in both cases.
     void reportForwarders();
+    // Says who a moved serial is announced to, so a dnsNotify= line that does
+    // nothing is visible at startup rather than as a secondary that stays stale.
+    void reportSecondaries();
 
     LdapServer *m_ldapServer = nullptr;
     DnsServer *m_dnsServer = nullptr;

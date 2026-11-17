@@ -553,6 +553,7 @@ private slots:
     void transfersTheZoneToASignedPeer();
     void splitsALargeZoneAcrossMessages();
     void answersAnIncrementalRequestWithTheDelta();
+    void notifiesTheSecondariesWhenTheZoneMoves();
     void answersAnEdnsQuery();
     void truncatesADatagramReplyToWhatTheClientCanReceive();
     void answersReverseLookupsForItsOwnAddress();
@@ -2341,6 +2342,163 @@ void DnsTest::answersAnIncrementalRequestWithTheDelta()
                        &unsignedReply));
     QCOMPARE(unsignedReply.rcode, 9); // NOTAUTH
     QVERIFY(unsignedReply.answers.isEmpty());
+}
+
+// A secondary that is told nothing learns about a change when its refresh timer
+// next fires, minutes after the change. NOTIFY (RFC 1996) is the announcement
+// that turns that wait into a diff pull. This binds a socket as the secondary and
+// reads what the primary sends it.
+void DnsTest::notifiesTheSecondariesWhenTheZoneMoves()
+{
+    DnsServer server;
+    QVERIFY(server.listen(0));
+    server.loadAdZone(QStringLiteral("notify.example.com"),
+                      QStringLiteral("dc1.notify.example.com"), QStringLiteral("10.40.0.10"),
+                      389, 3268, QStringLiteral("Default-First-Site-Name"));
+    // The default is silence: a DC that was never told about a secondary does not
+    // guess one from the zone and start announcing to it.
+    QCOMPARE(server.notifyTargets().size(), 0);
+
+    QUdpSocket secondary;
+    QVERIFY(secondary.bind(QHostAddress::LocalHost, 0));
+    server.setNotifyTargets({QStringLiteral("127.0.0.1:%1").arg(secondary.localPort())});
+
+    const QString keyName = QStringLiteral("notify-key");
+    const QString algorithm = QStringLiteral("hmac-sha256.");
+    const QByteArray secret = QByteArray("89abcdef0123456789abcdef01234567");
+    server.setUpdateTsig(keyName, QStringLiteral("hmac-sha256"), secret.toBase64());
+
+    // One datagram, pumping the event loop because the server lives in this
+    // thread.
+    auto awaitDatagram = [](QUdpSocket &socket, int timeoutMs) {
+        QByteArray received;
+        QElapsedTimer timer;
+        timer.start();
+        while (timer.elapsed() < timeoutMs && received.isEmpty()) {
+            QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+            if (!socket.hasPendingDatagrams() && !socket.waitForReadyRead(20))
+                continue;
+            while (socket.hasPendingDatagrams()) {
+                QByteArray buffer;
+                buffer.resize(int(socket.pendingDatagramSize()));
+                const qint64 read = socket.readDatagram(buffer.data(), buffer.size());
+                if (read <= 0)
+                    continue;
+                buffer.truncate(int(read));
+                received = buffer;
+            }
+        }
+        return received;
+    };
+
+    const QList<DnsServer::Record> soa =
+        server.records(QStringLiteral("notify.example.com"), DnsServer::TypeSoa);
+    QCOMPARE(soa.size(), 1);
+    const quint32 before = soaSerial(soa.first().rdata);
+
+    QList<UpdateRecord> updates;
+    updates.append({QStringLiteral("added.notify.example.com"), DnsServer::TypeA, 1, 300,
+                    QByteArray::fromHex("0a280001")});
+    const quint64 now = quint64(QDateTime::currentSecsSinceEpoch());
+    Reply updateReply;
+    QVERIFY(parseReply(exchange(server.serverPort(),
+                                withTsig(updatePacket(0x7400, QStringLiteral("notify.example.com"),
+                                                      {}, updates),
+                                         keyName, algorithm, secret, now, 300)),
+                       &updateReply));
+    QCOMPARE(updateReply.rcode, 0);
+    const quint32 after = soaSerial(
+        server.records(QStringLiteral("notify.example.com"), DnsServer::TypeSoa).first().rdata);
+    QVERIFY2(after > before, "an applied update moves the serial");
+
+    const QByteArray announce = awaitDatagram(secondary, 3000);
+    QVERIFY2(!announce.isEmpty(), "an applied update tells the secondary the serial moved");
+    QVERIFY(announce.size() >= 12);
+    const quint16 flags = quint16((quint8(announce[2]) << 8) | quint8(announce[3]));
+    QCOMPARE((flags >> 11) & 0x0f, 4); // opcode NOTIFY
+    QCOMPARE(flags & 0x8000, 0);       // a request, not an answer
+    QVERIFY((flags & 0x0400) != 0);    // authoritative
+    Reply notify;
+    QVERIFY(parseReply(announce, &notify));
+    QCOMPARE(notify.qdcount, quint16(1));
+    QCOMPARE(notify.answers.size(), 1);
+    QCOMPARE(notify.answers.first().type, DnsServer::TypeSoa);
+    QCOMPARE(notify.answers.first().name.toLower(), QStringLiteral("notify.example.com"));
+    QCOMPARE(soaSerial(notify.answers.first().rdata), after);
+
+    // Signed with the key the transfer requires, recomputed here from the secret
+    // over the bytes as sent: an announcement the secondary cannot check is one
+    // it will ignore, and the filtering it does is the point of the signature.
+    const Answer *announcedTsig = replyTsig(notify);
+    QVERIFY2(announcedTsig != nullptr, "a primary with a key signs what it announces");
+    TsigReply signature;
+    QVERIFY(parseTsigRdata(announcedTsig->rdata, &signature));
+    QCOMPARE(signature.error, quint16(0));
+    QCOMPARE(signature.mac.size(), 32);
+    QCOMPARE(signature.originalId, notify.id);
+    const int tsigStart =
+        announce.size() - (nameBytes(keyName).size() + 10 + announcedTsig->rdata.size());
+    QVERIFY(tsigStart > 12);
+    QByteArray withoutTsig = announce.left(tsigStart);
+    const quint16 arcount = quint16((quint8(withoutTsig[10]) << 8) | quint8(withoutTsig[11]));
+    const quint16 fewer = quint16(arcount - 1);
+    withoutTsig[10] = char((fewer >> 8) & 0xff);
+    withoutTsig[11] = char(fewer & 0xff);
+    QCOMPARE(hmacSha256(secret,
+                        withoutTsig
+                            + tsigVariables(keyName, algorithm, signature.timeSigned,
+                                            signature.fudge, signature.error, signature.other)),
+             signature.mac);
+
+    // The secondary's answer to a NOTIFY carries QR, and it ends the exchange:
+    // answering it with an rcode would read as a second one.
+    QByteArray ack;
+    put16(ack, notify.id);
+    put16(ack, quint16((4 << 11) | 0x8000 | 0x0400));
+    put16(ack, 0);
+    put16(ack, 0);
+    put16(ack, 0);
+    put16(ack, 0);
+    secondary.writeDatagram(ack, QHostAddress::LocalHost, server.serverPort());
+    QVERIFY2(awaitDatagram(secondary, 300).isEmpty(),
+             "a NOTIFY response ends the exchange instead of starting another");
+
+    // A NOTIFY addressed to this server is a peer that takes it for a secondary.
+    // There is no copy here to refresh, and REFUSED says that instead of the
+    // NOTIMP an unknowable opcode would get.
+    QByteArray asked;
+    put16(asked, 0x7402);
+    put16(asked, quint16(4 << 11));
+    put16(asked, 1);
+    put16(asked, 0);
+    put16(asked, 0);
+    put16(asked, 0);
+    asked += nameBytes(QStringLiteral("notify.example.com"));
+    put16(asked, DnsServer::TypeSoa);
+    put16(asked, 1);
+    Reply refusedNotify;
+    QVERIFY(parseReply(exchange(server.serverPort(), asked), &refusedNotify));
+    QCOMPARE(refusedNotify.rcode, 5); // REFUSED
+
+    // With the key cleared there is nothing to sign with, so the announcement
+    // goes out unsigned rather than carrying a TSIG that proves nothing.
+    server.setUpdateTsig(QString(), QString(), QByteArray());
+    updates.clear();
+    updates.append({QStringLiteral("again.notify.example.com"), DnsServer::TypeA, 1, 300,
+                    QByteArray::fromHex("0a280002")});
+    QVERIFY(parseReply(exchange(server.serverPort(),
+                                updatePacket(0x7403, QStringLiteral("notify.example.com"), {},
+                                             updates)),
+                       &updateReply));
+    QCOMPARE(updateReply.rcode, 0);
+    const QByteArray unsignedAnnounce = awaitDatagram(secondary, 3000);
+    QVERIFY2(!unsignedAnnounce.isEmpty(), "an announcement is not tied to a key being set");
+    Reply plainNotify;
+    QVERIFY(parseReply(unsignedAnnounce, &plainNotify));
+    QCOMPARE(plainNotify.answers.size(), 1);
+    QCOMPARE(plainNotify.answers.first().type, DnsServer::TypeSoa);
+    QVERIFY2(replyTsig(plainNotify) == nullptr,
+             "no key means no signature, not a signature over nothing");
 }
 
 void DnsTest::persistsZone()

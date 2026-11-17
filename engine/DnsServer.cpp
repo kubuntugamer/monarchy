@@ -967,6 +967,100 @@ QString DnsServer::updateTsigName() const
     return m_tsigName;
 }
 
+void DnsServer::setNotifyTargets(const QStringList &targets)
+{
+    m_notifyTargets.clear();
+    for (const QString &entry : targets) {
+        const QString trimmed = entry.trimmed();
+        if (!trimmed.isEmpty())
+            m_notifyTargets.append(trimmed);
+    }
+}
+
+QStringList DnsServer::notifyTargets() const
+{
+    return m_notifyTargets;
+}
+
+QByteArray DnsServer::buildNotify(quint16 id) const
+{
+    const QList<Record> soa = records(m_zone, TypeSoa);
+    if (m_zone.isEmpty() || soa.isEmpty())
+        return {};
+
+    QByteArray packet;
+    wr16(packet, id);
+    // QR clear, opcode NOTIFY, AA set: a primary announcing the version it now
+    // holds. Both sections are required by RFC 1996 §4 — the question names the
+    // zone, the answer carries its SOA, whose serial is the announcement.
+    wr16(packet, quint16((4 << 11) | 0x0400));
+    wr16(packet, 1);
+    wr16(packet, 1);
+    wr16(packet, 0);
+    wr16(packet, 0);
+    packet += encodeName(m_zone);
+    wr16(packet, TypeSoa);
+    wr16(packet, ClassIn);
+    packet += encodeName(m_zone);
+    wr16(packet, TypeSoa);
+    wr16(packet, ClassIn);
+    wr32(packet, soa.first().ttl);
+    wr16(packet, quint16(soa.first().rdata.size()));
+    packet += soa.first().rdata;
+
+    if (m_tsigName.isEmpty())
+        return packet;
+
+    // A NOTIFY this server sends is a request, so its MAC covers this message
+    // and the TSIG variables and nothing before it: a one-message exchange has no
+    // earlier MAC to chain from. Signing it lets a secondary that already trusts
+    // this key tell our announcement from anyone else's — which matters, because
+    // the announcement is what makes it pull a zone.
+    const quint64 now = quint64(QDateTime::currentSecsSinceEpoch());
+    const quint16 fudge = 300;
+    const QByteArray mac =
+        hmacSha256(m_tsigSecret,
+                   packet + tsigVariables(m_tsigName, m_tsigAlgorithm, now, fudge, 0, {}));
+    const quint16 arcount = quint16((quint8(packet[10]) << 8) | quint8(packet[11]));
+    const quint16 next = quint16(arcount + 1);
+    packet[10] = char((next >> 8) & 0xff);
+    packet[11] = char(next & 0xff);
+
+    QByteArray rdata;
+    rdata += encodeName(m_tsigAlgorithm);
+    for (int shift = 40; shift >= 0; shift -= 8)
+        rdata.append(char((now >> shift) & 0xff));
+    wr16(rdata, fudge);
+    wr16(rdata, quint16(mac.size()));
+    rdata += mac;
+    wr16(rdata, id);
+    wr16(rdata, 0);
+    wr16(rdata, 0);
+    packet += encodeName(m_tsigName);
+    wr16(packet, TypeTsig);
+    wr16(packet, 255);
+    wr32(packet, 0);
+    wr16(packet, quint16(rdata.size()));
+    packet += rdata;
+    return packet;
+}
+
+void DnsServer::notifySecondaries()
+{
+    if (m_notifyTargets.isEmpty() || !isListening())
+        return;
+    for (const QString &spec : m_notifyTargets) {
+        QHostAddress address;
+        quint16 port = 53;
+        if (!parseForwarder(spec, &address, &port))
+            continue;
+        const QByteArray notify = buildNotify(m_nextNotifyId++);
+        if (notify.isEmpty())
+            return;
+        m_socket->writeDatagram(notify, address, port);
+    }
+}
+
 int DnsServer::verifyTsig(const QByteArray &packet, QByteArray *requestMac,
                                 quint16 *error, QByteArray *other, bool *signRefusal) const
 {
@@ -1283,6 +1377,16 @@ QByteArray DnsServer::handlePacket(const QByteArray &packet, const QHostAddress 
         if (!m_tsigName.isEmpty() && !requestMac.isEmpty())
             answer = signTsigResponse(answer, requestMac, 0, {});
         return answer;
+    }
+    if (opcode == 4) {
+        // NOTIFY (RFC 1996). A NOTIFY that arrives with QR set is a secondary
+        // answering one of ours, and answering that with an rcode would read as
+        // a second exchange. One with QR clear is a peer asking this server to
+        // pull a zone, which it does not do: REFUSED says so, rather than NOTIMP
+        // pretending the opcode is unknown now that this server speaks it.
+        if ((message.flags & 0x8000) != 0)
+            return {};
+        return buildResponse(packet, {}, Refused, {}, udp);
     }
     if (opcode != 0)
         return buildResponse(packet, {}, NotImp, {}, udp);
@@ -2341,6 +2445,10 @@ int DnsServer::handleUpdate(const Message &message) {
     if (changed) {
         bumpSerial();
         recordDelta(serialBefore, beforeUpdate, zoneContents());
+        // The serial moved, so the secondaries are told rather than left to
+        // notice on their next refresh: this is what turns a change into a diff
+        // pull instead of a full transfer minutes later.
+        notifySecondaries();
     }
     return NoError;
 }

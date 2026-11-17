@@ -193,6 +193,18 @@ void DcService::reportForwarders()
     emit statusMessage(line);
 }
 
+void DcService::reportSecondaries()
+{
+    if (!m_dnsServer)
+        return;
+    const QStringList targets = m_dnsServer->notifyTargets();
+    if (targets.isEmpty())
+        return;
+    emit statusMessage(tr("Announcing %1 to %2 whenever its serial moves.")
+                           .arg(m_dnsServer->zone())
+                           .arg(targets.join(QStringLiteral(", "))));
+}
+
 namespace {
 
 // A TSIG key in dc.conf makes dynamic updates require a signature over that key
@@ -207,6 +219,19 @@ void applyDnsUpdateKey(DnsServer *server, const QSettings &config)
                           config.value(QStringLiteral("dnsTsigSecret")).toString().toLatin1());
 }
 
+// The secondaries to announce a moved serial to (RFC 1996), read the way the
+// forwarders are: a stored list, or one value with commas or spaces in it. An
+// empty list announces nothing, which is the default and stays the default until
+// an operator names a secondary in dc.conf.
+QStringList notifyTargetsFrom(const QSettings &config)
+{
+    const QStringList entries = config.value(QStringLiteral("dnsNotify")).toStringList();
+    QStringList targets;
+    for (const QString &entry : entries)
+        targets += entry.split(QRegularExpression(QStringLiteral("[,;\\s]+")), Qt::SkipEmptyParts);
+    return targets;
+}
+
 } // namespace
 
 void DcService::reloadForwarders()
@@ -218,8 +243,10 @@ void DcService::reloadForwarders()
     m_dnsServer->setForwarders(forwardersFrom(dcConfig));
     m_dnsServer->setForwardingEnabled(dcConfig.value(QStringLiteral("forwarding"), true).toBool());
     applyDnsUpdateKey(m_dnsServer, dcConfig);
+    m_dnsServer->setNotifyTargets(notifyTargetsFrom(dcConfig));
     emit statusMessage(tr("Re-read the DNS forwarder configuration from %1 on SIGHUP.").arg(path));
     reportForwarders();
+    reportSecondaries();
 }
 
 void DcService::stop()
@@ -1081,6 +1108,7 @@ bool DcService::start(const QString &dcDir)
     m_dnsServer->setForwarders(forwardersFrom(dcConfig));
     m_dnsServer->setForwardingEnabled(dcConfig.value(QStringLiteral("forwarding"), true).toBool());
     applyDnsUpdateKey(m_dnsServer, dcConfig);
+    m_dnsServer->setNotifyTargets(notifyTargetsFrom(dcConfig));
     if (!m_dnsServer->loadZone(m_zonePath)) {
         m_dnsServer->loadAdZone(dnsDomain, dcHost, dcIp, boundLdapPort, boundGcPort, siteName,
                                 boundKpasswdPort, boundKdcPort);
@@ -1125,6 +1153,7 @@ bool DcService::start(const QString &dcDir)
         // nothing to forward to. Report which upstreams are in effect so an
         // empty set is visible at startup rather than as a silent SERVFAIL.
         reportForwarders();
+        reportSecondaries();
     }
 
     m_started = true;

@@ -132,6 +132,16 @@ public:
     void setUpdateTsig(const QString &name, const QString &algorithm, const QByteArray &base64Secret);
     QString updateTsigName() const;
 
+    // Secondaries to tell when the zone's serial moves (RFC 1996), as
+    // "address" or "address:port" entries like the forwarders. An applied update
+    // that changes the zone sends each of them the SOA it now holds, signed with
+    // the transfer key when one is configured, so a secondary pulls the
+    // difference instead of waiting out its refresh interval. An empty list —
+    // the default — announces nothing: a DC that has never been told about a
+    // secondary does not invent one from the zone's NS records.
+    void setNotifyTargets(const QStringList &targets);
+    QStringList notifyTargets() const;
+
     // Caching forwarder. `forwarders` entries are "address" or
     // "address:port" (port 53 by default); an empty list reads the host's
     // /etc/resolv.conf, falling back to systemd-resolved's upstream file, and
@@ -315,6 +325,12 @@ private:
     QList<Record> incrementalResponse(quint32 clientSerial) const;
     void recordDelta(quint32 from, const QList<Record> &before, const QList<Record> &after);
 
+    // One NOTIFY message (RFC 1996 §4): QR clear, opcode NOTIFY, AA set, the
+    // zone as a single SOA question and the SOA being announced as its one
+    // answer — signed as a request when a key is configured.
+    QByteArray buildNotify(quint16 id) const;
+    void notifySecondaries();
+
     void bumpSerial();
     void bumpReverseSerial();
     // The zone a name belongs to: the reverse zone when this DC is authoritative
@@ -336,6 +352,8 @@ private:
     QString m_tsigAlgorithm;
     QByteArray m_tsigSecret;
     QList<ZoneDelta> m_journal;
+    QStringList m_notifyTargets;
+    quint16 m_nextNotifyId = 1;
     QHash<quint16, PendingQuery> m_pending;
     QHash<QString, CacheEntry> m_cache;
     QStringList m_forwarders;
