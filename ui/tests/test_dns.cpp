@@ -306,6 +306,44 @@ QList<QByteArray> exchangeTransfer(quint16 port, const QByteArray &request, int 
     return messages;
 }
 
+// An IXFR request carrying the version the client holds in the authority
+// section, which is where RFC 1995 §3 puts it. The TSIG is added on top, so the
+// additional count starts at zero.
+QByteArray ixfrQuery(quint16 id, const QString &zone, const QByteArray &clientSoa)
+{
+    QByteArray packet;
+    put16(packet, id);
+    put16(packet, 0x0000);
+    put16(packet, 1); // one question
+    put16(packet, 0); // no answers
+    put16(packet, 1); // one authority record: the client's SOA
+    put16(packet, 0); // no additional records yet
+    packet += nameBytes(zone);
+    put16(packet, DnsServer::TypeIxfr);
+    put16(packet, 1);
+    packet += nameBytes(zone);
+    put16(packet, DnsServer::TypeSoa);
+    put16(packet, 1);
+    put32(packet, 0);
+    put16(packet, quint16(clientSoa.size()));
+    packet += clientSoa;
+    return packet;
+}
+
+// An SOA's RDATA with its serial replaced: how a client says which version it has.
+QByteArray soaWithSerial(const QByteArray &rdata, quint32 serial)
+{
+    QByteArray out = rdata;
+    int pos = 0;
+    readName(out, pos);
+    readName(out, pos);
+    out[pos] = char((serial >> 24) & 0xff);
+    out[pos + 1] = char((serial >> 16) & 0xff);
+    out[pos + 2] = char((serial >> 8) & 0xff);
+    out[pos + 3] = char(serial & 0xff);
+    return out;
+}
+
 // --- TSIG (RFC 8945) -------------------------------------------------------
 // The server speaks hmac-sha256, so the test computes the same MACs from the
 // same key: verifying the reply's MAC here is what proves the signature is over
@@ -514,6 +552,7 @@ private slots:
     void refusesZoneTransfers();
     void transfersTheZoneToASignedPeer();
     void splitsALargeZoneAcrossMessages();
+    void answersAnIncrementalRequestWithTheDelta();
     void answersAnEdnsQuery();
     void truncatesADatagramReplyToWhatTheClientCanReceive();
     void answersReverseLookupsForItsOwnAddress();
@@ -2018,7 +2057,10 @@ void DnsTest::transfersTheZoneToASignedPeer()
     QCOMPARE(udpReply.rcode, 5); // REFUSED
     QVERIFY(udpReply.answers.isEmpty());
 
-    // IXFR still has no change journal behind it, signed or not.
+    // An IXFR that names no version cannot be answered with a difference, so it
+    // is handed the whole zone — the fallback RFC 1995 §6 asks for — rather than
+    // refused. The delta itself is covered by
+    // answersAnIncrementalRequestWithTheDelta().
     Reply ixfr;
     QVERIFY(parseReply(exchangeTcp(server.serverPort(),
                                    withTsig(DnsServer::buildQuery(
@@ -2026,8 +2068,10 @@ void DnsTest::transfersTheZoneToASignedPeer()
                                                 DnsServer::TypeIxfr, 0x7105),
                                             keyName, algorithm, secret, now, 300)),
                        &ixfr));
-    QCOMPARE(ixfr.rcode, 5);
-    QVERIFY(ixfr.answers.isEmpty());
+    QCOMPARE(ixfr.rcode, 0);
+    QCOMPARE(ixfr.answers.size(), server.zoneContents().size());
+    QCOMPARE(ixfr.answers.first().type, DnsServer::TypeSoa);
+    QCOMPARE(ixfr.answers.last().type, DnsServer::TypeSoa);
 
     // With the key cleared there is no peer that could authenticate, so the
     // transfer goes back to being refused rather than open — the default.
@@ -2172,6 +2216,131 @@ void DnsTest::splitsALargeZoneAcrossMessages()
     QVERIFY(parseReply(refused.first(), &denied));
     QCOMPARE(denied.rcode, 9); // NOTAUTH
     QVERIFY(denied.answers.isEmpty());
+}
+
+// IXFR (RFC 1995): a client that names the version it holds is sent the records
+// that changed instead of the zone, and the framing is the one the RFC draws —
+// it opens with the current SOA, each difference sequence starts with the older
+// SOA and starts its additions with the newer one, and the current SOA closes
+// the answer.
+void DnsTest::answersAnIncrementalRequestWithTheDelta()
+{
+    DnsServer server;
+    QVERIFY(server.listen(0));
+    server.loadAdZone(QStringLiteral("inc.example.com"),
+                      QStringLiteral("dc1.inc.example.com"), QStringLiteral("10.30.0.10"),
+                      389, 3268, QStringLiteral("Default-First-Site-Name"));
+    const QByteArray keepRdata = QByteArray::fromHex("0a1e0001");
+    const QByteArray goingRdata = QByteArray::fromHex("0a1e0002");
+    const QByteArray arrivedRdata = QByteArray::fromHex("0a1e0003");
+    server.addRecord(QStringLiteral("keep.inc.example.com"), DnsServer::TypeA, 300, keepRdata);
+    server.addRecord(QStringLiteral("going.inc.example.com"), DnsServer::TypeA, 300, goingRdata);
+
+    const QString keyName = QStringLiteral("inc-key");
+    const QString algorithm = QStringLiteral("hmac-sha256.");
+    const QByteArray secret = QByteArray("0123456789abcdef0123456789abcdef");
+    server.setUpdateTsig(keyName, QStringLiteral("hmac-sha256"), secret.toBase64());
+
+    const QList<DnsServer::Record> soa =
+        server.records(QStringLiteral("inc.example.com"), DnsServer::TypeSoa);
+    QCOMPARE(soa.size(), 1);
+    const quint32 before = soaSerial(soa.first().rdata);
+
+    // One update that removes an address and adds another, so the difference has
+    // both halves and the untouched record is the control.
+    QList<UpdateRecord> updates;
+    updates.append({QStringLiteral("arrived.inc.example.com"), DnsServer::TypeA, 1, 300,
+                    arrivedRdata});
+    updates.append({QStringLiteral("going.inc.example.com"), DnsServer::TypeA, 255, 0, {}});
+    const quint64 now = quint64(QDateTime::currentSecsSinceEpoch());
+    Reply updateReply;
+    QVERIFY(parseReply(exchange(server.serverPort(),
+                                withTsig(updatePacket(0x7300, QStringLiteral("inc.example.com"),
+                                                      {}, updates),
+                                         keyName, algorithm, secret, now, 300)),
+                       &updateReply));
+    QCOMPARE(updateReply.rcode, 0);
+    const quint32 after =
+        soaSerial(server.records(QStringLiteral("inc.example.com"), DnsServer::TypeSoa)
+                      .first()
+                      .rdata);
+    QVERIFY2(after > before, "an applied update moves the serial");
+
+    Reply delta;
+    QVERIFY(parseReply(exchangeTcp(server.serverPort(),
+                                   withTsig(ixfrQuery(0x7301, QStringLiteral("inc.example.com"),
+                                                      soaWithSerial(soa.first().rdata, before)),
+                                            keyName, algorithm, secret, now, 300)),
+                       &delta));
+    QCOMPARE(delta.rcode, 0);
+    QVERIFY(delta.authoritative);
+    QCOMPARE(delta.answers.size(), 6);
+    QCOMPARE(delta.answers.at(0).type, DnsServer::TypeSoa);
+    QCOMPARE(soaSerial(delta.answers.at(0).rdata), after);
+    QCOMPARE(delta.answers.at(1).type, DnsServer::TypeSoa);
+    QCOMPARE(soaSerial(delta.answers.at(1).rdata), before);
+    QCOMPARE(delta.answers.at(2).type, DnsServer::TypeA);
+    QCOMPARE(delta.answers.at(2).name.toLower(), QStringLiteral("going.inc.example.com"));
+    QCOMPARE(delta.answers.at(2).rdata, goingRdata);
+    QCOMPARE(delta.answers.at(3).type, DnsServer::TypeSoa);
+    QCOMPARE(soaSerial(delta.answers.at(3).rdata), after);
+    QCOMPARE(delta.answers.at(4).type, DnsServer::TypeA);
+    QCOMPARE(delta.answers.at(4).name.toLower(), QStringLiteral("arrived.inc.example.com"));
+    QCOMPARE(delta.answers.at(4).rdata, arrivedRdata);
+    QCOMPARE(delta.answers.at(5).type, DnsServer::TypeSoa);
+    QCOMPARE(soaSerial(delta.answers.at(5).rdata), after);
+    for (const Answer &answer : delta.answers) {
+        QVERIFY2(answer.name.toLower() != QStringLiteral("keep.inc.example.com"),
+                 "a record the update did not touch does not travel in the delta");
+    }
+
+    // A client that already holds this version is told so with one SOA.
+    Reply current;
+    QVERIFY(parseReply(exchangeTcp(server.serverPort(),
+                                   withTsig(ixfrQuery(0x7302, QStringLiteral("inc.example.com"),
+                                                      soaWithSerial(soa.first().rdata, after)),
+                                            keyName, algorithm, secret, now, 300)),
+                       &current));
+    QCOMPARE(current.rcode, 0);
+    QCOMPARE(current.answers.size(), 1);
+    QCOMPARE(current.answers.first().type, DnsServer::TypeSoa);
+    QCOMPARE(soaSerial(current.answers.first().rdata), after);
+
+    // A version the journal does not hold gets the whole zone, not an error: the
+    // client cannot be brought forward from a version this server no longer has.
+    Reply full;
+    QVERIFY(parseReply(exchangeTcp(server.serverPort(),
+                                   withTsig(ixfrQuery(0x7303, QStringLiteral("inc.example.com"),
+                                                      soaWithSerial(soa.first().rdata,
+                                                                    before - 5)),
+                                            keyName, algorithm, secret, now, 300)),
+                       &full));
+    QCOMPARE(full.rcode, 0);
+    QCOMPARE(full.answers.size(), server.zoneContents().size());
+    QCOMPARE(full.answers.first().type, DnsServer::TypeSoa);
+    QCOMPARE(full.answers.last().type, DnsServer::TypeSoa);
+
+    // Over a datagram the answer is the current SOA, which is what RFC 1995 §2
+    // has a server say when the difference is not carried in this message.
+    Reply datagram;
+    QVERIFY(parseReply(exchange(server.serverPort(),
+                                withTsig(ixfrQuery(0x7304, QStringLiteral("inc.example.com"),
+                                                   soaWithSerial(soa.first().rdata, before)),
+                                         keyName, algorithm, secret, now, 300)),
+                       &datagram));
+    QCOMPARE(datagram.rcode, 0);
+    QCOMPARE(datagram.answers.size(), 1);
+    QCOMPARE(datagram.answers.first().type, DnsServer::TypeSoa);
+    QCOMPARE(soaSerial(datagram.answers.first().rdata), after);
+
+    // Size and opcode change nothing about who may ask.
+    Reply unsignedReply;
+    QVERIFY(parseReply(exchangeTcp(server.serverPort(),
+                                   ixfrQuery(0x7305, QStringLiteral("inc.example.com"),
+                                             soaWithSerial(soa.first().rdata, before))),
+                       &unsignedReply));
+    QCOMPARE(unsignedReply.rcode, 9); // NOTAUTH
+    QVERIFY(unsignedReply.answers.isEmpty());
 }
 
 void DnsTest::persistsZone()

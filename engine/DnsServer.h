@@ -210,6 +210,11 @@ public:
     QByteArray handleTransferRequest(const QByteArray &packet, const Message &message, bool udp,
                                      QTcpSocket *tcpClient);
 
+    // The serial in the zone's own SOA, and that SOA carrying `serial`: what an
+    // IXFR reply opens with, marks each delta with, and closes with.
+    quint32 zoneSerial() const;
+    QList<Record> soaAtSerial(quint32 serial) const;
+
     // Zone persistence. `saveZone` writes the zone as JSON, `loadZone` reads
     // it back and restores the zone name and SOA serial.
     bool saveZone(const QString &path, QString *error = nullptr) const;
@@ -294,6 +299,22 @@ private:
                                 bool continuedMessage = false,
                                 QByteArray *macOut = nullptr) const;
 
+    // One change the zone went through, kept so a client that lags behind is
+    // handed the records that came and went instead of the whole zone
+    // (RFC 1995 §4). The journal is the store's own memory: bounded, oldest
+    // first, and lost on restart — a serial it no longer holds gets the whole
+    // zone, which is the fallback the RFC asks for rather than an error.
+    struct ZoneDelta {
+        quint32 from = 0;
+        quint32 to = 0;
+        QList<Record> removed;
+        QList<Record> added;
+    };
+    // The difference from `clientSerial` to the current version, or empty when
+    // this server cannot build one (unknown serial, or a gap in the chain).
+    QList<Record> incrementalResponse(quint32 clientSerial) const;
+    void recordDelta(quint32 from, const QList<Record> &before, const QList<Record> &after);
+
     void bumpSerial();
     void bumpReverseSerial();
     // The zone a name belongs to: the reverse zone when this DC is authoritative
@@ -314,6 +335,7 @@ private:
     QString m_tsigName;                     // configured update key, if any
     QString m_tsigAlgorithm;
     QByteArray m_tsigSecret;
+    QList<ZoneDelta> m_journal;
     QHash<quint16, PendingQuery> m_pending;
     QHash<QString, CacheEntry> m_cache;
     QStringList m_forwarders;

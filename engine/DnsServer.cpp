@@ -1874,6 +1874,140 @@ QStringList DnsServer::effectiveForwarders() const
     return result;
 }
 
+// The serial field of an SOA RDATA: after the two names, four big-endian octets.
+static quint32 serialInSoa(const QByteArray &rdata)
+{
+    int pos = 0;
+    if (!skipName(rdata, pos) || !skipName(rdata, pos) || pos + 4 > rdata.size())
+        return 0;
+    return (quint32(quint8(rdata[pos])) << 24) | (quint32(quint8(rdata[pos + 1])) << 16)
+           | (quint32(quint8(rdata[pos + 2])) << 8) | quint32(quint8(rdata[pos + 3]));
+}
+
+quint32 DnsServer::zoneSerial() const
+{
+    const QList<Record> soa = records(m_zone, TypeSoa);
+    if (soa.isEmpty())
+        return 0;
+    return serialInSoa(soa.first().rdata);
+}
+
+QList<DnsServer::Record> DnsServer::soaAtSerial(quint32 serial) const
+{
+    QList<Record> out;
+    const QList<Record> soa = records(m_zone, TypeSoa);
+    if (soa.isEmpty())
+        return out;
+    Record record = soa.first();
+    int pos = 0;
+    if (!skipName(record.rdata, pos) || !skipName(record.rdata, pos)
+        || pos + 4 > record.rdata.size())
+        return out;
+    record.rdata[pos] = char((serial >> 24) & 0xff);
+    record.rdata[pos + 1] = char((serial >> 16) & 0xff);
+    record.rdata[pos + 2] = char((serial >> 8) & 0xff);
+    record.rdata[pos + 3] = char(serial & 0xff);
+    out.append(record);
+    return out;
+}
+
+void DnsServer::recordDelta(quint32 from, const QList<Record> &before,
+                            const QList<Record> &after)
+{
+    // Identity for a difference is the whole RR: name, type, TTL and RDATA. A TTL
+    // change is a modification, and RFC 1995 §4 says a modification travels as a
+    // removal followed by the new copy, not as a silent difference a client
+    // applying only additions would never see.
+    const auto key = [](const Record &record) {
+        QByteArray out = record.name.toLower().toUtf8();
+        out.append(char((record.type >> 8) & 0xff));
+        out.append(char(record.type & 0xff));
+        out.append(char((record.ttl >> 24) & 0xff));
+        out.append(char((record.ttl >> 16) & 0xff));
+        out.append(char((record.ttl >> 8) & 0xff));
+        out.append(char(record.ttl & 0xff));
+        out.append(record.rdata);
+        return out;
+    };
+    QMap<QByteArray, QList<Record>> oldByKey;
+    QMap<QByteArray, QList<Record>> newByKey;
+    QSet<QByteArray> keys;
+    for (const Record &record : before) {
+        if (record.type == TypeSoa)
+            continue; // the serial is carried by the delta's own SOA records
+        oldByKey[key(record)].append(record);
+        keys.insert(key(record));
+    }
+    for (const Record &record : after) {
+        if (record.type == TypeSoa)
+            continue;
+        newByKey[key(record)].append(record);
+        keys.insert(key(record));
+    }
+    ZoneDelta delta;
+    delta.from = from;
+    delta.to = m_serial;
+    for (const QByteArray &k : keys) {
+        const QList<Record> oldRecords = oldByKey.value(k);
+        const QList<Record> newRecords = newByKey.value(k);
+        // Counted, not set-compared: the same address held twice at one name is
+        // two records, and dropping one of them is a change.
+        if (oldRecords.size() > newRecords.size())
+            delta.removed += oldRecords.mid(newRecords.size());
+        else if (newRecords.size() > oldRecords.size())
+            delta.added += newRecords.mid(oldRecords.size());
+    }
+    if (delta.removed.isEmpty() && delta.added.isEmpty())
+        return; // a serial bump that changed no record is not a difference
+    m_journal.append(delta);
+    while (m_journal.size() > 64)
+        m_journal.removeFirst();
+}
+
+QList<DnsServer::Record> DnsServer::incrementalResponse(quint32 clientSerial) const
+{
+    QList<Record> out;
+    if (m_zone.isEmpty() || clientSerial == 0)
+        return out;
+    const quint32 current = zoneSerial();
+    int start = -1;
+    for (int i = 0; i < m_journal.size(); ++i) {
+        if (m_journal.at(i).from == clientSerial) {
+            start = i;
+            break;
+        }
+    }
+    if (start < 0)
+        return out;
+    // The deltas have to be a chain that actually reaches the version this
+    // server holds; a gap means the client's copy would not become ours, so it
+    // is handed the whole zone instead.
+    QList<int> chain;
+    quint32 expect = clientSerial;
+    for (int i = start; i < m_journal.size(); ++i) {
+        if (m_journal.at(i).from != expect)
+            break;
+        chain.append(i);
+        expect = m_journal.at(i).to;
+    }
+    if (chain.isEmpty() || expect != current)
+        return out;
+
+    // RFC 1995 §4: the list of difference sequences "is preceded and followed by
+    // a copy of the server's current version of the SOA", and each sequence
+    // starts with the older SOA and starts its additions with the newer one.
+    out.append(soaAtSerial(current));
+    for (int index : chain) {
+        const ZoneDelta &delta = m_journal.at(index);
+        out += soaAtSerial(delta.from);
+        out += delta.removed;
+        out += soaAtSerial(delta.to);
+        out += delta.added;
+    }
+    out.append(soaAtSerial(current));
+    return out;
+}
+
 QList<DnsServer::Record> DnsServer::zoneContents() const
 {
     QList<Record> result;
@@ -1915,15 +2049,11 @@ QByteArray DnsServer::handleTransferRequest(const QByteArray &packet, const Mess
     const Message::Question question = message.questions.first();
     if (question.qclass != ClassIn || !inZone(question.name))
         return buildResponse(packet, {}, Refused, {}, udp);
-    // IXFR is answered from a change journal, which this store does not keep.
-    // Replying to it with a full zone would tell a secondary it was brought up
-    // to date by a delta it never received.
-    if (question.type == TypeIxfr)
-        return buildResponse(packet, {}, Refused, {}, udp);
-    // A transfer is a sequence of messages over a stream, not a datagram
+    // A full transfer is a sequence of messages over a stream, not a datagram
     // (RFC 5936 §4.2): a UDP request cannot be answered with a zone, and part of
-    // one is worse than a refusal because the client may commit it.
-    if (udp)
+    // one is worse than a refusal because the client may commit it. An IXFR
+    // request may arrive as a datagram, and RFC 1995 §2 has an answer for that.
+    if (udp && question.type != TypeIxfr)
         return buildResponse(packet, {}, Refused, {}, udp);
     // With no key configured there is no peer that could prove anything, and an
     // open transfer would hand the whole directory's DNS data to any address
@@ -1943,7 +2073,51 @@ QByteArray DnsServer::handleTransferRequest(const QByteArray &packet, const Mess
         return refusal;
     }
 
-    const QList<Record> answers = zoneContents();
+    if (udp) {
+        // IXFR over a datagram: the current SOA, which is what RFC 1995 §2 tells
+        // a server to send when the difference is not carried in this message. It
+        // costs the client one round trip and keeps a datagram from carrying half
+        // a delta.
+        const QByteArray answer =
+            buildResponse(packet, soaAtSerial(zoneSerial()), NoError, {}, true);
+        return signTsigResponse(answer, requestMac, 0, {});
+    }
+
+    QList<Record> answers;
+    if (question.type == TypeIxfr) {
+        // The version the client holds arrives as the SOA in the request's
+        // authority section, which the parser keeps in `updates` for that
+        // section; a client that puts it in the answer section is served the same
+        // way rather than told its request was malformed.
+        quint32 clientSerial = 0;
+        for (const Record &record : message.updates) {
+            if (record.type == TypeSoa) {
+                clientSerial = serialInSoa(record.rdata);
+                break;
+            }
+        }
+        if (clientSerial == 0) {
+            for (const Record &record : message.prerequisites) {
+                if (record.type == TypeSoa) {
+                    clientSerial = serialInSoa(record.rdata);
+                    break;
+                }
+            }
+        }
+        if (clientSerial != 0) {
+            const quint32 current = zoneSerial();
+            // RFC 1982 arithmetic: a client at or ahead of this version is
+            // answered with one SOA, which says there is nothing to send it.
+            if (qint32(quint32(clientSerial - current)) >= 0)
+                answers = soaAtSerial(current);
+            else
+                answers = incrementalResponse(clientSerial);
+        }
+    }
+    // No journal entry for that version: the whole zone, which is the fallback
+    // RFC 1995 §6 asks a server to make rather than an error.
+    if (answers.isEmpty())
+        answers = zoneContents();
     if (answers.isEmpty())
         return buildResponse(packet, {}, ServFail, {}, udp);
 
@@ -2110,6 +2284,11 @@ int DnsServer::handleUpdate(const Message &message) {
     }
 
     // --- Update section (RFC 2136 §2.5) -----------------------------------
+    // The zone as it stands, taken before the write so the difference this update
+    // makes can be journalled for an IXFR client (RFC 1995 §4) rather than
+    // guessed at from the update message, which does not record what it removed.
+    const QList<Record> beforeUpdate = zoneContents();
+    const quint32 serialBefore = m_serial;
     bool changed = false;
     for (const Record &update : message.updates) {
         if (update.rclass == ClassIn) {
@@ -2159,8 +2338,10 @@ int DnsServer::handleUpdate(const Message &message) {
         addRecord(m_zone, TypeSoa, 3600, soa);
         changed = true;
     }
-    if (changed)
+    if (changed) {
         bumpSerial();
+        recordDelta(serialBefore, beforeUpdate, zoneContents());
+    }
     return NoError;
 }
 
