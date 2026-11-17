@@ -69,6 +69,7 @@ public:
         TypeTxt = 16,
         TypeAaaa = 28,
         TypeSrv = 33,
+        TypeTsig = 250,
         TypeIxfr = 251,
         TypeAxfr = 252,
         TypeAny = 255
@@ -120,6 +121,14 @@ public:
     // which callers should keep on a trusted interface only.
     void setDynamicUpdatesEnabled(bool enabled);
     bool dynamicUpdatesEnabled() const;
+
+    // A shared-secret TSIG key (RFC 8945) that UPDATE messages must be signed
+    // with, given as the base64 secret from the key file. With a key set, an
+    // update that is unsigned, signed by another key, or carrying a MAC that
+    // does not verify is refused; without one, updates stay unauthenticated.
+    // hmac-sha256 is the algorithm this server speaks.
+    void setUpdateTsig(const QString &name, const QString &algorithm, const QByteArray &base64Secret);
+    QString updateTsigName() const;
 
     // Caching forwarder. `forwarders` entries are "address" or
     // "address:port" (port 53 by default); an empty list reads the host's
@@ -251,6 +260,14 @@ private:
     QByteArray buildResponse(const QByteArray &query, const QList<Record> &answers, int rcode,
                              const QList<Record> &authority = {}, bool udp = false) const;
 
+    // 0 when the request's TSIG verifies, otherwise the rcode to answer with.
+    // A verified request leaves its MAC in `requestMac`; `error` is the TSIG
+    // error field the reply must carry, `other` its other-data.
+    int verifyUpdateTsig(const QByteArray &packet, QByteArray *requestMac, quint16 *error,
+                         QByteArray *other, bool *signRefusal) const;
+    QByteArray signTsigResponse(const QByteArray &response, const QByteArray &requestMac,
+                                quint16 error, const QByteArray &other) const;
+
     void bumpSerial();
     void bumpReverseSerial();
     // The zone a name belongs to: the reverse zone when this DC is authoritative
@@ -268,6 +285,9 @@ private:
     QHash<QTcpSocket *, quint16> m_upstreamTcpIds;
     QMap<QString, QList<Record>> m_records; // lower-case owner name -> records
     QString m_reverseZone;                  // derived in-addr.arpa zone, if any
+    QString m_tsigName;                     // configured update key, if any
+    QString m_tsigAlgorithm;
+    QByteArray m_tsigSecret;
     QHash<quint16, PendingQuery> m_pending;
     QHash<QString, CacheEntry> m_cache;
     QStringList m_forwarders;

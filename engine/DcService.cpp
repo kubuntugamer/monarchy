@@ -193,6 +193,22 @@ void DcService::reportForwarders()
     emit statusMessage(line);
 }
 
+namespace {
+
+// A TSIG key in dc.conf makes dynamic updates require a signature over that key
+// (RFC 8945). Called on start and on SIGHUP, so a key added or rotated in the
+// file takes effect without a restart; an empty name clears it, which is how a
+// DC goes back to unauthenticated updates.
+void applyDnsUpdateKey(DnsServer *server, const QSettings &config)
+{
+    server->setUpdateTsig(config.value(QStringLiteral("dnsTsigName")).toString(),
+                          config.value(QStringLiteral("dnsTsigAlgorithm"),
+                                       QStringLiteral("hmac-sha256")).toString(),
+                          config.value(QStringLiteral("dnsTsigSecret")).toString().toLatin1());
+}
+
+} // namespace
+
 void DcService::reloadForwarders()
 {
     if (!m_dnsServer)
@@ -201,6 +217,7 @@ void DcService::reloadForwarders()
     const QSettings dcConfig(path, QSettings::IniFormat);
     m_dnsServer->setForwarders(forwardersFrom(dcConfig));
     m_dnsServer->setForwardingEnabled(dcConfig.value(QStringLiteral("forwarding"), true).toBool());
+    applyDnsUpdateKey(m_dnsServer, dcConfig);
     emit statusMessage(tr("Re-read the DNS forwarder configuration from %1 on SIGHUP.").arg(path));
     reportForwarders();
 }
@@ -1063,6 +1080,7 @@ bool DcService::start(const QString &dcDir)
     // everything else.
     m_dnsServer->setForwarders(forwardersFrom(dcConfig));
     m_dnsServer->setForwardingEnabled(dcConfig.value(QStringLiteral("forwarding"), true).toBool());
+    applyDnsUpdateKey(m_dnsServer, dcConfig);
     if (!m_dnsServer->loadZone(m_zonePath)) {
         m_dnsServer->loadAdZone(dnsDomain, dcHost, dcIp, boundLdapPort, boundGcPort, siteName,
                                 boundKpasswdPort, boundKdcPort);

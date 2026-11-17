@@ -11,6 +11,7 @@
 #include <QJsonObject>
 #include <QNetworkInterface>
 #include <QRegularExpression>
+#include <QCryptographicHash>
 #include <QTcpSocket>
 #include <QTimer>
 #include <QtEndian>
@@ -644,6 +645,140 @@ QList<AdSrvSpec> adSrvSpecs(const QString &zoneName, const QString &site, quint1
     };
 }
 
+// HMAC-SHA256 (RFC 2104). TSIG's hmac-sha256 is the one algorithm this server
+// speaks, and Qt gives us the hash but not the MAC.
+QByteArray hmacSha256(const QByteArray &key, const QByteArray &data)
+{
+    const int block = 64;
+    QByteArray k = key.size() > block ? QCryptographicHash::hash(key, QCryptographicHash::Sha256)
+                                      : key;
+    k.resize(block, '\0');
+    QByteArray inner(block, '\0');
+    QByteArray outer(block, '\0');
+    for (int i = 0; i < block; ++i) {
+        inner[i] = char(quint8(k[i]) ^ 0x36);
+        outer[i] = char(quint8(k[i]) ^ 0x5c);
+    }
+    return QCryptographicHash::hash(
+        outer + QCryptographicHash::hash(inner + data, QCryptographicHash::Sha256),
+        QCryptographicHash::Sha256);
+}
+
+// TSIG variables (RFC 8945 §4.3.3) in the order the MAC covers them. Names are
+// canonical — lower case, uncompressed — so a client that sent a mixed-case key
+// name still produces the same digest the server computes.
+QByteArray tsigVariables(const QString &keyName, const QString &algorithm, quint64 timeSigned,
+                         quint16 fudge, quint16 error, const QByteArray &other)
+{
+    QByteArray out;
+    out += encodeName(keyName.toLower());
+    wr16(out, 255); // class ANY
+    wr32(out, 0);   // TTL
+    out += encodeName(algorithm.toLower());
+    for (int shift = 40; shift >= 0; shift -= 8)
+        out.append(char((timeSigned >> shift) & 0xff));
+    wr16(out, fudge);
+    wr16(out, error);
+    wr16(out, quint16(other.size()));
+    out += other;
+    return out;
+}
+
+struct TsigParts {
+    int offset = -1; // where the TSIG RR starts, so the MAC can cover the rest
+    QString name;
+    QString algorithm;
+    quint64 timeSigned = 0;
+    quint16 fudge = 0;
+    QByteArray mac;
+    quint16 originalId = 0;
+    quint16 error = 0;
+    QByteArray other;
+};
+
+// Finds the TSIG RR in the additional section, which is where RFC 8945 puts it.
+// A TSIG name with its trailing root dot removed and lower-cased: a configured
+// "hmac-sha256." and a wire name that decodes to "hmac-sha256" are the same key.
+QString tsigKeyName(const QString &name)
+{
+    QString out = name.toLower();
+    if (out.endsWith(QLatin1Char('.')))
+        out.chop(1);
+    return out;
+}
+
+bool findTsig(const QByteArray &packet, TsigParts *out)
+{
+    int pos = 4;
+    quint16 qdcount = 0, ancount = 0, nscount = 0, arcount = 0;
+    if (!take16(packet, pos, &qdcount) || !take16(packet, pos, &ancount)
+        || !take16(packet, pos, &nscount) || !take16(packet, pos, &arcount))
+        return false;
+    pos = 12;
+    for (int i = 0; i < qdcount; ++i) {
+        decodeName(packet, pos);
+        quint16 skip = 0;
+        if (!take16(packet, pos, &skip) || !take16(packet, pos, &skip))
+            return false;
+    }
+    for (int i = 0; i < int(ancount) + int(nscount); ++i) {
+        decodeName(packet, pos);
+        quint16 type = 0, rclass = 0, rdlength = 0;
+        quint32 ttl = 0;
+        if (!take16(packet, pos, &type) || !take16(packet, pos, &rclass)
+            || !take32(packet, pos, &ttl) || !take16(packet, pos, &rdlength))
+            return false;
+        if (pos < 0 || pos + rdlength > packet.size())
+            return false;
+        pos += rdlength;
+    }
+    for (int i = 0; i < arcount; ++i) {
+        const int start = pos;
+        const QString owner = decodeName(packet, pos);
+        quint16 type = 0, rclass = 0, rdlength = 0;
+        quint32 ttl = 0;
+        if (!take16(packet, pos, &type) || !take16(packet, pos, &rclass)
+            || !take32(packet, pos, &ttl) || !take16(packet, pos, &rdlength))
+            return false;
+        if (pos < 0 || pos + rdlength > packet.size())
+            return false;
+        if (type != 250) {
+            pos += rdlength;
+            continue;
+        }
+        int cursor = pos;
+        out->offset = start;
+        out->name = owner;
+        out->algorithm = decodeName(packet, cursor);
+        if (cursor + 10 > packet.size())
+            return false;
+        quint64 signed0 = 0;
+        for (int k = 0; k < 6; ++k)
+            signed0 = (signed0 << 8) | quint8(packet[cursor + k]);
+        cursor += 6;
+        out->timeSigned = signed0;
+        out->fudge = quint16((quint8(packet[cursor]) << 8) | quint8(packet[cursor + 1]));
+        cursor += 2;
+        const int macLength = (quint8(packet[cursor]) << 8) | quint8(packet[cursor + 1]);
+        cursor += 2;
+        if (macLength < 0 || cursor + macLength + 6 > packet.size())
+            return false;
+        out->mac = packet.mid(cursor, macLength);
+        cursor += macLength;
+        out->originalId = quint16((quint8(packet[cursor]) << 8) | quint8(packet[cursor + 1]));
+        cursor += 2;
+        out->error = quint16((quint8(packet[cursor]) << 8) | quint8(packet[cursor + 1]));
+        cursor += 2;
+        const int otherLength = (quint8(packet[cursor]) << 8) | quint8(packet[cursor + 1]);
+        cursor += 2;
+        if (otherLength < 0 || cursor + otherLength > packet.size())
+            return false;
+        out->other = packet.mid(cursor, otherLength);
+        return true;
+    }
+    return false;
+}
+
 // A dotted quad as four canonical decimal octets. "01" and "1x" are rejected:
 // they are not addresses an AD client could have been configured with, and
 // reading them as 1 would derive a reverse zone for a different host.
@@ -808,6 +943,137 @@ bool DnsServer::repairAdZoneAddresses(const QString &host, const QString &ip)
     return changed;
 }
 
+void DnsServer::setUpdateTsig(const QString &name, const QString &algorithm,
+                              const QByteArray &base64Secret)
+{
+    m_tsigName = name.trimmed();
+    m_tsigAlgorithm = algorithm.trimmed();
+    if (m_tsigAlgorithm.isEmpty())
+        m_tsigAlgorithm = QStringLiteral("hmac-sha256");
+    if (!m_tsigAlgorithm.endsWith(QLatin1Char('.')))
+        m_tsigAlgorithm += QLatin1Char('.');
+    m_tsigSecret = QByteArray::fromBase64(base64Secret.trimmed());
+    // A key without a secret, or a secret without a name, is a configuration
+    // mistake: leaving it half-set would silently require nothing.
+    if (m_tsigName.isEmpty() || m_tsigSecret.isEmpty()) {
+        m_tsigName.clear();
+        m_tsigAlgorithm.clear();
+        m_tsigSecret.clear();
+    }
+}
+
+QString DnsServer::updateTsigName() const
+{
+    return m_tsigName;
+}
+
+int DnsServer::verifyUpdateTsig(const QByteArray &packet, QByteArray *requestMac,
+                                quint16 *error, QByteArray *other, bool *signRefusal) const
+{
+    *error = 0;
+    *signRefusal = false;
+    other->clear();
+    TsigParts tsig;
+    if (!findTsig(packet, &tsig)) {
+        // No TSIG at all: this update carries no proof of anything, and there is
+        // no key context to sign the refusal with.
+        return NotAuth;
+    }
+    *signRefusal = true;
+    if (tsigKeyName(tsig.name) != tsigKeyName(m_tsigName)
+        || tsigKeyName(tsig.algorithm) != tsigKeyName(m_tsigAlgorithm)) {
+        *error = 17; // BADKEY
+        return NotAuth;
+    }
+
+    // The MAC covers the message without the TSIG RR, with ARCOUNT decremented
+    // to what the sender's count would have been had it not appended one.
+    QByteArray unsignedMessage = packet.left(tsig.offset);
+    if (tsig.offset < 12 || unsignedMessage.size() < 12)
+        return FormErr;
+    const quint16 arcount =
+        quint16((quint8(unsignedMessage[10]) << 8) | quint8(unsignedMessage[11]));
+    unsignedMessage[10] = char((quint16(arcount - 1) >> 8) & 0xff);
+    unsignedMessage[11] = char((arcount - 1) & 0xff);
+
+    const QByteArray expected =
+        hmacSha256(m_tsigSecret,
+                   unsignedMessage
+                       + tsigVariables(tsig.name, tsig.algorithm, tsig.timeSigned, tsig.fudge,
+                                       tsig.error, tsig.other));
+    if (expected != tsig.mac) {
+        *error = 16; // BADSIG
+        return NotAuth;
+    }
+
+    const quint64 now = quint64(QDateTime::currentSecsSinceEpoch());
+    const quint64 skew = now > tsig.timeSigned ? now - tsig.timeSigned
+                                               : tsig.timeSigned - now;
+    if (skew > quint64(tsig.fudge)) {
+        // The key is right and the MAC verified; only the clocks disagree, so
+        // this is answered signed with the server's own time for the client to
+        // read, which is what BADTIME is for.
+        *error = 18; // BADTIME
+        for (int shift = 40; shift >= 0; shift -= 8)
+            other->append(char((now >> shift) & 0xff));
+        *requestMac = tsig.mac;
+        return NotAuth;
+    }
+    *requestMac = tsig.mac;
+    return 0;
+}
+
+QByteArray DnsServer::signTsigResponse(const QByteArray &response, const QByteArray &requestMac,
+                                       quint16 error, const QByteArray &other) const
+{
+    if (m_tsigName.isEmpty() || response.size() < 12)
+        return response;
+    const quint64 now = quint64(QDateTime::currentSecsSinceEpoch());
+    const quint16 fudge = 300;
+
+    // A response MAC also covers the request's MAC, so a reply cannot be
+    // replayed against a different request. An empty request MAC means the MAC
+    // could not be checked at all (BADKEY, BADSIG): the reply still identifies
+    // the key and the error, and carries a zero-length MAC, which is what
+    // RFC 8945 §5.3 asks for rather than a digest that proves nothing.
+    QByteArray mac;
+    if (!requestMac.isEmpty()) {
+        QByteArray prefix;
+        wr16(prefix, quint16(requestMac.size()));
+        prefix += requestMac;
+        mac = hmacSha256(m_tsigSecret,
+                         prefix + response
+                             + tsigVariables(m_tsigName, m_tsigAlgorithm, now, fudge, error, other));
+    }
+
+    QByteArray signedResponse = response;
+    const quint16 arcount =
+        quint16((quint8(signedResponse[10]) << 8) | quint8(signedResponse[11]));
+    const quint16 next = quint16(arcount + 1);
+    signedResponse[10] = char((next >> 8) & 0xff);
+    signedResponse[11] = char(next & 0xff);
+
+    QByteArray rdata;
+    rdata += encodeName(m_tsigAlgorithm);
+    for (int shift = 40; shift >= 0; shift -= 8)
+        rdata.append(char((now >> shift) & 0xff));
+    wr16(rdata, fudge);
+    wr16(rdata, quint16(mac.size()));
+    rdata += mac;
+    wr16(rdata, quint16((quint8(response[0]) << 8) | quint8(response[1])));
+    wr16(rdata, error);
+    wr16(rdata, quint16(other.size()));
+    rdata += other;
+
+    signedResponse += encodeName(m_tsigName);
+    wr16(signedResponse, 250); // TSIG
+    wr16(signedResponse, 255); // class ANY
+    wr32(signedResponse, 0);   // TTL 0
+    wr16(signedResponse, quint16(rdata.size()));
+    signedResponse += rdata;
+    return signedResponse;
+}
+
 bool DnsServer::repairReverseZone(const QString &host, const QString &ip)
 {
     if (m_zone.isEmpty())
@@ -970,8 +1236,31 @@ QByteArray DnsServer::handlePacket(const QByteArray &packet, const QHostAddress 
 
     const int opcode = (message.flags >> 11) & 0x0f;
     if (opcode == 5) {
+        // TSIG (RFC 8945). An update is the one message that changes the zone,
+        // so when a key is configured it is the one message that must prove it
+        // came from someone holding that key.
+        QByteArray requestMac;
+        quint16 tsigError = 0;
+        QByteArray other;
+        bool signRefusal = false;
+        if (!m_tsigName.isEmpty()) {
+            const int verdict =
+                verifyUpdateTsig(packet, &requestMac, &tsigError, &other, &signRefusal);
+            if (verdict != 0) {
+                QByteArray refusal = buildResponse(packet, {}, verdict, {}, udp);
+                // A refusal to something that carried a TSIG is answered with a
+                // TSIG too: that is how the client learns which end failed — an
+                // empty MAC for BADKEY/BADSIG, a real one for BADTIME.
+                if (signRefusal)
+                    refusal = signTsigResponse(refusal, requestMac, tsigError, other);
+                return refusal;
+            }
+        }
         const int rcode = handleUpdate(message);
-        return buildResponse(packet, {}, rcode, {}, udp);
+        QByteArray answer = buildResponse(packet, {}, rcode, {}, udp);
+        if (!m_tsigName.isEmpty() && !requestMac.isEmpty())
+            answer = signTsigResponse(answer, requestMac, 0, {});
+        return answer;
     }
     if (opcode != 0)
         return buildResponse(packet, {}, NotImp, {}, udp);

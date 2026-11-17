@@ -3,6 +3,7 @@
 
 #include <QtTest>
 
+#include <QCryptographicHash>
 #include <QElapsedTimer>
 #include <QFile>
 #include <QHash>
@@ -255,6 +256,135 @@ QByteArray exchangeTcp(quint16 port, const QByteArray &request, int timeoutMs = 
     return {};
 }
 
+// --- TSIG (RFC 8945) -------------------------------------------------------
+// The server speaks hmac-sha256, so the test computes the same MACs from the
+// same key: verifying the reply's MAC here is what proves the signature is over
+// the bytes on the wire rather than over something the server chose.
+QByteArray hmacSha256(const QByteArray &key, const QByteArray &data)
+{
+    const int block = 64;
+    QByteArray k = key.size() > block ? QCryptographicHash::hash(key, QCryptographicHash::Sha256)
+                                      : key;
+    k.resize(block, '\0');
+    QByteArray inner(block, '\0');
+    QByteArray outer(block, '\0');
+    for (int i = 0; i < block; ++i) {
+        inner[i] = char(quint8(k[i]) ^ 0x36);
+        outer[i] = char(quint8(k[i]) ^ 0x5c);
+    }
+    return QCryptographicHash::hash(
+        outer + QCryptographicHash::hash(inner + data, QCryptographicHash::Sha256),
+        QCryptographicHash::Sha256);
+}
+
+QByteArray tsigVariables(const QString &keyName, const QString &algorithm, quint64 timeSigned,
+                         quint16 fudge, quint16 error, const QByteArray &other)
+{
+    QByteArray out;
+    out += nameBytes(keyName.toLower());
+    put16(out, 255);
+    put32(out, 0);
+    out += nameBytes(algorithm.toLower());
+    for (int shift = 40; shift >= 0; shift -= 8)
+        out.append(char((timeSigned >> shift) & 0xff));
+    put16(out, fudge);
+    put16(out, error);
+    put16(out, quint16(other.size()));
+    out += other;
+    return out;
+}
+
+// Appends a TSIG over `message` as it stands: the MAC covers the message with
+// the ARCOUNT it had before the TSIG was added, which is what a server seeing
+// the sent packet recomputes after decrementing the count.
+QByteArray withTsig(const QByteArray &message, const QString &keyName, const QString &algorithm,
+                    const QByteArray &secret, quint64 timeSigned, quint16 fudge,
+                    QByteArray *macOut = nullptr, quint16 error = 0,
+                    const QByteArray &other = {})
+{
+    QByteArray out = message;
+    const QByteArray mac =
+        hmacSha256(secret, message + tsigVariables(keyName, algorithm, timeSigned, fudge, error, other));
+    if (macOut)
+        *macOut = mac;
+    const quint16 arcount =
+        quint16((quint8(out[10]) << 8) | quint8(out[11]));
+    const quint16 next = quint16(arcount + 1);
+    out[10] = char((next >> 8) & 0xff);
+    out[11] = char(next & 0xff);
+
+    QByteArray rdata;
+    rdata += nameBytes(algorithm);
+    for (int shift = 40; shift >= 0; shift -= 8)
+        rdata.append(char((timeSigned >> shift) & 0xff));
+    put16(rdata, fudge);
+    put16(rdata, quint16(mac.size()));
+    rdata += mac;
+    put16(rdata, quint16((quint8(message[0]) << 8) | quint8(message[1])));
+    put16(rdata, error);
+    put16(rdata, quint16(other.size()));
+    rdata += other;
+
+    out += nameBytes(keyName);
+    put16(out, 250); // TSIG
+    put16(out, 255); // class ANY
+    put32(out, 0);   // TTL
+    put16(out, quint16(rdata.size()));
+    out += rdata;
+    return out;
+}
+
+struct TsigReply {
+    QString algorithm;
+    quint64 timeSigned = 0;
+    quint16 fudge = 0;
+    QByteArray mac;
+    quint16 originalId = 0;
+    quint16 error = 0;
+    QByteArray other;
+};
+
+bool parseTsigRdata(const QByteArray &rdata, TsigReply *out)
+{
+    int pos = 0;
+    out->algorithm = readName(rdata, pos);
+    if (pos + 10 > rdata.size())
+        return false;
+    quint64 when = 0;
+    for (int i = 0; i < 6; ++i)
+        when = (when << 8) | quint8(rdata[pos + i]);
+    pos += 6;
+    out->timeSigned = when;
+    out->fudge = quint16((quint8(rdata[pos]) << 8) | quint8(rdata[pos + 1]));
+    pos += 2;
+    const int macLength = (quint8(rdata[pos]) << 8) | quint8(rdata[pos + 1]);
+    pos += 2;
+    if (pos + macLength + 6 > rdata.size())
+        return false;
+    out->mac = rdata.mid(pos, macLength);
+    pos += macLength;
+    out->originalId = quint16((quint8(rdata[pos]) << 8) | quint8(rdata[pos + 1]));
+    pos += 2;
+    out->error = quint16((quint8(rdata[pos]) << 8) | quint8(rdata[pos + 1]));
+    pos += 2;
+    const int otherLength = (quint8(rdata[pos]) << 8) | quint8(rdata[pos + 1]);
+    pos += 2;
+    if (pos + otherLength > rdata.size())
+        return false;
+    out->other = rdata.mid(pos, otherLength);
+    return true;
+}
+
+// The TSIG a reply carries, or null when it carries none.
+const Answer *replyTsig(const Reply &reply)
+{
+    for (const Answer &answer : reply.additional) {
+        if (answer.type == 250)
+            return &answer;
+    }
+    return nullptr;
+}
+
 struct UpdateRecord {
     QString name;
     quint16 type = 1;
@@ -335,6 +465,7 @@ private slots:
     void answersAnEdnsQuery();
     void truncatesADatagramReplyToWhatTheClientCanReceive();
     void answersReverseLookupsForItsOwnAddress();
+    void requiresTsigForDynamicUpdates();
     void persistsZone();
 };
 
@@ -1537,6 +1668,142 @@ void DnsTest::answersReverseLookupsForItsOwnAddress()
                                                       DnsServer::TypePtr, 0x96)),
                        &stale));
     QVERIFY2(stale.answers.isEmpty(), "the abandoned /24 must not keep pointing at this DC");
+}
+
+void DnsTest::requiresTsigForDynamicUpdates()
+{
+    DnsServer server;
+    QVERIFY(server.listen(0));
+    server.loadAdZone(QStringLiteral("corp.example.com"),
+                      QStringLiteral("dc1.corp.example.com"), QStringLiteral("192.168.5.20"),
+                      389, 3268, QStringLiteral("Default-First-Site-Name"));
+
+    const QString keyName = QStringLiteral("update-key");
+    const QString algorithm = QStringLiteral("hmac-sha256.");
+    const QByteArray secret = QByteArray("0123456789abcdef0123456789abcdef");
+    const QByteArray secretBase64 = secret.toBase64();
+    server.setUpdateTsig(keyName, QStringLiteral("hmac-sha256"), secretBase64);
+    QCOMPARE(server.updateTsigName(), keyName);
+
+    const QString host = QStringLiteral("tsig1.corp.example.com");
+    auto updateFor = [&host](quint16 id, const QByteArray &rdata) {
+        UpdateRecord add;
+        add.name = host;
+        add.type = DnsServer::TypeA;
+        add.rclass = 1;
+        add.ttl = 300;
+        add.rdata = rdata;
+        return updatePacket(id, QStringLiteral("corp.example.com"), {}, {add});
+    };
+
+    // Unsigned: with a key configured, the update proves nothing and is refused
+    // before the zone is touched.
+    Reply unsignedReply;
+    QVERIFY(parseReply(exchange(server.serverPort(), updateFor(0x8101, QByteArray::fromHex("0a000001"))),
+                       &unsignedReply));
+    QCOMPARE(unsignedReply.rcode, 9); // NOTAUTH
+    QVERIFY(server.records(host, DnsServer::TypeA).isEmpty());
+
+    // Signed with the right key: accepted, and the reply is signed too, with a
+    // MAC this test recomputes from the same secret.
+    const quint64 now = quint64(QDateTime::currentSecsSinceEpoch());
+    QByteArray requestMac;
+    const QByteArray signedUpdate =
+        withTsig(updateFor(0x8102, QByteArray::fromHex("0a000002")), keyName, algorithm,
+                 secret, now, 300, &requestMac);
+    const QByteArray raw = exchange(server.serverPort(), signedUpdate);
+    Reply accepted;
+    QVERIFY(parseReply(raw, &accepted));
+    QCOMPARE(accepted.rcode, 0);
+    QCOMPARE(server.records(host, DnsServer::TypeA).size(), 1);
+
+    const Answer *signedReply = replyTsig(accepted);
+    QVERIFY2(signedReply != nullptr, "an accepted signed update must be answered signed");
+    TsigReply signature;
+    QVERIFY(parseTsigRdata(signedReply->rdata, &signature));
+    QCOMPARE(signature.error, quint16(0));
+    QCOMPARE(signature.mac.size(), 32);
+    QCOMPARE(signature.originalId, quint16(0x8102));
+
+    // The reply MAC covers the request MAC and the reply as sent, minus the TSIG.
+    const int tsigStart =
+        raw.size() - (nameBytes(keyName).size() + 10 + signedReply->rdata.size());
+    QVERIFY(tsigStart > 12);
+    QByteArray withoutTsig = raw.left(tsigStart);
+    const quint16 arcount = quint16((quint8(withoutTsig[10]) << 8) | quint8(withoutTsig[11]));
+    const quint16 fewer = quint16(arcount - 1);
+    withoutTsig[10] = char((fewer >> 8) & 0xff);
+    withoutTsig[11] = char(fewer & 0xff);
+    QByteArray prefix;
+    put16(prefix, quint16(requestMac.size()));
+    prefix += requestMac;
+    QCOMPARE(hmacSha256(secret,
+                        prefix + withoutTsig
+                            + tsigVariables(keyName, algorithm, signature.timeSigned,
+                                            signature.fudge, signature.error, signature.other)),
+             signature.mac);
+
+    // Wrong secret: the key is known, the MAC is not, and nothing is written.
+    const QString other = QStringLiteral("tsig2.corp.example.com");
+    UpdateRecord addOther;
+    addOther.name = other;
+    addOther.type = DnsServer::TypeA;
+    addOther.rclass = 1;
+    addOther.ttl = 300;
+    addOther.rdata = QByteArray::fromHex("0a000003");
+    const QByteArray badSignature =
+        withTsig(updatePacket(0x8103, QStringLiteral("corp.example.com"), {}, {addOther}),
+                 keyName, algorithm, QByteArray("ffffffffffffffffffffffffffffffff"), now, 300);
+    Reply badSigReply;
+    QVERIFY(parseReply(exchange(server.serverPort(), badSignature), &badSigReply));
+    QCOMPARE(badSigReply.rcode, 9);
+    const Answer *badSigTsig = replyTsig(badSigReply);
+    QVERIFY(badSigTsig != nullptr);
+    TsigReply badSig;
+    QVERIFY(parseTsigRdata(badSigTsig->rdata, &badSig));
+    QCOMPARE(badSig.error, quint16(16)); // BADSIG
+    QCOMPARE(badSig.mac.size(), 0);      // nothing verified, so nothing is claimed
+    QVERIFY(server.records(other, DnsServer::TypeA).isEmpty());
+
+    // Another key's name: BADKEY, and the same refusal.
+    const QByteArray wrongKey =
+        withTsig(updatePacket(0x8104, QStringLiteral("corp.example.com"), {}, {addOther}),
+                 QStringLiteral("someone-elses-key"), algorithm, secret, now, 300);
+    Reply badKeyReply;
+    QVERIFY(parseReply(exchange(server.serverPort(), wrongKey), &badKeyReply));
+    QCOMPARE(badKeyReply.rcode, 9);
+    const Answer *badKeyTsig = replyTsig(badKeyReply);
+    QVERIFY(badKeyTsig != nullptr);
+    TsigReply badKey;
+    QVERIFY(parseTsigRdata(badKeyTsig->rdata, &badKey));
+    QCOMPARE(badKey.error, quint16(17)); // BADKEY
+
+    // A clock an hour out: the MAC verifies, so the answer is signed, carries
+    // BADTIME and the server's own time for the client to correct against.
+    const QByteArray skewed =
+        withTsig(updatePacket(0x8105, QStringLiteral("corp.example.com"), {}, {addOther}),
+                 keyName, algorithm, secret, now - 3600, 300);
+    Reply skewedReply;
+    QVERIFY(parseReply(exchange(server.serverPort(), skewed), &skewedReply));
+    QCOMPARE(skewedReply.rcode, 9);
+    const Answer *skewedTsig = replyTsig(skewedReply);
+    QVERIFY(skewedTsig != nullptr);
+    TsigReply skewedParsed;
+    QVERIFY(parseTsigRdata(skewedTsig->rdata, &skewedParsed));
+    QCOMPARE(skewedParsed.error, quint16(18)); // BADTIME
+    QCOMPARE(skewedParsed.mac.size(), 32);
+    QCOMPARE(skewedParsed.other.size(), 6);    // the server's time
+    QVERIFY(server.records(other, DnsServer::TypeA).isEmpty());
+
+    // With the key cleared, updates go back to being unauthenticated: the
+    // default posture, and what STATUS.md documents.
+    server.setUpdateTsig(QString(), QString(), QByteArray());
+    QVERIFY(server.updateTsigName().isEmpty());
+    Reply openReply;
+    QVERIFY(parseReply(exchange(server.serverPort(),
+                                updateFor(0x8106, QByteArray::fromHex("0a000004"))),
+                       &openReply));
+    QCOMPARE(openReply.rcode, 0);
 }
 
 void DnsTest::refusesZoneTransfers()
