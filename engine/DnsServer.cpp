@@ -967,6 +967,25 @@ QString DnsServer::updateTsigName() const
     return m_tsigName;
 }
 
+void DnsServer::setTransferZones(const QStringList &zones)
+{
+    // A zone name here is compared against the zone a question belongs to, so it
+    // is stored the way `zoneFor` answers: lower case, no trailing dot.
+    m_transferZones.clear();
+    for (const QString &entry : zones) {
+        QString zone = entry.trimmed().toLower();
+        while (zone.endsWith(QLatin1Char('.')))
+            zone.chop(1);
+        if (!zone.isEmpty())
+            m_transferZones.append(zone);
+    }
+}
+
+QStringList DnsServer::transferZones() const
+{
+    return m_transferZones;
+}
+
 void DnsServer::setNotifyTargets(const QStringList &targets)
 {
     m_notifyTargets.clear();
@@ -2114,17 +2133,22 @@ QList<DnsServer::Record> DnsServer::incrementalResponse(quint32 clientSerial) co
 
 QList<DnsServer::Record> DnsServer::zoneContents() const
 {
+    return zoneContentsFor(m_zone);
+}
+
+QList<DnsServer::Record> DnsServer::zoneContentsFor(const QString &zone) const
+{
     QList<Record> result;
-    if (m_zone.isEmpty())
+    if (zone.isEmpty())
         return result;
-    const QList<Record> soa = records(m_zone, TypeSoa);
+    const QList<Record> soa = records(zone, TypeSoa);
     if (soa.isEmpty())
         return result;
     // A transfer opens and closes with the same SOA: the first record tells the
     // client the serial it is about to receive, the last one says the transfer
     // is complete and may be committed.
     result.append(soa.first());
-    QString apex = m_zone.toLower();
+    QString apex = zone.toLower();
     if (apex.endsWith(QLatin1Char('.')))
         apex.chop(1);
     const QString suffix = QLatin1Char('.') + apex;
@@ -2153,6 +2177,7 @@ QByteArray DnsServer::handleTransferRequest(const QByteArray &packet, const Mess
     const Message::Question question = message.questions.first();
     if (question.qclass != ClassIn || !inZone(question.name))
         return buildResponse(packet, {}, Refused, {}, udp);
+    const QString zone = zoneFor(question.name);
     // A full transfer is a sequence of messages over a stream, not a datagram
     // (RFC 5936 §4.2): a UDP request cannot be answered with a zone, and part of
     // one is worse than a refusal because the client may commit it. An IXFR
@@ -2177,18 +2202,33 @@ QByteArray DnsServer::handleTransferRequest(const QByteArray &packet, const Mess
         return refusal;
     }
 
+    // The key proves who is asking; this says what it may read. An empty list
+    // leaves the older posture alone — the one configured key may transfer every
+    // zone this server holds — while a host that lists zones narrows that key to
+    // them. Refused is answered signed, since the client has proved its key and
+    // an unsigned refusal would look like a server that did not understand it.
+    if (!m_transferZones.isEmpty() && !m_transferZones.contains(zone))
+        return signTsigResponse(buildResponse(packet, {}, Refused, {}, udp), requestMac, 0, {});
+
     if (udp) {
         // IXFR over a datagram: the current SOA, which is what RFC 1995 §2 tells
         // a server to send when the difference is not carried in this message. It
         // costs the client one round trip and keeps a datagram from carrying half
         // a delta.
+        // The SOA of the zone that was asked for: the forward zone's serial says
+        // nothing about the reverse zone, and a client would cache the wrong one.
+        const QList<Record> zoneSoa = records(zone, TypeSoa);
         const QByteArray answer =
-            buildResponse(packet, soaAtSerial(zoneSerial()), NoError, {}, true);
+            buildResponse(packet, zoneSoa.isEmpty() ? soaAtSerial(zoneSerial()) : zoneSoa.mid(0, 1),
+                          NoError, {}, true);
         return signTsigResponse(answer, requestMac, 0, {});
     }
 
     QList<Record> answers;
-    if (question.type == TypeIxfr) {
+    // The journal is the forward zone's history: a serial from the reverse zone
+    // means nothing against it, so a reverse-zone IXFR falls through to the whole
+    // zone, which is the fallback RFC 1995 §6 asks for anyway.
+    if (question.type == TypeIxfr && zone == m_zone) {
         // The version the client holds arrives as the SOA in the request's
         // authority section, which the parser keeps in `updates` for that
         // section; a client that puts it in the answer section is served the same
@@ -2221,7 +2261,7 @@ QByteArray DnsServer::handleTransferRequest(const QByteArray &packet, const Mess
     // No journal entry for that version: the whole zone, which is the fallback
     // RFC 1995 §6 asks a server to make rather than an error.
     if (answers.isEmpty())
-        answers = zoneContents();
+        answers = zoneContentsFor(zone);
     if (answers.isEmpty())
         return buildResponse(packet, {}, ServFail, {}, udp);
 

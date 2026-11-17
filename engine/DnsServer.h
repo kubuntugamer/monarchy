@@ -132,6 +132,16 @@ public:
     void setUpdateTsig(const QString &name, const QString &algorithm, const QByteArray &base64Secret);
     QString updateTsigName() const;
 
+    // The zones the configured key may transfer, lower case and without a
+    // trailing dot. Empty — the default — keeps the older posture, where the one
+    // key may read every zone this server holds; a list narrows it to those
+    // zones, so a key handed to a partner for the reverse zone cannot also pull
+    // the forward zone out of this server. A transfer of a zone that is not in
+    // the list is refused after the key has been proved, and the refusal is
+    // signed, because the client has shown it holds the key.
+    void setTransferZones(const QStringList &zones);
+    QStringList transferZones() const;
+
     // Secondaries to tell when the zone's serial moves (RFC 1996), as
     // "address" or "address:port" entries like the forwarders. An applied update
     // that changes the zone sends each of them the SOA it now holds, signed with
@@ -212,6 +222,10 @@ public:
     // form an AXFR reply carries. The reverse zone lives in the same store, so
     // names outside `zone()` are filtered out rather than transferred.
     QList<Record> zoneContents() const;
+    // The same, for the zone a transfer asked about: this server holds the
+    // reverse zone beside the forward one, and a client that asks for it must be
+    // handed that zone's SOA and names rather than the forward zone's.
+    QList<Record> zoneContentsFor(const QString &zone) const;
     // Answers one AXFR/IXFR request: the whole zone to a peer that proves it
     // holds the configured TSIG key, over TCP; a refusal otherwise. A zone too
     // large for one message is sent as several messages (RFC 5936 §2.2), each
@@ -350,6 +364,7 @@ private:
     QMap<QString, QList<Record>> m_records; // lower-case owner name -> records
     QString m_reverseZone;                  // derived in-addr.arpa zone, if any
     QString m_tsigName;                     // configured update key, if any
+    QStringList m_transferZones;            // zones that key may transfer, if narrowed
     QString m_tsigAlgorithm;
     QByteArray m_tsigSecret;
     QList<ZoneDelta> m_journal;

@@ -223,6 +223,27 @@ void applyDnsUpdateKey(DnsServer *server, const QSettings &config)
 // forwarders are: a stored list, or one value with commas or spaces in it. An
 // empty list announces nothing, which is the default and stays the default until
 // an operator names a secondary in dc.conf.
+QStringList transferZonesFrom(const QSettings &config)
+{
+    // `dnsTransferZones` narrows the configured key to the zones it may transfer;
+    // unset means the key keeps the reach it had, so no existing deployment
+    // changes behaviour by upgrading.
+    const QStringList entries = config.value(QStringLiteral("dnsTransferZones")).toStringList();
+    QStringList zones;
+    for (const QString &entry : entries) {
+        const QStringList parts =
+            entry.split(QRegularExpression(QStringLiteral("[,;\\s]+")), Qt::SkipEmptyParts);
+        for (const QString &part : parts) {
+            QString zone = part.trimmed().toLower();
+            while (zone.endsWith(QLatin1Char('.')))
+                zone.chop(1);
+            if (!zone.isEmpty())
+                zones.append(zone);
+        }
+    }
+    return zones;
+}
+
 QStringList notifyTargetsFrom(const QSettings &config)
 {
     const QStringList entries = config.value(QStringLiteral("dnsNotify")).toStringList();
@@ -244,6 +265,7 @@ void DcService::reloadForwarders()
     m_dnsServer->setForwardingEnabled(dcConfig.value(QStringLiteral("forwarding"), true).toBool());
     applyDnsUpdateKey(m_dnsServer, dcConfig);
     m_dnsServer->setNotifyTargets(notifyTargetsFrom(dcConfig));
+    m_dnsServer->setTransferZones(transferZonesFrom(dcConfig));
     emit statusMessage(tr("Re-read the DNS forwarder configuration from %1 on SIGHUP.").arg(path));
     reportForwarders();
     reportSecondaries();
@@ -1109,6 +1131,7 @@ bool DcService::start(const QString &dcDir)
     m_dnsServer->setForwardingEnabled(dcConfig.value(QStringLiteral("forwarding"), true).toBool());
     applyDnsUpdateKey(m_dnsServer, dcConfig);
     m_dnsServer->setNotifyTargets(notifyTargetsFrom(dcConfig));
+    m_dnsServer->setTransferZones(transferZonesFrom(dcConfig));
     if (!m_dnsServer->loadZone(m_zonePath)) {
         m_dnsServer->loadAdZone(dnsDomain, dcHost, dcIp, boundLdapPort, boundGcPort, siteName,
                                 boundKpasswdPort, boundKdcPort);

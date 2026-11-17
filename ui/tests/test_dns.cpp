@@ -555,6 +555,7 @@ private slots:
     void answersAnIncrementalRequestWithTheDelta();
     void notifiesTheSecondariesWhenTheZoneMoves();
     void remembersTheDifferenceAcrossARestart();
+    void gatesATransferOnTheZonesTheKeyMayRead();
     void answersAnEdnsQuery();
     void truncatesADatagramReplyToWhatTheClientCanReceive();
     void answersReverseLookupsForItsOwnAddress();
@@ -2584,6 +2585,85 @@ void DnsTest::remembersTheDifferenceAcrossARestart()
         QVERIFY2(answer.name.toLower() != QStringLiteral("keep.restart.example.com"),
                  "a restart costs a lagging client its difference only when the serial is gone");
     }
+}
+
+void DnsTest::gatesATransferOnTheZonesTheKeyMayRead()
+{
+    DnsServer server;
+    QVERIFY(server.listen(0));
+    const QString zone = QStringLiteral("acl.example.com");
+    server.loadAdZone(zone, QStringLiteral("dc1.acl.example.com"), QStringLiteral("10.33.0.10"),
+                      389, 3268, QStringLiteral("Default-First-Site-Name"));
+    server.addRecord(QStringLiteral("files.acl.example.com"), DnsServer::TypeA, 300,
+                     QByteArray::fromHex("0a210001"));
+    // The same store holds the reverse zone this DC answers for; a transfer of it
+    // must carry its records, not the forward zone's.
+    QVERIFY(server.repairReverseZone(QStringLiteral("dc1.acl.example.com"),
+                                     QStringLiteral("10.33.0.10")));
+    const QString keyName = QStringLiteral("acl-key");
+    const QString algorithm = QStringLiteral("hmac-sha256.");
+    const QByteArray secret = QByteArray("0123456789abcdef0123456789abcdef");
+    server.setUpdateTsig(keyName, QStringLiteral("hmac-sha256"), secret.toBase64());
+    const quint64 now = quint64(QDateTime::currentSecsSinceEpoch());
+    const auto axfr = [&zone](quint16 id) {
+        return DnsServer::buildQuery(zone, DnsServer::TypeAxfr, id);
+    };
+
+    // No list configured: the key keeps the reach it had, so an upgrade does not
+    // silently stop serving a peer that used to be served.
+    QVERIFY(server.transferZones().isEmpty());
+    Reply open;
+    QVERIFY(parseReply(exchangeTcp(server.serverPort(),
+                                   withTsig(axfr(0x7b01), keyName, algorithm, secret, now, 300)),
+                       &open));
+    QCOMPARE(open.rcode, 0);
+    QCOMPARE(open.answers.first().type, DnsServer::TypeSoa);
+    QVERIFY(open.answers.size() > 2);
+
+    // Narrowed to a zone this server does not hold: a good MAC is not a licence.
+    server.setTransferZones({QStringLiteral("elsewhere.example.com.")});
+    QCOMPARE(server.transferZones(), QStringList{QStringLiteral("elsewhere.example.com")});
+    Reply refused;
+    QVERIFY(parseReply(exchangeTcp(server.serverPort(),
+                                   withTsig(axfr(0x7b02), keyName, algorithm, secret, now, 300)),
+                       &refused));
+    QCOMPARE(refused.rcode, 5); // REFUSED
+    QVERIFY(refused.answers.isEmpty());
+
+    // The zone the key is narrowed to is still served, so the gate is per zone
+    // rather than a blanket refusal whenever a list is set.
+    server.setTransferZones({zone.toUpper() + QStringLiteral(".")});
+    Reply served;
+    QVERIFY(parseReply(exchangeTcp(server.serverPort(),
+                                   withTsig(axfr(0x7b03), keyName, algorithm, secret, now, 300)),
+                       &served));
+    QCOMPARE(served.rcode, 0);
+    QCOMPARE(served.answers.size(), open.answers.size());
+
+    // A transfer carries the zone that was asked for. Narrowed to the reverse
+    // zone, the key is served that zone with its own SOA and PTR, and none of the
+    // forward zone's names travel with it.
+    const QString reverseZone = QStringLiteral("0.33.10.in-addr.arpa");
+    server.setTransferZones({reverseZone});
+    Reply reverse;
+    QVERIFY(parseReply(exchangeTcp(server.serverPort(),
+                                   withTsig(DnsServer::buildQuery(reverseZone, DnsServer::TypeAxfr,
+                                                                 0x7b04),
+                                            keyName, algorithm, secret, now, 300)),
+                       &reverse));
+    QCOMPARE(reverse.rcode, 0);
+    QCOMPARE(reverse.answers.first().name.toLower(), reverseZone);
+    QCOMPARE(reverse.answers.first().type, DnsServer::TypeSoa);
+    bool sawPtr = false;
+    bool sawForwardName = false;
+    for (const Answer &answer : reverse.answers) {
+        if (answer.type == DnsServer::TypePtr)
+            sawPtr = true;
+        if (answer.name.toLower().endsWith(QStringLiteral(".acl.example.com")))
+            sawForwardName = true;
+    }
+    QVERIFY2(sawPtr, "the reverse zone's PTR record travels in its own transfer");
+    QVERIFY2(!sawForwardName, "the forward zone does not travel in a reverse zone's transfer");
 }
 
 void DnsTest::persistsZone()
