@@ -2580,18 +2580,43 @@ bool DnsServer::saveZone(const QString &path, QString *error) const {
     root[QStringLiteral("serial")] = double(m_serial);
     if (!m_reverseZone.isEmpty())
         root[QStringLiteral("reverseZone")] = m_reverseZone;
+    // One shape for a record wherever it travels: the zone's own list and each
+    // half of a remembered difference.
+    const auto recordToObject = [](const Record &record) {
+        QJsonObject entry;
+        entry[QStringLiteral("name")] = record.name;
+        entry[QStringLiteral("type")] = int(record.type);
+        entry[QStringLiteral("ttl")] = double(record.ttl);
+        entry[QStringLiteral("rdata")] = QString::fromLatin1(record.rdata.toHex());
+        return entry;
+    };
     QJsonArray recordsArray;
     for (auto it = m_records.constBegin(); it != m_records.constEnd(); ++it) {
-        for (const Record &record : it.value()) {
-            QJsonObject entry;
-            entry[QStringLiteral("name")] = record.name;
-            entry[QStringLiteral("type")] = int(record.type);
-            entry[QStringLiteral("ttl")] = double(record.ttl);
-            entry[QStringLiteral("rdata")] = QString::fromLatin1(record.rdata.toHex());
-            recordsArray.append(entry);
-        }
+        for (const Record &record : it.value())
+            recordsArray.append(recordToObject(record));
     }
     root[QStringLiteral("records")] = recordsArray;
+
+    // The journal rides in the zone file. A daemon that restarts still holds the
+    // differences that let a lagging client be brought forward, instead of being
+    // handed the whole zone for a change it was only a little behind on; a zone
+    // written before this key existed loads with an empty journal.
+    QJsonArray journalArray;
+    for (const ZoneDelta &delta : m_journal) {
+        QJsonObject entry;
+        entry[QStringLiteral("from")] = double(delta.from);
+        entry[QStringLiteral("to")] = double(delta.to);
+        QJsonArray removed;
+        for (const Record &record : delta.removed)
+            removed.append(recordToObject(record));
+        QJsonArray added;
+        for (const Record &record : delta.added)
+            added.append(recordToObject(record));
+        entry[QStringLiteral("removed")] = removed;
+        entry[QStringLiteral("added")] = added;
+        journalArray.append(entry);
+    }
+    root[QStringLiteral("journal")] = journalArray;
 
     QFile file(path);
     if (!file.open(QFile::WriteOnly | QFile::Truncate)) {
@@ -2632,6 +2657,45 @@ bool DnsServer::loadZone(const QString &path, QString *error) {
                   quint32(entry.value(QStringLiteral("ttl")).toDouble(3600)),
                   QByteArray::fromHex(entry.value(QStringLiteral("rdata")).toString().toLatin1()));
     }
+
+    // A difference the zone file carries is a difference this server can still
+    // answer for, so a restart does not turn an IXFR into an AXFR. Entries that
+    // do not carry the bounds they were written with are dropped rather than
+    // given a made-up version, and the journal keeps at most the same 64 changes
+    // the running one does.
+    m_journal.clear();
+    for (const QJsonValue &value : root.value(QStringLiteral("journal")).toArray()) {
+        const QJsonObject entry = value.toObject();
+        if (!entry.contains(QStringLiteral("from")) || !entry.contains(QStringLiteral("to")))
+            continue;
+        ZoneDelta delta;
+        delta.from = quint32(entry.value(QStringLiteral("from")).toDouble());
+        delta.to = quint32(entry.value(QStringLiteral("to")).toDouble());
+        const auto recordsOf = [&entry](const QString &key) {
+            QList<Record> records;
+            for (const QJsonValue &element : entry.value(key).toArray()) {
+                const QJsonObject object = element.toObject();
+                const QString recordName = object.value(QStringLiteral("name")).toString();
+                if (recordName.isEmpty())
+                    continue;
+                Record record;
+                record.name = recordName;
+                record.type = quint16(object.value(QStringLiteral("type")).toInt());
+                record.ttl = quint32(object.value(QStringLiteral("ttl")).toDouble(3600));
+                record.rdata = QByteArray::fromHex(
+                    object.value(QStringLiteral("rdata")).toString().toLatin1());
+                records.append(record);
+            }
+            return records;
+        };
+        delta.removed = recordsOf(QStringLiteral("removed"));
+        delta.added = recordsOf(QStringLiteral("added"));
+        if (delta.removed.isEmpty() && delta.added.isEmpty())
+            continue; // a difference that changes no record was never journalled
+        m_journal.append(delta);
+    }
+    while (m_journal.size() > 64)
+        m_journal.removeFirst();
     return true;
 }
 

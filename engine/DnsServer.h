@@ -311,9 +311,10 @@ private:
 
     // One change the zone went through, kept so a client that lags behind is
     // handed the records that came and went instead of the whole zone
-    // (RFC 1995 §4). The journal is the store's own memory: bounded, oldest
-    // first, and lost on restart — a serial it no longer holds gets the whole
-    // zone, which is the fallback the RFC asks for rather than an error.
+    // (RFC 1995 §4). Bounded and oldest first, and written into the zone file
+    // with the records, so a restart keeps the differences a client may still
+    // need; a serial it no longer holds gets the whole zone, which is the
+    // fallback the RFC asks for rather than an error.
     struct ZoneDelta {
         quint32 from = 0;
         quint32 to = 0;

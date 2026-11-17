@@ -554,6 +554,7 @@ private slots:
     void splitsALargeZoneAcrossMessages();
     void answersAnIncrementalRequestWithTheDelta();
     void notifiesTheSecondariesWhenTheZoneMoves();
+    void remembersTheDifferenceAcrossARestart();
     void answersAnEdnsQuery();
     void truncatesADatagramReplyToWhatTheClientCanReceive();
     void answersReverseLookupsForItsOwnAddress();
@@ -2499,6 +2500,90 @@ void DnsTest::notifiesTheSecondariesWhenTheZoneMoves()
     QCOMPARE(plainNotify.answers.first().type, DnsServer::TypeSoa);
     QVERIFY2(replyTsig(plainNotify) == nullptr,
              "no key means no signature, not a signature over nothing");
+}
+
+void DnsTest::remembersTheDifferenceAcrossARestart()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString path = dir.filePath(QStringLiteral("dnszone.json"));
+    const QString zone = QStringLiteral("restart.example.com");
+    const QString keyName = QStringLiteral("restart-key");
+    const QString algorithm = QStringLiteral("hmac-sha256.");
+    const QByteArray secret = QByteArray("0123456789abcdef0123456789abcdef");
+    const QByteArray keepRdata = QByteArray::fromHex("0a1f0001");
+    const QByteArray goingRdata = QByteArray::fromHex("0a1f0002");
+    const QByteArray arrivedRdata = QByteArray::fromHex("0a1f0003");
+    const quint64 now = quint64(QDateTime::currentSecsSinceEpoch());
+
+    quint32 before = 0;
+    quint32 after = 0;
+    {
+        DnsServer server;
+        QVERIFY(server.listen(0));
+        server.loadAdZone(zone, QStringLiteral("dc1.restart.example.com"),
+                          QStringLiteral("10.31.0.10"), 389, 3268,
+                          QStringLiteral("Default-First-Site-Name"));
+        server.addRecord(QStringLiteral("keep.restart.example.com"), DnsServer::TypeA, 300,
+                         keepRdata);
+        server.addRecord(QStringLiteral("going.restart.example.com"), DnsServer::TypeA, 300,
+                         goingRdata);
+        server.setUpdateTsig(keyName, QStringLiteral("hmac-sha256"), secret.toBase64());
+        before = soaSerial(server.records(zone, DnsServer::TypeSoa).first().rdata);
+        QString error;
+        QVERIFY2(server.saveZone(path, &error), qPrintable(error));
+
+        QList<UpdateRecord> updates;
+        updates.append({QStringLiteral("arrived.restart.example.com"), DnsServer::TypeA, 1, 300,
+                        arrivedRdata});
+        updates.append({QStringLiteral("going.restart.example.com"), DnsServer::TypeA, 255, 0, {}});
+        Reply update;
+        QVERIFY(parseReply(exchange(server.serverPort(),
+                                    withTsig(updatePacket(0x7a00, zone, {}, updates), keyName,
+                                             algorithm, secret, now, 300)),
+                           &update));
+        QCOMPARE(update.rcode, 0);
+        after = soaSerial(server.records(zone, DnsServer::TypeSoa).first().rdata);
+        QVERIFY(after > before);
+        // The daemon saves the zone after every applied update, so the difference
+        // has to be in that file or the restart below would never see it.
+        QVERIFY2(server.saveZone(path, &error), qPrintable(error));
+    }
+
+    DnsServer restored;
+    QVERIFY(restored.listen(0));
+    QString error;
+    QVERIFY2(restored.loadZone(path, &error), qPrintable(error));
+    restored.setUpdateTsig(keyName, QStringLiteral("hmac-sha256"), secret.toBase64());
+    QCOMPARE(restored.zone(), zone);
+    const QList<DnsServer::Record> soa = restored.records(zone, DnsServer::TypeSoa);
+    QCOMPARE(soa.size(), 1);
+    QCOMPARE(soaSerial(soa.first().rdata), after);
+
+    // The client was at the version before the update; the reloaded server has to
+    // answer with the same six-record difference the running one would have, not
+    // with the whole zone it would fall back to if the journal had been lost.
+    Reply delta;
+    QVERIFY(parseReply(exchangeTcp(restored.serverPort(),
+                                   withTsig(ixfrQuery(0x7a01, zone,
+                                                      soaWithSerial(soa.first().rdata, before)),
+                                            keyName, algorithm, secret, now, 300)),
+                       &delta));
+    QCOMPARE(delta.rcode, 0);
+    QVERIFY(delta.authoritative);
+    QCOMPARE(delta.answers.size(), 6);
+    QCOMPARE(soaSerial(delta.answers.at(0).rdata), after);
+    QCOMPARE(soaSerial(delta.answers.at(1).rdata), before);
+    QCOMPARE(delta.answers.at(2).name.toLower(), QStringLiteral("going.restart.example.com"));
+    QCOMPARE(delta.answers.at(2).rdata, goingRdata);
+    QCOMPARE(soaSerial(delta.answers.at(3).rdata), after);
+    QCOMPARE(delta.answers.at(4).name.toLower(), QStringLiteral("arrived.restart.example.com"));
+    QCOMPARE(delta.answers.at(4).rdata, arrivedRdata);
+    QCOMPARE(soaSerial(delta.answers.at(5).rdata), after);
+    for (const Answer &answer : delta.answers) {
+        QVERIFY2(answer.name.toLower() != QStringLiteral("keep.restart.example.com"),
+                 "a restart costs a lagging client its difference only when the serial is gone");
+    }
 }
 
 void DnsTest::persistsZone()
