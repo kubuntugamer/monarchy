@@ -86,6 +86,10 @@ enum Opnum : quint16 {
     OpGetMembersInAlias = 33,
     OpOpenUser = 34,
     OpGetGroupsForUser = 39,
+    // SamrGetUserPwInfo (44): the domain password policy behind a user handle,
+    // as samr_PwInfo { uint16 min_password_length; uint32 password_properties; }.
+    // A Windows 2000 join asks for it after creating its machine account.
+    OpGetUserPwInfo = 44,
     OpDeleteUser = 35,
     // SamrQueryInformationUser (36) is the pre-revision form of the (2) call:
     // same [in] handle + [in] class, same [out] Buffer union + NTSTATUS.

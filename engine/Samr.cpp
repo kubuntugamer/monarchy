@@ -1382,6 +1382,38 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
                                  .arg(rids.size()));
         return fixed;
     }
+    // SamrGetUserPwInfo (opnum 44): the domain policy the account's password is
+    // held to, as samr_PwInfo { uint16 min_password_length;
+    // samr_PasswordProperties password_properties; } behind a referent. A
+    // Windows 2000 join asks for it after creating its machine account and
+    // abandons the join with "the parameter is incorrect" when the answer is
+    // not this whole structure. The values come from the domain object, so the
+    // policy a client reads here is the one LDAP and password changes enforce.
+    case Samr::OpGetUserPwInfo: {
+        QByteArray handle;
+        if (!reader.bytes(kHandleSize, &handle))
+            return {};
+        Handle user;
+        if (!lookupHandle(handle, Handle::User, &user)) {
+            putLe32(fixed, 0); // NULL referent
+            putLe32(fixed, kStatusInvalidHandle);
+            return fixed;
+        }
+        const LdapServer::PasswordPolicy policy =
+            LdapServer::passwordPolicyFrom(domainObject());
+        putLe32(fixed, 0x0002e580u); // referent
+        fixed.append(char(policy.minLength & 0xff));
+        fixed.append(char((policy.minLength >> 8) & 0xff));
+        fixed.append(char(0));
+        fixed.append(char(0)); // padding to the 32-bit properties word
+        putLe32(fixed, policy.properties);
+        putLe32(fixed, kStatusSuccess);
+        emit requestReceived(QStringLiteral("GetUserPwInfo(%1: %2 chars, props 0x%3)")
+                                 .arg(user.dn)
+                                 .arg(policy.minLength)
+                                 .arg(policy.properties, 0, 16));
+        return fixed;
+    }
     case Samr::OpEnumerateUsersInDomain: {
         QByteArray handle;
         if (!reader.bytes(kHandleSize, &handle))
@@ -2244,6 +2276,20 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
                                      QString::number(accountFlags != 0 ? accountFlags : 512u));
             object.attributes.insert(QStringLiteral("displayName"), account);
             object.attributes.insert(QStringLiteral("pwdLastSet"), QStringLiteral("0"));
+            // A machine account carries its own service principal names. A
+            // Windows join creates the account here and does not write them
+            // afterwards, while its first domain logon asks the KDC for
+            // HOST/<name>; without these the TGT is issued and the next
+            // request is answered S_PRINCIPAL_UNKNOWN, so the logon fails.
+            if (account.endsWith(QLatin1Char('$'))) {
+                const QString host = account.left(account.size() - 1);
+                object.attributes.insert(
+                    QStringLiteral("servicePrincipalName"),
+                    QStringLiteral("HOST/%1; HOST/%2; RestrictedKrbHost/%1; RestrictedKrbHost/%2")
+                        .arg(host.toUpper(),
+                             QStringLiteral("%1.%2").arg(host.toLower(),
+                                                         m_config.realm.toLower())));
+            }
         }
 
         const QString kindName = creatingAlias ? QStringLiteral("Alias")

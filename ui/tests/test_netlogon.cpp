@@ -1676,6 +1676,22 @@ void NetlogonTest::answersTheLegacyLocatorCalls()
         server.handleCall(Netlogon::OpDsRGetSiteName, siteRequest);
     QCOMPARE(readLe32(site, site.size() - 4), quint32(0));
     QVERIFY(site.contains(Ndr::utf16le(QStringLiteral("Default-First-Site-Name"))));
+
+    // DsrEnumerateDomainTrusts (40): the call a Windows 2000 join makes after
+    // opening the Netlogon pipe. The [out,ref] list is inline — the count and
+    // the array pointer, with no referent id — and stopping at a bare WERROR
+    // leaves the client unable to unmarshal the answer ("The stub received bad
+    // data"). This forest holds one domain and no trusts, so the list is empty
+    // but well formed.
+    QByteArray trustRequest;
+    appendLe32(trustRequest, 0); // NULL server_name
+    appendLe32(trustRequest, 0); // trust_flags
+    const QByteArray trusts =
+        server.handleCall(Netlogon::OpDsrEnumerateDomainTrusts, trustRequest);
+    QCOMPARE(trusts.size(), 12);
+    QCOMPARE(readLe32(trusts, 0), quint32(0)); // count
+    QCOMPARE(readLe32(trusts, 4), quint32(0)); // NULL array
+    QCOMPARE(readLe32(trusts, 8), quint32(0)); // WERROR
 }
 
 void NetlogonTest::dcLocatorNamesThisDc()

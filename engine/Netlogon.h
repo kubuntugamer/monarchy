@@ -73,6 +73,7 @@ enum Opnum : quint16 {
     OpDsRGetSiteName = 28,
     OpDsRGetDcNameEx2 = 34,
     OpLogonSamLogonEx = 39,
+    OpDsrEnumerateDomainTrusts = 40,
     OpLogonSamLogonWithFlags = 45
 };
 
@@ -168,6 +169,7 @@ private:
     QByteArray serverPasswordSet2(const QByteArray &stub);
     QByteArray getAnyDcName(const QByteArray &stub);
     QByteArray dsrGetSiteName(const QByteArray &stub);
+    QByteArray dsrEnumerateDomainTrusts(const QByteArray &stub);
     QByteArray logonGetTrustRid(const QByteArray &stub);
     QByteArray getDcName(const QByteArray &stub);
     QByteArray dsrGetDcNameEx2(const QByteArray &stub);

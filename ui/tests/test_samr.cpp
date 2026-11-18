@@ -756,6 +756,20 @@ void SamrTest::samrDirectoryCalls()
     // QueryInformationUser2, class 6 (Name): a union whose tag is a USHORT and
     // whose arm carries both strings in the deferred area.
     const QByteArray userHandle = userReply.left(20);
+
+    // GetUserPwInfo (44): the domain policy behind the user handle as
+    // samr_PwInfo — a referent, the 16-bit minimum length, two bytes of
+    // padding, then the 32-bit properties word. A Windows 2000 client asks for
+    // this while joining and aborts with "the parameter is incorrect" if the
+    // answer is anything less than this whole structure.
+    const QByteArray pwInfo = server.handleCall(Samr::OpGetUserPwInfo, userHandle);
+    QCOMPARE(pwInfo.size(), 16);
+    QCOMPARE(lastWord(pwInfo), 0u);
+    QVERIFY(pwInfo.left(4) != QByteArray(4, '\0'));
+    QCOMPARE(quint8(pwInfo.at(4)), quint8(7));  // minPwdLength
+    QCOMPARE(quint8(pwInfo.at(5)), quint8(0));
+    QCOMPARE(pwInfo.mid(8, 4), QByteArray::fromHex("01000000")); // pwdProperties
+
     QByteArray nameRequest = userHandle;
     nameRequest.append(char(6));
     nameRequest.append(QByteArray(2, '\0'));
@@ -1190,6 +1204,19 @@ void SamrTest::samrWritesAccountsAndGroups()
     QCOMPARE(lastWord(server.handleCall(Samr::OpQueryInformationUser2,
                                         userHandle + QByteArray::fromHex("06000000"))),
              0xc0000008u); // STATUS_INVALID_HANDLE
+
+    // A machine account's own service principal names are written when the
+    // account is created. A Windows join does not write them afterwards, and
+    // its first logon asks the KDC for HOST/<name>; without them the TGT is
+    // issued and the next request is answered S_PRINCIPAL_UNKNOWN.
+    const QByteArray machineReply = server.handleCall(
+        Samr::OpCreateUser2, createStub(domainHandle, QStringLiteral("NEURALNODE0$"), true));
+    QCOMPARE(lastWord(machineReply), 0u);
+    const QString machineSpns =
+        store.last().attributes.value(QStringLiteral("servicePrincipalName"));
+    QVERIFY(machineSpns.contains(QStringLiteral("HOST/NEURALNODE0")));
+    QVERIFY(machineSpns.contains(QStringLiteral("HOST/neuralnode0.corp.example.com")));
+    QVERIFY(machineSpns.contains(QStringLiteral("RestrictedKrbHost/neuralnode0.corp.example.com")));
 }
 
 // The write path ADUC and `net rpc` use once an account exists: account flags,

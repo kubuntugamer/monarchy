@@ -125,22 +125,27 @@ DC believes it started.
 These are places where a change can pass everything and still be wrong. They are
 recorded, not hidden:
 
-- **G12 — a Windows 2000 client's pipe transactions stop at domain
-  discovery.** Two shapes were missing and are now answered: the
+- **G12 — closed: a Windows 2000 Pro client joins a domain served by this
+  tree.** Two shapes were missing and are now answered: the
   `TRANS_SET_NMPIPE_STATE` (0x0001) request a 2000 client sends on `\PIPE\`
   before it binds, and `TRANS_TRANSACT_NMPIPE` (0x0026) with the PDU in
   Trans_Data rather than Trans_Parameters. With both in place the client binds
   `\pipe\NETLOGON` and the DC log reads `netlogon bind accepted`, where before
-  it logged the session off after the open. It still stops one call later, at
-  `NetrDsrEnumerateDomainTrusts` (opnum 40, the "domains in the forest" the
-  wizard reports), which answers `STATUS_NOT_SUPPORTED` and reads to that client
-  as `A remote procedure call (RPC) protocol error occurred`. The response —
-  WERROR plus a `NETLOGON_DOMAIN_TRUST_ARRAY` — was tried here in three
-  encodings and rejected by the client as `The array bounds are invalid` and by
-  `rpcclient -c dsr_enumtrustdom` as `HRES code 0xc000008c`, so the wire layout
-  is still unknown and none of the three was committed. Samba answers the call
-  `WERR_NOT_SUPPORTED` too. Nothing in the tree claims a 2000 replica can be
-  promoted; this entry is the reason it cannot yet.
+  it logged the session off after the open. Live, a `CYBERDYNE.LAN` domain
+  provisioned into a throwaway store and served by `monarchy-dcd` took
+  `NEURALNODE0` through the Network Identification wizard to `Workstation domain
+  CYBERDYNE`, with `CN=NEURALNODE0$,CN=Users` in the store and its HOST/ and
+  RestrictedKrbHost/ SPNs written by `SamrCreateUser2InDomain`. The last two
+  calls were `SamrGetUserPwInfo` (opnum 44), answered from the domain's password
+  policy as the referent, minimum length, two pad bytes, properties and status,
+  and `NetrDsrEnumerateDomainTrusts` (opnum 40), answered as the `[out,ref]`
+  list inline — count, NULL array and WERROR — because a referent before the
+  count reads as 193280 entries and a long frame. Both carry unit tests
+  (`monarchy-samr-tests`, `monarchy-netlogon-tests`). The interactive domain
+  logon was not completed: the client obtained a TGT and then a TGS for
+  `host/neuralnode0.cyberdyne.lan`, but refused before opening the Netlogon
+  pipe, so no secure-channel call reached the DC. The join is measured; a 2000
+  workstation's domain logon is still not claimed.
 
 - **G11 — share enumeration is absent.** The probe that reaches the server is
   the pipe open: `rpcclient -c netshareenum` fails with

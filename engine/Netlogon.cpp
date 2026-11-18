@@ -1579,6 +1579,31 @@ QByteArray NetlogonServer::dsrGetSiteName(const QByteArray &stub)
     return out;
 }
 
+// NetrDsrEnumerateDomainTrusts (MS-NRPC 3.5.4.4.8): the domains in this
+// forest. This server holds one domain and no trusts, so the list is empty, but
+// the answer is still the whole netr_DomainTrustList — the count and the array
+// pointer — because a client that receives only a WERROR cannot unmarshal it
+// (a Windows 2000 join reports "The stub received bad data").
+QByteArray NetlogonServer::dsrEnumerateDomainTrusts(const QByteArray &stub)
+{
+    Ndr::Reader reader(stub);
+    QString serverName;
+    if (!readUniqueString(reader, &serverName))
+        return statusOnly(kStatusInvalidParameter);
+    quint32 flags = 0;
+    reader.u32(&flags);
+    Q_UNUSED(flags)
+    QByteArray out;
+    // [out,ref] puts the list itself inline: a reference pointer has no
+    // referent id, so the first word is the count rather than a pointer. A
+    // referent here reads to the client as a count of 193280 and a long frame.
+    putLe32(out, 0); // count
+    putLe32(out, 0); // NULL array
+    putLe32(out, 0); // WERROR
+    emit requestReceived(QStringLiteral("DsrEnumerateDomainTrusts: 0 trusts"));
+    return out;
+}
+
 // NetrLogonGetTrustRid (MS-NRPC 3.5.4.4.6): the RID of the account the trust
 // keeps in this domain, which is the `FABRIKAM$` account LSAD created beside
 // the trustedDomain object. A caller that names a domain this DC has no trust
@@ -1727,6 +1752,8 @@ QByteArray NetlogonServer::handleCall(quint16 opnum, const QByteArray &stub,
         return getAnyDcName(stub);
     case Netlogon::OpDsRGetSiteName:
         return dsrGetSiteName(stub);
+    case Netlogon::OpDsrEnumerateDomainTrusts:
+        return dsrEnumerateDomainTrusts(stub);
     case Netlogon::OpLogonGetTrustRid:
         return logonGetTrustRid(stub);
     case Netlogon::OpGetDcName:
