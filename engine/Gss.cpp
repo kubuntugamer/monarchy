@@ -482,36 +482,51 @@ bool dceUnseal(const QByteArray &verifier, const QByteArray &payload, int etype,
     return true;
 }
 
-QByteArray dceMic(const QByteArray &data, quint64 seq, int etype, const QByteArray &key)
+QByteArray cfxMic(const QByteArray &data, quint64 seq, int etype, const QByteArray &key,
+                  bool acceptor)
 {
     if (etype == Krb5::kRc4Hmac || !Krb5::isSupportedEtype(etype))
         return {};
     QByteArray header;
     header.append(kCfxMicTokenId);
-    header.append(char(0x01 | 0x04)); // acceptor, acceptor subkey
+    header.append(char((acceptor ? 0x01 : 0x00) | 0x04)); // sender, integrity only
     header.append(char(0xff));
     appendBe16(header, 0xffff);       // EC and RRC carry no meaning in a MIC token
     appendBe16(header, 0xffff);
     appendBe64(header, seq);
-    return header + Krb5::checksum(etype, kAcceptorSignUsage, key, data + header);
+    return header
+           + Krb5::checksum(etype, acceptor ? kAcceptorSignUsage : kInitiatorSignUsage, key,
+                            data + header);
 }
 
-bool checkDceMic(const QByteArray &token, const QByteArray &data, int etype,
-                 const QByteArray &key, quint64 *seq)
+bool checkCfxMic(const QByteArray &token, const QByteArray &data, int etype,
+                 const QByteArray &key, bool acceptor, quint64 *seq)
 {
     if (etype == Krb5::kRc4Hmac || !Krb5::isSupportedEtype(etype))
         return false;
     if (token.size() != 16 + 12 || token.left(2) != kCfxMicTokenId)
         return false;
-    if (quint8(token[2]) & 0x01)
+    if ((quint8(token[2]) & 0x01) != (acceptor ? 0x01 : 0x00))
         return false;
     const QByteArray expected =
-        Krb5::checksum(etype, kInitiatorSignUsage, key, data + token.left(16));
+        Krb5::checksum(etype, acceptor ? kAcceptorSignUsage : kInitiatorSignUsage, key,
+                       data + token.left(16));
     if (!Ntlm::secureEquals(expected, token.mid(16, 12)))
         return false;
     if (seq)
         *seq = readBe64(token, 8);
     return true;
+}
+
+QByteArray dceMic(const QByteArray &data, quint64 seq, int etype, const QByteArray &key)
+{
+    return cfxMic(data, seq, etype, key, true);
+}
+
+bool checkDceMic(const QByteArray &token, const QByteArray &data, int etype,
+                 const QByteArray &key, quint64 *seq)
+{
+    return checkCfxMic(token, data, etype, key, false, seq);
 }
 
 } // namespace Gss

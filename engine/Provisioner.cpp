@@ -589,10 +589,15 @@ ProvisionResult provisionDomain(const ProvisionConfig &config)
     dc.attributes.insert(QStringLiteral("ntHash"), randomKeyHex());
     Krb5::storeRandomKeys(dc);
     dc.attributes.insert(QStringLiteral("msDS-KeyVersionNumber"), QStringLiteral("1"));
+    // `DNS/ns1.<domain>` is the name the zone publishes as its NS and resolves
+    // to this DC. A GSS-TSIG client asks for the primary a SOA query named, so
+    // without this SPN the KDC has no key to issue that ticket from and a
+    // member's own dynamic update cannot start.
     dc.attributes.insert(
         QStringLiteral("servicePrincipalName"),
         QStringLiteral("ldap/%1; ldap/%1.%2; HOST/%1; HOST/%1.%2; GC/%1.%2; "
-                       "cifs/%1.%2; DNS/%1.%2; RestrictedKrbHost/%1; RestrictedKrbHost/%1.%2")
+                       "cifs/%1.%2; DNS/%1.%2; DNS/ns1.%2; RestrictedKrbHost/%1; "
+                       "RestrictedKrbHost/%1.%2")
             .arg(b.dcName.toLower(), b.dnsDomain));
 
     // The DC belongs to Domain Controllers. `member` holds distinguished names

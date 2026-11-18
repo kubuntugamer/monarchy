@@ -5,6 +5,7 @@
 
 #include "DnsServer.h"
 #include "Drs.h"
+#include "Gss.h"
 #include "Epm.h"
 #include "Kdc.h"
 #include "Kpasswd.h"
@@ -1139,6 +1140,45 @@ bool DcService::start(const QString &dcDir)
     // and an unprovisioned console synthesises the same AD service records for
     // itself so the domain resolves consistently either way.
     m_dnsServer = new DnsServer(this);
+    // GSS-TSIG: the TKEY exchange is accepted by the KDC's Kerberos acceptor,
+    // the same one LDAP's SASL bind uses, so the ticket a member already holds
+    // is what authorises its DNS registration. A ticket for anything but this
+    // DC's DNS service is not a DNS registration right: it is refused before a
+    // context exists.
+    if (m_kdc) {
+        m_dnsServer->setGssAcceptor(
+            [this](const QByteArray &token, DnsServer::GssContext *context, QString *error) {
+                Kdc::ApResult result;
+                QByteArray apReq = token;
+                bool spnego = false;
+                const QByteArray inner = Gss::kerberosToken(token);
+                if (!inner.isEmpty()) {
+                    apReq = inner;
+                    spnego = true;
+                }
+                if (!m_kdc->acceptApReq(apReq, &result, error))
+                    return false;
+                if (!result.servicePrincipal.startsWith(QStringLiteral("DNS/"),
+                                                        Qt::CaseInsensitive)) {
+                    if (error)
+                        *error = QStringLiteral("the ticket is not for DNS/%1")
+                                     .arg(m_dnsServer->zone());
+                    return false;
+                }
+                context->key = result.contextKey;
+                context->etype = result.contextEtype;
+                context->principal = result.clientPrincipal;
+                context->recvSeq = result.clientSeq;
+                context->sendSeq = 0;
+                // The acceptor's AP-REP is the TKEY key data. A SPNEGO client
+                // reads it inside a NegTokenResp, which is the form it parsed.
+                context->replyToken =
+                    spnego ? Gss::spnegoResponse(1, QStringLiteral("1.2.840.113554.1.2.2"),
+                                                 result.replyToken)
+                           : result.replyToken;
+                return true;
+            });
+    }
     // Out-of-zone names are resolved through the forwarders in dc.conf, or the
     // host's own nameservers when none are listed. This is what lets the DC be
     // the machine's resolver: it answers its zone authoritatively and caches

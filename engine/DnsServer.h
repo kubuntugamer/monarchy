@@ -19,6 +19,8 @@
 #include <QList>
 #include <QByteArray>
 
+#include <functional>
+
 class QTcpSocket;
 class QTimer;
 
@@ -71,6 +73,7 @@ public:
         TypeTxt = 16,
         TypeAaaa = 28,
         TypeSrv = 33,
+        TypeTkey = 249,
         TypeTsig = 250,
         TypeIxfr = 251,
         TypeAxfr = 252,
@@ -149,6 +152,31 @@ public:
     void refreshSecondaryZones();
     // The serial of the copy served for `zone`, or 0 when there is no copy.
     quint32 secondarySerial(const QString &zone) const;
+    // GSS-TSIG (RFC 3645): a client negotiates a Kerberos context in a TKEY
+    // query and signs later updates with a GSS MIC over the message, which is
+    // the path a Windows member or BIND's `nsupdate -g` takes. The acceptor is
+    // the same one the directory's SASL bind uses: it turns a GSS-API token into
+    // the context key both sides then sign with. Without an acceptor a TKEY
+    // query is answered REFUSED rather than pretending to negotiate.
+    struct GssContext {
+        QByteArray key;
+        int etype = 0;
+        quint64 recvSeq = 0; // next sequence number the client's MIC must carry
+        quint64 sendSeq = 0; // next sequence number this server's MIC carries
+        QString principal;
+        qint64 expires = 0;  // Unix seconds; 0 means as long as this process runs
+        // The acceptor's AP-REP (or the SPNEGO response carrying it), which the
+        // TKEY answer returns as its key data.
+        QByteArray replyToken;
+    };
+    using GssAcceptor =
+        std::function<bool(const QByteArray &token, GssContext *context, QString *error)>;
+    void setGssAcceptor(GssAcceptor acceptor);
+    bool gssTsigEnabled() const;
+    // An established context, for an embedding daemon that accepted the token
+    // itself or a test that pins the signed path without a KDC.
+    void addGssContext(const QString &name, const GssContext &context);
+    bool hasGssContext(const QString &name) const;
 
     // The zones the configured key may transfer, lower case and without a
     // trailing dot. Empty — the default — keeps the older posture, where the one
@@ -340,20 +368,45 @@ private:
                              bool includeQuestion = true) const;
 
     // 0 when the request's TSIG verifies, otherwise the rcode to answer with.
-    // A verified request leaves its MAC in `requestMac`; `error` is the TSIG
-    // error field the reply must carry, `other` its other-data.
+    // A verified request leaves its MAC in `requestMac` and the key name it
+    // proved in `keyName`; `error` is the TSIG error field the reply must carry,
+    // `other` its other-data. Non-const because a GSS-TSIG MIC consumes a
+    // sequence number.
+    // `clientTimeSigned` and `clientFudge` receive the request's own timers, which
+    // a BADTIME reply must echo (RFC 8945 §5.2.3) so the client can verify it
+    // despite the clock difference. `keyName` is for the update path, which must
+    // sign its answer with the key the request proved; a caller that only needs
+    // the verdict may leave it null.
     int verifyTsig(const QByteArray &packet, QByteArray *requestMac, quint16 *error,
-                         QByteArray *other, bool *signRefusal) const;
+                   QByteArray *other, bool *signRefusal, QString *keyName = nullptr,
+                   quint64 *clientTimeSigned = nullptr, quint16 *clientFudge = nullptr);
     // `timeSigned` and `fudge` of 0 mean this server's clock now and 300.
     // `continuedMessage` marks the second and later messages of a transfer,
     // whose MAC covers the prior MAC and this message's timers but not the TSIG
     // variables block (RFC 8945 §5.3.1). `macOut` receives the MAC the message
     // carried, which is what the next message in the stream signs over.
+    // `gssTsig` signs with the negotiated context's MIC instead of the shared
+    // secret; `signWithoutRequestMac` is for the reply to an unsigned TKEY
+    // query, which RFC 3645 requires the server to sign over the new key even
+    // though there is no request MAC to chain from. `errorAlgorithm` asks for
+    // the TSIG error shape of RFC 8945 §5.3.2: the RR present under the request's
+    // algorithm with a zero-length MAC, used when the key or MAC could not be
+    // validated and there is nothing this server could sign with.
     QByteArray signTsigResponse(const QByteArray &response, const QByteArray &requestMac,
                                 quint16 error, const QByteArray &other,
                                 quint64 timeSigned = 0, quint16 fudge = 0,
                                 bool continuedMessage = false,
-                                QByteArray *macOut = nullptr) const;
+                                QByteArray *macOut = nullptr,
+                                const QString &keyName = QString(),
+                                bool gssTsig = false,
+                                bool signWithoutRequestMac = false,
+                                const QString &errorAlgorithm = QString());
+
+    // One TKEY query: negotiate a GSS-API context and answer with the server's
+    // token, signed with the key the negotiation just established.
+    QByteArray handleTkey(const QByteArray &packet, const Message &message);
+    GssContext *gssContextFor(const QString &name);
+    void pruneGssContexts();
 
     // One change the zone went through, kept so a client that lags behind is
     // handed the records that came and went instead of the whole zone
@@ -447,6 +500,8 @@ private:
     QStringList m_transferZones;            // zones that key may transfer, if narrowed
     QString m_tsigAlgorithm;
     QByteArray m_tsigSecret;
+    QHash<QString, GssContext> m_gssContexts; // negotiated GSS-TSIG keys by name
+    GssAcceptor m_gssAcceptor;
     QList<ZoneDelta> m_journal;
     QStringList m_notifyTargets;
     QString m_master;                        // configured master, if any

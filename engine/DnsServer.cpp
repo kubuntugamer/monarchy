@@ -17,6 +17,9 @@
 #include <QtEndian>
 #include <algorithm>
 
+#include "Gss.h"
+#include "Krb5.h"
+
 namespace {
 
 // DNS result codes (RFC 1035 §4.1.1 and RFC 2136 §2.2).
@@ -811,6 +814,90 @@ bool findTsig(const QByteArray &packet, TsigParts *out)
     return false;
 }
 
+// A TKEY RR (RFC 2930), which travels in the additional section of a query and
+// carries one GSS-API token. Its RDATA is a sequence of fixed fields around two
+// variable ones, so the offsets are kept rather than the whole record: the
+// answer echoes the mode and replaces the token.
+struct TkeyParts {
+    QString name;
+    QString algorithm;
+    quint32 inception = 0;
+    quint32 expiration = 0;
+    quint16 mode = 0;
+    quint16 error = 0;
+    QByteArray keyData;
+    QByteArray other;
+};
+
+bool findTkey(const QByteArray &packet, TkeyParts *out)
+{
+    int pos = 4;
+    quint16 qdcount = 0, ancount = 0, nscount = 0, arcount = 0;
+    if (!take16(packet, pos, &qdcount) || !take16(packet, pos, &ancount)
+        || !take16(packet, pos, &nscount) || !take16(packet, pos, &arcount))
+        return false;
+    pos = 12;
+    for (int i = 0; i < qdcount; ++i) {
+        decodeName(packet, pos);
+        quint16 skip = 0;
+        if (!take16(packet, pos, &skip) || !take16(packet, pos, &skip))
+            return false;
+    }
+    for (int i = 0; i < int(ancount) + int(nscount); ++i) {
+        decodeName(packet, pos);
+        quint16 type = 0, rclass = 0, rdlength = 0;
+        quint32 ttl = 0;
+        if (!take16(packet, pos, &type) || !take16(packet, pos, &rclass)
+            || !take32(packet, pos, &ttl) || !take16(packet, pos, &rdlength))
+            return false;
+        if (pos < 0 || pos + rdlength > packet.size())
+            return false;
+        pos += rdlength;
+    }
+    for (int i = 0; i < arcount; ++i) {
+        const QString owner = decodeName(packet, pos);
+        quint16 type = 0, rclass = 0, rdlength = 0;
+        quint32 ttl = 0;
+        if (!take16(packet, pos, &type) || !take16(packet, pos, &rclass)
+            || !take32(packet, pos, &ttl) || !take16(packet, pos, &rdlength))
+            return false;
+        if (pos < 0 || pos + rdlength > packet.size())
+            return false;
+        if (type != 249) {
+            pos += rdlength;
+            continue;
+        }
+        int cursor = pos;
+        out->name = owner;
+        out->algorithm = decodeName(packet, cursor);
+        if (cursor + 14 > packet.size())
+            return false;
+        for (int k = 0; k < 4; ++k)
+            out->inception = (out->inception << 8) | quint8(packet[cursor + k]);
+        cursor += 4;
+        for (int k = 0; k < 4; ++k)
+            out->expiration = (out->expiration << 8) | quint8(packet[cursor + k]);
+        cursor += 4;
+        out->mode = quint16((quint8(packet[cursor]) << 8) | quint8(packet[cursor + 1]));
+        cursor += 2;
+        out->error = quint16((quint8(packet[cursor]) << 8) | quint8(packet[cursor + 1]));
+        cursor += 2;
+        const int keyLength = (quint8(packet[cursor]) << 8) | quint8(packet[cursor + 1]);
+        cursor += 2;
+        if (keyLength < 0 || cursor + keyLength + 2 > packet.size())
+            return false;
+        out->keyData = packet.mid(cursor, keyLength);
+        cursor += keyLength;
+        const int otherLength = (quint8(packet[cursor]) << 8) | quint8(packet[cursor + 1]);
+        cursor += 2;
+        if (otherLength < 0 || cursor + otherLength > packet.size())
+            return false;
+        out->other = packet.mid(cursor, otherLength);
+        return true;
+    }
+    return false;
+}
+
 // A dotted quad as four canonical decimal octets. "01" and "1x" are rejected:
 // they are not addresses an AD client could have been configured with, and
 // reading them as 1 would derive a reverse zone for a different host.
@@ -1174,11 +1261,14 @@ void DnsServer::setNotifyRetry(int initialIntervalMs, int maxAttempts)
 }
 
 int DnsServer::verifyTsig(const QByteArray &packet, QByteArray *requestMac,
-                                quint16 *error, QByteArray *other, bool *signRefusal) const
+                          quint16 *error, QByteArray *other, bool *signRefusal,
+                          QString *keyName, quint64 *clientTimeSigned, quint16 *clientFudge)
 {
     *error = 0;
     *signRefusal = false;
     other->clear();
+    if (keyName)
+        keyName->clear();
     TsigParts tsig;
     if (!findTsig(packet, &tsig)) {
         // No TSIG at all: this update carries no proof of anything, and there is
@@ -1186,14 +1276,10 @@ int DnsServer::verifyTsig(const QByteArray &packet, QByteArray *requestMac,
         return NotAuth;
     }
     *signRefusal = true;
-    if (tsigKeyName(tsig.name) != tsigKeyName(m_tsigName)
-        || tsigKeyName(tsig.algorithm) != tsigKeyName(m_tsigAlgorithm)) {
-        *error = 17; // BADKEY
-        return NotAuth;
-    }
 
     // The MAC covers the message without the TSIG RR, with ARCOUNT decremented
-    // to what the sender's count would have been had it not appended one.
+    // to what the sender's count would have been had it not appended one. Both
+    // algorithms sign this block; only what turns it into a MAC differs.
     QByteArray unsignedMessage = packet.left(tsig.offset);
     if (tsig.offset < 12 || unsignedMessage.size() < 12)
         return FormErr;
@@ -1201,15 +1287,50 @@ int DnsServer::verifyTsig(const QByteArray &packet, QByteArray *requestMac,
         quint16((quint8(unsignedMessage[10]) << 8) | quint8(unsignedMessage[11]));
     unsignedMessage[10] = char((quint16(arcount - 1) >> 8) & 0xff);
     unsignedMessage[11] = char((arcount - 1) & 0xff);
+    const QByteArray signedBlock =
+        unsignedMessage
+        + tsigVariables(tsig.name, tsig.algorithm, tsig.timeSigned, tsig.fudge, tsig.error,
+                        tsig.other);
 
-    const QByteArray expected =
-        hmacSha256(m_tsigSecret,
-                   unsignedMessage
-                       + tsigVariables(tsig.name, tsig.algorithm, tsig.timeSigned, tsig.fudge,
-                                       tsig.error, tsig.other));
-    if (expected != tsig.mac) {
-        *error = 16; // BADSIG
-        return NotAuth;
+    if (keyName)
+        *keyName = tsig.name;
+    if (clientTimeSigned)
+        *clientTimeSigned = tsig.timeSigned;
+    if (clientFudge)
+        *clientFudge = tsig.fudge;
+    if (tsigKeyName(tsig.algorithm) == QStringLiteral("gss-tsig")) {
+        // RFC 3645: the TSIG MAC field is a GSS MIC over the message and the
+        // variables, under the context key a TKEY negotiation established. The
+        // TSIG's owner name identifies the context, so a message cannot name
+        // one context and be signed by another.
+        pruneGssContexts();
+        GssContext *context = gssContextFor(tsig.name);
+        if (!context) {
+            *error = 17; // BADKEY: no context was negotiated under this name
+            return NotAuth;
+        }
+        quint64 sequence = 0;
+        if (!Gss::checkCfxMic(tsig.mac, signedBlock, context->etype, context->key, false,
+                              &sequence)
+            || sequence != context->recvSeq) {
+            // A MIC that verifies but carries the wrong sequence number is a
+            // replay, or a message from another position in the stream.
+            *error = 16; // BADSIG
+            return NotAuth;
+        }
+        ++context->recvSeq;
+        *requestMac = tsig.mac;
+    } else {
+        if (tsigKeyName(tsig.name) != tsigKeyName(m_tsigName)
+            || tsigKeyName(tsig.algorithm) != tsigKeyName(m_tsigAlgorithm)) {
+            *error = 17; // BADKEY
+            return NotAuth;
+        }
+        if (hmacSha256(m_tsigSecret, signedBlock) != tsig.mac) {
+            *error = 16; // BADSIG
+            return NotAuth;
+        }
+        *requestMac = tsig.mac;
     }
 
     const quint64 now = quint64(QDateTime::currentSecsSinceEpoch());
@@ -1222,53 +1343,85 @@ int DnsServer::verifyTsig(const QByteArray &packet, QByteArray *requestMac,
         *error = 18; // BADTIME
         for (int shift = 40; shift >= 0; shift -= 8)
             other->append(char((now >> shift) & 0xff));
-        *requestMac = tsig.mac;
         return NotAuth;
     }
-    *requestMac = tsig.mac;
     return 0;
 }
 
 QByteArray DnsServer::signTsigResponse(const QByteArray &response, const QByteArray &requestMac,
                                        quint16 error, const QByteArray &other,
                                        quint64 timeSigned, quint16 fudge,
-                                       bool continuedMessage, QByteArray *macOut) const
+                                       bool continuedMessage, QByteArray *macOut,
+                                       const QString &keyName, bool gssTsig,
+                                       bool signWithoutRequestMac,
+                                       const QString &errorAlgorithm)
 {
     if (macOut)
         macOut->clear();
-    if (m_tsigName.isEmpty() || response.size() < 12)
+    if (response.size() < 12)
         return response;
+
+    const QString signName = keyName.isEmpty() ? m_tsigName : keyName;
+    QString signAlgorithm = m_tsigAlgorithm;
+    GssContext *gss = nullptr;
+    // An error reply to an unverifiable key or MAC (BADKEY, BADSIG) is unsigned:
+    // the TSIG RR is still present, with a zero-length MAC, under the name and
+    // algorithm the request used, so a client can attribute the error even when
+    // this server holds no such key (RFC 8945 §5.3.2). `errorAlgorithm` selects
+    // that shape and is only meaningful when there is no request MAC to chain
+    // from; a validated request always produces a real signature.
+    const bool errorOnly = !errorAlgorithm.isEmpty() && requestMac.isEmpty();
+    if (errorOnly) {
+        if (signName.isEmpty())
+            return response;
+        signAlgorithm = errorAlgorithm;
+    } else if (gssTsig) {
+        pruneGssContexts();
+        gss = gssContextFor(signName);
+        if (!gss)
+            return response; // no context, so nothing this reply could prove
+        signAlgorithm = QStringLiteral("gss-tsig");
+    } else if (signName.isEmpty()) {
+        return response;
+    }
+
     const quint64 now = timeSigned != 0 ? timeSigned
                                         : quint64(QDateTime::currentSecsSinceEpoch());
-    if (fudge == 0)
+    // A BADTIME reply must echo the client's fudge even when it is small; only a
+    // reply that was given no timers at all falls back to the defaults.
+    if (fudge == 0 && timeSigned == 0)
         fudge = 300;
 
     // A response MAC also covers the request's MAC, so a reply cannot be
     // replayed against a different request. An empty request MAC means the MAC
     // could not be checked at all (BADKEY, BADSIG): the reply still identifies
     // the key and the error, and carries a zero-length MAC, which is what
-    // RFC 8945 §5.3 asks for rather than a digest that proves nothing.
+    // RFC 8945 §5.3 asks for rather than a digest that proves nothing. The one
+    // exception is the reply to an unsigned TKEY query, which RFC 3645 §3.1.3
+    // requires to be signed over the key the exchange just established.
     QByteArray mac;
-    if (!requestMac.isEmpty()) {
-        QByteArray prefix;
-        wr16(prefix, quint16(requestMac.size()));
-        prefix += requestMac;
+    if (!requestMac.isEmpty() || signWithoutRequestMac) {
+        QByteArray digest;
+        if (!requestMac.isEmpty()) {
+            QByteArray prefix;
+            wr16(prefix, quint16(requestMac.size()));
+            prefix += requestMac;
+            digest += prefix;
+        }
+        digest += response;
         // A later message of a transfer covers the prior MAC, the message and
         // only this message's timers: "only the timers are included in the
         // second and subsequent messages, not all the TSIG variables"
-        // (RFC 8945 §5.3.1). Signing the whole variables block there is what
-        // made BIND validate the first message of a transfer and warn that the
-        // rest could not be validated, while a receiver checking by this tree's
-        // own formula liked it fine.
-        QByteArray digest = prefix + response;
+        // (RFC 8945 §5.3.1).
         if (continuedMessage) {
             for (int shift = 40; shift >= 0; shift -= 8)
                 digest.append(char((now >> shift) & 0xff));
             wr16(digest, fudge);
         } else {
-            digest += tsigVariables(m_tsigName, m_tsigAlgorithm, now, fudge, error, other);
+            digest += tsigVariables(signName, signAlgorithm, now, fudge, error, other);
         }
-        mac = hmacSha256(m_tsigSecret, digest);
+        mac = gss ? Gss::cfxMic(digest, gss->sendSeq++, gss->etype, gss->key, true)
+                  : hmacSha256(m_tsigSecret, digest);
     }
 
     if (macOut)
@@ -1282,7 +1435,7 @@ QByteArray DnsServer::signTsigResponse(const QByteArray &response, const QByteAr
     signedResponse[11] = char(next & 0xff);
 
     QByteArray rdata;
-    rdata += encodeName(m_tsigAlgorithm);
+    rdata += encodeName(signAlgorithm);
     for (int shift = 40; shift >= 0; shift -= 8)
         rdata.append(char((now >> shift) & 0xff));
     wr16(rdata, fudge);
@@ -1293,7 +1446,7 @@ QByteArray DnsServer::signTsigResponse(const QByteArray &response, const QByteAr
     wr16(rdata, quint16(other.size()));
     rdata += other;
 
-    signedResponse += encodeName(m_tsigName);
+    signedResponse += encodeName(signName);
     wr16(signedResponse, 250); // TSIG
     wr16(signedResponse, 255); // class ANY
     wr32(signedResponse, 0);   // TTL 0
@@ -1395,6 +1548,131 @@ QString DnsServer::zoneFor(const QString &name) const {
 
 bool DnsServer::inZone(const QString &name) const {
     return !zoneFor(name).isEmpty();
+}
+
+void DnsServer::setGssAcceptor(GssAcceptor acceptor)
+{
+    m_gssAcceptor = acceptor;
+}
+
+bool DnsServer::gssTsigEnabled() const
+{
+    return bool(m_gssAcceptor);
+}
+
+void DnsServer::addGssContext(const QString &name, const GssContext &context)
+{
+    m_gssContexts.insert(tsigKeyName(name), context);
+}
+
+bool DnsServer::hasGssContext(const QString &name) const
+{
+    return m_gssContexts.contains(tsigKeyName(name));
+}
+
+DnsServer::GssContext *DnsServer::gssContextFor(const QString &name)
+{
+    auto it = m_gssContexts.find(tsigKeyName(name));
+    if (it == m_gssContexts.end())
+        return nullptr;
+    // A context outlives the message that established it only until the
+    // Kerberos ticket behind it does; an expired one is dropped rather than
+    // answering a MIC nobody can verify.
+    if (it->expires != 0 && it->expires <= qint64(QDateTime::currentSecsSinceEpoch())) {
+        m_gssContexts.erase(it);
+        return nullptr;
+    }
+    return &it.value();
+}
+
+void DnsServer::pruneGssContexts()
+{
+    const qint64 now = qint64(QDateTime::currentSecsSinceEpoch());
+    for (auto it = m_gssContexts.begin(); it != m_gssContexts.end();) {
+        if (it->expires != 0 && it->expires <= now)
+            it = m_gssContexts.erase(it);
+        else
+            ++it;
+    }
+}
+
+QByteArray DnsServer::handleTkey(const QByteArray &packet, const Message &message)
+{
+    if (message.questions.size() != 1)
+        return buildResponse(packet, {}, FormErr);
+    const Message::Question question = message.questions.first();
+    TkeyParts tkey;
+    if (!findTkey(packet, &tkey) || tsigKeyName(tkey.name) != tsigKeyName(question.name))
+        return buildResponse(packet, {}, FormErr);
+    // Without a GSS acceptor this server cannot negotiate a key at all, and
+    // RFC 2930 §3 allows saying so with an ordinary refusal rather than
+    // pretending the exchange was understood.
+    if (!m_gssAcceptor)
+        return buildResponse(packet, {}, Refused);
+
+    const quint64 now = quint64(QDateTime::currentSecsSinceEpoch());
+    // A TKEY failure lives in the RR's error field while the header stays
+    // NOERROR (RFC 2930 §2.6), and the answer echoes the mode and algorithm the
+    // client asked for so it can match the failure to its own request.
+    const auto answerWith = [&](const QByteArray &keyData, quint16 tkeyError,
+                                quint64 expiration, const QString &algorithm) {
+        Record record;
+        record.name = tkey.name;
+        record.type = TypeTkey;
+        record.rclass = ClassAny; // RFC 2930 §2.1: TKEY is class ANY
+        record.ttl = 0;
+        QByteArray rdata;
+        rdata += encodeName(algorithm);
+        for (int shift = 24; shift >= 0; shift -= 8)
+            rdata.append(char((now >> shift) & 0xff));
+        for (int shift = 24; shift >= 0; shift -= 8)
+            rdata.append(char((expiration >> shift) & 0xff));
+        wr16(rdata, tkey.mode);
+        wr16(rdata, tkeyError);
+        wr16(rdata, quint16(keyData.size()));
+        rdata += keyData;
+        wr16(rdata, 0); // no other data
+        record.rdata = rdata;
+        return buildResponse(packet, {record}, NoError, {}, false);
+    };
+
+    if (tsigKeyName(tkey.algorithm) != QStringLiteral("gss-tsig"))
+        return answerWith({}, 21, now + 3600, tkey.algorithm); // BADALG
+
+    if (tkey.mode == 5) {
+        // Key deletion (RFC 2930 §2.5, §4.2). The answer is signed with the
+        // context being retired, which is the last thing that key can prove; a
+        // name this server never issued is BADNAME, not a silent success.
+        const QString name = tsigKeyName(tkey.name);
+        if (!gssContextFor(name))
+            return answerWith({}, 20, now + 3600, tkey.algorithm); // BADNAME
+        QByteArray answer = answerWith({}, 0, now + 3600, tkey.algorithm);
+        answer = signTsigResponse(answer, {}, 0, {}, 0, 0, false, nullptr, name, true, true);
+        m_gssContexts.remove(name);
+        return answer;
+    }
+    if (tkey.mode != 3) // only GSS-API negotiation is served here
+        return answerWith({}, 19, now + 3600, tkey.algorithm); // BADMODE
+
+    GssContext context;
+    QString error;
+    if (!m_gssAcceptor(tkey.keyData, &context, &error) || context.key.isEmpty()
+        || !Krb5::isSupportedEtype(context.etype)) {
+        // The token did not produce a context, so there is nothing to sign with:
+        // the TKEY error carries BADKEY and the header stays NOERROR, which is
+        // how a client reads "the negotiation was understood and failed".
+        return answerWith({}, 17, now + 3600, tkey.algorithm);
+    }
+    if (context.expires == 0)
+        context.expires = qint64(now) + 3600;
+    const QString name = tsigKeyName(tkey.name);
+    m_gssContexts.insert(name, context);
+    // RFC 3645 §4.1.3: a completed negotiation is answered signed over the key
+    // it just established, even though the query itself was unsigned.
+    return signTsigResponse(
+        answerWith(context.replyToken, 0, quint64(context.expires),
+                   QStringLiteral("gss-tsig")),
+        {}, 0, {}, 0, 0, false, nullptr, name, true, true);
 }
 
 void DnsServer::bumpSerial() {
@@ -1808,29 +2086,54 @@ QByteArray DnsServer::handlePacket(const QByteArray &packet, const QHostAddress 
 
     const int opcode = (message.flags >> 11) & 0x0f;
     if (opcode == 5) {
-        // TSIG (RFC 8945). An update is the one message that changes the zone,
-        // so when a key is configured it is the one message that must prove it
-        // came from someone holding that key.
+        // TSIG (RFC 8945) or GSS-TSIG (RFC 3645). An update is the one message
+        // that changes the zone, so when a key is configured — a shared secret
+        // or a negotiated context — it is the one message that must prove where
+        // it came from.
         QByteArray requestMac;
         quint16 tsigError = 0;
         QByteArray other;
         bool signRefusal = false;
-        if (!m_tsigName.isEmpty()) {
-            const int verdict =
-                verifyTsig(packet, &requestMac, &tsigError, &other, &signRefusal);
+        QString tsigKey;
+        quint64 clientTime = 0;
+        quint16 clientFudge = 0;
+        TsigParts present;
+        const bool carriesTsig = findTsig(packet, &present);
+        const bool gssAttempt =
+            carriesTsig && tsigKeyName(present.algorithm) == QStringLiteral("gss-tsig");
+        if (!m_tsigName.isEmpty() || gssAttempt) {
+            const int verdict = verifyTsig(packet, &requestMac, &tsigError, &other,
+                                           &signRefusal, &tsigKey, &clientTime, &clientFudge);
             if (verdict != 0) {
                 QByteArray refusal = buildResponse(packet, {}, verdict, {}, udp);
                 // A refusal to something that carried a TSIG is answered with a
-                // TSIG too: that is how the client learns which end failed — an
-                // empty MAC for BADKEY/BADSIG, a real one for BADTIME.
-                if (signRefusal)
-                    refusal = signTsigResponse(refusal, requestMac, tsigError, other);
+                // TSIG too: that is how the client learns which end failed.
+                if (signRefusal && !requestMac.isEmpty()) {
+                    // BADTIME: the MAC verified and only the clocks disagree.
+                    // RFC 8945 §5.2.3 has the reply carry the client's own time
+                    // and fudge, so it verifies despite the skew, and this
+                    // server's time in Other Data for the client to correct to.
+                    refusal = signTsigResponse(refusal, requestMac, tsigError, other,
+                                               clientTime, clientFudge, false, nullptr,
+                                               tsigKey, gssAttempt);
+                } else if (signRefusal) {
+                    // BADKEY/BADSIG: unsigned, with a zero-length MAC, but the
+                    // RR is present under the name and algorithm the request
+                    // used so the error is readable even when no such key exists
+                    // here (RFC 8945 §5.3.2).
+                    refusal = signTsigResponse(refusal, {}, tsigError, other, 0, 0, false,
+                                               nullptr, tsigKey, gssAttempt, false,
+                                               present.algorithm);
+                }
                 return refusal;
             }
         }
         const int rcode = handleUpdate(message);
         QByteArray answer = buildResponse(packet, {}, rcode, {}, udp);
-        if (!m_tsigName.isEmpty() && !requestMac.isEmpty())
+        if (gssAttempt && !requestMac.isEmpty())
+            answer = signTsigResponse(answer, requestMac, 0, {}, 0, 0, false, nullptr,
+                                      tsigKey, true);
+        else if (!m_tsigName.isEmpty() && !requestMac.isEmpty())
             answer = signTsigResponse(answer, requestMac, 0, {});
         return answer;
     }
@@ -1893,6 +2196,12 @@ QByteArray DnsServer::handlePacket(const QByteArray &packet, const QHostAddress 
     }
     if (opcode != 0)
         return buildResponse(packet, {}, NotImp, {}, udp);
+
+    // GSS-TSIG negotiation (RFC 3645): a TKEY query carries one GSS-API token
+    // and is the only message that may establish the context a later UPDATE
+    // names in its TSIG.
+    if (message.questions.size() == 1 && message.questions.first().type == TypeTkey)
+        return handleTkey(packet, message);
 
     // Zone transfers (RFC 5936) are answered here rather than by handleQuery():
     // a transfer's answer is the whole zone, not the records at one name, and
@@ -2670,7 +2979,9 @@ QByteArray DnsServer::handleTransferRequest(const QByteArray &packet, const Mess
     quint16 tsigError = 0;
     QByteArray other;
     bool signRefusal = false;
-    const int verdict = verifyTsig(packet, &requestMac, &tsigError, &other, &signRefusal);
+    QString tsigKey;
+    const int verdict =
+        verifyTsig(packet, &requestMac, &tsigError, &other, &signRefusal, &tsigKey);
     if (verdict != 0) {
         QByteArray refusal = buildResponse(packet, {}, verdict, {}, udp);
         if (signRefusal)
@@ -3074,7 +3385,9 @@ QByteArray DnsServer::buildResponse(const QByteArray &query, const QList<Record>
             QByteArray encoded;
             encoded.append(encodeName(record.name));
             wr16(encoded, record.type);
-            wr16(encoded, ClassIn);
+            // A zone record is IN; a TKEY answer is class ANY (RFC 2930 §2.1)
+            // and carries that class in the record itself.
+            wr16(encoded, record.rclass == 0 ? ClassIn : record.rclass);
             wr32(encoded, record.ttl);
             wr16(encoded, quint16(record.rdata.size()));
             encoded.append(record.rdata);

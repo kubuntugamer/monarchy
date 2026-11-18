@@ -89,6 +89,15 @@ QByteArray dceMic(const QByteArray &data, quint64 seq, int etype, const QByteArr
 bool checkDceMic(const QByteArray &token, const QByteArray &data, int etype,
                  const QByteArray &key, quint64 *seq);
 
+// The same token outside DCE/RPC, where the side that made it matters: a
+// client's MIC carries the initiator flag and is signed under the initiator's
+// key usage, a server's carries the acceptor flag and its usage. GSS-TSIG
+// (RFC 3645 §5) signs a DNS message with exactly this token.
+QByteArray cfxMic(const QByteArray &data, quint64 seq, int etype, const QByteArray &key,
+                  bool acceptor);
+bool checkCfxMic(const QByteArray &token, const QByteArray &data, int etype,
+                 const QByteArray &key, bool acceptor, quint64 *seq);
+
 } // namespace Gss
 
 #endif // GSS_H

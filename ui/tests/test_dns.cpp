@@ -14,6 +14,8 @@
 #include <QUdpSocket>
 
 #include "DnsServer.h"
+#include "Gss.h"
+#include "Krb5.h"
 
 namespace {
 
@@ -563,6 +565,7 @@ private slots:
     void truncatesADatagramReplyToWhatTheClientCanReceive();
     void answersReverseLookupsForItsOwnAddress();
     void requiresTsigForDynamicUpdates();
+    void negotiatesGssTsigAndSignsUpdates();
     void persistsZone();
 };
 
@@ -1874,14 +1877,22 @@ void DnsTest::requiresTsigForDynamicUpdates()
     TsigReply badKey;
     QVERIFY(parseTsigRdata(badKeyTsig->rdata, &badKey));
     QCOMPARE(badKey.error, quint16(17)); // BADKEY
+    // The refusal names the key and algorithm the request used, not this
+    // server's configured key: the client has to be able to read the error
+    // without holding a key the server would accept.
+    QCOMPARE(badKeyTsig->name.toLower(), QStringLiteral("someone-elses-key"));
+    QCOMPARE(badKey.algorithm, QStringLiteral("hmac-sha256")); // wire name, no root dot
+    QVERIFY(badKey.mac.isEmpty());
 
     // A clock an hour out: the MAC verifies, so the answer is signed, carries
     // BADTIME and the server's own time for the client to correct against.
+    QByteArray skewedMac;
     const QByteArray skewed =
         withTsig(updatePacket(0x8105, QStringLiteral("corp.example.com"), {}, {addOther}),
-                 keyName, algorithm, secret, now - 3600, 300);
+                 keyName, algorithm, secret, now - 3600, 300, &skewedMac);
+    const QByteArray skewedRaw = exchange(server.serverPort(), skewed);
     Reply skewedReply;
-    QVERIFY(parseReply(exchange(server.serverPort(), skewed), &skewedReply));
+    QVERIFY(parseReply(skewedRaw, &skewedReply));
     QCOMPARE(skewedReply.rcode, 9);
     const Answer *skewedTsig = replyTsig(skewedReply);
     QVERIFY(skewedTsig != nullptr);
@@ -1890,6 +1901,33 @@ void DnsTest::requiresTsigForDynamicUpdates()
     QCOMPARE(skewedParsed.error, quint16(18)); // BADTIME
     QCOMPARE(skewedParsed.mac.size(), 32);
     QCOMPARE(skewedParsed.other.size(), 6);    // the server's time
+    // RFC 8945 §5.2.3: the signed reply echoes the client's own timers, so the
+    // client can verify it despite the skew, and carries this server's clock
+    // for the client to correct against.
+    QCOMPARE(skewedParsed.timeSigned, now - 3600);
+    QCOMPARE(skewedParsed.fudge, quint16(300));
+    quint64 serverClock = 0;
+    for (char byte : skewedParsed.other)
+        serverClock = (serverClock << 8) | quint8(byte);
+    QVERIFY(serverClock >= now);
+
+    const int skewedStart = skewedRaw.size()
+        - (nameBytes(keyName).size() + 10 + skewedTsig->rdata.size());
+    QVERIFY(skewedStart > 12);
+    QByteArray skewedBody = skewedRaw.left(skewedStart);
+    const quint16 skewedArcount =
+        quint16((quint8(skewedBody[10]) << 8) | quint8(skewedBody[11]));
+    skewedBody[10] = char((quint16(skewedArcount - 1) >> 8) & 0xff);
+    skewedBody[11] = char((quint16(skewedArcount - 1)) & 0xff);
+    QByteArray skewedPrefix;
+    put16(skewedPrefix, quint16(skewedMac.size()));
+    skewedPrefix += skewedMac;
+    QCOMPARE(hmacSha256(secret,
+                        skewedPrefix + skewedBody
+                            + tsigVariables(keyName, algorithm, skewedParsed.timeSigned,
+                                            skewedParsed.fudge, skewedParsed.error,
+                                            skewedParsed.other)),
+             skewedParsed.mac);
     QVERIFY(server.records(other, DnsServer::TypeA).isEmpty());
 
     // With the key cleared, updates go back to being unauthenticated: the
@@ -2919,6 +2957,280 @@ void DnsTest::gatesATransferOnTheZonesTheKeyMayRead()
     }
     QVERIFY2(sawPtr, "the reverse zone's PTR record travels in its own transfer");
     QVERIFY2(!sawForwardName, "the forward zone does not travel in a reverse zone's transfer");
+}
+
+void DnsTest::negotiatesGssTsigAndSignsUpdates()
+{
+    DnsServer server;
+    QVERIFY(server.listen(0));
+    const QString zone = QStringLiteral("corp.example.com");
+    server.loadAdZone(zone, QStringLiteral("dc1.corp.example.com"),
+                      QStringLiteral("192.168.5.20"), 389, 3268,
+                      QStringLiteral("Default-First-Site-Name"));
+    QVERIFY(!server.gssTsigEnabled());
+
+    const QString keyName = QStringLiteral("gss-key.corp.example.com");
+    const QByteArray contextKey(32, 'k'); // AES-256 context key
+    const QByteArray clientToken = QByteArrayLiteral("client-token");
+    const QByteArray serverToken = QByteArrayLiteral("server-token");
+
+    // RFC 4121 §4.2.6.1 MIC, written out here rather than borrowed from the
+    // implementation: header, sequence, then HMAC-SHA1-96 over header|message
+    // under the sign usage for the side that made it (23 acceptor, 25
+    // initiator, RFC 4121 §7).
+    const auto gssMic = [](const QByteArray &data, quint64 seq, const QByteArray &key,
+                           bool acceptor) {
+        QByteArray token = QByteArrayLiteral("\x04\x04");
+        token.append(char((acceptor ? 0x01 : 0x00) | 0x04));
+        token.append(char(0xff));
+        put16(token, 0xffff);
+        put16(token, 0xffff);
+        for (int shift = 56; shift >= 0; shift -= 8)
+            token.append(char((seq >> shift) & 0xff));
+        token += Krb5::checksum(Krb5::kAes256, acceptor ? 23 : 25, key, data + token);
+        return token;
+    };
+
+    const auto tkeyQuery = [](quint16 id, const QString &name, const QByteArray &token,
+                              quint16 mode = 3,
+                              const QString &algorithm = QStringLiteral("gss-tsig")) {
+        QByteArray packet;
+        put16(packet, id);
+        put16(packet, 0x0000); // standard query
+        put16(packet, 1);      // one question
+        put16(packet, 0);
+        put16(packet, 0);
+        put16(packet, 1); // the TKEY is the one additional record
+        packet += nameBytes(name);
+        put16(packet, DnsServer::TypeTkey);
+        put16(packet, 255); // class ANY
+        const quint32 now = quint32(QDateTime::currentSecsSinceEpoch());
+        QByteArray rdata;
+        rdata += nameBytes(algorithm);
+        put32(rdata, now);
+        put32(rdata, now + 3600);
+        put16(rdata, mode);
+        put16(rdata, 0); // no error
+        put16(rdata, quint16(token.size()));
+        rdata += token;
+        put16(rdata, 0);
+        packet += nameBytes(name);
+        put16(packet, DnsServer::TypeTkey);
+        put16(packet, 255);
+        put32(packet, 0);
+        put16(packet, quint16(rdata.size()));
+        packet += rdata;
+        return packet;
+    };
+
+    const auto appendGssTsig = [](QByteArray message, const QString &name,
+                                   const QByteArray &mac, quint64 when) {
+        const quint16 arcount = quint16((quint8(message[10]) << 8) | quint8(message[11]));
+        const quint16 next = quint16(arcount + 1);
+        message[10] = char((next >> 8) & 0xff);
+        message[11] = char(next & 0xff);
+        QByteArray rdata;
+        rdata += nameBytes(QStringLiteral("gss-tsig"));
+        for (int shift = 40; shift >= 0; shift -= 8)
+            rdata.append(char((when >> shift) & 0xff));
+        put16(rdata, 300);
+        put16(rdata, quint16(mac.size()));
+        rdata += mac;
+        put16(rdata, quint16((quint8(message[0]) << 8) | quint8(message[1])));
+        put16(rdata, 0);
+        put16(rdata, 0);
+        message += nameBytes(name);
+        put16(message, 250);
+        put16(message, 255);
+        put32(message, 0);
+        put16(message, quint16(rdata.size()));
+        message += rdata;
+        return message;
+    };
+
+    // Without an acceptor there is no context to establish, so a TKEY query is
+    // refused rather than answered as if one had been negotiated.
+    Reply noAcceptor;
+    QVERIFY(parseReply(exchange(server.serverPort(),
+                                tkeyQuery(0x8a01, keyName, clientToken)),
+                       &noAcceptor));
+    QCOMPARE(noAcceptor.rcode, 5); // REFUSED
+    QVERIFY(!server.hasGssContext(keyName));
+
+    server.setGssAcceptor([&](const QByteArray &token, DnsServer::GssContext *context,
+                              QString *) {
+        if (token != clientToken)
+            return false;
+        context->key = contextKey;
+        context->etype = Krb5::kAes256;
+        context->principal = QStringLiteral("dc1$@CORP.EXAMPLE.COM");
+        context->replyToken = serverToken;
+        return true;
+    });
+    QVERIFY(server.gssTsigEnabled());
+
+    // A GSS-API token in a TKEY query establishes the context; the answer
+    // carries the acceptor's token and is signed over the new key with seq 0.
+    const quint64 now = quint64(QDateTime::currentSecsSinceEpoch());
+    const QByteArray tkeyRaw = exchange(server.serverPort(), tkeyQuery(0x8a02, keyName, clientToken));
+    Reply tkeyReply;
+    QVERIFY(parseReply(tkeyRaw, &tkeyReply));
+    QCOMPARE(tkeyReply.rcode, 0);
+    QCOMPARE(tkeyReply.answers.size(), 1);
+    QCOMPARE(tkeyReply.answers.first().type, quint16(249));
+    QCOMPARE(tkeyReply.answers.first().rclass, quint16(255));
+    int tkeyPos = 0;
+    QCOMPARE(readName(tkeyReply.answers.first().rdata, tkeyPos), QStringLiteral("gss-tsig"));
+    tkeyPos += 4 + 4;
+    quint16 tkeyMode = 0, tkeyError = 0, keyLength = 0;
+    QVERIFY(take16(tkeyReply.answers.first().rdata, tkeyPos, &tkeyMode));
+    QVERIFY(take16(tkeyReply.answers.first().rdata, tkeyPos, &tkeyError));
+    QVERIFY(take16(tkeyReply.answers.first().rdata, tkeyPos, &keyLength));
+    QCOMPARE(tkeyMode, quint16(3));
+    QCOMPARE(tkeyError, quint16(0));
+    QCOMPARE(tkeyReply.answers.first().rdata.mid(tkeyPos, keyLength), serverToken);
+    QVERIFY(server.hasGssContext(keyName));
+
+    const Answer *tkeyTsig = replyTsig(tkeyReply);
+    QVERIFY2(tkeyTsig != nullptr, "a completed TKEY negotiation must be signed");
+    TsigReply tkeySignature;
+    QVERIFY(parseTsigRdata(tkeyTsig->rdata, &tkeySignature));
+    QCOMPARE(tkeySignature.algorithm, QStringLiteral("gss-tsig"));
+    QCOMPARE(tkeySignature.mac.size(), 28); // 16-byte MIC header + 12-byte HMAC
+    const int tkeyTsigStart =
+        tkeyRaw.size() - (nameBytes(keyName).size() + 10 + tkeyTsig->rdata.size());
+    QByteArray tkeyDigest = tkeyRaw.left(tkeyTsigStart);
+    const quint16 tkeyArcount =
+        quint16((quint8(tkeyDigest[10]) << 8) | quint8(tkeyDigest[11]));
+    tkeyDigest[10] = char((quint16(tkeyArcount - 1) >> 8) & 0xff);
+    tkeyDigest[11] = char((quint16(tkeyArcount - 1)) & 0xff);
+    tkeyDigest += tsigVariables(keyName, QStringLiteral("gss-tsig"),
+                                tkeySignature.timeSigned, tkeySignature.fudge, 0, {});
+    QCOMPARE(tkeySignature.mac, gssMic(tkeyDigest, 0, contextKey, true));
+
+    // An UPDATE naming the context is accepted when its MAC is the client's
+    // MIC at the next sequence number, and the reply is signed at the server's.
+    UpdateRecord add;
+    add.name = QStringLiteral("gss1.corp.example.com");
+    add.type = DnsServer::TypeA;
+    add.rclass = 1;
+    add.ttl = 300;
+    add.rdata = QByteArray::fromHex("0a0000aa");
+    const QByteArray update = updatePacket(0x8a03, zone, {}, {add});
+    const QByteArray clientMic = gssMic(
+        update + tsigVariables(keyName, QStringLiteral("gss-tsig"), now, 300, 0, {}), 0,
+        contextKey, false);
+    const QByteArray signedUpdate =
+        appendGssTsig(update, keyName, clientMic, now);
+
+    const QByteArray updateRaw = exchange(server.serverPort(), signedUpdate);
+    Reply accepted;
+    QVERIFY(parseReply(updateRaw, &accepted));
+    QCOMPARE(accepted.rcode, 0);
+    QCOMPARE(server.records(add.name, DnsServer::TypeA).size(), 1);
+
+    const Answer *updateTsig = replyTsig(accepted);
+    QVERIFY(updateTsig != nullptr);
+    TsigReply updateSignature;
+    QVERIFY(parseTsigRdata(updateTsig->rdata, &updateSignature));
+    const int updateTsigStart =
+        updateRaw.size() - (nameBytes(keyName).size() + 10 + updateTsig->rdata.size());
+    QByteArray updateDigest = updateRaw.left(updateTsigStart);
+    const quint16 updateArcount =
+        quint16((quint8(updateDigest[10]) << 8) | quint8(updateDigest[11]));
+    updateDigest[10] = char((quint16(updateArcount - 1) >> 8) & 0xff);
+    updateDigest[11] = char((quint16(updateArcount - 1)) & 0xff);
+    QByteArray requestPrefix;
+    put16(requestPrefix, quint16(clientMic.size()));
+    requestPrefix += clientMic;
+    updateDigest = requestPrefix + updateDigest
+                   + tsigVariables(keyName, QStringLiteral("gss-tsig"),
+                                   updateSignature.timeSigned, updateSignature.fudge, 0, {});
+    QCOMPARE(updateSignature.mac, gssMic(updateDigest, 1, contextKey, true));
+
+    // The same bytes again are a replay: the MIC verifies but carries the
+    // sequence number the first message used, so nothing is written twice.
+    Reply replayed;
+    QVERIFY(parseReply(exchange(server.serverPort(), signedUpdate), &replayed));
+    QCOMPARE(replayed.rcode, 9); // NOTAUTH
+    QCOMPARE(server.records(add.name, DnsServer::TypeA).size(), 1);
+    const Answer *replayTsig = replyTsig(replayed);
+    QVERIFY(replayTsig != nullptr);
+    TsigReply replaySignature;
+    QVERIFY(parseTsigRdata(replayTsig->rdata, &replaySignature));
+    QCOMPARE(replaySignature.error, quint16(16)); // BADSIG
+    QCOMPARE(replaySignature.mac.size(), 0);      // nothing verified, nothing claimed
+    QCOMPARE(replayTsig->name.toLower(), keyName);
+    QCOMPARE(replaySignature.algorithm, QStringLiteral("gss-tsig"));
+
+    // An UPDATE naming a context this server never issued gets BADKEY, and the
+    // refusal still carries a TSIG under the request's own name so a client can
+    // tell an unknown key from a dropped packet.
+    const QString unknownName = QStringLiteral("unknown.corp.example.com");
+    const QByteArray unknownUpdate =
+        appendGssTsig(updatePacket(0x8a04, zone, {}, {add}), unknownName,
+                      QByteArray(28, 'x'), now);
+    Reply unknownReply;
+    QVERIFY(parseReply(exchange(server.serverPort(), unknownUpdate), &unknownReply));
+    QCOMPARE(unknownReply.rcode, 9); // NOTAUTH
+    const Answer *unknownTsig = replyTsig(unknownReply);
+    QVERIFY2(unknownTsig != nullptr, "a BADKEY refusal still carries the TSIG RR");
+    QCOMPARE(unknownTsig->name.toLower(), unknownName);
+    TsigReply unknownSignature;
+    QVERIFY(parseTsigRdata(unknownTsig->rdata, &unknownSignature));
+    QCOMPARE(unknownSignature.error, quint16(17)); // BADKEY
+    QCOMPARE(unknownSignature.mac.size(), 0);
+    QCOMPARE(unknownSignature.algorithm, QStringLiteral("gss-tsig"));
+
+    // TKEY failures live in the RR's error field while the header stays NOERROR
+    // (RFC 2930 §2.6), and the answer echoes the mode and algorithm asked for.
+    const auto parseTkeyError = [](const Reply &reply, quint16 *mode, quint16 *error,
+                                   QString *algorithm) {
+        if (reply.answers.size() != 1)
+            return false;
+        int pos = 0;
+        *algorithm = readName(reply.answers.first().rdata, pos);
+        pos += 4 + 4; // inception, expiration
+        return take16(reply.answers.first().rdata, pos, mode)
+               && take16(reply.answers.first().rdata, pos, error);
+    };
+
+    // A mode this server does not serve is BADMODE (19), not 22 (BADTRUNC), and
+    // not a DNS rcode that would blame the transport.
+    Reply badMode;
+    QVERIFY(parseReply(exchange(server.serverPort(),
+                                tkeyQuery(0x8a05, QStringLiteral("mode.corp.example.com"),
+                                          {}, 4)),
+                       &badMode));
+    QCOMPARE(badMode.rcode, 0);
+    quint16 modeField = 0, errorField = 0;
+    QString reportedAlgorithm;
+    QVERIFY(parseTkeyError(badMode, &modeField, &errorField, &reportedAlgorithm));
+    QCOMPARE(modeField, quint16(4));
+    QCOMPARE(errorField, quint16(19)); // BADMODE
+    QCOMPARE(reportedAlgorithm, QStringLiteral("gss-tsig"));
+
+    // An algorithm this server cannot negotiate is BADALG (21), echoed back.
+    Reply badAlgorithm;
+    QVERIFY(parseReply(exchange(server.serverPort(),
+                                tkeyQuery(0x8a06, QStringLiteral("alg.corp.example.com"),
+                                          {}, 3, QStringLiteral("hmac-sha256"))),
+                       &badAlgorithm));
+    QCOMPARE(badAlgorithm.rcode, 0);
+    QVERIFY(parseTkeyError(badAlgorithm, &modeField, &errorField, &reportedAlgorithm));
+    QCOMPARE(errorField, quint16(21)); // BADALG
+    QCOMPARE(reportedAlgorithm, QStringLiteral("hmac-sha256"));
+
+    // Deleting a name this server never issued is BADNAME (20), not a silent
+    // success that leaves the client believing the key was retired here.
+    Reply badName;
+    QVERIFY(parseReply(exchange(server.serverPort(),
+                                tkeyQuery(0x8a07, QStringLiteral("absent.corp.example.com"),
+                                          {}, 5)),
+                       &badName));
+    QCOMPARE(badName.rcode, 0);
+    QVERIFY(parseTkeyError(badName, &modeField, &errorField, &reportedAlgorithm));
+    QCOMPARE(errorField, quint16(20)); // BADNAME
 }
 
 void DnsTest::persistsZone()
