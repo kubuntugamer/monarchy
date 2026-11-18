@@ -164,9 +164,19 @@ failure) |
   answered for NT LM 0.12 (`engine/Smb1.{h,cpp}`): negotiate, extended session
   setup with NTLMSSP in SPNEGO, tree connect to `IPC$`, NT create on a pipe,
   and write/read/transact over it, which is the transport a Windows 2000
-  workstation needs for a domain join. SMB1 signing is not implemented (the
-  server answers `SecurityMode` without the signature bits), so a client whose
-  policy makes signing mandatory, such as Samba's default client, is refused.
+  workstation needs for a domain join. SMB1 signing is implemented: `SecurityMode`
+  advertises `SIGNING_ENABLED` (never `SIGNING_REQUIRED`), a signed request is
+  verified with MD5(session key || message) before dispatch and refused
+  `ACCESS_DENIED` when the MAC does not cover the message, and every reply to a
+  signed session carries its own signature over one sequence number shared by
+  both directions. That sequence is measured, not assumed: Samba's client logged
+  `seq 1: got good` for the session-setup reply, signed its tree connect as 2 and
+  expected 3 back. Live with `client signing = required`: `\\dc\SYSVOL` lists,
+  and Samba's dcerpc-over-SMB1 transport — which signs every PDU whatever
+  `client signing` says — carries SAMR (`enumdomusers`) and Netlogon
+  (`getdcname`) over `\pipe\samr` and `\pipe\netlogon`. A client that does not
+  sign, such as Windows 2000 with no signing policy, is still answered without a
+  signature it never asked for.
   SMB1 also serves the disk shares (`SYSVOL`, `NETLOGON`) the way SMB2 does:
   authenticated tree connect, case-insensitive path resolution, positional
   reads and the TRANS2 query a client makes before reading, with every write,

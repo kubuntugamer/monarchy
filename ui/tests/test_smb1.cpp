@@ -3,6 +3,7 @@
 
 #include <QtTest>
 
+#include <QCryptographicHash>
 #include <QFile>
 #include <QTemporaryDir>
 
@@ -320,6 +321,42 @@ quint16 tidOf(const QByteArray &framed)
     return readLe16(payloadOf(framed), 24);
 }
 
+// Signs one message the way a client does: FLAGS2 says it is signed, the
+// sequence number goes into the signature field, and the first eight bytes of
+// MD5(session key || message) replace that field (MS-CIFS 3.2.4.1).
+QByteArray signedMessage(QByteArray message, const QByteArray &key, quint32 sequence)
+{
+    const quint16 flags2 = quint16(readLe16(message, 10) | 0x0004);
+    message[10] = char(flags2 & 0xff);
+    message[11] = char((flags2 >> 8) & 0xff);
+    QByteArray field;
+    putLe32(field, sequence);
+    field.append(QByteArray(4, '\0'));
+    message.replace(14, 8, field);
+    QByteArray macInput = key;
+    macInput.append(message);
+    message.replace(14, 8, QCryptographicHash::hash(macInput, QCryptographicHash::Md5).left(8));
+    return message;
+}
+
+// Checks a reply the way the client did: put the expected sequence number where
+// the signature sits and see whether the MAC covers the rest of the message.
+bool signatureMatches(const QByteArray &framed, const QByteArray &key, quint32 sequence)
+{
+    QByteArray message = payloadOf(framed);
+    if (!(readLe16(message, 10) & 0x0004))
+        return false;
+    const QByteArray received = message.mid(14, 8);
+    QByteArray field;
+    putLe32(field, sequence);
+    field.append(QByteArray(4, '\0'));
+    message.replace(14, 8, field);
+    QByteArray macInput = key;
+    macInput.append(message);
+    return received
+        == QCryptographicHash::hash(macInput, QCryptographicHash::Md5).left(8);
+}
+
 } // namespace
 
 class Smb1Test : public QObject
@@ -335,6 +372,7 @@ private slots:
     void refusesWrites();
     void answersARawNtlmTokenWithoutSpnego();
     void setsTheStateOfAnOpenPipe();
+    void signsAndVerifiesASignedSession();
 
 private:
     QTemporaryDir m_root;
@@ -702,6 +740,91 @@ void Smb1Test::setsTheStateOfAnOpenPipe()
     QCOMPARE(readLe16(paramMessage, 45), quint16(0));          // DataCount
     QCOMPARE(paramMessage.mid(int(readLe16(paramMessage, 41)), 2),
              QByteArray("\x05\x00", 2)); // a DCE/RPC 5.0 PDU at ParameterOffset
+}
+
+// A client that signs has to get signed replies and have its own signatures
+// checked. Samba's dcerpc-over-SMB1 transport signs every PDU whatever the
+// `client signing` setting says, which is how this was measured: with no reply
+// signing, tree connect to SYSVOL and the Netlogon pipe both died on
+// `smb1_signing_good: BAD SIG`, and the DC answered a flag it did not honour.
+void Smb1Test::signsAndVerifiesASignedSession()
+{
+    const QByteArray key = QByteArray::fromHex("00112233445566778899aabbccddeeff");
+    QHash<QString, QString> shares;
+    shares.insert(QStringLiteral("sysvol"), m_root.path());
+    Smb1::Session session(
+        QHash<QString, RpcServer *>(),
+        [&key](const Rpc::AuthRequest &, Ntlm::SessionKeys *keys) {
+            *keys = Ntlm::SessionKeys();
+            keys->sessionBaseKey = key;
+            return true;
+        },
+        QStringLiteral("MONARCHY"), QStringLiteral("DC1"),
+        QStringLiteral("monarchy.test"), shares);
+
+    // Before a session key exists there is nothing to sign with, and a reply
+    // that claimed a signature would be lying.
+    const QByteArray negotiateReply = session.feed(negotiateMessage());
+    QCOMPARE(readLe16(payloadOf(negotiateReply), 10) & 0x0004, quint16(0));
+
+    QByteArray type1("NTLMSSP", 7);
+    type1.append(char(0));
+    putLe32(type1, 1);
+    putLe32(type1, 0x00008201u);
+    QCOMPARE(statusOf(session.feed(sessionSetupMessage(type1))),
+             Smb1::kStatusMoreProcessingRequired);
+
+    // A client that means to sign says so on the session-setup request, before it
+    // has a key to sign with, and the accepted reply is then sequence number 1.
+    QByteArray type3Setup = sessionSetupMessage(
+        authenticateToken(QStringLiteral("alice"), QStringLiteral("MONARCHY")));
+    type3Setup[10] = char(readLe16(type3Setup, 10) | 0x0004);
+    const QByteArray acceptReply = session.feed(type3Setup);
+    QCOMPARE(statusOf(acceptReply), quint32(0));
+    QVERIFY2(signatureMatches(acceptReply, key, 1), "the first signed reply is not seq 1");
+
+    // One sequence numbers both directions, so the client's seq 2 request is
+    // answered by seq 3. Samba's client verified exactly this: it logged
+    // "seq 1: got good", signed its tree connect as 2, and expected 3 back.
+    const QByteArray treeReply = session.feed(signedMessage(
+        treeConnectMessage(QStringLiteral("\\\\dc1\\SYSVOL")), key, 2));
+    QCOMPARE(statusOf(treeReply), quint32(0));
+    QVERIFY2(signatureMatches(treeReply, key, 3), "the reply to seq 2 is not seq 3");
+
+    // A signature that does not cover the message is refused before dispatch, so
+    // a signed request cannot be altered in flight and still be executed.
+    QByteArray forged = signedMessage(
+        treeConnectMessage(QStringLiteral("\\\\dc1\\SYSVOL")), key, 4);
+    forged[24] = char(0x77); // a TID the signature above never covered
+    QCOMPARE(statusOf(session.feed(forged)), Smb1::kStatusAccessDenied);
+
+    // Once the connection is signing, its replies stay signed: the sequence
+    // belongs to the session, not to the message.
+    const QByteArray afterForgery =
+        session.feed(treeConnectMessage(QStringLiteral("\\\\dc1\\SYSVOL")));
+    QCOMPARE(statusOf(afterForgery), quint32(0));
+    QVERIFY(signatureMatches(afterForgery, key, 5));
+
+    // A session that never signalled intent — Windows 2000 with no signing
+    // policy — is served too, and its replies claim no signature.
+    Smb1::Session plain(
+        QHash<QString, RpcServer *>(),
+        [&key](const Rpc::AuthRequest &, Ntlm::SessionKeys *keys) {
+            *keys = Ntlm::SessionKeys();
+            keys->sessionBaseKey = key;
+            return true;
+        },
+        QStringLiteral("MONARCHY"), QStringLiteral("DC1"),
+        QStringLiteral("monarchy.test"), shares);
+    plain.feed(negotiateMessage());
+    plain.feed(sessionSetupMessage(type1));
+    QCOMPARE(statusOf(plain.feed(sessionSetupMessage(
+                 authenticateToken(QStringLiteral("alice"), QStringLiteral("MONARCHY"))))),
+             quint32(0));
+    const QByteArray plainReply =
+        plain.feed(treeConnectMessage(QStringLiteral("\\\\dc1\\SYSVOL")));
+    QCOMPARE(statusOf(plainReply), quint32(0));
+    QCOMPARE(readLe16(payloadOf(plainReply), 10) & 0x0004, quint16(0));
 }
 
 QTEST_GUILESS_MAIN(Smb1Test)

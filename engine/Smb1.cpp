@@ -178,7 +178,7 @@ QString Session::stringAt(const QByteArray &data, int at) const
 }
 
 QByteArray Session::reply(const QByteArray &request, quint32 status, const QByteArray &words,
-                          const QByteArray &data) const
+                          const QByteArray &data, int uid, int tid) const
 {
     QByteArray out;
     out.append("\377SMB", 4);
@@ -186,26 +186,41 @@ QByteArray Session::reply(const QByteArray &request, quint32 status, const QByte
     putLe32(out, status);
     const quint8 flags = quint8(readLe16(request, 6) & 0x18) | 0x80;
     out.append(char(flags));
-    // FLAGS2 is echoed so Unicode, long names and NT status stay on; the
-    // signature is zero because signing is not negotiated.
     // FLAGS2 is echoed so Unicode, long names and NT status stay on. The
-    // signature bit is cleared only before a session key exists, when the reply
-    // cannot be signed.
-    putLe16(out, quint16(readLe16(request, 10) & ~0x0004));
+    // signature bit is set only on a reply that actually carries one: before a
+    // session key exists there is nothing to sign with, and a client that did
+    // not sign its own requests must not be answered with a signature it will
+    // not check.
+    const bool signedReply =
+        !m_sessionKey.isEmpty() && m_authenticated && m_signingActive;
+    putLe16(out, quint16((readLe16(request, 10) & ~0x0004) | (signedReply ? 0x0004 : 0)));
     putLe16(out, 0);  // PID high
-    out.append(QByteArray(8, '\0')); // signature
+    out.append(QByteArray(8, '\0')); // signature, filled in below
     putLe16(out, 0);  // reserved
-    putLe16(out, readLe16(request, 24)); // TID
+    putLe16(out, tid >= 0 ? quint16(tid) : readLe16(request, 24)); // TID
     putLe16(out, readLe16(request, 26)); // PID
-    putLe16(out, readLe16(request, 28)); // UID
+    putLe16(out, uid >= 0 ? quint16(uid) : readLe16(request, 28)); // UID
     putLe16(out, readLe16(request, 30)); // MID
     out.append(char(words.size() / 2));
     out.append(words);
     putLe16(out, quint16(data.size()));
     out.append(data);
 
-    // SMB1 signing (MS-CIFS 3.2.4.1): MD5(session key || header with the
-    // signature zeroed || message), first eight bytes.
+    // SMB1 signing (MS-CIFS 3.2.4.1): the signature field holds a sequence
+    // number, one counter per direction, and the MAC is MD5(session key ||
+    // message with that number in the field), first eight bytes. The header is
+    // final before the hash: a UID or TID written in afterwards would break the
+    // signature the client is about to verify.
+    if (signedReply) {
+        QByteArray sequence;
+        putLe32(sequence, m_signingSeq++);
+        sequence.append(QByteArray(4, '\0'));
+        out.replace(14, 8, sequence);
+        QByteArray macInput = m_sessionKey;
+        macInput.append(out);
+        const QByteArray digest = QCryptographicHash::hash(macInput, QCryptographicHash::Md5);
+        out.replace(14, 8, digest.left(8));
+    }
     return nbtFrame(out);
 }
 
@@ -217,17 +232,18 @@ QByteArray Session::unsupportedReply(const QByteArray &message)
     return reply(message, kStatusNotSupported, QByteArray(2, '\0'), QByteArray());
 }
 
-bool Session::signatureValid(const QByteArray &message) const
+bool Session::signatureValid(const QByteArray &message, quint32 sequence) const
 {
     if (m_sessionKey.isEmpty() || !(readLe16(message, 10) & 0x0004))
         return true;
-    // The signature field is replaced by the sequence number, which for a
-    // request is its message id (MS-CIFS 3.2.4.1).
+    // The client's own counter is not trusted; the number this side expects is
+    // put in the field and the MAC is recomputed, so a replayed or reordered
+    // message fails here as surely as a forged one (MS-CIFS 3.2.4.1).
     QByteArray zeroed = message;
-    QByteArray sequence;
-    putLe32(sequence, readLe16(message, 30));
-    putLe32(sequence, 0);
-    zeroed.replace(14, 8, sequence);
+    QByteArray expected;
+    putLe32(expected, sequence);
+    expected.append(QByteArray(4, '\0'));
+    zeroed.replace(14, 8, expected);
     QByteArray macInput = m_sessionKey;
     macInput.append(zeroed);
     const QByteArray digest = QCryptographicHash::hash(macInput, QCryptographicHash::Md5);
@@ -242,6 +258,22 @@ QByteArray Session::feed(const QByteArray &message)
     m_unicode = header.unicode;
     if (m_notifier)
         m_notifier(QStringLiteral("SMB1 cmd %1").arg(header.command));
+
+    // A signed request is checked before it is dispatched, and refused when the
+    // signature does not cover the message received. Until this existed the bit
+    // was read and ignored: a signing client's requests were accepted whatever
+    // they carried, so the flag promised integrity the endpoint did not give.
+    if (header.flags2 & 0x0004)
+        m_signingActive = true;
+    if (!m_sessionKey.isEmpty() && (header.flags2 & 0x0004)) {
+        if (!signatureValid(message, m_signingSeq)) {
+            if (m_notifier)
+                m_notifier(QStringLiteral("SMB1 cmd %1 refused: bad signature")
+                               .arg(header.command));
+            return reply(message, kStatusAccessDenied, QByteArray(), QByteArray());
+        }
+        ++m_signingSeq;
+    }
 
     switch (header.command) {
     case CmdNegotiate:
@@ -311,7 +343,10 @@ QByteArray Session::negotiate(const QByteArray &message)
 
     QByteArray words;
     putLe16(words, quint16(index));       // DialectIndex
-    words.append(char(0x03));             // SecurityMode: user, encrypted passwords
+    // SECURITY_MODE_SIGNING_ENABLED: signing is offered, not demanded, so a
+    // client with no signing policy (Windows 2000 by default) is served
+    // unsigned and a client that signs is held to it.
+    words.append(char(0x03 | 0x04));      // user, encrypted passwords, signing enabled
     putLe16(words, 50);                   // MaxMpxCount
     putLe16(words, 1);                    // MaxNumberVcs
     putLe32(words, 4356);                 // MaxBufferSize
@@ -422,16 +457,8 @@ QByteArray Session::sessionSetup(const QByteArray &message)
 
     if (m_notifier)
         m_notifier(QStringLiteral("SMB1 session setup type %1").arg(type));
-    QByteArray framed = reply(message, status, words, data);
-    // The UID is assigned by session setup; reply() echoed the request's zero.
-    if (m_uid) {
-        const int uidAt = 4 + 28;
-        if (framed.size() >= uidAt + 2) {
-            framed[uidAt] = char(m_uid & 0xff);
-            framed[uidAt + 1] = char((m_uid >> 8) & 0xff);
-        }
-    }
-    return framed;
+    // The UID is assigned here and has to be in the header the signature covers.
+    return reply(message, status, words, data, m_uid ? m_uid : -1);
 }
 
 QByteArray Session::treeConnect(const QByteArray &message)
@@ -476,13 +503,8 @@ QByteArray Session::treeConnect(const QByteArray &message)
     data.append(char(0)); // pad so the Unicode name starts on an even offset
     data.append(toUtf16Bytes(QStringLiteral("NTFS")));
     data.append(QByteArray(2, '\0'));
-    QByteArray framed = reply(message, kStatusSuccess, words, data);
-    const int tidAt = 4 + 24;
-    if (framed.size() >= tidAt + 2) {
-        framed[tidAt] = char(tid & 0xff);
-        framed[tidAt + 1] = char((tid >> 8) & 0xff);
-    }
-    return framed;
+    // The TID is assigned here and has to be in the header the signature covers.
+    return reply(message, kStatusSuccess, words, data, -1, tid);
 }
 
 QByteArray Session::treeDisconnect(const QByteArray &message)

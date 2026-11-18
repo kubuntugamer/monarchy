@@ -109,10 +109,15 @@ private:
     QByteArray find(const QByteArray &message, quint16 subcommand,
                     const QByteArray &parameters, const QString &shareRoot);
     QByteArray unsupportedReply(const QByteArray &message);
-    bool signatureValid(const QByteArray &message) const;
+    // MS-CIFS 3.2.4.1: the signature field carries a sequence number per
+    // direction, so a request is checked against the number expected next.
+    bool signatureValid(const QByteArray &message, quint32 sequence) const;
 
+    // uid and tid override the echoed ones; session setup assigns the UID and
+    // tree connect the TID, and both have to be in the header before a signed
+    // reply is hashed or the client rejects the signature it is given.
     QByteArray reply(const QByteArray &request, quint32 status, const QByteArray &words,
-                     const QByteArray &data) const;
+                     const QByteArray &data, int uid = -1, int tid = -1) const;
     QString stringAt(const QByteArray &data, int at) const;
     // Splits `data` on DCE/RPC frag_length and feeds each PDU to the channel.
     void feedPipe(OpenFile *file, const QByteArray &data);
@@ -127,6 +132,16 @@ private:
     QByteArray m_challenge;
     QByteArray m_sessionKey;
     mutable quint32 m_sendSeq = 1;
+    // One counter for both directions: MS-CIFS numbers each signed message on
+    // the connection in one sequence, so the reply to a request carries the
+    // number after it. Measured against Samba's client, which verified our
+    // session-setup reply as seq 1, signed its tree connect as seq 2 and then
+    // expected our reply as seq 3.
+    mutable quint32 m_signingSeq = 1;
+    // Set when a request arrives saying it is signed. A client announces
+    // that before it has a key to sign with, so the flag is intent: replies
+    // are signed only for a session that asked for it.
+    mutable bool m_signingActive = false;
     bool m_authenticated = false;
     QString m_user;
     bool m_unicode = false;
