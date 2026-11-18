@@ -1011,10 +1011,10 @@ QStringList DnsServer::notifyTargets() const
     return m_notifyTargets;
 }
 
-QByteArray DnsServer::buildNotify(quint16 id) const
+QByteArray DnsServer::buildNotify(quint16 id, const QString &zone) const
 {
-    const QList<Record> soa = records(m_zone, TypeSoa);
-    if (m_zone.isEmpty() || soa.isEmpty())
+    const QList<Record> soa = records(zone, TypeSoa);
+    if (zone.isEmpty() || soa.isEmpty())
         return {};
 
     QByteArray packet;
@@ -1027,10 +1027,10 @@ QByteArray DnsServer::buildNotify(quint16 id) const
     wr16(packet, 1);
     wr16(packet, 0);
     wr16(packet, 0);
-    packet += encodeName(m_zone);
+    packet += encodeName(zone);
     wr16(packet, TypeSoa);
     wr16(packet, ClassIn);
-    packet += encodeName(m_zone);
+    packet += encodeName(zone);
     wr16(packet, TypeSoa);
     wr16(packet, ClassIn);
     wr32(packet, soa.first().ttl);
@@ -1074,11 +1074,11 @@ QByteArray DnsServer::buildNotify(quint16 id) const
     return packet;
 }
 
-void DnsServer::notifySecondaries()
+void DnsServer::notifySecondaries(const QString &zone)
 {
     if (m_notifyTargets.isEmpty() || !isListening())
         return;
-    if (m_zone.isEmpty() || records(m_zone, TypeSoa).isEmpty())
+    if (zone.isEmpty() || records(zone, TypeSoa).isEmpty())
         return;
     for (const QString &spec : m_notifyTargets) {
         QHostAddress address;
@@ -1091,13 +1091,15 @@ void DnsServer::notifySecondaries()
         // repeating the older one would walk it backwards.
         for (int i = m_pendingNotifies.size() - 1; i >= 0; --i) {
             if (m_pendingNotifies.at(i).address == address
-                && m_pendingNotifies.at(i).port == port)
+                && m_pendingNotifies.at(i).port == port
+                && m_pendingNotifies.at(i).zone == zone)
                 m_pendingNotifies.removeAt(i);
         }
 
         PendingNotify entry;
         entry.address = address;
         entry.port = port;
+        entry.zone = zone;
         entry.id = m_nextNotifyId++;
         entry.waitMs = m_notifyInitialIntervalMs;
         m_pendingNotifies.append(entry);
@@ -1109,7 +1111,7 @@ void DnsServer::notifySecondaries()
 
 void DnsServer::sendNotify(PendingNotify &entry)
 {
-    const QByteArray notify = buildNotify(entry.id);
+    const QByteArray notify = buildNotify(entry.id, entry.zone);
     if (notify.isEmpty())
         return;
     m_socket->writeDatagram(notify, entry.address, entry.port);
@@ -2514,7 +2516,17 @@ int DnsServer::handleUpdate(const Message &message) {
     const QList<Record> beforeUpdate = zoneContents();
     const quint32 serialBefore = m_serial;
     bool changed = false;
+    // Which zones this update wrote into. The forward zone's serial used to move
+    // for a PTR as well, and the reverse zone's never did: the reverse copy then
+    // carried a serial older than its own contents, and the announcement named a
+    // zone whose version had not changed.
+    bool forwardTouched = false;
+    bool reverseTouched = false;
     for (const Record &update : message.updates) {
+        if (!m_reverseZone.isEmpty() && zoneFor(update.name) == m_reverseZone)
+            reverseTouched = true;
+        else
+            forwardTouched = true;
         if (update.rclass == ClassIn) {
             if (update.rdata.isEmpty())
                 return FormErr;
@@ -2561,14 +2573,24 @@ int DnsServer::handleUpdate(const Message &message) {
         wr32(soa, 3600);
         addRecord(m_zone, TypeSoa, 3600, soa);
         changed = true;
+        forwardTouched = true;
     }
     if (changed) {
-        bumpSerial();
-        recordDelta(serialBefore, beforeUpdate, zoneContents());
-        // The serial moved, so the secondaries are told rather than left to
-        // notice on their next refresh: this is what turns a change into a diff
-        // pull instead of a full transfer minutes later.
-        notifySecondaries();
+        if (forwardTouched) {
+            bumpSerial();
+            recordDelta(serialBefore, beforeUpdate, zoneContents());
+        }
+        if (reverseTouched)
+            bumpReverseSerial();
+        // Each zone that moved is announced by name, because that is the zone a
+        // secondary compares serials against: this turns a change into a diff
+        // pull instead of a full transfer minutes later. The journal is the
+        // forward zone's history, so a reverse change tells its secondaries to
+        // pull rather than handing them a delta.
+        if (forwardTouched)
+            notifySecondaries(m_zone);
+        if (reverseTouched)
+            notifySecondaries(m_reverseZone);
     }
     return NoError;
 }

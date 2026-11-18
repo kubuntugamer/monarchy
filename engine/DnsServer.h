@@ -353,15 +353,19 @@ private:
 
     // One NOTIFY message (RFC 1996 §4): QR clear, opcode NOTIFY, AA set, the
     // zone as a single SOA question and the SOA being announced as its one
-    // answer — signed as a request when a key is configured.
-    QByteArray buildNotify(quint16 id) const;
-    void notifySecondaries();
+    // answer — signed as a request when a key is configured. `zone` is the zone
+    // whose serial moved: the reverse zone is transferred from this server too,
+    // and an announcement that named the forward zone after a PTR change would
+    // carry a version nobody moved.
+    QByteArray buildNotify(quint16 id, const QString &zone) const;
+    void notifySecondaries(const QString &zone);
     // One announcement in flight. The id is kept across repeats, because the
     // secondary's answer echoes it and that is what says which announcement is
     // settled. `waitMs` is the gap before the next repeat and doubles per send.
     struct PendingNotify {
         QHostAddress address;
         quint16 port = 53;
+        QString zone; // which zone's serial is being announced
         quint16 id = 0;
         int attempts = 0;
         int waitMs = 0;

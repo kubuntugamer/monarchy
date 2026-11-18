@@ -555,6 +555,7 @@ private slots:
     void answersAnIncrementalRequestWithTheDelta();
     void notifiesTheSecondariesWhenTheZoneMoves();
     void retriesAnAnnouncementUntilTheSecondaryAnswers();
+    void announcesTheZoneThatMoved();
     void remembersTheDifferenceAcrossARestart();
     void gatesATransferOnTheZonesTheKeyMayRead();
     void answersAnEdnsQuery();
@@ -2583,6 +2584,97 @@ void DnsTest::retriesAnAnnouncementUntilTheSecondaryAnswers()
 
     QVERIFY2(collect(secondary, 1200).isEmpty(),
              "the secondary's answer ends the announcement");
+}
+
+void DnsTest::announcesTheZoneThatMoved()
+{
+    DnsServer server;
+    QVERIFY(server.listen(0));
+    server.loadAdZone(QStringLiteral("moved.example.com"),
+                      QStringLiteral("dc1.moved.example.com"), QStringLiteral("10.40.0.10"),
+                      389, 3268, QStringLiteral("Default-First-Site-Name"));
+    // loadAdZone publishes the forward zone; the /24 reverse zone comes from the
+    // repair path, and the reverse zone is what this test is about.
+    QVERIFY(server.repairReverseZone(QStringLiteral("dc1.moved.example.com"),
+                                     QStringLiteral("10.40.0.10")));
+    const QString forward = QStringLiteral("moved.example.com");
+    const QString reverse = server.reverseZone();
+    QCOMPARE(reverse, QStringLiteral("0.40.10.in-addr.arpa"));
+
+    QUdpSocket secondary;
+    QVERIFY(secondary.bind(QHostAddress::LocalHost, 0));
+    server.setNotifyTargets({QStringLiteral("127.0.0.1:%1").arg(secondary.localPort())});
+
+    auto awaitDatagram = [](QUdpSocket &socket, int timeoutMs) {
+        QByteArray received;
+        QElapsedTimer timer;
+        timer.start();
+        while (timer.elapsed() < timeoutMs && received.isEmpty()) {
+            QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+            if (!socket.hasPendingDatagrams() && !socket.waitForReadyRead(20))
+                continue;
+            while (socket.hasPendingDatagrams()) {
+                QByteArray buffer;
+                buffer.resize(int(socket.pendingDatagramSize()));
+                const qint64 read = socket.readDatagram(buffer.data(), buffer.size());
+                if (read <= 0)
+                    continue;
+                buffer.truncate(int(read));
+                received = buffer;
+            }
+        }
+        return received;
+    };
+
+    const quint32 forwardBefore =
+        soaSerial(server.records(forward, DnsServer::TypeSoa).first().rdata);
+    const quint32 reverseBefore =
+        soaSerial(server.records(reverse, DnsServer::TypeSoa).first().rdata);
+
+    // A PTR written into the reverse zone: the update names the forward zone and
+    // the record lives under the reverse one, which is a zone this server serves.
+    QList<UpdateRecord> ptrUpdate;
+    ptrUpdate.append({QStringLiteral("5.") + reverse, DnsServer::TypePtr, 1, 1200,
+                      nameBytes(QStringLiteral("moved1.moved.example.com."))});
+    Reply ptrReply;
+    QVERIFY(parseReply(exchange(server.serverPort(), updatePacket(0x7600, forward, {}, ptrUpdate)),
+                       &ptrReply));
+    QCOMPARE(ptrReply.rcode, 0);
+
+    // The record moved in the reverse zone, so that is the serial that moves and
+    // the zone the announcement names. Announcing the forward zone instead would
+    // carry a version nobody changed, and a secondary comparing serials would
+    // find nothing to pull while its reverse copy stayed stale.
+    QCOMPARE(soaSerial(server.records(forward, DnsServer::TypeSoa).first().rdata), forwardBefore);
+    const quint32 reverseAfter =
+        soaSerial(server.records(reverse, DnsServer::TypeSoa).first().rdata);
+    QVERIFY2(reverseAfter > reverseBefore, "a reverse-zone write moves the reverse serial");
+
+    const QByteArray announce = awaitDatagram(secondary, 3000);
+    QVERIFY2(!announce.isEmpty(), "a reverse-zone write is announced");
+    Reply notify;
+    QVERIFY(parseReply(announce, &notify));
+    QCOMPARE(notify.answers.size(), 1);
+    QCOMPARE(notify.answers.first().name.toLower(), reverse);
+    QCOMPARE(soaSerial(notify.answers.first().rdata), reverseAfter);
+
+    // A forward change announces the forward zone and nothing else.
+    QList<UpdateRecord> addressUpdate;
+    addressUpdate.append({QStringLiteral("moved2.moved.example.com"), DnsServer::TypeA, 1, 300,
+                          QByteArray::fromHex("0a280064")});
+    Reply addressReply;
+    QVERIFY(parseReply(exchange(server.serverPort(),
+                                updatePacket(0x7601, forward, {}, addressUpdate)),
+                       &addressReply));
+    QCOMPARE(addressReply.rcode, 0);
+
+    const QByteArray forwardAnnounce = awaitDatagram(secondary, 3000);
+    QVERIFY2(!forwardAnnounce.isEmpty(), "a forward-zone write is announced");
+    Reply forwardNotify;
+    QVERIFY(parseReply(forwardAnnounce, &forwardNotify));
+    QCOMPARE(forwardNotify.answers.size(), 1);
+    QCOMPARE(forwardNotify.answers.first().name.toLower(), forward);
+    QVERIFY(soaSerial(forwardNotify.answers.first().rdata) > forwardBefore);
 }
 
 void DnsTest::remembersTheDifferenceAcrossARestart()
