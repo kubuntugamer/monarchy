@@ -482,8 +482,19 @@ QByteArray LdapServer::cldapResponse(const QByteArray &request) const {
     if (!asksAboutDomain) return {};
 
     const int msgId = int(Asn1::toInteger(*idField));
-    if (domainIndex > 0 && domainIndex < assertions.size() &&
-        assertions.at(domainIndex).compare(m_identity.dnsDomain, Qt::CaseInsensitive) != 0) {
+    // A Windows locator ping names the domain as an FQDN with its root dot
+    // (`corp.example.com.`); the SRV record it followed does not. They name the
+    // same domain, and treating the dot as a different name made every Windows
+    // 2000 logon answer noSuchObject, after which the client reports the domain
+    // unavailable without ever opening the Netlogon pipe.
+    const auto canonicalDomain = [](QString name) {
+        while (name.endsWith(QLatin1Char('.'))) name.chop(1);
+        return name;
+    };
+    if (domainIndex > 0 && domainIndex < assertions.size()
+        && canonicalDomain(assertions.at(domainIndex))
+                   .compare(canonicalDomain(m_identity.dnsDomain), Qt::CaseInsensitive)
+               != 0) {
         QByteArray inner;
         writeInt(inner, 0x0a, 32); // noSuchObject
         writeString(inner, 0x04, QString());

@@ -390,6 +390,14 @@ QByteArray Session::sessionSetup(const QByteArray &message)
                                        : QByteArray();
             status = kStatusLogonFailure;
         }
+    } else if (spnegoWrapped && Gss::carriesKerberos(token)) {
+        // SPNEGO lets the acceptor choose any mechanism the initiator listed.
+        // This endpoint authenticates SMB1 with NTLMSSP only; a Windows 2000
+        // member offers Kerberos first and NTLMSSP last, so select NTLMSSP and
+        // let it continue rather than dropping the session with LOGON_FAILURE
+        // and never reaching the Netlogon pipe.
+        replyToken = Gss::spnegoResponse(1, kNtlmMech, QByteArray());
+        status = kStatusMoreProcessingRequired;
     } else {
         status = kStatusLogonFailure;
     }

@@ -142,10 +142,17 @@ recorded, not hidden:
   list inline — count, NULL array and WERROR — because a referent before the
   count reads as 193280 entries and a long frame. Both carry unit tests
   (`monarchy-samr-tests`, `monarchy-netlogon-tests`). The interactive domain
-  logon was not completed: the client obtained a TGT and then a TGS for
-  `host/neuralnode0.cyberdyne.lan`, but refused before opening the Netlogon
-  pipe, so no secure-channel call reached the DC. The join is measured; a 2000
-  workstation's domain logon is still not claimed.
+  logon did not complete, but it got further: with the machine's HOST/ SPNs
+  present the client obtained a TGT and a TGS for
+  `host/neuralnode0.cyberdyne.lan`, then reached the SMB1 session setup for the
+  secure channel. Two defects on that path were found and fixed, with tests. A
+  Windows locator ping names the domain with its root dot (`cyberdyne.lan.`);
+  the CLDAP answer compared it literally and replied `noSuchObject`, which the
+  client reads as the domain being unavailable. And the SMB1 endpoint answered
+  a SPNEGO offer listing Kerberos first and NTLMSSP last with
+  `STATUS_LOGON_FAILURE`; it now selects NTLMSSP from the client's own list and
+  continues. The interactive logon was not driven to completion after those
+  fixes, so a 2000 workstation's domain logon is still not claimed.
 
 - **G11 — share enumeration is absent.** The probe that reaches the server is
   the pipe open: `rpcclient -c netshareenum` fails with

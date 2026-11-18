@@ -118,6 +118,35 @@ QByteArray sambaLocatorPing(int id = 0x0000FB3D)
     return ldapMessage(id, char(0x63), inner);
 }
 
+// The ping a Windows 2000 member sends, captured from a live logon: the domain
+// as an FQDN with its root dot, and the client's own account facts alongside
+// it. The extra clauses are the client's, not the DC's, and must not stop the
+// answer; the dotted domain is the same domain the SRV record named.
+QByteArray windows2000LocatorPing(const QByteArray &domain, int id = 26)
+{
+    QByteArray filter = tlv(char(0xa0),
+                            tlv(char(0xa3), tlv(0x04, "DnsDomain") + tlv(0x04, domain))
+                                + tlv(char(0xa3), tlv(0x04, "Host") + tlv(0x04, "NEURALNODE0"))
+                                + tlv(char(0xa3), tlv(0x04, "User") + tlv(0x04, "NEURALNODE0$"))
+                                + tlv(char(0xa3), tlv(0x04, "AAC")
+                                                      + tlv(0x04, QByteArray("\x80\x00\x00\x00", 4)))
+                                + tlv(char(0xa3), tlv(0x04, "DomainSid")
+                                                      + tlv(0x04, "S-1-5-21-1-2-3"))
+                                + tlv(char(0xa3), tlv(0x04, "DomainGuid")
+                                                      + tlv(0x04, "{00000000-0000-0000-0000-000000000000}"))
+                                + tlv(char(0xa3), tlv(0x04, "NtVer")
+                                                      + tlv(0x04, QByteArray("\x06\x00\x00\x00", 4))));
+    QByteArray inner = tlv(0x04, QByteArray());        // base: the root DSE
+    inner += tlv(char(0x0a), QByteArray(1, char(0)));   // scope: baseObject
+    inner += tlv(char(0x0a), QByteArray(1, char(0)));   // derefAliases: never
+    inner += tlv(char(0x02), QByteArray(1, char(0)));   // sizeLimit
+    inner += tlv(char(0x02), QByteArray(1, char(0)));   // timeLimit
+    inner += tlv(char(0x01), QByteArray(1, char(0)));   // typesOnly: FALSE
+    inner += filter;
+    inner += tlv(char(0x30), tlv(0x04, "Netlogon"));    // one attribute named
+    return ldapMessage(id, char(0x63), inner);
+}
+
 // The GUID a Windows client is told and then matches against the directory, in
 // the byte order a GUID wears on the wire.
 QByteArray wireGuid(const QUuid &guid)
@@ -991,6 +1020,16 @@ void LdapTest::answersTheDcLocatorPingOverUdp()
     QCOMPARE(operationTag(messages.at(1)), 0x65);
     QCOMPARE(messageId(messages.at(1)), 7);
     QCOMPARE(messages.at(0) + messages.at(1), reply);
+
+    // The ping a Windows 2000 member sends. Its domain carries the root dot and
+    // its filter also names its own Host, User, AAC, DomainSid and DomainGuid;
+    // the answer has to be the entry, not noSuchObject, or the logon stops with
+    // "the domain is not available" before any Netlogon call.
+    const QByteArray win2000 =
+        udpQuery(server.cldapPort(), windows2000LocatorPing("corp.example.com."));
+    QVERIFY2(!win2000.isEmpty(), "a Windows 2000 locator ping went unanswered");
+    QCOMPARE(operationTag(win2000), 0x64); // searchResEntry
+    QVERIFY(win2000.contains("Netlogon"));
 
     // What the client reads to decide this DC hosts the domain.
     QVERIFY(reply.contains("DnsDomain"));

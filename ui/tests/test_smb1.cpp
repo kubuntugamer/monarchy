@@ -145,6 +145,31 @@ QByteArray sessionSetupMessage(const QByteArray &token)
     return smb(Smb1::CmdSessionSetupAndX, 0, 0, words, token);
 }
 
+// A GSS-SPNEGO NegTokenInit the way a Windows 2000 member sends it when it
+// holds a TGT: mechTypes lists Kerberos first and NTLMSSP last, and the
+// mechToken is a Kerberos AP-REQ. This SMB1 endpoint speaks NTLMSSP only, so it
+// has to select NTLMSSP from that list rather than end the session.
+QByteArray spnegoKerberosToken()
+{
+    const QByteArray krb5Oid = QByteArray::fromHex("06092a864886f712010202");
+    const QByteArray ntlmOid = QByteArray::fromHex("060a2b06010401823702020a");
+    QByteArray mechList(1, char(0x30));
+    mechList.append(char(krb5Oid.size() + ntlmOid.size()));
+    mechList.append(krb5Oid);
+    mechList.append(ntlmOid);
+    QByteArray init(1, char(0x30));
+    init.append(char(mechList.size() + 7));
+    init.append(mechList);
+    init.append(QByteArray::fromHex("a2050403aabbcc")); // dummy mechToken
+    QByteArray token(1, char(0x60));
+    token.append(char(init.size() + 8));
+    token.append(QByteArray::fromHex("06062b0601050502")); // SPNEGO OID
+    token.append(QByteArray(1, char(0xa0)));
+    token.append(char(init.size()));
+    token.append(init);
+    return token;
+}
+
 QByteArray treeConnectMessage(const QString &path)
 {
     QByteArray words;
@@ -584,6 +609,21 @@ void Smb1Test::answersARawNtlmTokenWithoutSpnego()
     const QByteArray wrappedBlob = payloadOf(wrappedReply);
     QVERIFY(readLe16(wrappedBlob, 33 + 6) > 32);
     QCOMPARE(wrappedBlob.at(43), char(0xa1)); // NegTokenResp
+
+    // A Windows 2000 member offers Kerberos first and NTLMSSP last. The SMB1
+    // endpoint cannot accept the Kerberos AP-REQ, so it must select NTLMSSP
+    // from the offered list and continue; answering LOGON_FAILURE dropped the
+    // session before the client ever opened the Netlogon pipe.
+    QScopedPointer<Smb1::Session> kerberos(plainSession());
+    QVERIFY(kerberos);
+    kerberos->feed(negotiateMessage());
+    const QByteArray kerberosReply =
+        kerberos->feed(sessionSetupMessage(spnegoKerberosToken()));
+    QCOMPARE(statusOf(kerberosReply), Smb1::kStatusMoreProcessingRequired);
+    const QByteArray kerberosBlob = payloadOf(kerberosReply);
+    QVERIFY(readLe16(kerberosBlob, 33 + 6) > 0);
+    QCOMPARE(kerberosBlob.at(43), char(0xa1)); // NegTokenResp
+    QVERIFY(kerberosBlob.contains(QByteArray::fromHex("2b06010401823702020a")));
 }
 
 // Windows 2000 sets a named pipe's handle state on the handle it has already
