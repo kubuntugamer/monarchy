@@ -554,6 +554,7 @@ private slots:
     void splitsALargeZoneAcrossMessages();
     void answersAnIncrementalRequestWithTheDelta();
     void notifiesTheSecondariesWhenTheZoneMoves();
+    void retriesAnAnnouncementUntilTheSecondaryAnswers();
     void remembersTheDifferenceAcrossARestart();
     void gatesATransferOnTheZonesTheKeyMayRead();
     void answersAnEdnsQuery();
@@ -2501,6 +2502,87 @@ void DnsTest::notifiesTheSecondariesWhenTheZoneMoves()
     QCOMPARE(plainNotify.answers.first().type, DnsServer::TypeSoa);
     QVERIFY2(replyTsig(plainNotify) == nullptr,
              "no key means no signature, not a signature over nothing");
+}
+
+void DnsTest::retriesAnAnnouncementUntilTheSecondaryAnswers()
+{
+    DnsServer server;
+    QVERIFY(server.listen(0));
+    server.loadAdZone(QStringLiteral("retry.example.com"),
+                      QStringLiteral("dc1.retry.example.com"), QStringLiteral("10.41.0.10"),
+                      389, 3268, QStringLiteral("Default-First-Site-Name"));
+
+    QUdpSocket secondary;
+    QVERIFY(secondary.bind(QHostAddress::LocalHost, 0));
+    server.setNotifyTargets({QStringLiteral("127.0.0.1:%1").arg(secondary.localPort())});
+    // The schedule is an argument so this test can watch repeats without waiting
+    // out the two-second default: the first repeat after 100 ms, doubling, at
+    // most six datagrams.
+    server.setNotifyRetry(100, 6);
+
+    QList<UpdateRecord> updates;
+    updates.append({QStringLiteral("added.retry.example.com"), DnsServer::TypeA, 1, 300,
+                    QByteArray::fromHex("0a290001")});
+    Reply updateReply;
+    QVERIFY(parseReply(exchange(server.serverPort(),
+                                updatePacket(0x7500, QStringLiteral("retry.example.com"), {},
+                                             updates)),
+                       &updateReply));
+    QCOMPARE(updateReply.rcode, 0);
+
+    auto collect = [](QUdpSocket &socket, int timeoutMs) {
+        QList<QByteArray> received;
+        QElapsedTimer timer;
+        timer.start();
+        while (timer.elapsed() < timeoutMs) {
+            QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+            if (!socket.hasPendingDatagrams() && !socket.waitForReadyRead(20))
+                continue;
+            while (socket.hasPendingDatagrams()) {
+                QByteArray buffer;
+                buffer.resize(int(socket.pendingDatagramSize()));
+                const qint64 read = socket.readDatagram(buffer.data(), buffer.size());
+                if (read > 0) {
+                    buffer.truncate(int(read));
+                    received.append(buffer);
+                }
+            }
+        }
+        return received;
+    };
+
+    // A datagram lost in the network is not the end of the announcement: the same
+    // message is sent again, with the same id so an answer can be tied to it.
+    const QList<QByteArray> repeats = collect(secondary, 1000);
+    QVERIFY2(repeats.size() >= 3,
+             qPrintable(QStringLiteral("an unanswered announcement is repeated (%1 datagrams)")
+                            .arg(repeats.size())));
+    Reply first;
+    QVERIFY(parseReply(repeats.first(), &first));
+    for (const QByteArray &datagram : repeats) {
+        Reply repeat;
+        QVERIFY(parseReply(datagram, &repeat));
+        QCOMPARE(repeat.id, first.id);
+        const quint16 flags = quint16((quint8(datagram[2]) << 8) | quint8(datagram[3]));
+        QCOMPARE((flags >> 11) & 0x0f, 4); // still a NOTIFY
+        QCOMPARE(flags & 0x8000, 0);       // still a request
+        QCOMPARE(repeat.answers.size(), 1);
+        QCOMPARE(soaSerial(repeat.answers.first().rdata), soaSerial(first.answers.first().rdata));
+    }
+
+    // The secondary's answer stops them. On this schedule another datagram would
+    // land well inside the window below if the answer were ignored.
+    QByteArray ack;
+    put16(ack, first.id);
+    put16(ack, quint16((4 << 11) | 0x8000 | 0x0400));
+    put16(ack, 0);
+    put16(ack, 0);
+    put16(ack, 0);
+    put16(ack, 0);
+    secondary.writeDatagram(ack, QHostAddress::LocalHost, server.serverPort());
+
+    QVERIFY2(collect(secondary, 1200).isEmpty(),
+             "the secondary's answer ends the announcement");
 }
 
 void DnsTest::remembersTheDifferenceAcrossARestart()

@@ -430,6 +430,13 @@ DnsServer::DnsServer(QObject *parent) : QObject(parent) {
 
     m_tcpServer = new QTcpServer(this);
     connect(m_tcpServer, &QTcpServer::newConnection, this, &DnsServer::onNewTcpConnection);
+
+    // Repeats announcements that have not been answered. The tick is fixed and
+    // each entry keeps its own due time, so the doubling schedule reads off the
+    // same clock instead of one timer per peer.
+    m_notifyTimer = new QTimer(this);
+    m_notifyTimer->setInterval(100);
+    connect(m_notifyTimer, &QTimer::timeout, this, &DnsServer::pumpNotifies);
 }
 
 DnsServer::~DnsServer() {
@@ -463,6 +470,9 @@ void DnsServer::close() {
         client->abort();
     m_tcpServer->close();
     m_socket->close();
+    m_pendingNotifies.clear();
+    if (m_notifyTimer)
+        m_notifyTimer->stop();
 }
 
 bool DnsServer::isListening() const {
@@ -1068,16 +1078,75 @@ void DnsServer::notifySecondaries()
 {
     if (m_notifyTargets.isEmpty() || !isListening())
         return;
+    if (m_zone.isEmpty() || records(m_zone, TypeSoa).isEmpty())
+        return;
     for (const QString &spec : m_notifyTargets) {
         QHostAddress address;
         quint16 port = 53;
         if (!parseForwarder(spec, &address, &port))
             continue;
-        const QByteArray notify = buildNotify(m_nextNotifyId++);
-        if (notify.isEmpty())
-            return;
-        m_socket->writeDatagram(notify, address, port);
+
+        // A newer change replaces whatever was still being announced to that
+        // peer: the newer message already names the version it should pull, so
+        // repeating the older one would walk it backwards.
+        for (int i = m_pendingNotifies.size() - 1; i >= 0; --i) {
+            if (m_pendingNotifies.at(i).address == address
+                && m_pendingNotifies.at(i).port == port)
+                m_pendingNotifies.removeAt(i);
+        }
+
+        PendingNotify entry;
+        entry.address = address;
+        entry.port = port;
+        entry.id = m_nextNotifyId++;
+        entry.waitMs = m_notifyInitialIntervalMs;
+        m_pendingNotifies.append(entry);
+        sendNotify(m_pendingNotifies.last());
     }
+    if (!m_pendingNotifies.isEmpty() && m_notifyTimer && !m_notifyTimer->isActive())
+        m_notifyTimer->start();
+}
+
+void DnsServer::sendNotify(PendingNotify &entry)
+{
+    const QByteArray notify = buildNotify(entry.id);
+    if (notify.isEmpty())
+        return;
+    m_socket->writeDatagram(notify, entry.address, entry.port);
+    ++entry.attempts;
+    entry.sinceSend.start();
+}
+
+void DnsServer::pumpNotifies()
+{
+    for (int i = m_pendingNotifies.size() - 1; i >= 0; --i) {
+        PendingNotify &entry = m_pendingNotifies[i];
+        if (entry.attempts >= m_notifyMaxAttempts) {
+            // Given up. The secondary still refreshes on its own timer, so an
+            // announcement that never got through costs a bounded number of
+            // datagrams rather than a retry that never ends.
+            m_pendingNotifies.removeAt(i);
+            continue;
+        }
+        const bool due = !entry.sinceSend.isValid()
+                         || entry.sinceSend.elapsed() >= qint64(entry.waitMs);
+        if (!due)
+            continue;
+        sendNotify(entry);
+        // Doubling rather than a fixed gap: a secondary that is down is not
+        // worth a datagram every two seconds, and one that is merely slow is
+        // still reached. The gap is applied after the send it follows, so the
+        // first repeat lands at `initialIntervalMs` and not twice that.
+        entry.waitMs = qMin(entry.waitMs * 2, 16000);
+    }
+    if (m_pendingNotifies.isEmpty() && m_notifyTimer)
+        m_notifyTimer->stop();
+}
+
+void DnsServer::setNotifyRetry(int initialIntervalMs, int maxAttempts)
+{
+    m_notifyInitialIntervalMs = qMax(10, initialIntervalMs);
+    m_notifyMaxAttempts = qMax(1, maxAttempts);
 }
 
 int DnsServer::verifyTsig(const QByteArray &packet, QByteArray *requestMac,
@@ -1403,8 +1472,19 @@ QByteArray DnsServer::handlePacket(const QByteArray &packet, const QHostAddress 
         // a second exchange. One with QR clear is a peer asking this server to
         // pull a zone, which it does not do: REFUSED says so, rather than NOTIMP
         // pretending the opcode is unknown now that this server speaks it.
-        if ((message.flags & 0x8000) != 0)
+        if ((message.flags & 0x8000) != 0) {
+            // The answer to an announcement still in flight. It echoes the id,
+            // which is what says which announcement is settled; any answer ends
+            // the repeats, a refusal included, because the peer has spoken and
+            // another datagram would not change its mind.
+            for (int i = 0; i < m_pendingNotifies.size(); ++i) {
+                if (m_pendingNotifies.at(i).id == message.id) {
+                    m_pendingNotifies.removeAt(i);
+                    break;
+                }
+            }
             return {};
+        }
         return buildResponse(packet, {}, Refused, {}, udp);
     }
     if (opcode != 0)

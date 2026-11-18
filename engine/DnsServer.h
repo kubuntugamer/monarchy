@@ -12,6 +12,7 @@
 #include <QHostAddress>
 #include <QMap>
 #include <QPointer>
+#include <QElapsedTimer>
 #include <QSet>
 #include <QString>
 #include <QStringList>
@@ -19,6 +20,7 @@
 #include <QByteArray>
 
 class QTcpSocket;
+class QTimer;
 
 // AD-integrated DNS server (UDP, RFC 1035 + RFC 2136). It serves one
 // authoritative forward zone that belongs to the domain, publishes the
@@ -151,6 +153,15 @@ public:
     // secondary does not invent one from the zone's NS records.
     void setNotifyTargets(const QStringList &targets);
     QStringList notifyTargets() const;
+
+    // How hard an announcement is tried before it is dropped: `initialIntervalMs`
+    // until the first repeat, doubling after every send, and at most
+    // `maxAttempts` datagrams in all. RFC 1996 §3.5 asks a primary to repeat
+    // until the secondary answers and then to give up rather than retry forever;
+    // the defaults (two seconds, five attempts) are the schedule an operator gets
+    // without asking, and the setter exists so a test can watch several repeats
+    // without waiting them out.
+    void setNotifyRetry(int initialIntervalMs, int maxAttempts);
 
     // Caching forwarder. `forwarders` entries are "address" or
     // "address:port" (port 53 by default); an empty list reads the host's
@@ -345,6 +356,19 @@ private:
     // answer — signed as a request when a key is configured.
     QByteArray buildNotify(quint16 id) const;
     void notifySecondaries();
+    // One announcement in flight. The id is kept across repeats, because the
+    // secondary's answer echoes it and that is what says which announcement is
+    // settled. `waitMs` is the gap before the next repeat and doubles per send.
+    struct PendingNotify {
+        QHostAddress address;
+        quint16 port = 53;
+        quint16 id = 0;
+        int attempts = 0;
+        int waitMs = 0;
+        QElapsedTimer sinceSend;
+    };
+    void sendNotify(PendingNotify &entry);
+    void pumpNotifies();
 
     void bumpSerial();
     void bumpReverseSerial();
@@ -370,6 +394,10 @@ private:
     QList<ZoneDelta> m_journal;
     QStringList m_notifyTargets;
     quint16 m_nextNotifyId = 1;
+    QList<PendingNotify> m_pendingNotifies;
+    QTimer *m_notifyTimer = nullptr;
+    int m_notifyInitialIntervalMs = 2000;
+    int m_notifyMaxAttempts = 5;
     QHash<quint16, PendingQuery> m_pending;
     QHash<QString, CacheEntry> m_cache;
     QStringList m_forwarders;
