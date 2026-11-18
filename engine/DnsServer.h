@@ -134,6 +134,22 @@ public:
     void setUpdateTsig(const QString &name, const QString &algorithm, const QByteArray &base64Secret);
     QString updateTsigName() const;
 
+    // The secondary side (RFC 1996 §3.8, RFC 5936). `master` is "address" or
+    // "address:port"; `zones` are the zones this server copies from it. With a
+    // master set, an announcement from that address for one of those zones is
+    // answered and the zone is pulled over TCP, verified against the configured
+    // key and served from the copy — including while the master is unreachable,
+    // which is the reason a secondary exists. A pull needs the key: an
+    // unauthenticated copy is one anybody could have written.
+    void setMaster(const QString &master, const QStringList &zones);
+    QString master() const;
+    QStringList masterZones() const;
+    // Pulls every configured zone now. A no-op without both a master and zones,
+    // and without the key a pull would be worth trusting.
+    void refreshSecondaryZones();
+    // The serial of the copy served for `zone`, or 0 when there is no copy.
+    quint32 secondarySerial(const QString &zone) const;
+
     // The zones the configured key may transfer, lower case and without a
     // trailing dot. Empty — the default — keeps the older posture, where the one
     // key may read every zone this server holds; a list narrows it to those
@@ -266,6 +282,11 @@ signals:
     // SERVFAIL either way; this is what makes a DC that has become its host's
     // only resolver say so instead of looking like a resolver that refuses.
     void forwardingUnavailable(const QString &detail);
+    // A verified copy replaced what this server was serving for `zone`.
+    void secondaryZoneUpdated(const QString &zone, quint32 serial);
+    // A pull did not complete, so the previous copy — if any — is still what is
+    // served. `detail` says what went wrong rather than that something did.
+    void secondaryZoneFailed(const QString &zone, const QString &detail);
 
 private slots:
     void onReadyRead();
@@ -374,6 +395,37 @@ private:
     void sendNotify(PendingNotify &entry);
     void pumpNotifies();
 
+    // One AXFR in flight (RFC 5936). `chain` is the previous message's MAC,
+    // which is what the next message's MAC covers; `soaCount` counts the
+    // opening and closing SOA, because the closing one is what says the stream
+    // is complete rather than cut off at a message boundary.
+    struct SecondaryPull {
+        QString zone;
+        QPointer<QTcpSocket> socket;
+        QByteArray buffer;
+        QByteArray requestMac;
+        QByteArray chain;
+        QList<Record> collected;
+        int soaCount = 0;
+        quint32 serial = 0;
+        QPointer<QTimer> deadline;
+    };
+    QByteArray buildTransferQuery(const QString &zone, quint16 id) const;
+    // Appends a TSIG over `packet` as a request: the MAC covers the message and
+    // the variables block, and `macOut` is what the response's MAC will cover.
+    QByteArray signTsigRequest(const QByteArray &packet, QByteArray *macOut) const;
+    // 0 when the response's MAC verifies, with the message minus its TSIG RR in
+    // `payload` and the MAC it carried in `macOut`. `first` selects the request
+    // variables block for the opening message and this message's timers for
+    // every later one (RFC 8945 §5.3.1).
+    bool verifySecondaryMessage(const QByteArray &packet, const QByteArray &requestMac,
+                                const QByteArray &priorMac, bool first, QByteArray *macOut,
+                                QByteArray *payload) const;
+    void startSecondaryPull(const QString &zone);
+    void onSecondaryReadyRead();
+    void finishSecondaryPull(bool ok, const QString &detail);
+    const QList<Record> *secondaryRecords(const QString &name) const;
+
     void bumpSerial();
     void bumpReverseSerial();
     // The zone a name belongs to: the reverse zone when this DC is authoritative
@@ -397,6 +449,12 @@ private:
     QByteArray m_tsigSecret;
     QList<ZoneDelta> m_journal;
     QStringList m_notifyTargets;
+    QString m_master;                        // configured master, if any
+    QStringList m_masterZones;               // zones copied from it
+    QHash<QString, QList<Record>> m_secondary; // owner -> served copy records
+    SecondaryPull *m_pull = nullptr;
+    QStringList m_pullQueue;
+    quint16 m_nextPullId = 0x2a00;
     quint16 m_nextNotifyId = 1;
     QList<PendingNotify> m_pendingNotifies;
     QTimer *m_notifyTimer = nullptr;

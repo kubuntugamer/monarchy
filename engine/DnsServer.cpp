@@ -245,6 +245,19 @@ bool parseForwarder(const QString &spec, QHostAddress *address, quint16 *port)
     return true;
 }
 
+// Whether two addresses name the same host. An IPv4 peer seen on a dual-stack
+// socket arrives as an IPv4-mapped IPv6 address (::ffff:127.0.0.1), and
+// comparing that against a configured IPv4 master as text is false: the
+// secondary then refuses the announcement of the master it was told to follow.
+bool sameHostAddress(const QHostAddress &left, const QHostAddress &right)
+{
+    if (left == right)
+        return true;
+    const quint32 leftV4 = left.toIPv4Address();
+    const quint32 rightV4 = right.toIPv4Address();
+    return leftV4 != 0 && leftV4 == rightV4;
+}
+
 QString cacheKeyFor(const QString &name, quint16 type, quint16 qclass)
 {
     return name.toLower() + QLatin1Char('|') + QString::number(type) + QLatin1Char('|')
@@ -574,12 +587,21 @@ void DnsServer::removeRecord(const QString &name, quint16 type) {
 
 QList<DnsServer::Record> DnsServer::records(const QString &name, quint16 type) const {
     QList<Record> result;
-    auto it = m_records.find(name.toLower());
-    if (it == m_records.end())
-        return result;
-    for (const Record &record : it.value()) {
-        if (type == 0 || type == TypeAny || record.type == type)
-            result.append(record);
+    auto collect = [&result, type](const QList<Record> &list) {
+        for (const Record &record : list) {
+            if (type == 0 || type == TypeAny || record.type == type)
+                result.append(record);
+        }
+    };
+    const auto it = m_records.constFind(name.toLower());
+    if (it != m_records.constEnd())
+        collect(it.value());
+    // A zone this server copies is served from the copy: while the master is
+    // unreachable the secondary is the only thing answering, which is what it
+    // is for. Records of this DC's own zones come first and shadow a copy.
+    if (result.isEmpty()) {
+        if (const QList<Record> *copy = secondaryRecords(name))
+            collect(*copy);
     }
     return result;
 }
@@ -1353,14 +1375,21 @@ void DnsServer::loadDefaultZone(const QString &zone) {
 }
 
 QString DnsServer::zoneFor(const QString &name) const {
-    if (m_zone.isEmpty())
-        return {};
     const QString lower = name.toLower();
-    if (!m_reverseZone.isEmpty()
-        && (lower == m_reverseZone || lower.endsWith(QLatin1Char('.') + m_reverseZone)))
-        return m_reverseZone;
-    if (lower == m_zone || lower.endsWith(QLatin1Char('.') + m_zone))
-        return m_zone;
+    if (!m_zone.isEmpty()) {
+        if (!m_reverseZone.isEmpty()
+            && (lower == m_reverseZone || lower.endsWith(QLatin1Char('.') + m_reverseZone)))
+            return m_reverseZone;
+        if (lower == m_zone || lower.endsWith(QLatin1Char('.') + m_zone))
+            return m_zone;
+    }
+    // A zone served from a copy is a zone this server answers for, so a name in
+    // it is in-zone: the authority section of a negative answer and the AA bit
+    // both hang off that.
+    for (const QString &copied : m_masterZones) {
+        if (lower == copied || lower.endsWith(QLatin1Char('.') + copied))
+            return copied;
+    }
     return {};
 }
 
@@ -1413,6 +1442,343 @@ void DnsServer::bumpReverseSerial() {
         soa[pos + 3] = char(next & 0xff);
         return;
     }
+}
+
+namespace {
+
+// The serial a SOA rdata carries: two names, then the 32-bit serial.
+quint32 serialFromSoaRdata(const QByteArray &rdata)
+{
+    int pos = 0;
+    if (!skipName(rdata, pos) || !skipName(rdata, pos) || pos + 4 > rdata.size())
+        return 0;
+    return (quint32(quint8(rdata[pos])) << 24) | (quint32(quint8(rdata[pos + 1])) << 16)
+           | (quint32(quint8(rdata[pos + 2])) << 8) | quint32(quint8(rdata[pos + 3]));
+}
+
+} // namespace
+
+void DnsServer::setMaster(const QString &master, const QStringList &zones)
+{
+    m_master = master.trimmed();
+    QStringList normalized;
+    for (const QString &zone : zones) {
+        QString name = zone.trimmed().toLower();
+        while (name.endsWith(QLatin1Char('.')))
+            name.chop(1);
+        if (!name.isEmpty() && !normalized.contains(name))
+            normalized.append(name);
+    }
+    m_masterZones = normalized;
+}
+
+QString DnsServer::master() const
+{
+    return m_master;
+}
+
+QStringList DnsServer::masterZones() const
+{
+    return m_masterZones;
+}
+
+void DnsServer::refreshSecondaryZones()
+{
+    if (m_master.isEmpty() || m_masterZones.isEmpty())
+        return;
+    for (const QString &zone : m_masterZones)
+        startSecondaryPull(zone);
+}
+
+quint32 DnsServer::secondarySerial(const QString &zone) const
+{
+    const QList<Record> soa = records(zone, TypeSoa);
+    if (soa.isEmpty())
+        return 0;
+    return serialFromSoaRdata(soa.first().rdata);
+}
+
+const QList<DnsServer::Record> *DnsServer::secondaryRecords(const QString &name) const
+{
+    const auto it = m_secondary.constFind(name.toLower());
+    if (it == m_secondary.constEnd() || it->isEmpty())
+        return nullptr;
+    return &it.value();
+}
+
+QByteArray DnsServer::buildTransferQuery(const QString &zone, quint16 id) const
+{
+    QByteArray packet;
+    wr16(packet, id);
+    // A standard query, RD clear: a transfer is asked of the zone's own master,
+    // and a recursive lookup of a zone name would be answered from its cache.
+    wr16(packet, 0x0000);
+    wr16(packet, 1);
+    wr16(packet, 0);
+    wr16(packet, 0);
+    wr16(packet, 0);
+    packet += encodeName(zone);
+    wr16(packet, TypeAxfr);
+    wr16(packet, ClassIn);
+    return packet;
+}
+
+QByteArray DnsServer::signTsigRequest(const QByteArray &packet, QByteArray *macOut) const
+{
+    if (macOut)
+        macOut->clear();
+    if (m_tsigName.isEmpty() || packet.size() < 12)
+        return packet;
+
+    const quint64 now = quint64(QDateTime::currentSecsSinceEpoch());
+    const quint16 fudge = 300;
+    const quint16 id = quint16((quint8(packet[0]) << 8) | quint8(packet[1]));
+    const QByteArray mac =
+        hmacSha256(m_tsigSecret,
+                   packet + tsigVariables(m_tsigName, m_tsigAlgorithm, now, fudge, 0, {}));
+
+    QByteArray signedPacket = packet;
+    const quint16 arcount =
+        quint16((quint8(signedPacket[10]) << 8) | quint8(signedPacket[11]));
+    const quint16 next = quint16(arcount + 1);
+    signedPacket[10] = char((next >> 8) & 0xff);
+    signedPacket[11] = char(next & 0xff);
+
+    QByteArray rdata;
+    rdata += encodeName(m_tsigAlgorithm);
+    for (int shift = 40; shift >= 0; shift -= 8)
+        rdata.append(char((now >> shift) & 0xff));
+    wr16(rdata, fudge);
+    wr16(rdata, quint16(mac.size()));
+    rdata += mac;
+    wr16(rdata, id);
+    wr16(rdata, 0);
+    wr16(rdata, 0);
+    signedPacket += encodeName(m_tsigName);
+    wr16(signedPacket, TypeTsig);
+    wr16(signedPacket, 255);
+    wr32(signedPacket, 0);
+    wr16(signedPacket, quint16(rdata.size()));
+    signedPacket += rdata;
+    if (macOut)
+        *macOut = mac;
+    return signedPacket;
+}
+
+bool DnsServer::verifySecondaryMessage(const QByteArray &packet, const QByteArray &requestMac,
+                                       const QByteArray &priorMac, bool first,
+                                       QByteArray *macOut, QByteArray *payload) const
+{
+    if (macOut)
+        macOut->clear();
+    if (payload)
+        payload->clear();
+    if (m_tsigName.isEmpty() || packet.size() < 12)
+        return false;
+    TsigParts tsig;
+    if (!findTsig(packet, &tsig) || tsig.offset < 12)
+        return false;
+
+    QByteArray unsignedMessage = packet.left(tsig.offset);
+    const quint16 arcount =
+        quint16((quint8(unsignedMessage[10]) << 8) | quint8(unsignedMessage[11]));
+    unsignedMessage[10] = char((quint16(arcount - 1) >> 8) & 0xff);
+    unsignedMessage[11] = char((quint16(arcount - 1)) & 0xff);
+
+    const QByteArray &covered = first ? requestMac : priorMac;
+    QByteArray prefix;
+    wr16(prefix, quint16(covered.size()));
+    prefix += covered;
+    QByteArray digest = prefix + unsignedMessage;
+    if (first) {
+        digest += tsigVariables(tsig.name, tsig.algorithm, tsig.timeSigned, tsig.fudge,
+                                tsig.error, tsig.other);
+    } else {
+        for (int shift = 40; shift >= 0; shift -= 8)
+            digest.append(char((tsig.timeSigned >> shift) & 0xff));
+        wr16(digest, tsig.fudge);
+    }
+    if (hmacSha256(m_tsigSecret, digest) != tsig.mac)
+        return false;
+    if (macOut)
+        *macOut = tsig.mac;
+    if (payload)
+        *payload = unsignedMessage;
+    return true;
+}
+
+void DnsServer::startSecondaryPull(const QString &zone)
+{
+    if (m_master.isEmpty() || !m_masterZones.contains(zone))
+        return;
+    if (m_pull) {
+        if (m_pull->zone != zone && !m_pullQueue.contains(zone))
+            m_pullQueue.append(zone);
+        return;
+    }
+
+    QHostAddress address;
+    quint16 port = 53;
+    if (!parseForwarder(m_master, &address, &port)) {
+        emit secondaryZoneFailed(zone, tr("%1 is not an address to pull from").arg(m_master));
+        return;
+    }
+    if (m_tsigName.isEmpty()) {
+        emit secondaryZoneFailed(
+            zone, tr("no TSIG key is configured, so a copy of %1 could not be trusted").arg(zone));
+        return;
+    }
+
+    auto *pull = new SecondaryPull;
+    pull->zone = zone;
+    auto *socket = new QTcpSocket(this);
+    pull->socket = socket;
+    auto *deadline = new QTimer(this);
+    deadline->setSingleShot(true);
+    pull->deadline = deadline;
+    m_pull = pull;
+
+    connect(deadline, &QTimer::timeout, this, [this]() {
+        finishSecondaryPull(false, tr("the master did not finish the transfer in time"));
+    });
+    connect(socket, &QTcpSocket::connected, this, [this]() {
+        if (!m_pull || !m_pull->socket)
+            return;
+        const QByteArray query = buildTransferQuery(m_pull->zone, m_nextPullId++);
+        const QByteArray signedQuery = signTsigRequest(query, &m_pull->requestMac);
+        QByteArray framed;
+        framed.append(char((signedQuery.size() >> 8) & 0xff));
+        framed.append(char(signedQuery.size() & 0xff));
+        framed.append(signedQuery);
+        m_pull->socket->write(framed);
+    });
+    connect(socket, &QTcpSocket::readyRead, this, &DnsServer::onSecondaryReadyRead);
+    connect(socket, &QTcpSocket::disconnected, this, [this]() {
+        if (m_pull)
+            finishSecondaryPull(
+                false, tr("the master closed the connection before the transfer ended"));
+    });
+    connect(socket, &QTcpSocket::errorOccurred, this, [this](QAbstractSocket::SocketError) {
+        if (m_pull && m_pull->socket)
+            finishSecondaryPull(false, m_pull->socket->errorString());
+    });
+    deadline->start(15000);
+    socket->connectToHost(address, port);
+}
+
+void DnsServer::onSecondaryReadyRead()
+{
+    auto *socket = qobject_cast<QTcpSocket *>(sender());
+    if (!socket || !m_pull || m_pull->socket != socket) {
+        if (socket)
+            socket->readAll();
+        return;
+    }
+
+    // Kept as a member rather than a local: finishSecondaryPull() deletes the
+    // pull, so every use below has to happen before that call returns.
+    SecondaryPull *pull = m_pull;
+    pull->buffer += socket->readAll();
+    while (pull->buffer.size() >= 2) {
+        const int length = (int(quint8(pull->buffer[0])) << 8) | int(quint8(pull->buffer[1]));
+        if (length == 0) {
+            pull->buffer.remove(0, 2);
+            continue;
+        }
+        if (pull->buffer.size() < 2 + length)
+            return;
+        const QByteArray message = pull->buffer.mid(2, length);
+        pull->buffer.remove(0, 2 + length);
+
+        const bool first = pull->chain.isEmpty();
+        QByteArray mac;
+        QByteArray payload;
+        if (!verifySecondaryMessage(message, pull->requestMac, pull->chain, first, &mac, &payload)) {
+            finishSecondaryPull(
+                false, tr("a message of the transfer did not verify against the configured key"));
+            return;
+        }
+        Message parsed;
+        if (!parseMessage(payload, &parsed) || (parsed.flags & 0x8000) == 0) {
+            finishSecondaryPull(false, tr("the master sent a message that is not an answer"));
+            return;
+        }
+        const int rcode = parsed.flags & 0x000f;
+        if (rcode != 0) {
+            finishSecondaryPull(
+                false, tr("the master refused the transfer with rcode %1").arg(rcode));
+            return;
+        }
+        pull->chain = mac;
+
+        // The answer section of a transfer message lands in `prerequisites`:
+        // parseMessage() collects the answer section there, which is where
+        // UPDATE and NOTIFY keep theirs too.
+        for (const Record &record : parsed.prerequisites) {
+            const QString owner = record.name.toLower();
+            if (owner != pull->zone && !owner.endsWith(QLatin1Char('.') + pull->zone)) {
+                finishSecondaryPull(
+                    false, tr("the master sent %1, which is outside %2").arg(owner, pull->zone));
+                return;
+            }
+            if (record.type == TypeSoa) {
+                if (pull->soaCount == 0)
+                    pull->serial = serialFromSoaRdata(record.rdata);
+                ++pull->soaCount;
+                if (pull->soaCount == 2) {
+                    // The closing SOA: the stream is complete and the copy
+                    // replaces whatever was served before.
+                    finishSecondaryPull(true, {});
+                    return;
+                }
+            }
+            pull->collected.append(record);
+        }
+    }
+}
+
+void DnsServer::finishSecondaryPull(bool ok, const QString &detail)
+{
+    SecondaryPull *pull = m_pull;
+    if (!pull)
+        return;
+    m_pull = nullptr;
+    if (pull->socket) {
+        pull->socket->close();
+        pull->socket->deleteLater();
+    }
+    if (pull->deadline) {
+        pull->deadline->stop();
+        pull->deadline->deleteLater();
+    }
+
+    if (ok) {
+        // A transfer replaces the zone rather than merging into it: a record the
+        // master dropped has to disappear here too, or this server keeps serving
+        // something the zone no longer contains.
+        for (auto it = m_secondary.begin(); it != m_secondary.end();) {
+            const QString owner = it.key();
+            if (owner == pull->zone || owner.endsWith(QLatin1Char('.') + pull->zone))
+                it = m_secondary.erase(it);
+            else
+                ++it;
+        }
+        for (const Record &record : pull->collected)
+            m_secondary[record.name.toLower()].append(record);
+        emit secondaryZoneUpdated(pull->zone, pull->serial);
+    } else {
+        // The previous copy is deliberately left in place: a master that is down
+        // is exactly when the copy is the only thing answering.
+        emit secondaryZoneFailed(pull->zone, detail);
+    }
+
+    const QString zone = pull->zone;
+    delete pull;
+    if (!m_pullQueue.isEmpty()) {
+        const QString next = m_pullQueue.takeFirst();
+        QTimer::singleShot(0, this, [this, next]() { startSecondaryPull(next); });
+    }
+    Q_UNUSED(zone)
 }
 
 void DnsServer::onReadyRead() {
@@ -1486,6 +1852,42 @@ QByteArray DnsServer::handlePacket(const QByteArray &packet, const QHostAddress 
                 }
             }
             return {};
+        }
+        // A NOTIFY this server is a secondary for: the zone is one it copies and
+        // the datagram comes from the master it copies from. It is answered and
+        // the pull is queued, so the answer goes out before the transfer starts
+        // rather than the master waiting on this server's TCP client.
+        if (message.questions.size() == 1) {
+            QString zone = message.questions.first().name.toLower();
+            while (zone.endsWith(QLatin1Char('.')))
+                zone.chop(1);
+            QHostAddress masterAddress;
+            quint16 masterPort = 53;
+            if (!m_master.isEmpty() && parseForwarder(m_master, &masterAddress, &masterPort)
+                && sameHostAddress(masterAddress, from) && m_masterZones.contains(zone)) {
+                // A master that signs its announcements is held to it: an
+                // unsigned one from the right address would let anyone who can
+                // forge a source address make this server pull.
+                if (!m_tsigName.isEmpty()) {
+                    QByteArray requestMac;
+                    quint16 tsigError = 0;
+                    QByteArray other;
+                    bool signRefusal = false;
+                    const int verdict =
+                        verifyTsig(packet, &requestMac, &tsigError, &other, &signRefusal);
+                    if (verdict != 0) {
+                        QByteArray refusal = buildResponse(packet, {}, verdict, {}, udp);
+                        if (signRefusal)
+                            refusal = signTsigResponse(refusal, requestMac, tsigError, other);
+                        return refusal;
+                    }
+                }
+                const QString announced = zone;
+                QTimer::singleShot(0, this, [this, announced]() {
+                    startSecondaryPull(announced);
+                });
+                return buildResponse(packet, {}, NoError, {}, udp);
+            }
         }
         return buildResponse(packet, {}, Refused, {}, udp);
     }
@@ -2080,21 +2482,13 @@ QStringList DnsServer::effectiveForwarders() const
 }
 
 // The serial field of an SOA RDATA: after the two names, four big-endian octets.
-static quint32 serialInSoa(const QByteArray &rdata)
-{
-    int pos = 0;
-    if (!skipName(rdata, pos) || !skipName(rdata, pos) || pos + 4 > rdata.size())
-        return 0;
-    return (quint32(quint8(rdata[pos])) << 24) | (quint32(quint8(rdata[pos + 1])) << 16)
-           | (quint32(quint8(rdata[pos + 2])) << 8) | quint32(quint8(rdata[pos + 3]));
-}
 
 quint32 DnsServer::zoneSerial() const
 {
     const QList<Record> soa = records(m_zone, TypeSoa);
     if (soa.isEmpty())
         return 0;
-    return serialInSoa(soa.first().rdata);
+    return serialFromSoaRdata(soa.first().rdata);
 }
 
 QList<DnsServer::Record> DnsServer::soaAtSerial(quint32 serial) const
@@ -2318,14 +2712,14 @@ QByteArray DnsServer::handleTransferRequest(const QByteArray &packet, const Mess
         quint32 clientSerial = 0;
         for (const Record &record : message.updates) {
             if (record.type == TypeSoa) {
-                clientSerial = serialInSoa(record.rdata);
+                clientSerial = serialFromSoaRdata(record.rdata);
                 break;
             }
         }
         if (clientSerial == 0) {
             for (const Record &record : message.prerequisites) {
                 if (record.type == TypeSoa) {
-                    clientSerial = serialInSoa(record.rdata);
+                    clientSerial = serialFromSoaRdata(record.rdata);
                     break;
                 }
             }
@@ -2438,8 +2832,9 @@ int DnsServer::handleQuery(const Message &message, QList<Record> &answers) {
     // is an empty NOERROR. Answering the first as the second told every client
     // and every cache that the name merely had no A record, so a negative lookup
     // was retried instead of cached (RFC 2308 §2.1).
-    const auto it = m_records.constFind(question.name.toLower());
-    if (it == m_records.constEnd() || it->isEmpty())
+    // `records()` also reads the copy of a zone this server is secondary for,
+    // so a name the master never sent is NXDOMAIN here too.
+    if (records(question.name, TypeAny).isEmpty())
         return NxDomain;
     return NoError;
 }

@@ -556,6 +556,7 @@ private slots:
     void notifiesTheSecondariesWhenTheZoneMoves();
     void retriesAnAnnouncementUntilTheSecondaryAnswers();
     void announcesTheZoneThatMoved();
+    void pullsTheCopyWhenTheMasterAnnouncesIt();
     void remembersTheDifferenceAcrossARestart();
     void gatesATransferOnTheZonesTheKeyMayRead();
     void answersAnEdnsQuery();
@@ -2675,6 +2676,86 @@ void DnsTest::announcesTheZoneThatMoved()
     QCOMPARE(forwardNotify.answers.size(), 1);
     QCOMPARE(forwardNotify.answers.first().name.toLower(), forward);
     QVERIFY(soaSerial(forwardNotify.answers.first().rdata) > forwardBefore);
+}
+
+void DnsTest::pullsTheCopyWhenTheMasterAnnouncesIt()
+{
+    const QString keyName = QStringLiteral("update-key");
+    // The key as bytes; the server takes it base64-encoded, the test's own
+    // HMAC helper takes it decoded.
+    const QByteArray secret = QByteArray("0123456789abcdef0123456789abcdef");
+    const QString zone = QStringLiteral("sec.example.com");
+
+    DnsServer primary;
+    QVERIFY(primary.listen(0));
+    primary.loadAdZone(zone, QStringLiteral("dc1.sec.example.com"),
+                       QStringLiteral("10.60.0.10"), 389, 3268,
+                       QStringLiteral("Default-First-Site-Name"));
+    primary.setUpdateTsig(keyName, QStringLiteral("hmac-sha256"), secret.toBase64());
+    const quint32 primarySerial =
+        soaSerial(primary.records(zone, DnsServer::TypeSoa).first().rdata);
+
+    DnsServer secondary;
+    QVERIFY(secondary.listen(0));
+    secondary.setUpdateTsig(keyName, QStringLiteral("hmac-sha256"), secret.toBase64());
+    secondary.setMaster(QStringLiteral("127.0.0.1:%1").arg(primary.serverPort()), {zone});
+    primary.setNotifyTargets({QStringLiteral("127.0.0.1:%1").arg(secondary.serverPort())});
+
+    // Without an announcement: a secondary that starts after its master has a
+    // stale copy or none, and its refresh is the pull it makes on its own.
+    secondary.refreshSecondaryZones();
+    QElapsedTimer startup;
+    startup.start();
+    while (secondary.secondarySerial(zone) != primarySerial && startup.elapsed() < 5000)
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+    QCOMPARE(secondary.secondarySerial(zone), primarySerial);
+    QCOMPARE(secondary.records(QStringLiteral("dc1.sec.example.com"), DnsServer::TypeA).size(), 1);
+
+    // The copy answers like any authoritative zone, which is what a client sees
+    // when it is pointed at the secondary.
+    Reply copy;
+    QVERIFY(parseReply(exchange(secondary.serverPort(),
+                                DnsServer::buildQuery(QStringLiteral("dc1.sec.example.com"),
+                                                      DnsServer::TypeA, 0x7a00)),
+                       &copy));
+    QCOMPARE(copy.rcode, 0);
+    QVERIFY2(copy.authoritative, "a copied zone is answered as authoritative");
+    QCOMPARE(copy.answers.size(), 1);
+
+    // The master moves the serial, announces it, and the secondary pulls that
+    // version rather than the one it started with.
+    QList<UpdateRecord> updates;
+    updates.append({QStringLiteral("copy.sec.example.com"), DnsServer::TypeA, 1, 300,
+                    QByteArray::fromHex("0a3c0001")});
+    // The master requires the key for updates, and an unsigned update is
+    // NOTAUTH; signing it is also what makes the announcement signed, which is
+    // what the secondary holds this server to.
+    Reply updateReply;
+    QVERIFY(parseReply(exchange(primary.serverPort(),
+                                withTsig(updatePacket(0x7a01, zone, {}, updates), keyName,
+                                         QStringLiteral("hmac-sha256"), secret,
+                                         quint64(QDateTime::currentSecsSinceEpoch()), 300)),
+                       &updateReply));
+    QCOMPARE(updateReply.rcode, 0);
+    const quint32 movedSerial = soaSerial(primary.records(zone, DnsServer::TypeSoa).first().rdata);
+    QVERIFY(movedSerial > primarySerial);
+
+    QElapsedTimer announced;
+    announced.start();
+    while (secondary.secondarySerial(zone) != movedSerial && announced.elapsed() < 5000)
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+    QCOMPARE(secondary.secondarySerial(zone), movedSerial);
+    QCOMPARE(secondary.records(QStringLiteral("copy.sec.example.com"), DnsServer::TypeA).size(), 1);
+
+    // The master going away is the case the copy exists for.
+    primary.close();
+    Reply offline;
+    QVERIFY(parseReply(exchange(secondary.serverPort(),
+                                DnsServer::buildQuery(QStringLiteral("copy.sec.example.com"),
+                                                      DnsServer::TypeA, 0x7a02)),
+                       &offline));
+    QCOMPARE(offline.rcode, 0);
+    QCOMPARE(offline.answers.size(), 1);
 }
 
 void DnsTest::remembersTheDifferenceAcrossARestart()

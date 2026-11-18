@@ -244,6 +244,21 @@ QStringList transferZonesFrom(const QSettings &config)
     return zones;
 }
 
+// The master a copy is pulled from and the zones copied from it. `dnsMaster` is
+// one "address" or "address:port"; `dnsMasterZones` lists the zones, either as
+// a stored list or one value with commas or spaces. Both are needed: a master
+// with no zones copies nothing, and zones with no master have nowhere to ask.
+void applyDnsMaster(DnsServer *server, const QSettings &config)
+{
+    QStringList masters;
+    for (const QString &entry : config.value(QStringLiteral("dnsMaster")).toStringList())
+        masters += entry.split(QRegularExpression(QStringLiteral("[,;\\s]+")), Qt::SkipEmptyParts);
+    QStringList zones;
+    for (const QString &entry : config.value(QStringLiteral("dnsMasterZones")).toStringList())
+        zones += entry.split(QRegularExpression(QStringLiteral("[,;\\s]+")), Qt::SkipEmptyParts);
+    server->setMaster(masters.value(0), zones);
+}
+
 QStringList notifyTargetsFrom(const QSettings &config)
 {
     const QStringList entries = config.value(QStringLiteral("dnsNotify")).toStringList();
@@ -266,6 +281,7 @@ void DcService::reloadForwarders()
     applyDnsUpdateKey(m_dnsServer, dcConfig);
     m_dnsServer->setNotifyTargets(notifyTargetsFrom(dcConfig));
     m_dnsServer->setTransferZones(transferZonesFrom(dcConfig));
+    applyDnsMaster(m_dnsServer, dcConfig);
     emit statusMessage(tr("Re-read the DNS forwarder configuration from %1 on SIGHUP.").arg(path));
     reportForwarders();
     reportSecondaries();
@@ -1132,6 +1148,12 @@ bool DcService::start(const QString &dcDir)
     applyDnsUpdateKey(m_dnsServer, dcConfig);
     m_dnsServer->setNotifyTargets(notifyTargetsFrom(dcConfig));
     m_dnsServer->setTransferZones(transferZonesFrom(dcConfig));
+    // A zone copied from a master is served from the copy until the pull
+    // succeeds, so the pull starts with the server rather than on the first
+    // announcement: after a restart the copy would otherwise be missing exactly
+    // while the master is also restarting.
+    applyDnsMaster(m_dnsServer, dcConfig);
+    m_dnsServer->refreshSecondaryZones();
     if (!m_dnsServer->loadZone(m_zonePath)) {
         m_dnsServer->loadAdZone(dnsDomain, dcHost, dcIp, boundLdapPort, boundGcPort, siteName,
                                 boundKpasswdPort, boundKdcPort);
