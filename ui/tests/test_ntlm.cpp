@@ -396,6 +396,7 @@ class NtlmTest : public QObject
 
 private slots:
     void primitivesMatchPublishedVectors();
+    void verifiesNtlmv1UnderPolicy();
     void challengePublishesDnsNames();
     void sessionSecurityMatchesReferenceImplementation();
     void authenticatesWithNtlmv2();
@@ -423,6 +424,86 @@ void NtlmTest::primitivesMatchPublishedVectors()
              QByteArray("750c783e6ab0b503eaa86e310a5db738"));
     QCOMPARE(Ntlm::secureEquals(QByteArray("abc"), QByteArray("abc")), true);
     QCOMPARE(Ntlm::secureEquals(QByteArray("abc"), QByteArray("abd")), false);
+}
+
+void NtlmTest::verifiesNtlmv1UnderPolicy()
+{
+    // The response of "Password" to the challenge 0123456789abcdef: three DES
+    // blocks computed with an independent DES implementation (openssl
+    // -des-ecb -provider legacy) from NTOWFv1 a4f49c40…, which is also the
+    // Ntlmv1 example in MS-NLMP 4.2.2.
+    const QByteArray ntHash = Ntlm::ntowfV1(QStringLiteral("Password"));
+    QCOMPARE(ntHash.toHex(), QByteArray("a4f49c406510bdcab6824ee7c30fd852"));
+    const QByteArray challenge = QByteArray::fromHex("0123456789abcdef");
+    const QByteArray response = Ntlm::ntResponseV1(ntHash, challenge);
+    QCOMPARE(response.toHex(), QByteArray("67c43011f30298a2ad35ece64f16331c44bdbed927841f94"));
+    QVERIFY(Ntlm::isNtlmv1Response(response));
+    QVERIFY(Ntlm::verifyNtlmv1(ntHash, challenge, response));
+
+    // Another challenge, another password and a flipped bit are all refused, so
+    // the comparison covers the whole 24 bytes rather than a prefix.
+    QVERIFY(!Ntlm::verifyNtlmv1(ntHash, QByteArray::fromHex("0123456789abcdee"), response));
+    QVERIFY(!Ntlm::verifyNtlmv1(Ntlm::ntowfV1(QStringLiteral("password")), challenge, response));
+    QByteArray tampered = response;
+    tampered[23] = char(tampered.at(23) ^ 0x01);
+    QVERIFY(!Ntlm::verifyNtlmv1(ntHash, challenge, tampered));
+    // A v2 response is not mistaken for a v1 one.
+    QVERIFY(!Ntlm::isNtlmv1Response(QByteArray(44, 'x')));
+
+    // AD's policy: LmCompatibilityLevel 0-2 accept NTLMv1, 3-5 do not.
+    QVERIFY(Ntlm::acceptsNtlmv1(0));
+    QVERIFY(Ntlm::acceptsNtlmv1(2));
+    QVERIFY(!Ntlm::acceptsNtlmv1(3));
+    QVERIFY(!Ntlm::acceptsNtlmv1(5));
+
+    // The session base key of a v1 logon is MD4(NTOWFv1), not a proof string's
+    // HMAC, and it is what the signing and sealing keys derive from.
+    Ntlm::SessionKeys keys;
+    QVERIFY(Ntlm::verifyResponse(ntHash, QStringLiteral("alice"), QStringLiteral("CORP"),
+                                 challenge, response, QByteArray(), Ntlm::kNegotiate128, 2,
+                                 &keys));
+    QCOMPARE(keys.sessionBaseKey.toHex(), QByteArray("d87262b0cde4b1cb7499becccdf10784"));
+    QVERIFY(!keys.serverSigningKey.isEmpty());
+    // The same response under the default policy is refused, before the keys
+    // are touched.
+    QVERIFY(!Ntlm::verifyResponse(ntHash, QStringLiteral("alice"), QStringLiteral("CORP"),
+                                  challenge, response, QByteArray(), Ntlm::kNegotiate128,
+                                  Ntlm::kDefaultLmCompatibilityLevel, &keys));
+
+    // An NTLM2 session response: the same 24 bytes, computed over
+    // MD5(challenge || client challenge), with that challenge in the LM
+    // response's first eight bytes. This is what a client that negotiated
+    // extended session security sends — measured with Samba's client.
+    const QByteArray clientChallenge = QByteArray::fromHex("0102030405060708");
+    const QByteArray sessionResponse =
+        Ntlm::ntlm2SessionResponse(ntHash, challenge, clientChallenge);
+    QCOMPARE(sessionResponse.toHex(),
+             QByteArray("4a9319086aa73d9d89a519d903210b518cca8b5c823dd152"));
+    // The session base key is an HMAC keyed by MD4(NTOWFv1), which is what
+    // Samba's client signs with (see the comment in Ntlm.cpp).
+    const QByteArray lmResponse = clientChallenge + QByteArray(16, '\0');
+    const quint32 extendedSecurity = Ntlm::kNegotiate128 | Ntlm::kNegotiateExtendedSessionSecurity;
+    QVERIFY(Ntlm::verifyResponse(ntHash, QStringLiteral("alice"), QStringLiteral("CORP"),
+                                 challenge, sessionResponse, lmResponse, extendedSecurity, 2,
+                                 &keys));
+    QCOMPARE(keys.sessionBaseKey.toHex(), QByteArray("c69da534ad62647096901a7c70ac2af2"));
+    // Without the client challenge the answer is refused rather than checked as
+    // a plain NTLMv1 response over the wrong seed.
+    QVERIFY(!Ntlm::verifyResponse(ntHash, QStringLiteral("alice"), QStringLiteral("CORP"),
+                                  challenge, sessionResponse, QByteArray(24, '\0'),
+                                  extendedSecurity, 2, &keys));
+
+    // An NTLMv2 response still verifies through the same entry point, and does
+    // so under the default policy.
+    QByteArray v2Response;
+    QByteArray v2Proof;
+    QVERIFY(Ntlm::ntlmv2Response(ntHash, QStringLiteral("alice"), QStringLiteral("CORP"),
+                                 challenge, QByteArray(), &v2Response, &v2Proof));
+    QVERIFY(!Ntlm::isNtlmv1Response(v2Response));
+    QVERIFY(Ntlm::verifyResponse(ntHash, QStringLiteral("alice"), QStringLiteral("CORP"),
+                                 challenge, v2Response, QByteArray(), Ntlm::kNegotiate128,
+                                 Ntlm::kDefaultLmCompatibilityLevel, &keys));
+    QCOMPARE(keys.sessionBaseKey.size(), 16);
 }
 
 void NtlmTest::challengePublishesDnsNames()

@@ -33,6 +33,10 @@ struct Authenticate {
     QString user;
     QString workstation;
     QByteArray ntResponse;
+    // MS-NLMP 2.2.1.3's first security buffer. An NTLM2 session response puts
+    // the client challenge in its first eight bytes and sixteen zero bytes
+    // after it, which is the only place that challenge travels.
+    QByteArray lmResponse;
 };
 
 // 1 = NEGOTIATE, 2 = CHALLENGE, 3 = AUTHENTICATE, 0 = not an NTLMSSP token.
@@ -69,6 +73,32 @@ QByteArray embeddedToken(const QByteArray &token);
 // NtProofStr    = HMAC_MD5(ResponseKeyNT, ServerChallenge + blob)[0..15]
 bool verifyNtlmv2(const QByteArray &ntHash, const QString &user, const QString &domain,
                   const QByteArray &serverChallenge, const QByteArray &ntResponse);
+
+// ---------- NTLMv1 (MS-NLMP 3.3.1) ----------
+//
+// The version that predates NTLMv2, and the only one a client set to speak it
+// sends: three DES blocks over the eight-byte server challenge, keyed from
+// seven-byte slices of NTOWFv1 followed by five zero bytes. The stored NT hash
+// proves the password here exactly as it does for v2, so the password and an LM
+// hash still never exist in this store.
+QByteArray ntResponseV1(const QByteArray &ntHash, const QByteArray &serverChallenge);
+bool verifyNtlmv1(const QByteArray &ntHash, const QByteArray &serverChallenge,
+                  const QByteArray &ntResponse);
+// A v1 response is exactly three DES blocks. An NTLMv2 one carries a 16-byte
+// proof plus a blob of at least 28 bytes, so the length separates the two
+// without trusting a flag the client chose.
+bool isNtlmv1Response(const QByteArray &ntResponse);
+
+// NTLM2 session response (MS-NLMP 3.3.1), which is what a client that negotiated
+// NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY sends instead of plain NTLMv1: the
+// same three DES blocks over the first eight bytes of MD5(challenge || client
+// challenge), with the client challenge carried in the LM response. Measured
+// against Samba's client, which negotiates extended session security and sends
+// nothing else when told not to use NTLMv2.
+QByteArray ntlm2SessionResponse(const QByteArray &ntHash, const QByteArray &serverChallenge,
+                                const QByteArray &clientChallenge);
+QByteArray ntlm2SessionBaseKey(const QByteArray &ntHash, const QByteArray &serverChallenge,
+                               const QByteArray &clientChallenge);
 
 // ---------- Initiator half ----------
 //
@@ -130,6 +160,25 @@ inline bool sessionKeys(const QByteArray &ntHash, const QString &user, const QSt
 {
     return sessionKeys(ntHash, user, domain, ntProofStr, out, kNegotiate128);
 }
+
+// MS-NLMP 3.3.1: with NTLMv1 the session base key is MD4(NTOWFv1) — the NT
+// one-way function of the one-way function — and the per-direction keys derive
+// from it exactly as they do for v2.
+bool v1SessionKeys(const QByteArray &ntHash, quint32 negotiateFlags, SessionKeys *out);
+
+// AD's LmCompatibilityLevel decides whether an NTLMv1 answer is accepted at all:
+// 0, 1 and 2 send and accept it; 3, 4 and 5 require NTLMv2. The default is 3,
+// which is what this DC answered before the policy was configurable.
+constexpr int kDefaultLmCompatibilityLevel = 3;
+bool acceptsNtlmv1(int lmCompatibilityLevel);
+
+// Verifies whichever response arrived, under that policy, and returns the
+// session keys for the version it accepted. An LM response on its own is never
+// accepted: this store keeps no LM hash to check one against.
+bool verifyResponse(const QByteArray &ntHash, const QString &user, const QString &domain,
+                    const QByteArray &serverChallenge, const QByteArray &ntResponse,
+                    const QByteArray &lmResponse, quint32 negotiateFlags,
+                    int lmCompatibilityLevel, SessionKeys *keys);
 
 // NTLMSSP MAC: HMAC_MD5(signingKey, LE32(sequence) || message)[0..7].
 QByteArray mac(const QByteArray &signingKey, quint32 sequence, const QByteArray &message);

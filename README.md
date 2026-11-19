@@ -762,6 +762,16 @@ provisioned DC, `smbclient -m NT1` fetches a policy's `GPT.INI` and a NETLOGON
 logon script byte for byte, and an anonymous session is refused with logon
 failure.
 
+NTLMv1 and NTLM2-session answers are accepted only when `dc.conf` sets
+`lmCompatibilityLevel` to 2 or lower (AD's scale: 0–2 accept it, 3–5 require
+NTLMv2). A client that predates NTLMv2 answers a challenge with one of those, so
+a domain whose members include a machine that has not been raised to "Send
+NTLMv2 response only" needs that line; without it the session setup is refused
+`LOGON_FAILURE`, which is what this DC did before the setting existed. The
+session key such a session signs with is an HMAC keyed by MD4(NTOWFv1) —
+measured from Samba's client rather than assumed — and an LM response on its own
+is always refused, because this store keeps no LM hash to check one against.
+
 **Endpoint mapper** (`engine/Epm.cpp`): `ept_lookup` and `ept_map` on `epmPort`
 (135 by default, `epmPort` in `dc.conf`), so a client that knows an interface
 UUID and a protocol can ask which port it lives on instead of being told.

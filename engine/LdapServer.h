@@ -139,6 +139,11 @@ public:
     void setKdc(Kdc *kdc) { m_kdc = kdc; }
     Kdc *kdc() const { return m_kdc; }
 
+    // AD's LmCompatibilityLevel, which decides whether an NTLMv1 challenge
+    // response is answered at all: 0-2 accept it, 3-5 require NTLMv2. The
+    // default refuses it, as this store did before the policy existed.
+    void setLmCompatibilityLevel(int level) { m_lmCompatibilityLevel = level; }
+
     // A request control (RFC 4511 §4.1.11). Only paged results is implemented;
     // an unknown control that a client marks critical is refused with
     // unavailableCriticalExtension rather than silently ignored.
@@ -364,6 +369,7 @@ private:
     QUdpSocket *m_cldap = nullptr;
     Identity m_identity;
     Kdc *m_kdc = nullptr;
+    int m_lmCompatibilityLevel = Ntlm::kDefaultLmCompatibilityLevel;
     QSslCertificate m_tlsCertificate;
     QSslKey m_tlsKey;
     bool m_tlsAvailable = false;

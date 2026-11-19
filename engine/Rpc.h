@@ -59,6 +59,9 @@ struct AuthRequest {
     QString domain;
     QByteArray challenge;
     QByteArray ntResponse;
+    // The LM response, carried because an NTLM2 session response keeps its
+    // client challenge there; it is never accepted as a credential on its own.
+    QByteArray lmResponse;
     quint32 flags = 0;
 };
 

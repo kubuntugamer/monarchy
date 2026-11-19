@@ -140,6 +140,7 @@ bool parseAuthenticate(const QByteArray &token, Rpc::AuthRequest *request,
         return ntlm.mid(offset, length);
     };
     request->ntResponse = field(20);
+    request->lmResponse = field(12);
     request->domain = fromUtf16(field(28));
     request->user = fromUtf16(field(36));
     // EncryptedRandomSessionKey (MS-NLMP 2.2.1.3): the sixth security buffer,

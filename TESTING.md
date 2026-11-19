@@ -141,7 +141,7 @@ recorded, not hidden:
   and `NetrDsrEnumerateDomainTrusts` (opnum 40), answered as the `[out,ref]`
   list inline — count, NULL array and WERROR — because a referent before the
   count reads as 193280 entries and a long frame. Both carry unit tests
-  (`monarchy-samr-tests`, `monarchy-netlogon-tests`). The interactive domain
+  (  `monarchy-samr-tests`, `monarchy-netlogon-tests`). The interactive domain
   logon did not complete, but it got further: with the machine's HOST/ SPNs
   present the client obtained a TGT and a TGS for
   `host/neuralnode0.cyberdyne.lan`, then reached the SMB1 session setup for the
@@ -153,6 +153,22 @@ recorded, not hidden:
   `STATUS_LOGON_FAILURE`; it now selects NTLMSSP from the client's own list and
   continues. The interactive logon was not driven to completion after those
   fixes, so a 2000 workstation's domain logon is still not claimed.
+
+  The session setup on that path is also where AD's NTLM policy decides whether
+  a 2000 client's answer can be checked at all. A machine whose policy has not
+  been raised to "Send NTLMv2 response only" answers a challenge with an NTLMv1
+  or NTLM2-session response, and this DC refuses those unless `dc.conf` sets
+  `lmCompatibilityLevel=2` (AD's scale: 0–2 accept it, 3–5 require NTLMv2; the
+  default here is 3, which is what this DC answered before the setting existed).
+  Measured with Samba's client configured `client ntlmv2 auth = no`: at level 2
+  it lists SYSVOL over SMB1 both with and without `client signing = required`,
+  and over SMB2; at the default it is refused `NT_STATUS_LOGON_FAILURE` while
+  NTLMv2 keeps listing on both transports. The signing key was the part that had
+  to be measured rather than read: an HMAC keyed by NTOWFv1 — the shape MS-NLMP
+  suggests — was rejected `smb1_signing_good: BAD SIG: seq 1`, and the client's
+  own wanted MAC then reproduced byte for byte from an HMAC keyed by
+  MD4(NTOWFv1). An LM response on its own is still refused: this store keeps no
+  LM hash to check one against.
 
 - **G11 — share enumeration is absent.** The probe that reaches the server is
   the pipe open: `rpcclient -c netshareenum` fails with

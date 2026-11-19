@@ -319,6 +319,13 @@ bool DcService::start(const QString &dcDir)
     // directory (console) or refuses to serve one (daemon).
     m_ldapServer = new LdapServer(this);
     const QSettings dcConfig(resolvedDcDir + QStringLiteral("/dc.conf"), QSettings::IniFormat);
+    // AD's LmCompatibilityLevel decides whether an NTLMv1 challenge response is
+    // answered at all: 0-2 accept it, 3-5 require NTLMv2. The default is 3,
+    // which is what this DC answered before the setting existed.
+    const int lmCompatibilityLevel =
+        dcConfig.value(QStringLiteral("lmCompatibilityLevel"),
+                       Ntlm::kDefaultLmCompatibilityLevel).toInt();
+    m_ldapServer->setLmCompatibilityLevel(lmCompatibilityLevel);
     m_storePath = dcConfig.value(QStringLiteral("storePath"),
                                  resolvedDcDir + QStringLiteral("/directory.json")).toString();
     m_baseDn = dcConfig.value(QStringLiteral("baseDn"),
@@ -625,7 +632,7 @@ bool DcService::start(const QString &dcDir)
     // One authenticator serves both management endpoints, so an account that can
     // open SAMR can open the LSA policy too, with the same credential.
     const Rpc::Authenticator authenticator =
-        [this](const Rpc::AuthRequest &request, Ntlm::SessionKeys *keys) {
+        [this, lmCompatibilityLevel](const Rpc::AuthRequest &request, Ntlm::SessionKeys *keys) {
             for (const DirectoryObject &object : m_ldapServer->objects()) {
                 const QString account = object.attributes.value(QStringLiteral("sAMAccountName"));
                 if (account.compare(request.user, Qt::CaseInsensitive) != 0 || object.id.isEmpty())
@@ -634,11 +641,10 @@ bool DcService::start(const QString &dcDir)
                     object.attributes.value(QStringLiteral("ntHash")).toLatin1());
                 if (ntHash.size() != 16)
                     return false;
-                if (!Ntlm::verifyNtlmv2(ntHash, request.user, request.domain, request.challenge,
-                                        request.ntResponse))
-                    return false;
-                return Ntlm::sessionKeys(ntHash, request.user, request.domain,
-                                         request.ntResponse.left(16), keys, request.flags);
+                return Ntlm::verifyResponse(ntHash, request.user, request.domain,
+                                            request.challenge, request.ntResponse,
+                                            request.lmResponse, request.flags,
+                                            lmCompatibilityLevel, keys);
             }
             return false;
         };

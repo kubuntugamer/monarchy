@@ -2209,8 +2209,12 @@ QByteArray LdapServer::handleSaslBind(ClientState *st, int msgId, const QByteArr
             if (ntHash.size() != 16)
                 return makeBindResponse(msgId, 49);
 
-            if (!Ntlm::verifyNtlmv2(ntHash, authenticate.user, authenticate.domain, challenge,
-                                    authenticate.ntResponse))
+            // NTLMv1 is answered only when the domain's policy allows it (AD's
+            // LmCompatibilityLevel 0-2); the keys come with the verification.
+            Ntlm::SessionKeys keys;
+            if (!Ntlm::verifyResponse(ntHash, authenticate.user, authenticate.domain, challenge,
+                                      authenticate.ntResponse, authenticate.lmResponse,
+                                      authenticate.flags, m_lmCompatibilityLevel, &keys))
                 return makeBindResponse(msgId, 49);
 
             if (!LogonHours::allowsHex(
@@ -2227,10 +2231,6 @@ QByteArray LdapServer::handleSaslBind(ClientState *st, int msgId, const QByteArr
             // and the per-direction keys are derived from it. A client that
             // asked for sign or seal gets a security layer for the rest of the
             // session; sealing implies signing.
-            Ntlm::SessionKeys keys;
-            if (!Ntlm::sessionKeys(ntHash, authenticate.user, authenticate.domain,
-                                   authenticate.ntResponse.left(16), &keys, authenticate.flags))
-                return makeBindResponse(msgId, 49);
             st->ntlmKeys = keys;
 
             const quint32 agreed = authenticate.flags

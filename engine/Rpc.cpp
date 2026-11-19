@@ -1059,6 +1059,7 @@ bool RpcServer::verifyAuthenticate(Client *client, const QByteArray &ntlmsspToke
     request.domain = authenticate.domain;
     request.challenge = client->security.challenge;
     request.ntResponse = authenticate.ntResponse;
+    request.lmResponse = authenticate.lmResponse;
     request.flags = authenticate.flags;
 
     Ntlm::SessionKeys keys;

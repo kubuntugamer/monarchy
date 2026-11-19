@@ -3,6 +3,8 @@
 
 #include "Ntlm.h"
 
+#include "Des.h"
+
 #include <QCryptographicHash>
 #include <QRandomGenerator>
 
@@ -157,6 +159,7 @@ bool parseAuthenticate(const QByteArray &token, Authenticate *out)
     out->user = decodeString(fieldBytes(token, 36), out->flags);
     out->workstation = decodeString(fieldBytes(token, 44), out->flags);
     out->ntResponse = fieldBytes(token, 20);
+    out->lmResponse = fieldBytes(token, 12);
     return !out->user.isEmpty() && !out->ntResponse.isEmpty();
 }
 
@@ -234,20 +237,81 @@ bool verifyNtlmv2(const QByteArray &ntHash, const QString &user, const QString &
     return secureEquals(expected, proof);
 }
 
+bool isNtlmv1Response(const QByteArray &ntResponse)
+{
+    return ntResponse.size() == 24;
+}
+
+namespace {
+
+// The three DES blocks MS-NLMP 3.3.1 defines, over an eight-byte seed: the
+// challenge itself for NTLMv1, and the first eight bytes of MD5(challenge ||
+// client challenge) for an NTLM2 session response.
+QByteArray desResponse(const QByteArray &ntHash, const QByteArray &seed)
+{
+    if (ntHash.size() != 16 || seed.size() < 8)
+        return {};
+    // 16 bytes of NTOWFv1 padded to 21, then three 7-byte keys.
+    QByteArray keyBytes = ntHash;
+    keyBytes.resize(21, '\0');
+    QByteArray response;
+    for (int i = 0; i < 3; ++i) {
+        response.append(Des::encryptBlock(Des::keyFromPassword(keyBytes.mid(i * 7, 7)),
+                                          seed.left(8)));
+    }
+    return response;
+}
+
+} // namespace
+
+QByteArray ntResponseV1(const QByteArray &ntHash, const QByteArray &serverChallenge)
+{
+    return desResponse(ntHash, serverChallenge);
+}
+
+QByteArray ntlm2SessionResponse(const QByteArray &ntHash, const QByteArray &serverChallenge,
+                                const QByteArray &clientChallenge)
+{
+    if (clientChallenge.size() < 8)
+        return {};
+    const QByteArray seed = QCryptographicHash::hash(
+        serverChallenge.left(8) + clientChallenge.left(8), QCryptographicHash::Md5);
+    return desResponse(ntHash, seed.left(8));
+}
+
+QByteArray ntlm2SessionBaseKey(const QByteArray &ntHash, const QByteArray &serverChallenge,
+                               const QByteArray &clientChallenge)
+{
+    if (ntHash.size() != 16 || clientChallenge.size() < 8)
+        return {};
+    // Measured, not assumed: the HMAC is keyed by MD4(NTOWFv1) — the NTLMv1
+    // session base key — rather than by NTOWFv1 itself. Samba's client refused
+    // the latter with `smb1_signing_good: BAD SIG: seq 1`, and its own wanted MAC
+    // reproduced byte for byte from this key.
+    const QByteArray v1Base = QCryptographicHash::hash(ntHash, QCryptographicHash::Md4);
+    return hmacMd5(v1Base, serverChallenge.left(8) + clientChallenge.left(8));
+}
+
+bool verifyNtlmv1(const QByteArray &ntHash, const QByteArray &serverChallenge,
+                  const QByteArray &ntResponse)
+{
+    if (!isNtlmv1Response(ntResponse))
+        return false;
+    return secureEquals(ntResponseV1(ntHash, serverChallenge), ntResponse);
+}
+
 // ---------- Session security (MS-NLMP §3.4) ----------
 
-bool sessionKeys(const QByteArray &ntHash, const QString &user, const QString &domain,
-                 const QByteArray &ntProofStr, SessionKeys *out, quint32 negotiateFlags)
-{
-    if (!out || ntHash.size() != 16 || ntProofStr.size() != 16)
-        return false;
-    const QByteArray responseKey =
-        hmacMd5(ntHash, utf16le(user.toUpper() + domain));
-    out->sessionBaseKey = hmacMd5(responseKey, ntProofStr);
+namespace {
 
-    // The magic constants are fixed by MS-NLMP §3.4.5.3; all four keys are MD5
-    // of the exported session key and the matching constant.
-    const QByteArray exported = exportedSessionKey(out->sessionBaseKey, negotiateFlags);
+// The four per-direction keys, from the session base key: the magic constants
+// are fixed by MS-NLMP §3.4.5.3, and §3.4.5.1 decides how much of the base key
+// the exported key carries. Both response versions share this once the base key
+// is known, which is the only thing that differs between them.
+void deriveSessionKeys(const QByteArray &sessionBaseKey, quint32 negotiateFlags,
+                       SessionKeys *out)
+{
+    const QByteArray exported = exportedSessionKey(sessionBaseKey, negotiateFlags);
     out->clientSigningKey = QCryptographicHash::hash(
         exported + QByteArrayLiteral("session key to client-to-server signing key magic constant\0"),
         QCryptographicHash::Md5);
@@ -260,7 +324,74 @@ bool sessionKeys(const QByteArray &ntHash, const QString &user, const QString &d
     out->serverSealingKey = QCryptographicHash::hash(
         exported + QByteArrayLiteral("session key to server-to-client sealing key magic constant\0"),
         QCryptographicHash::Md5);
+}
+
+} // namespace
+
+bool sessionKeys(const QByteArray &ntHash, const QString &user, const QString &domain,
+                 const QByteArray &ntProofStr, SessionKeys *out, quint32 negotiateFlags)
+{
+    if (!out || ntHash.size() != 16 || ntProofStr.size() != 16)
+        return false;
+    const QByteArray responseKey =
+        hmacMd5(ntHash, utf16le(user.toUpper() + domain));
+    out->sessionBaseKey = hmacMd5(responseKey, ntProofStr);
+    deriveSessionKeys(out->sessionBaseKey, negotiateFlags, out);
     return true;
+}
+
+bool v1SessionKeys(const QByteArray &ntHash, quint32 negotiateFlags, SessionKeys *out)
+{
+    if (!out || ntHash.size() != 16)
+        return false;
+    out->sessionBaseKey = QCryptographicHash::hash(ntHash, QCryptographicHash::Md4);
+    deriveSessionKeys(out->sessionBaseKey, negotiateFlags, out);
+    return true;
+}
+
+bool acceptsNtlmv1(int lmCompatibilityLevel)
+{
+    return lmCompatibilityLevel >= 0 && lmCompatibilityLevel <= 2;
+}
+
+bool verifyResponse(const QByteArray &ntHash, const QString &user, const QString &domain,
+                    const QByteArray &serverChallenge, const QByteArray &ntResponse,
+                    const QByteArray &lmResponse, quint32 negotiateFlags,
+                    int lmCompatibilityLevel, SessionKeys *keys)
+{
+    if (isNtlmv1Response(ntResponse)) {
+        if (!acceptsNtlmv1(lmCompatibilityLevel))
+            return false;
+        if (negotiateFlags & kNegotiateExtendedSessionSecurity) {
+            // Extended session security makes the LM response a carrier for the
+            // client challenge (eight bytes, then sixteen zero bytes), and the
+            // answer is a DES response over a seed both challenges hash into.
+            // Without that challenge the answer cannot be checked, so refuse it
+            // rather than test it against the wrong seed.
+            if (lmResponse.size() != 24 || lmResponse.mid(8) != QByteArray(16, '\0'))
+                return false;
+            const QByteArray clientChallenge = lmResponse.left(8);
+            if (!secureEquals(ntlm2SessionResponse(ntHash, serverChallenge, clientChallenge),
+                              ntResponse))
+                return false;
+            if (!keys)
+                return true;
+            const QByteArray base = ntlm2SessionBaseKey(ntHash, serverChallenge, clientChallenge);
+            if (base.size() != 16)
+                return false;
+            keys->sessionBaseKey = base;
+            deriveSessionKeys(base, negotiateFlags, keys);
+            return true;
+        }
+        if (!verifyNtlmv1(ntHash, serverChallenge, ntResponse))
+            return false;
+        return keys ? v1SessionKeys(ntHash, negotiateFlags, keys) : true;
+    }
+    if (!verifyNtlmv2(ntHash, user, domain, serverChallenge, ntResponse))
+        return false;
+    if (!keys)
+        return true;
+    return sessionKeys(ntHash, user, domain, ntResponse.left(16), keys, negotiateFlags);
 }
 
 QByteArray mac(const QByteArray &signingKey, quint32 sequence, const QByteArray &message)
