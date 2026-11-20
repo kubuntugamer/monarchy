@@ -116,8 +116,10 @@ public:
     bool removeObject(const QString &dn);
     bool modifyObject(const QString &dn, const QMap<QString, QString> &attrs);
     // Apply one replication cycle from another DC. A live object is created or
-    // updated in place (matched by objectGUID, then by DN); an isDeleted
-    // entry removes the local copy and is kept as a tombstone. A live copy of
+    // updated in place (matched by objectGUID, then by DN), and an update
+    // overlays only the attributes the cycle carries, so the credentials and
+    // logon state this DC holds and a partner never sends survive it; an
+    // isDeleted entry removes the local copy and is kept as a tombstone. A live copy of
     // an object that is already a tombstone here is not resurrected, and
     // applying the same cycle twice changes nothing the second time. The root
     // DSE is derived, so it is never applied. Returns the objects acted on.

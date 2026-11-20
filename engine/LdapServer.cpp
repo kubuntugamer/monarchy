@@ -752,6 +752,18 @@ quint16 LdapServer::serverPort() const { return m_server ? m_server->serverPort(
 void LdapServer::setObjects(const QList<DirectoryObject> &objects) {
     m_objects = objects;
     m_tombstones.clear();
+    // uSNChanged has to keep moving forward across a restart. The counter lives
+    // in memory, so a store that already holds USNs up to 1031 would otherwise
+    // hand the next object 1001: a replication partner whose cursor is already
+    // past that never sees the object at all, and two objects would share one
+    // USN. Start from the store's high-water mark instead of over again.
+    for (const DirectoryObject &object : m_objects) {
+        bool ok = false;
+        const long long usn =
+            object.attributes.value(QStringLiteral("uSNChanged")).toLongLong(&ok);
+        if (ok && usn > m_usn)
+            m_usn = usn;
+    }
     normalizeMembership();
     ensureRootDse();
 }
@@ -1222,7 +1234,13 @@ bool LdapServer::removeObject(const QString &dn) {
             }
             QString guid = tombstone.attributes.value(QStringLiteral("objectGUID"));
             if (guid.isEmpty()) {
-                guid = QUuid::createUuid().toString(QUuid::WithoutBraces);
+                // The tombstone has to carry the identity the live object had,
+                // or a partner cannot tell which object was deleted: it would
+                // match nothing here and leave the live copy standing. This
+                // store derives an objectGUID from the DN when it holds none,
+                // and that derived GUID is the identity every other path
+                // publishes, so carry that one rather than inventing another.
+                guid = objectGuidFor(tombstone.id).toString(QUuid::WithoutBraces);
                 tombstone.attributes.insert(QStringLiteral("objectGUID"), guid);
             }
             QString bare = guid;
@@ -1271,16 +1289,23 @@ int LdapServer::applyReplication(const QList<DirectoryObject> &incoming)
         const QString changeGuid =
             change.attributes.value(QStringLiteral("objectGUID")).toLower();
 
-        const auto sameObject = [&changeGuid, &change](const DirectoryObject &candidate) {
+        // Identity is the objectGUID. A store here derives one from the DN when
+        // it holds none (ObjectGuid.h), and that is the GUID DRS exported for
+        // the same object, so comparing stored attributes alone left this DC's
+        // own copy of an account unmatched and appended a second object at the
+        // same distinguished name — two entries for one object, which AD never
+        // has. Compare the effective GUID, the one every other path publishes.
+        const QUuid changeObjectGuid(changeGuid);
+        const auto sameObject = [&changeObjectGuid, &change](const DirectoryObject &candidate) {
             if (candidate.id.isEmpty())
                 return false;
-            const QString candidateGuid =
-                candidate.attributes.value(QStringLiteral("objectGUID")).toLower();
-            if (!changeGuid.isEmpty() && !candidateGuid.isEmpty())
-                return candidateGuid.compare(changeGuid, Qt::CaseInsensitive) == 0;
-            return !changeGuid.isEmpty() && candidateGuid.isEmpty()
-                ? false
-                : candidate.id.compare(change.id, Qt::CaseInsensitive) == 0;
+            if (!changeObjectGuid.isNull()) {
+                const QUuid stored(
+                    candidate.attributes.value(QStringLiteral("objectGUID")));
+                const QUuid candidateGuid = stored.isNull() ? objectGuidFor(candidate.id) : stored;
+                return candidateGuid == changeObjectGuid;
+            }
+            return candidate.id.compare(change.id, Qt::CaseInsensitive) == 0;
         };
 
         int liveIndex = -1;
@@ -1340,8 +1365,30 @@ int LdapServer::applyReplication(const QList<DirectoryObject> &incoming)
         if (liveIndex >= 0) {
             DirectoryObject &target = m_objects[liveIndex];
             const QString localDn = target.id;
-            target = change;
+            // A cycle carries the replicated attribute set: object class, name,
+            // membership, SID and GUID. Credentials are not part of it — every
+            // DC holds its own copy of the password hashes — and neither is the
+            // per-DC logon state. Replacing the object with the inbound copy
+            // alone therefore stripped this DC's own secrets, and an account
+            // that had replicated in could no longer authenticate here at all.
+            // Overlay what arrived and keep what this DC holds and a partner
+            // never sends.
+            for (auto it = change.attributes.constBegin(); it != change.attributes.constEnd();
+                 ++it) {
+                target.attributes.insert(it.key(), it.value());
+            }
+            target.type = change.type;
+            if (change.kind != ObjectKind::Unknown)
+                target.kind = change.kind;
+            if (!change.container.isEmpty())
+                target.container = change.container;
+            // Membership is carried as the member attribute; an empty list on
+            // the wire cannot be told from an attribute that was not sent, so
+            // only a non-empty one replaces what this DC holds.
+            if (!change.members.isEmpty())
+                target.members = change.members;
             target.id = localDn; // the local DN names the object here
+            target.attributes.insert(QStringLiteral("distinguishedName"), localDn);
             target.attributes.insert(QStringLiteral("uSNChanged"),
                                      QString::number(nextUsn()));
             ++applied;
