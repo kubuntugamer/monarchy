@@ -295,6 +295,26 @@ QByteArray findNextMessage(quint16 tid, quint16 searchId, quint16 maxEntries, qu
     return smb(Smb1::CmdTrans2, tid, 0x1234, words, data);
 }
 
+// TRANS2 FIND_CLOSE2: the search the client is done with. Windows echoes the id
+// it named, so the client can match the answer to the call it made.
+QByteArray findCloseMessage(quint16 tid, quint16 searchId)
+{
+    QByteArray parameters;
+    putLe16(parameters, searchId);
+
+    QByteArray words(28, '\0');
+    words[26] = char(1);
+    words[18] = char(parameters.size() & 0xff);
+    words[19] = char((parameters.size() >> 8) & 0xff);
+    const quint16 parameterOffset = quint16(32 + 1 + 30 + 2 + 1);
+    words[20] = char(parameterOffset & 0xff);
+    words[21] = char((parameterOffset >> 8) & 0xff);
+    putLe16(words, 0x0004); // FIND_CLOSE2
+    QByteArray data(1, '\0');
+    data.append(parameters);
+    return smb(Smb1::CmdTrans2, tid, 0x1234, words, data);
+}
+
 // SMB_COM_TRANSACTION to a pipe the client has already opened, addressed the
 // way Windows 2000 addresses it: the name field is `\PIPE\` with the pipe name
 // left empty, Setup[0] is the subcommand, Setup[1] the handle, and the
@@ -939,6 +959,18 @@ void Smb1Test::listsADirectoryOverFindFirst2()
     // cannot read another session's listing by guessing an id.
     QCOMPARE(statusOf(session.feed(findNextMessage(tid, 0x9999, 1, 0x0101))),
              Smb1::kStatusInvalidHandle);
+
+    // A client closes the search it opened when it is done, and that call is
+    // what retires the handle: a FIND_NEXT2 naming it afterwards is refused, so
+    // a session cannot keep a search alive behind the client's back.
+    QCOMPARE(statusOf(session.feed(findCloseMessage(tid, searchId))), quint32(0));
+    QCOMPARE(statusOf(session.feed(findNextMessage(tid, searchId, 1, 0x0101))),
+             Smb1::kStatusInvalidHandle);
+    // A repeated close answers success rather than a refusal, which is what this
+    // server does today; the refusal above is what shows the id was retired, and
+    // this line is here so that staying that way is a decision rather than an
+    // accident nobody looked at.
+    QCOMPARE(statusOf(session.feed(findCloseMessage(tid, searchId))), quint32(0));
 }
 
 // A client that signs has to get signed replies and have its own signatures
