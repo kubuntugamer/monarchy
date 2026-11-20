@@ -131,7 +131,8 @@ QByteArray lookupIdsStub(const QByteArray &domainHandle, const QList<quint32> &r
 
 // SamrCreateUser2InDomain / SamrCreateGroupInDomain: the name travels inline
 // right behind its pointer, then the scalars.
-QByteArray createStub(const QByteArray &domainHandle, const QString &name, bool user)
+QByteArray createStub(const QByteArray &domainHandle, const QString &name, bool user,
+                      quint32 accountType = 0x10) // USER_NORMAL_ACCOUNT
 {
     const QByteArray utf16 = Ndr::utf16le(name);
     QByteArray stub = domainHandle;
@@ -147,7 +148,7 @@ QByteArray createStub(const QByteArray &domainHandle, const QString &name, bool 
     while (stub.size() % 4 != 0)
         stub.append('\0');
     if (user)
-        appendLe32(stub, 0x10); // USER_NORMAL_ACCOUNT
+        appendLe32(stub, accountType);
     appendLe32(stub, 0x000f001fu); // MAXIMUM_ALLOWED
     return stub;
 }
@@ -1082,6 +1083,11 @@ void SamrTest::samrWritesAccountsAndGroups()
     QCOMPARE(store.size(), 1);
     QCOMPARE(store.at(0).attributes.value(QStringLiteral("objectSid")),
              QStringLiteral("S-1-5-21-1-2-3-1001"));
+    // USER_NORMAL_ACCOUNT on the wire (0x10) is NORMAL_ACCOUNT in the directory
+    // (0x200), and it stays a user in CN=Users.
+    QCOMPARE(store.at(0).kind, ObjectKind::User);
+    QCOMPARE(store.at(0).attributes.value(QStringLiteral("userAccountControl")),
+             QStringLiteral("512"));
 
     // Opening the same account by RID works, and its name arm reports it.
     const QByteArray reopened = server.handleCall(Samr::OpOpenUser,
@@ -1209,9 +1215,26 @@ void SamrTest::samrWritesAccountsAndGroups()
     // account is created. A Windows join does not write them afterwards, and
     // its first logon asks the KDC for HOST/<name>; without them the TGT is
     // issued and the next request is answered S_PRINCIPAL_UNKNOWN.
+    //
+    // It is also a `computer`, not a user: the account type on the wire is
+    // 0x80 (workstation trust), which is userAccountControl 0x1000, and AD
+    // keeps it in CN=Computers under Domain Computers. Copying the wire value
+    // across would store 0x80, which means PASSWD_NOTREQD.
     const QByteArray machineReply = server.handleCall(
-        Samr::OpCreateUser2, createStub(domainHandle, QStringLiteral("NEURALNODE0$"), true));
+        Samr::OpCreateUser2,
+        createStub(domainHandle, QStringLiteral("NEURALNODE0$"), true, 0x80));
     QCOMPARE(lastWord(machineReply), 0u);
+    const DirectoryObject &machine = store.last();
+    QCOMPARE(machine.kind, ObjectKind::Computer);
+    QCOMPARE(machine.container, QStringLiteral("CN=Computers,DC=corp,DC=example,DC=com"));
+    QCOMPARE(machine.id, QStringLiteral("CN=NEURALNODE0$,CN=Computers,DC=corp,DC=example,DC=com"));
+    QCOMPARE(machine.attributes.value(QStringLiteral("userAccountControl")),
+             QStringLiteral("4096"));
+    QCOMPARE(machine.attributes.value(QStringLiteral("primaryGroupID")), QStringLiteral("515"));
+    QCOMPARE(machine.attributes.value(QStringLiteral("dNSHostName")),
+             QStringLiteral("neuralnode0.corp.example.com"));
+    QVERIFY(machine.attributes.value(QStringLiteral("objectClass"))
+                .contains(QStringLiteral("computer")));
     const QString machineSpns =
         store.last().attributes.value(QStringLiteral("servicePrincipalName"));
     QVERIFY(machineSpns.contains(QStringLiteral("HOST/NEURALNODE0")));

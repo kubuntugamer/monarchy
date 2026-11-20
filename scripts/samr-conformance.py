@@ -50,6 +50,7 @@ CHECKS = [
     'SamrLookupNamesInDomain (BUILTIN)',
     'BUILTIN aliases are read-only',
     'SamrCreateUser2InDomain',
+    'SamrCreateUser2InDomain makes a machine a computer',
     'SamrOpenUser / SamrQueryInformationUser2',
     'SamrLookupNamesInDomain',
     'SamrLookupIdsInDomain',
@@ -86,6 +87,7 @@ CHECKS = [
     BUILTIN_NAMES,
     BUILTIN_READONLY,
     CREATE_USER,
+    MACHINE_USER,
     OPEN_USER,
     LOOKUP_NAMES,
     LOOKUP_IDS,
@@ -360,6 +362,32 @@ def main():
         check(LOOKUP_IDS, len(back) == 1 and back[0]['Data'] == name, back)
     except Exception as error:  # noqa: BLE001
         check(LOOKUP_IDS, False, '%s: %s' % (type(error).__name__, error))
+
+    # A joined machine is a computer, not a user. The account type on the wire
+    # is USER_WORKSTATION_TRUST_ACCOUNT (0x80), which is userAccountControl
+    # 0x1000 in the directory and Domain Computers (515) as its primary group;
+    # storing the wire value instead would mean PASSWD_NOTREQD, and the domain
+    # would hold no computer for a machine that believes it has joined.
+    machine_name = 'CONF-PC-%s$' % uuid.uuid4().hex[:6].upper()
+    machine = None
+    try:
+        made = samr.hSamrCreateUser2InDomain(
+            dce, domain, machine_name, samr.USER_WORKSTATION_TRUST_ACCOUNT, MAXIMUM_ALLOWED)
+        machine = made['UserHandle']
+        machine_info = samr.hSamrQueryInformationUser2(dce, machine, 21)['Buffer']['All']
+        check(MACHINE_USER,
+              machine_info['UserAccountControl'] == 0x1000
+              and machine_info['PrimaryGroupId'] == 515,
+              (machine_info['UserAccountControl'], machine_info['PrimaryGroupId']))
+        samr.hSamrDeleteUser(dce, machine)
+        machine = None
+    except Exception as error:  # noqa: BLE001
+        check(MACHINE_USER, False, '%s: %s' % (type(error).__name__, error))
+    if machine is not None:
+        try:
+            samr.hSamrDeleteUser(dce, machine)
+        except Exception:  # noqa: BLE001 - the check above already failed
+            pass
 
     group = None
     group_name = 'conf-group-%s' % uuid.uuid4().hex[:6]

@@ -78,6 +78,30 @@ void appendVaryingString(QByteArray &out, const QString &text)
         out.append('\0');
 }
 
+// SamrCreateUser2InDomain's AccountType is a SAM_ACCOUNT_TYPE, not a set of
+// userAccountControl bits: a plain user is 0x10 there and 0x200 here, a
+// workstation trust 0x80 against 0x1000. Copying the value across stores an
+// account that means something else — 128 is PASSWD_NOTREQD, not
+// WORKSTATION_TRUST — and the directory then has no computer for the machine
+// that joined, so `(objectClass=computer)` misses it and Netlogon has no
+// workstation trust to open a secure channel against.
+quint32 accountControlFor(quint32 accountType)
+{
+    switch (accountType) {
+    case 0x08: return 0x0100;       // USER_TEMP_DUPLICATE_ACCOUNT
+    case 0x10: return 0x0200;       // USER_NORMAL_ACCOUNT
+    case 0x20: return 0x020000;     // USER_MNS_LOGON_ACCOUNT
+    case 0x40: return 0x0800;       // USER_INTERDOMAIN_TRUST_ACCOUNT
+    case 0x80: return 0x1000;       // USER_WORKSTATION_TRUST_ACCOUNT
+    case 0x100: return 0x2000;      // USER_SERVER_TRUST_ACCOUNT
+    case 0x100000: return 0x4000000; // USER_PARTIAL_SECRETS_ACCOUNT
+    default:
+        // Zero is what a client that predates the account type sends, and AD
+        // makes a plain user of it.
+        return 0x0200;
+    }
+}
+
 // SID_NAME_USE as MS-SAMR reports it for a relative identifier.
 bool isAlias(const DirectoryObject &object);
 
@@ -2251,17 +2275,35 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
             return fixed;
         }
 
+        // A user created here may be a machine: a workstation or server trust
+        // account is a `computer` in CN=Computers, owned by Domain Computers —
+        // not a user in CN=Users. A Windows join reads the entry back after
+        // creating it, and every later search for members of the domain looks
+        // for the computer class, so the class has to be right from the first
+        // write rather than patched in afterwards.
+        const quint32 accountControl = accountControlFor(accountFlags);
+        const bool machineAccount =
+            !creatingContainer && (accountControl & (0x1000u | 0x2000u)) != 0;
         DirectoryObject object;
         object.name = account;
-        object.kind = creatingContainer ? ObjectKind::Group : ObjectKind::User;
-        object.type = creatingContainer ? QStringLiteral("Security Group") : QStringLiteral("User");
-        object.container = QStringLiteral("CN=Users,%1").arg(m_config.baseDn);
+        object.kind = creatingContainer ? ObjectKind::Group
+                     : machineAccount   ? ObjectKind::Computer
+                                        : ObjectKind::User;
+        object.type = creatingContainer ? QStringLiteral("Security Group")
+                      : machineAccount   ? QStringLiteral("Computer")
+                                         : QStringLiteral("User");
+        object.container = machineAccount
+            ? QStringLiteral("CN=Computers,%1").arg(m_config.baseDn)
+            : QStringLiteral("CN=Users,%1").arg(m_config.baseDn);
         object.id = QStringLiteral("CN=%1,%2").arg(account, object.container);
         object.attributes.insert(QStringLiteral("cn"), account);
         object.attributes.insert(QStringLiteral("sAMAccountName"), account);
-        object.attributes.insert(QStringLiteral("objectClass"),
-                                 creatingContainer ? QStringLiteral("group")
-                                                   : QStringLiteral("user"));
+        object.attributes.insert(
+            QStringLiteral("objectClass"),
+            creatingContainer ? QStringLiteral("group")
+            : machineAccount
+                ? QStringLiteral("top;person;organizationalPerson;user;computer")
+                : QStringLiteral("user"));
         if (creatingAlias) {
             // GROUP_TYPE_RESOURCE_GROUP | SECURITY_ENABLED: the domain-local
             // group AD presents to SAMR as an alias.
@@ -2270,10 +2312,20 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
         } else if (creatingGroup) {
             object.attributes.insert(QStringLiteral("groupType"), QStringLiteral("Security"));
         } else {
-            // SamrCreateUser2's AccountType is a SAMR_ACCT_FLAGS set, which is
-            // the low half of userAccountControl; a plain user is 512.
             object.attributes.insert(QStringLiteral("userAccountControl"),
-                                     QString::number(accountFlags != 0 ? accountFlags : 512u));
+                                     QString::number(accountControl));
+            if (machineAccount) {
+                // A joined machine is a member of Domain Computers, and its
+                // host name is what Netlogon and the DNS zone publish.
+                object.attributes.insert(QStringLiteral("primaryGroupID"),
+                                         QStringLiteral("515"));
+                const QString host = account.endsWith(QLatin1Char('$'))
+                                         ? account.left(account.size() - 1)
+                                         : account;
+                object.attributes.insert(
+                    QStringLiteral("dNSHostName"),
+                    QStringLiteral("%1.%2").arg(host.toLower(), m_config.realm.toLower()));
+            }
             object.attributes.insert(QStringLiteral("displayName"), account);
             object.attributes.insert(QStringLiteral("pwdLastSet"), QStringLiteral("0"));
             // A machine account carries its own service principal names. A
@@ -2281,8 +2333,10 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
             // afterwards, while its first domain logon asks the KDC for
             // HOST/<name>; without these the TGT is issued and the next
             // request is answered S_PRINCIPAL_UNKNOWN, so the logon fails.
-            if (account.endsWith(QLatin1Char('$'))) {
-                const QString host = account.left(account.size() - 1);
+            if (machineAccount || account.endsWith(QLatin1Char('$'))) {
+                const QString host = account.endsWith(QLatin1Char('$'))
+                                         ? account.left(account.size() - 1)
+                                         : account;
                 object.attributes.insert(
                     QStringLiteral("servicePrincipalName"),
                     QStringLiteral("HOST/%1; HOST/%2; RestrictedKrbHost/%1; RestrictedKrbHost/%2")
