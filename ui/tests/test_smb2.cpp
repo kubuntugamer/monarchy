@@ -172,7 +172,8 @@ QByteArray treeConnectTo(quint64 messageId, quint64 sessionId, const QString &sh
 }
 
 QByteArray createRequest(quint64 messageId, quint64 sessionId, quint32 treeId,
-                         const QString &name, quint32 options, quint32 access)
+                         const QString &name, quint32 options, quint32 access,
+                         quint32 disposition = 1 /* FILE_OPEN */)
 {
     const QByteArray encoded = utf16(name);
     QByteArray body;
@@ -185,7 +186,7 @@ QByteArray createRequest(quint64 messageId, quint64 sessionId, quint32 treeId,
     putLe32(body, access);  // DesiredAccess
     putLe32(body, 0);       // FileAttributes
     putLe32(body, 7);       // ShareAccess
-    putLe32(body, 1);       // CreateDisposition: FILE_OPEN
+    putLe32(body, disposition); // CreateDisposition
     putLe32(body, options); // CreateOptions
     putLe16(body, quint16(name.isEmpty() ? 0 : 64 + 56)); // NameOffset
     putLe16(body, quint16(encoded.size()));
@@ -248,6 +249,54 @@ QByteArray setInfoRequest(quint64 messageId, quint64 sessionId, quint32 treeId, 
     return header(Smb2::CmdSetInfo, messageId, sessionId, treeId) + body;
 }
 
+// A set-info carrying one file info class and its buffer, as a client sends it.
+QByteArray setInfoBuffer(quint64 messageId, quint64 sessionId, quint32 treeId, quint64 id,
+                         quint8 infoClass, const QByteArray &buffer)
+{
+    QByteArray body;
+    putLe16(body, 33); // StructureSize
+    body.append(char(1)); // InfoType: SMB2_0_INFO_FILE
+    body.append(char(infoClass));
+    putLe32(body, quint32(buffer.size()));
+    putLe16(body, quint16(buffer.isEmpty() ? 0 : 64 + 32)); // BufferOffset
+    putLe16(body, 0);  // Reserved
+    putLe32(body, 0);  // AdditionalInformation
+    putLe64(body, id);
+    putLe64(body, id);
+    body.append(buffer);
+    return header(Smb2::CmdSetInfo, messageId, sessionId, treeId) + body;
+}
+
+QByteArray writeRequest(quint64 messageId, quint64 sessionId, quint32 treeId, quint64 id,
+                        quint64 offset, const QByteArray &data)
+{
+    QByteArray body;
+    putLe16(body, 49);
+    putLe16(body, 64 + 48); // DataOffset
+    putLe32(body, quint32(data.size()));
+    putLe64(body, offset);
+    putLe64(body, id);   // FileId
+    putLe64(body, id);
+    putLe32(body, 0);    // Channel
+    putLe32(body, 0);    // RemainingBytes
+    putLe16(body, 0);    // WriteChannelInfoOffset
+    putLe16(body, 0);    // WriteChannelInfoLength
+    putLe32(body, 0);    // Flags
+    body.append(data);
+    return header(Smb2::CmdWrite, messageId, sessionId, treeId) + body;
+}
+
+QByteArray closeRequest(quint64 messageId, quint64 sessionId, quint32 treeId, quint64 id)
+{
+    QByteArray body;
+    putLe16(body, 24); // StructureSize
+    putLe16(body, 0);  // Flags
+    putLe32(body, 0);  // Reserved
+    putLe64(body, id);
+    putLe64(body, id);
+    return header(Smb2::CmdClose, messageId, sessionId, treeId) + body;
+}
+
 } // namespace
 
 class Smb2Test : public QObject
@@ -260,6 +309,7 @@ private slots:
     void refusesAnUnknownPipeAndUnknownShare();
     void carriesADceBindThroughThePipe();
     void servesADiskShareReadOnly();
+    void writesADiskShareForAnAdministratorOnly();
 };
 
 void Smb2Test::negotiatesTheHighestOfferedDialect()
@@ -606,6 +656,108 @@ void Smb2Test::servesADiskShareReadOnly()
     reply = server.feed(nbt(queryDirectoryRequest(11, sessionId, treeId, directoryId,
                                                   QStringLiteral("*"), 0x25)));
     QCOMPARE(statusOf(reply), quint32(Smb2::StatusNoMoreFiles));
+}
+
+// A writable disk share is how a GPO is edited and a logon script dropped: the
+// account that administers the domain creates, writes, truncates, renames and
+// deletes; a member who is not an administrator meets the share's read-only
+// flag and the refusals behind it.
+void Smb2Test::writesADiskShareForAnAdministratorOnly()
+{
+    QTemporaryDir root;
+    QVERIFY(root.isValid());
+    const QString sysvol = root.filePath(QStringLiteral("sysvol"));
+    QVERIFY(QDir().mkpath(sysvol + QStringLiteral("/Policies")));
+
+    Smb2Server server;
+    server.addShare(QStringLiteral("SYSVOL"), sysvol, false);
+    server.setAuthenticator([](const Rpc::AuthRequest &, Ntlm::SessionKeys *keys) {
+        keys->sessionBaseKey = QByteArray(16, 'k');
+        return true;
+    });
+    server.setWritePolicy([](const QString &principal) {
+        return principal.endsWith(QStringLiteral("\\Administrator"), Qt::CaseInsensitive);
+    });
+
+    server.feed(nbt(sessionSetup(1, ntlmNegotiate())));
+    QByteArray reply = server.feed(nbt(sessionSetup(2, ntlmAuthenticate(
+        QStringLiteral("CYBERDYNE"), QStringLiteral("Administrator"),
+        QByteArray(16, 'r') + QByteArray(40, 'b')))));
+    QCOMPARE(statusOf(reply), quint32(Smb2::StatusSuccess));
+    const quint64 sessionId = readLe64(reply, 4 + 40);
+
+    reply = server.feed(nbt(treeConnectTo(3, sessionId, QStringLiteral("SYSVOL"))));
+    QCOMPARE(statusOf(reply), quint32(Smb2::StatusSuccess));
+    QCOMPARE(readLe32(bodyOf(reply), 4) & 1u, 0u); // ShareFlags: writable
+    const quint32 treeId = readLe32(reply, 4 + 36);
+
+    // FILE_CREATE of a name that is not there yet, for data write access.
+    const QString name = QStringLiteral("Policies/logon.bat");
+    reply = server.feed(nbt(createRequest(4, sessionId, treeId, name, 0x40, 0x00120116u, 2)));
+    QCOMPARE(statusOf(reply), quint32(Smb2::StatusSuccess));
+    QByteArray body = bodyOf(reply);
+    QCOMPARE(readLe32(body, 4), quint32(2)); // CreateAction: FILE_CREATED
+    const quint64 fileId = readLe64(body, 64);
+
+    const QByteArray script("@echo off\r\nnet use h: \\\\dc\\home\r\n");
+    reply = server.feed(nbt(writeRequest(5, sessionId, treeId, fileId, 0, script)));
+    QCOMPARE(statusOf(reply), quint32(Smb2::StatusSuccess));
+    QCOMPARE(readLe32(bodyOf(reply), 4), quint32(script.size()));
+
+    // A positional rewrite lands where the offset names.
+    reply = server.feed(nbt(writeRequest(6, sessionId, treeId, fileId, 0, QByteArray("@rem "))));
+    QCOMPARE(statusOf(reply), quint32(Smb2::StatusSuccess));
+
+    // FileEndOfFileInformation shortens it, and the closing handle sees that:
+    // the rewritten prefix plus the original byte at offset 5, nothing more.
+    QByteArray endOfFile;
+    putLe64(endOfFile, 6);
+    reply = server.feed(nbt(setInfoBuffer(7, sessionId, treeId, fileId, 0x14, endOfFile)));
+    QCOMPARE(statusOf(reply), quint32(Smb2::StatusSuccess));
+    reply = server.feed(nbt(closeRequest(8, sessionId, treeId, fileId)));
+    QCOMPARE(statusOf(reply), quint32(Smb2::StatusSuccess));
+
+    QFile written(sysvol + QLatin1Char('/') + name);
+    QVERIFY(written.open(QIODevice::ReadOnly));
+    QCOMPARE(written.readAll(), QByteArray("@rem  "));
+    written.close();
+
+    // A rename, then the delete-on-close a client sends for a file it removes.
+    const QString renamed = QStringLiteral("Policies/startup.bat");
+    QByteArray rename;
+    putLe64(rename, 0);                     // ReplaceIfExists
+    putLe64(rename, 0);                     // RootDirectory
+    putLe32(rename, quint32(renamed.size() * 2));
+    rename.append(utf16(renamed));
+    reply = server.feed(nbt(createRequest(9, sessionId, treeId, name, 0x40, 0x00120116u)));
+    QCOMPARE(statusOf(reply), quint32(Smb2::StatusSuccess));
+    const quint64 renameId = readLe64(bodyOf(reply), 64);
+    reply = server.feed(nbt(setInfoBuffer(10, sessionId, treeId, renameId, 0x0a, rename)));
+    QCOMPARE(statusOf(reply), quint32(Smb2::StatusSuccess));
+    reply = server.feed(nbt(setInfoBuffer(11, sessionId, treeId, renameId, 0x0d, QByteArray(1, '\1'))));
+    QCOMPARE(statusOf(reply), quint32(Smb2::StatusSuccess));
+    reply = server.feed(nbt(closeRequest(12, sessionId, treeId, renameId)));
+    QCOMPARE(statusOf(reply), quint32(Smb2::StatusSuccess));
+    QVERIFY(!QFileInfo::exists(sysvol + QStringLiteral("/Policies/logon.bat")));
+    QVERIFY(!QFileInfo::exists(sysvol + QStringLiteral("/Policies/startup.bat")));
+
+    // A member who does not administer the domain sees a read-only share and is
+    // refused the same creation, which is what the ACL on a Windows DC does.
+    server.feed(nbt(sessionSetup(13, ntlmNegotiate())));
+    reply = server.feed(nbt(sessionSetup(14, ntlmAuthenticate(
+        QStringLiteral("CYBERDYNE"), QStringLiteral("alice"),
+        QByteArray(16, 'r') + QByteArray(40, 'c')))));
+    QCOMPARE(statusOf(reply), quint32(Smb2::StatusSuccess));
+    const quint64 memberSession = readLe64(reply, 4 + 40);
+    reply = server.feed(nbt(treeConnectTo(15, memberSession, QStringLiteral("SYSVOL"))));
+    QCOMPARE(statusOf(reply), quint32(Smb2::StatusSuccess));
+    QCOMPARE(readLe32(bodyOf(reply), 4) & 1u, 1u); // ShareFlags: read-only
+    const quint32 memberTree = readLe32(reply, 4 + 36);
+    reply = server.feed(nbt(createRequest(16, memberSession, memberTree,
+                                          QStringLiteral("Policies/member.bat"), 0x40,
+                                          0x00120116u, 2)));
+    QCOMPARE(statusOf(reply), quint32(Smb2::StatusAccessDenied));
+    QVERIFY(!QFileInfo::exists(sysvol + QStringLiteral("/Policies/member.bat")));
 }
 
 QTEST_MAIN(Smb2Test)

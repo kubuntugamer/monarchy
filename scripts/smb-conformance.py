@@ -78,7 +78,8 @@ CHECKS = [
     'an SMB 2.1 session opens SYSVOL and lists the domain directory',
     'smbclient -k opens SYSVOL on a Kerberos ticket alone',
     'a file read over SMB 2.1 matches the bytes on disk',
-    'NETLOGON refuses a write over SMB 2.1 and creates nothing',
+    'SYSVOL stores a file an administrator puts and serves it back',
+    'SYSVOL refuses a write from a member who does not administer it',
     'an SMB1 client negotiates NT LM 0.12 and lists the domain directory',
     'SMB1 lists a subdirectory rather than the directory itself',
     'SMB1 answers a pattern that matches nothing with NO_SUCH_FILE',
@@ -96,6 +97,7 @@ CHECKS = [
     SESSION,
     KERBEROS_SESSION,
     FILE_BYTES,
+    WRITE_STORED,
     WRITE_REFUSED,
     SMB1_LIST,
     SMB1_SUBDIR,
@@ -127,6 +129,22 @@ def summary():
 
 def credential(options):
     return '%s\\%s%%%s' % (options.domain, options.user, options.password)
+
+
+def member_credential(options, member, password):
+    return '%s\\%s%%%s' % (options.domain, member, password)
+
+
+def smbclient_member(options, member, password, share, command):
+    """The same client as an account that is not an administrator."""
+    return run([
+        options.smbclient,
+        '//%s/%s' % (options.host, share),
+        '-m', 'SMB2_10',
+        '-p', str(options.port),
+        '-U', member_credential(options, member, password),
+        '-c', command,
+    ])
 
 
 def run(argv, timeout=60):
@@ -226,6 +244,38 @@ def pipe(options, name, uuid):
     dce.connect()
     dce.bind(uuid)
     return dce
+
+
+def create_member(options, name, password):
+    """A plain domain account, made through SAMR over the pipe: SYSVOL is
+    writable for the accounts that administer the domain and read-only for
+    everyone else, so proving the refusal needs an account that is not one.
+    Returns (handle, domain handle, dce) so the caller can remove it again."""
+    dce = pipe(options, 'samr', samr.MSRPC_UUID_SAMR)
+    try:
+        server = samr.hSamrConnect5(dce, '\\\\%s\x00' % options.host,
+                                    MAXIMUM_ALLOWED, 1, 3)['ServerHandle']
+        sid = samr.hSamrLookupDomainInSamServer(dce, server, options.domain)['DomainId']
+        domain = samr.hSamrOpenDomain(dce, server, MAXIMUM_ALLOWED, sid)['DomainHandle']
+        user = samr.hSamrCreateUser2InDomain(
+            dce, domain, name, samr.USER_NORMAL_ACCOUNT, MAXIMUM_ALLOWED)['UserHandle']
+        # Class 25 with the RC4 pass-through the pipe's own session key allows,
+        # which is the call a password-reset tool makes over SMB.
+        samr.hSamrSetNTInternal1(dce, user, password)
+        return user, domain, dce
+    except Exception:
+        dce.disconnect()
+        raise
+
+
+def remove_member(user, domain, dce):
+    try:
+        samr.hSamrDeleteUser(dce, user)
+    finally:
+        try:
+            samr.hSamrCloseHandle(dce, domain)
+        finally:
+            dce.disconnect()
 
 
 def main():
@@ -345,23 +395,70 @@ def main():
             if os.path.exists(stored):
                 os.unlink(stored)
 
-    # The shares are read-only by design, and a refusal that leaves the file
-    # behind would be a lie: the write is attempted and the directory is then
-    # listed for its name.
-    forbidden = 'smbconf-write-%s.txt' % os.urandom(4).hex()
+    # SYSVOL and NETLOGON are writable for the accounts that administer the
+    # domain — a GPO is edited over this share and a logon script is dropped
+    # into it — and read-only for every other member, which is what the ACL on a
+    # Windows DC's share root achieves. Samba's client measures both halves: a
+    # put, a listing and a fetch back as the administrator, then the same put by
+    # an account that is not one.
+    written = 'smbconf-put-%s.txt' % os.urandom(4).hex()
+    body = b'the bytes a GPO reader has to see back\n'
+    local = os.path.join(tempfile.gettempdir(), written)
+    fetched = local + '.back'
+    with open(local, 'wb') as handle:
+        handle.write(body)
+    try:
+        result = smbclient(options, 'SYSVOL', 'put %s %s' % (local, written))
+        listing = smbclient(options, 'SYSVOL', 'ls')
+        present = written.lower() in output(listing).lower()
+        got = smbclient(options, 'SYSVOL', 'get %s %s' % (written, fetched))
+        read_back = None
+        if os.path.exists(fetched):
+            with open(fetched, 'rb') as handle:
+                read_back = handle.read()
+        ok = (result.returncode == 0 and present and got.returncode == 0
+              and read_back == body)
+        check(WRITE_STORED, ok,
+              '' if ok else 'rc=%d present=%s read=%r %s'
+              % (result.returncode, present, read_back, output(result)))
+        # And a delete the same client sends takes it away again.
+        deleted = smbclient(options, 'SYSVOL', 'del %s' % written)
+        gone = written.lower() not in output(smbclient(options, 'SYSVOL', 'ls')).lower()
+        if deleted.returncode != 0 or not gone:
+            print('note: delete of %s -> rc=%d %s' % (written, deleted.returncode,
+                                                      output(deleted)))
+    except Exception as error:  # noqa: BLE001
+        check(WRITE_STORED, False, '%s: %s' % (type(error).__name__, error))
+    finally:
+        for path in (local, fetched):
+            if os.path.exists(path):
+                os.unlink(path)
+
+    # The other half: an account that does not administer the domain sees a
+    # read-only share, is refused the write, and leaves nothing behind.
+    forbidden = 'smbconf-forbidden-%s.txt' % os.urandom(4).hex()
     local = os.path.join(tempfile.gettempdir(), forbidden)
+    member = 'smbconf-member-%s' % os.urandom(3).hex()
+    password = 'P@ssw0rd-%s!' % os.urandom(3).hex()
     with open(local, 'w', encoding='utf-8') as handle:
         handle.write('this must not land on the share\n')
+    created = None
     try:
-        result = smbclient(options, 'NETLOGON', 'put %s %s' % (local, forbidden))
+        created = create_member(options, member, password)
+        result = smbclient_member(options, member, password, 'SYSVOL',
+                                  'put %s %s' % (local, forbidden))
         refused = result.returncode != 0 and 'NT_STATUS_ACCESS_DENIED' in output(result)
-        listing = smbclient(options, 'NETLOGON', 'ls')
-        absent = forbidden.lower() not in output(listing).lower()
+        absent = forbidden.lower() not in output(smbclient(options, 'SYSVOL', 'ls')).lower()
         ok = refused and absent
         check(WRITE_REFUSED, ok, '' if ok else (output(result) or 'the write was accepted'))
     except Exception as error:  # noqa: BLE001
         check(WRITE_REFUSED, False, '%s: %s' % (type(error).__name__, error))
     finally:
+        if created is not None:
+            try:
+                remove_member(*created)
+            except Exception as error:  # noqa: BLE001
+                print('note: could not remove %s: %s' % (member, error))
         if os.path.exists(local):
             os.unlink(local)
 

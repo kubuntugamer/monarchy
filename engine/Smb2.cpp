@@ -63,6 +63,11 @@ void putBe32(QByteArray &out, quint32 value)
     out.append(char(value & 0xff));
 }
 
+quint8 readLe8(const QByteArray &data, int at)
+{
+    return at < 0 || at >= data.size() ? 0 : quint8(data.at(at));
+}
+
 quint16 readLe16(const QByteArray &data, int at)
 {
     if (at < 0 || at + 2 > data.size())
@@ -104,6 +109,15 @@ quint64 fileTime(const QDateTime &time)
     if (!time.isValid())
         return 0;
     return quint64((time.toMSecsSinceEpoch() + 11644473600000LL) * 10000LL);
+}
+
+// The inverse, for a client that sets a timestamp: an invalid result means the
+// value was "leave this one alone".
+QDateTime fromFileTime(quint64 ticks)
+{
+    if (ticks == 0 || ticks == 0xffffffffffffffffull)
+        return QDateTime();
+    return QDateTime::fromMSecsSinceEpoch(qint64(ticks / 10000) - 11644473600000LL);
 }
 
 QString fromUtf16(const QByteArray &bytes)
@@ -169,6 +183,9 @@ struct Smb2Server::Connection {
         bool pipe = false;
         QString path;
         bool readOnly = true;
+        // Whether this session may change the share at all; the share's own
+        // readOnly flag combined with who authenticated.
+        bool writable = false;
     };
 
     // A handle is either a named pipe (whole DCE/RPC PDUs in, answers out) or
@@ -180,6 +197,13 @@ struct Smb2Server::Connection {
         QFile *file = nullptr;
         bool directory = false;
         bool readOnly = true;
+        // Whether this handle was opened for write, and whether closing it
+        // removes it (FILE_DISPOSITION on a writable share).
+        bool writable = false;
+        bool deletePending = false;
+        // The share root this handle was opened in, so a rename names a path
+        // from the share root the way the client does.
+        QString root;
         // Absolute path of whatever this handle opened inside its share.
         QString path;
         // The directory listing, fetched when the query asks for it and
@@ -223,6 +247,11 @@ void Smb2Server::addShare(const QString &name, const QString &path, bool readOnl
     if (!info.isDir())
         return;
     m_shares.insert(name.toLower(), Share{ info.absoluteFilePath(), readOnly });
+}
+
+void Smb2Server::setWritePolicy(std::function<bool(const QString &)> policy)
+{
+    m_writePolicy = std::move(policy);
 }
 
 void Smb2Server::setAuthenticator(Rpc::Authenticator authenticator)
@@ -709,6 +738,10 @@ QByteArray Smb2Server::treeConnect(Connection *connection, const QByteArray &bod
         }
         tree.path = found->path;
         tree.readOnly = found->readOnly;
+        // A writable share is writable only for the principal the policy
+        // accepts; the share flag tells the client the truth it will meet.
+        tree.writable = !found->readOnly && bool(m_writePolicy)
+                        && m_writePolicy(connection->user);
     }
 
     const quint32 treeId = quint32(++connection->nextTree);
@@ -720,9 +753,9 @@ QByteArray Smb2Server::treeConnect(Connection *connection, const QByteArray &bod
     putLe16(out, 16);     // StructureSize
     out.append(char(tree.pipe ? 2 : 1)); // ShareType: pipe or disk
     out.append(char(0));  // Reserved
-    // A read-only disk share says so, so a client does not attempt writes it
+    // A share nobody may write says so, so a client does not attempt writes it
     // would only have refused.
-    putLe32(out, tree.pipe || !tree.readOnly ? 0u : 0x00000001u); // ShareFlags
+    putLe32(out, tree.pipe || tree.writable ? 0u : 0x00000001u); // ShareFlags
     putLe32(out, 0);      // Capabilities
     putLe32(out, 0x001f01ff); // MaximalAccess
     emit requestReceived(QStringLiteral("SMB2 tree connect %1").arg(share));
@@ -774,10 +807,10 @@ QByteArray Smb2Server::create(Connection *connection, quint32 treeId, const QByt
             *status = Smb2::StatusObjectNameNotFound;
             return createResponse(0, 0, 0, QByteArray(), 0);
         }
-        // Every access that could change the share is refused by a read-only
-        // share before the name is even resolved: data, attributes, delete,
-        // ACLs. A client creating a new name gets access denied, not "not
-        // found", exactly as a Windows read-only share answers it.
+        // A change on a share this session may not write is refused before the
+        // name is even resolved: data, attributes, delete, ACLs. A client
+        // creating a new name gets access denied, not "not found", exactly as a
+        // Windows read-only share answers it.
         constexpr quint32 kWriteAccess = 0x00000002u  // FILE_WRITE_DATA / FILE_ADD_FILE
                                          | 0x00000004u // FILE_APPEND_DATA / ADD_SUBDIRECTORY
                                          | 0x00000010u // FILE_WRITE_EA
@@ -788,39 +821,108 @@ QByteArray Smb2Server::create(Connection *connection, quint32 treeId, const QByt
         const quint32 desiredAccess = readLe32(body, 24);
         const quint32 createOptions = readLe32(body, 40);
         const quint32 createDisposition = readLe32(body, 36);
-        if (tree.readOnly
-            && ((desiredAccess & kWriteAccess) || createDisposition == 2 /* FILE_CREATE */
-                || createDisposition == 5 /* FILE_OVERWRITE_IF */)) {
+        const bool creating = createDisposition == 0 /* FILE_SUPERSEDE */
+                              || createDisposition == 2 /* FILE_CREATE */
+                              || createDisposition == 3 /* FILE_OPEN_IF */
+                              || createDisposition == 5 /* FILE_OVERWRITE_IF */;
+        const bool truncating = createDisposition == 0 || createDisposition == 4 /* OVERWRITE */
+                                || createDisposition == 5;
+        if (!tree.writable
+            && ((desiredAccess & kWriteAccess) || createDisposition == 2 || createDisposition == 5)) {
             *status = Smb2::StatusAccessDenied;
             return createResponse(0, 0, 0, QByteArray(), 0);
         }
 
-        const QString full = resolveCaseInsensitive(tree.path, relative);
+        QString full = resolveCaseInsensitive(tree.path, relative);
         if (full.isEmpty()) {
-            *status = Smb2::StatusObjectNameNotFound;
-            return createResponse(0, 0, 0, QByteArray(), 0);
+            // A name that is not there resolves to nothing; a create still has
+            // to name where it goes, so the directory it lives in is resolved
+            // case-insensitively and the client's own leaf name is used.
+            const int sep = relative.lastIndexOf(QLatin1Char('/'));
+            const QString parentRel = sep >= 0 ? relative.left(sep) : QString();
+            const QString leaf = sep >= 0 ? relative.mid(sep + 1) : relative;
+            const QString parent =
+                parentRel.isEmpty() ? QFileInfo(tree.path).absoluteFilePath()
+                                    : resolveCaseInsensitive(tree.path, parentRel);
+            if (!tree.writable || !creating || parent.isEmpty() || leaf.isEmpty()
+                || leaf == QLatin1String(".") || leaf == QLatin1String("..")
+                || leaf.contains(QLatin1Char('/'))) {
+                *status = Smb2::StatusObjectNameNotFound;
+                return createResponse(0, 0, 0, QByteArray(), 0);
+            }
+            full = parent + QLatin1Char('/') + leaf;
         }
         const QFileInfo info(full);
+
+        // A name that does not exist is created only on a writable share, and
+        // only for a disposition that asks for it; FILE_OPEN stays "not found".
+        if (!info.exists()) {
+            if (!tree.writable || !creating) {
+                *status = Smb2::StatusObjectNameNotFound;
+                return createResponse(0, 0, 0, QByteArray(), 0);
+            }
+            const quint64 id = ++connection->nextHandle;
+            Connection::Handle handle;
+            handle.name = relative;
+            handle.path = full;
+            handle.root = tree.path;
+            handle.readOnly = false;
+            handle.writable = true;
+            QByteArray times;
+            quint32 attributes = 0x00000080u; // FILE_ATTRIBUTE_NORMAL
+            if (createOptions & 0x00000001u) { // FILE_DIRECTORY_FILE
+                if (!QDir().mkpath(full)) {
+                    *status = Smb2::StatusAccessDenied;
+                    return createResponse(0, 0, 0, QByteArray(), 0);
+                }
+                handle.directory = true;
+                attributes = 0x00000010u;
+            } else {
+                auto *file = new QFile(full);
+                if (!file->open(QIODevice::ReadWrite)) {
+                    delete file;
+                    *status = Smb2::StatusAccessDenied;
+                    return createResponse(0, 0, 0, QByteArray(), 0);
+                }
+                handle.file = file;
+            }
+            connection->handles.insert(id, handle);
+            emit requestReceived(QStringLiteral("SMB2 create %1%2%3")
+                                     .arg(tree.name, relative.isEmpty() ? QString()
+                                                                      : QStringLiteral("\\"))
+                                     .arg(relative));
+            return createResponse(id, attributes, 0, times, 2); // FILE_CREATED
+        }
 
         const quint64 id = ++connection->nextHandle;
         Connection::Handle handle;
         handle.name = relative;
         handle.path = full;
-        handle.readOnly = tree.readOnly;
+        handle.root = tree.path;
+        handle.readOnly = !tree.writable;
+        handle.writable = tree.writable;
         QByteArray times;
         quint32 attributes = 0;
         quint64 endOfFile = 0;
         if (info.isDir()) {
             handle.directory = true;
+            handle.writable = false;
             attributes = 0x00000010u; // FILE_ATTRIBUTE_DIRECTORY
         } else if (info.isFile()) {
             auto *file = new QFile(full);
-            if (!file->open(QIODevice::ReadOnly)) {
+            // An open that asks for data write access on a writable share opens
+            // the file for writing; every other open is read-only, which is what
+            // a read still needs on a share the session may change.
+            const bool writableOpen = tree.writable && (desiredAccess & kWriteAccess);
+            if (!file->open(writableOpen ? QIODevice::ReadWrite : QIODevice::ReadOnly)) {
                 delete file;
                 *status = Smb2::StatusAccessDenied;
                 return createResponse(0, 0, 0, QByteArray(), 0);
             }
             handle.file = file;
+            handle.writable = writableOpen;
+            if (writableOpen && truncating)
+                file->resize(0);
             endOfFile = quint64(file->size());
             attributes = 0x00000080u; // FILE_ATTRIBUTE_NORMAL
             const QDateTime modified = info.lastModified();
@@ -883,8 +985,7 @@ QByteArray Smb2Server::write(Connection *connection, const QByteArray &body, qui
     const quint64 id = readLe64(body, 16);
 
     auto it = connection->handles.find(id);
-    if (it == connection->handles.end() || !it->channel) {
-        // A disk share is read-only, so this is the refusal a write to it gets.
+    if (it == connection->handles.end() || (!it->channel && !it->file)) {
         *status = it != connection->handles.end() ? Smb2::StatusAccessDenied
                                                   : Smb2::StatusFileClosed;
         QByteArray out;
@@ -895,6 +996,36 @@ QByteArray Smb2Server::write(Connection *connection, const QByteArray &body, qui
     QByteArray data;
     if (dataOffset >= Smb2::kHeaderSize && length > 0)
         data = body.mid(int(dataOffset) - int(Smb2::kHeaderSize), int(length));
+
+    // A file opened for write on a writable share takes the bytes at the offset
+    // the request names, which is how a client rewrites a policy in place.
+    if (!it->channel) {
+        if (!it->writable || !it->file
+            || !(it->file->openMode() & QIODevice::WriteOnly)) {
+            *status = Smb2::StatusAccessDenied;
+        } else {
+            const quint64 offset = readLe64(body, 8);
+            const qint64 written =
+                it->file->seek(qint64(offset)) ? it->file->write(data) : qint64(-1);
+            if (written != qint64(data.size())) {
+                *status = Smb2::StatusAccessDenied;
+            } else {
+                it->file->flush();
+                emit requestReceived(QStringLiteral("SMB2 write %1 (%2 bytes at %3)")
+                                         .arg(it->name)
+                                         .arg(data.size())
+                                         .arg(offset));
+            }
+        }
+        QByteArray out;
+        putLe16(out, 17);     // StructureSize
+        putLe16(out, 0);      // Reserved
+        putLe32(out, *status == Smb2::StatusSuccess ? length : 0u); // Count
+        putLe32(out, 0);      // Remaining
+        putLe16(out, 0);      // WriteChannelInfoOffset
+        putLe16(out, 0);      // WriteChannelInfoLength
+        return out;
+    }
 
     // One write carries whole DCE/RPC PDUs; a client may pack more than one, so
     // they are split on frag_length the way the TCP path splits a stream.
@@ -1427,16 +1558,151 @@ QByteArray Smb2Server::queryInfo(Connection *connection, const QByteArray &body,
     return answer(QByteArray(), 0, Smb2::StatusNotSupported);
 }
 
-// SET_INFO: every write to a read-only share, including the delete-on-close a
-// client sends after opening a file it intended to remove, is refused.
+// SET_INFO (MS-SMB2 2.2.39): the attributes a client changes on a writable
+// share — end-of-file, timestamps, a rename and the delete-on-close flag a
+// client sets after opening a file it intends to remove. On a share this
+// session may not write, and for a pipe, every class is refused.
 QByteArray Smb2Server::setInfo(Connection *connection, const QByteArray &body, quint32 *status)
 {
+    // InfoType and FileInfoClass are single bytes; the length and offset of the
+    // buffer follow them, and the file id comes after the additional value.
+    const quint8 infoType = readLe8(body, 2);
+    const quint8 fileInfoClass = readLe8(body, 3);
+    const quint32 bufferLength = readLe32(body, 4);
+    const quint16 bufferOffset = readLe16(body, 8);
     const quint64 id = readLe64(body, 16);
-    const auto it = connection->handles.constFind(id);
-    *status = it == connection->handles.constEnd() || it->channel ? Smb2::StatusNotSupported
-                                                                 : Smb2::StatusAccessDenied;
+
     QByteArray out;
     putLe16(out, 2); // StructureSize
+
+    auto it = connection->handles.find(id);
+    if (it == connection->handles.end() || it->channel) {
+        *status = Smb2::StatusNotSupported;
+        return out;
+    }
+    // A read-only share answers a set-info with access denied, as it does every
+    // other change.
+    if (!it->writable) {
+        *status = Smb2::StatusAccessDenied;
+        return out;
+    }
+    if (infoType != 1) { // SMB2_0_INFO_FILE
+        *status = Smb2::StatusNotSupported;
+        return out;
+    }
+    QByteArray buffer;
+    if (bufferOffset >= Smb2::kHeaderSize && bufferLength > 0)
+        buffer = body.mid(int(bufferOffset) - int(Smb2::kHeaderSize), int(bufferLength));
+
+    switch (fileInfoClass) {
+    case 0x04: { // FileBasicInformation: four FILETIME stamps, attributes
+        if (buffer.size() < 32) {
+            *status = Smb2::StatusInvalidParameter;
+            return out;
+        }
+        // Zero means "leave this one alone", which is how a client sets one
+        // timestamp without disturbing the others.
+        const auto stamp = [&buffer](int at) -> QDateTime {
+            const quint64 value = readLe64(buffer, at);
+            return value == 0 || value == 0xffffffffffffffffull ? QDateTime()
+                                                                : fromFileTime(value);
+        };
+        const QDateTime created = stamp(0);
+        const QDateTime accessed = stamp(8);
+        const QDateTime modified = stamp(16);
+        Q_UNUSED(created)
+        if (!it->file || (!accessed.isValid() && !modified.isValid()))
+            break;
+        // QFile sets one stamp at a time, so each one the client named is set.
+        if (modified.isValid()
+            && !it->file->setFileTime(modified, QFileDevice::FileModificationTime)) {
+            *status = Smb2::StatusAccessDenied;
+            return out;
+        }
+        if (accessed.isValid()
+            && !it->file->setFileTime(accessed, QFileDevice::FileAccessTime)) {
+            *status = Smb2::StatusAccessDenied;
+            return out;
+        }
+        emit requestReceived(QStringLiteral("SMB2 set times %1").arg(it->name));
+        break;
+    }
+    case 0x0a: { // FileRenameInformation
+        if (buffer.size() < 20) {
+            *status = Smb2::StatusInvalidParameter;
+            return out;
+        }
+        const quint32 nameLength = readLe32(buffer, 16);
+        if (nameLength == 0 || buffer.size() < 20 + int(nameLength)) {
+            *status = Smb2::StatusInvalidParameter;
+            return out;
+        }
+        QString target = fromUtf16(buffer.mid(20, int(nameLength)));
+        while (target.startsWith(QLatin1Char('\\')))
+            target.remove(0, 1);
+        QString relativeTarget;
+        if (!safeRelativeName(target, &relativeTarget) || relativeTarget.isEmpty()) {
+            *status = Smb2::StatusObjectNameNotFound;
+            return out;
+        }
+        // A rename target is share-relative, not relative to the directory the
+        // handle happens to sit in.
+        const int sep = relativeTarget.lastIndexOf(QLatin1Char('/'));
+        const QString parentRel = sep >= 0 ? relativeTarget.left(sep) : QString();
+        const QString leaf = sep >= 0 ? relativeTarget.mid(sep + 1) : relativeTarget;
+        const QString parent = parentRel.isEmpty() ? it->root
+                                                   : resolveCaseInsensitive(it->root, parentRel);
+        if (parent.isEmpty() || leaf.isEmpty()) {
+            *status = Smb2::StatusObjectNameNotFound;
+            return out;
+        }
+        const QString destination = parent + QLatin1Char('/') + leaf;
+        if (QFileInfo::exists(destination)) {
+            *status = Smb2::StatusObjectNameCollision;
+            return out;
+        }
+        if (!QFile::rename(it->path, destination)) {
+            *status = Smb2::StatusAccessDenied;
+            return out;
+        }
+        it->path = destination;
+        it->name = relativeTarget;
+        emit requestReceived(QStringLiteral("SMB2 rename to %1").arg(relativeTarget));
+        break;
+    }
+    case 0x0d: { // FileDispositionInformation
+        if (buffer.isEmpty()) {
+            *status = Smb2::StatusInvalidParameter;
+            return out;
+        }
+        // The flag is applied when the last handle closes, which is what makes
+        // a client's "open, then delete" safe to abort by closing without it.
+        it->deletePending = buffer.at(0) != 0;
+        emit requestReceived(QStringLiteral("SMB2 delete-on-close %1 = %2")
+                                 .arg(it->name, it->deletePending ? QStringLiteral("yes")
+                                                                 : QStringLiteral("no")));
+        break;
+    }
+    case 0x14: { // FileEndOfFileInformation
+        if (buffer.size() < 8 || !it->file) {
+            *status = Smb2::StatusInvalidParameter;
+            return out;
+        }
+        const quint64 endOfFile = readLe64(buffer, 0);
+        if (!it->file->resize(qint64(endOfFile))) {
+            *status = Smb2::StatusAccessDenied;
+            return out;
+        }
+        emit requestReceived(QStringLiteral("SMB2 truncate %1 to %2")
+                                 .arg(it->name)
+                                 .arg(endOfFile));
+        break;
+    }
+    default:
+        *status = Smb2::StatusNotSupported;
+        return out;
+    }
+    *status = Smb2::StatusSuccess;
     return out;
 }
 
@@ -1450,6 +1716,15 @@ QByteArray Smb2Server::closeHandle(Connection *connection, const QByteArray &bod
         it->channel = nullptr;
         delete it->file;
         it->file = nullptr;
+        // A file opened with the delete-on-close flag is removed now, when the
+        // handle that set it goes away.
+        if (it->deletePending && it->writable) {
+            if (it->directory)
+                QDir().rmdir(it->path);
+            else
+                QFile::remove(it->path);
+            emit requestReceived(QStringLiteral("SMB2 delete %1").arg(it->name));
+        }
         connection->handles.erase(it);
     }
     QByteArray out;

@@ -15,6 +15,7 @@
 #include "Srvsvc.h"
 #include "Rpc.h"
 #include "Ntlm.h"
+#include "Pac.h"
 #include "Samr.h"
 #include "Smb2.h"
 
@@ -1165,8 +1166,47 @@ bool DcService::start(const QString &dcDir)
     // `\\dc\SYSVOL\<domain>\Policies\{GUID}` resolves; NETLOGON is the domain's
     // scripts directory under it.
     const QString sysvolShare = QFileInfo(domainSysvol).absolutePath();
-    m_smbServer->addShare(QStringLiteral("SYSVOL"), sysvolShare);
-    m_smbServer->addShare(QStringLiteral("NETLOGON"), domainSysvol + QStringLiteral("/scripts"));
+    m_smbServer->addShare(QStringLiteral("SYSVOL"), sysvolShare, false);
+    m_smbServer->addShare(QStringLiteral("NETLOGON"), domainSysvol + QStringLiteral("/scripts"),
+                          false);
+    // SYSVOL and NETLOGON are writable for the accounts that administer the
+    // domain — a GPO is edited over SMB, and a logon script is dropped there —
+    // and read-only for every other authenticated member, which is what a
+    // Windows DC's ACL on the share root achieves. The groups are AD's own: 512
+    // Domain Admins, 518 Schema Admins, 519 Enterprise Admins. A principal the
+    // directory does not resolve is not an administrator.
+    m_smbServer->setWritePolicy([this](const QString &principal) {
+        QString name = principal;
+        const int slash = name.indexOf(QLatin1Char('\\'));
+        if (slash >= 0)
+            name = name.mid(slash + 1);
+        const int at = name.indexOf(QLatin1Char('@'));
+        if (at > 0)
+            name = name.left(at);
+        if (name.isEmpty())
+            return false;
+        const QList<DirectoryObject> objects = m_ldapServer->objects();
+        for (const DirectoryObject &object : objects) {
+            if (object.kind != ObjectKind::User)
+                continue;
+            if (object.attributes.value(QStringLiteral("sAMAccountName"))
+                    .compare(name, Qt::CaseInsensitive)
+                != 0)
+                continue;
+            for (const QString &groupDn : object.memberOf) {
+                for (const DirectoryObject &group : objects) {
+                    if (group.kind != ObjectKind::Group
+                        || group.id.compare(groupDn, Qt::CaseInsensitive) != 0)
+                        continue;
+                    const quint32 rid = Pac::ridOf(group);
+                    if (rid == 512 || rid == 518 || rid == 519)
+                        return true;
+                }
+            }
+            return false;
+        }
+        return false;
+    });
     emit statusMessage(tr("SYSVOL and NETLOGON shared from %1.").arg(sysvolShare));
 
     // What NetrShareEnum reports: the two shares above, plus IPC$, which is not

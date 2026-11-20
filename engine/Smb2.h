@@ -6,6 +6,8 @@
 
 #include <QByteArray>
 #include <QHash>
+
+#include <functional>
 #include <QHostAddress>
 #include <QObject>
 #include <QString>
@@ -58,6 +60,7 @@ enum Status : quint32 {
     StatusLogonFailure = 0xc000006du,
     StatusBadNetworkName = 0xc00000ccu,
     StatusObjectNameNotFound = 0xc0000034u,
+    StatusObjectNameCollision = 0xc0000035u,
     StatusNotSupported = 0xc00000bbu,
     StatusInvalidParameter = 0xc000000du,
     StatusFileClosed = 0xc0000128u,
@@ -87,9 +90,14 @@ public:
     // Registers a pipe name ("samr", "lsarpc") and the endpoint its PDUs go to.
     void addPipe(const QString &name, RpcServer *endpoint);
     // Exposes a directory as a disk share ("SYSVOL", "NETLOGON"). Only a
-    // client with an authenticated session may connect; a read-only share
-    // refuses every write, set-info and delete with access denied.
+    // client with an authenticated session may connect. A read-only share
+    // refuses every write, set-info and delete with access denied; a writable
+    // one allows them only for a principal the write policy accepts.
     void addShare(const QString &name, const QString &path, bool readOnly = true);
+    // Who may change a writable share, decided from the session's principal
+    // name (the account SMB authenticated). Without a policy a writable share
+    // is writable by nobody, rather than by whoever connects first.
+    void setWritePolicy(std::function<bool(const QString &principal)> policy);
     // The same authenticator SAMR and LSAD use, so one directory credential
     // opens the pipes as well as the TCP endpoints.
     void setAuthenticator(Rpc::Authenticator authenticator);
@@ -156,6 +164,7 @@ private:
     QHash<QString, Share> m_shares;
     Rpc::Authenticator m_authenticator;
     Rpc::KerberosAcceptor m_kerberosAcceptor;
+    std::function<bool(const QString &)> m_writePolicy;
     QString m_domain;
     QString m_serverName;
     QString m_dnsDomain;
