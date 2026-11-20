@@ -185,6 +185,12 @@ struct Smb2Server::Connection {
     quint16 dialect = Smb2::Dialect202;
     QByteArray preauth;
     QByteArray signingKey;
+    // The cipher keys a 3.x session seals with, and the nonce prefix that keeps
+    // what this server sends from ever repeating a nonce inside one session.
+    QByteArray cipherKeyOut;
+    QByteArray cipherKeyIn;
+    QByteArray noncePrefix;
+    quint64 nonceCounter = 0;
 
     struct Tree {
         QString name;
@@ -471,8 +477,83 @@ QByteArray messageSignature(const QByteArray &message, quint16 dialect,
     return hmac.result().left(16);
 }
 
-QByteArray Smb2Server::handleMessage(Connection *connection, const QByteArray &message)
+// A 3.x message that was sealed is a 52-byte transform header followed by the
+// ciphertext (MS-SMB2 2.2.41): protocol id, signature, a 16-byte nonce field,
+// the size of what it wraps, flags, and the session. Two things about it are
+// easy to get wrong and are measured here: the AES-CCM tag is what the header's
+// signature field carries — it is not appended after the ciphertext — and what
+// the tag covers is the header from the nonce on, 32 bytes, leaving the
+// protocol id and that signature field outside it. Under AES-CCM the nonce
+// itself is the first 11 bytes of the field, the rest of it zero.
+constexpr int kTransformHeader = 52;
+constexpr int kTransformAad = 32;      // from offset 20 to the end
+constexpr int kCcmNonce = 11;
+constexpr int kCcmTag = 16;
+
+QByteArray Smb2Server::openTransform(Connection *connection, const QByteArray &message)
 {
+    if (connection->cipherKeyIn.isEmpty() || message.size() < kTransformHeader)
+        return QByteArray();
+    const quint32 original = readLe32(message, 36);
+    if (original == 0 || int(original) > message.size() - kTransformHeader)
+        return QByteArray();
+    const QByteArray plain = Smb3::ccmDecrypt(
+        connection->cipherKeyIn, message.mid(20, kCcmNonce), message.mid(20, kTransformAad),
+        message.mid(kTransformHeader) + message.mid(4, kCcmTag));
+    if (plain.isEmpty() || plain.size() != int(original))
+        return QByteArray();
+    return plain;
+}
+
+QByteArray Smb2Server::sealTransform(Connection *connection, const QByteArray &reply)
+{
+    if (connection->cipherKeyOut.isEmpty())
+        return reply;
+    if (connection->noncePrefix.isEmpty()) {
+        connection->noncePrefix.resize(3);
+        for (int i = 0; i < 3; ++i)
+            connection->noncePrefix[i] = char(QRandomGenerator::system()->generate() & 0xff);
+    }
+    // A nonce is never reused under one key, so it is a per-session random prefix
+    // and a counter rather than anything derived from the message.
+    QByteArray nonce = connection->noncePrefix;
+    const quint64 counter = ++connection->nonceCounter;
+    for (int i = 7; i >= 0; --i)
+        nonce.append(char((counter >> (8 * i)) & 0xff));
+
+    QByteArray header;
+    header.append(char(0xfd));
+    header.append(QByteArray("SMB", 3));
+    header.append(QByteArray(kCcmTag, '\0')); // Signature: the tag goes here
+    header.append(nonce);
+    header.append(QByteArray(16 - kCcmNonce, '\0')); // the rest of the nonce field
+    putLe32(header, quint32(reply.size())); // OriginalMessageSize
+    putLe16(header, 0);                     // Reserved
+    putLe16(header, 0x0001);                // Flags: encrypted
+    for (int i = 0; i < 8; ++i)
+        header.append(char((connection->sessionId >> (8 * i)) & 0xff));
+    const QByteArray sealed =
+        Smb3::ccmEncrypt(connection->cipherKeyOut, nonce, header.mid(20), reply);
+    header.replace(4, kCcmTag, sealed.right(kCcmTag));
+    return header + sealed.left(sealed.size() - kCcmTag);
+}
+
+QByteArray Smb2Server::handleMessage(Connection *connection, QByteArray message)
+{
+    // A sealed message is opened first: everything after this point reads the
+    // SMB2 message itself, and a reply to a sealed request is sealed again.
+    bool encrypted = false;
+    if (message.size() >= 52 && quint8(message.at(0)) == 0xfd
+        && message.mid(1, 3) == QByteArray("SMB", 3)) {
+        const QByteArray plain = openTransform(connection, message);
+        if (plain.isEmpty()) {
+            if (!qEnvironmentVariableIsEmpty("MONARCHY_SMB_TRACE"))
+                qWarning("SMB2 dropped a sealed message: %s", message.left(52).toHex().constData());
+            return QByteArray();
+        }
+        message = plain;
+        encrypted = true;
+    }
     if (Smb1::Session::isSmb1(message))
         return handleSmb1(connection, message);
     if (message.size() < int(Smb2::kHeaderSize) || message.left(4) != QByteArray("\376SMB", 4))
@@ -497,7 +578,7 @@ QByteArray Smb2Server::handleMessage(Connection *connection, const QByteArray &m
             putLe16(body, 9);
             body.append(QByteArray(7, '\0'));
             refused.append(body);
-            return nbtFrame(refused);
+            return nbtFrame(encrypted ? sealTransform(connection, refused) : refused);
         }
     }
     const quint32 treeId = readLe32(message, 36);
@@ -606,6 +687,13 @@ QByteArray Smb2Server::handleMessage(Connection *connection, const QByteArray &m
             return QByteArray();
         }
     }
+    // The cipher keys are derived once, alongside the signing key, from the same
+    // session key and the same preauth hash (MS-SMB2 3.2.5.3.1).
+    if (command == Smb2::CmdSessionSetup && connection->authenticated
+        && connection->cipherKeyOut.isEmpty() && connection->dialect >= Smb2::Dialect300) {
+        Smb3::encryptionKeys(connection->sessionKey, connection->dialect, connection->preauth,
+                             &connection->cipherKeyOut, &connection->cipherKeyIn);
+    }
 
     // Signing (MS-SMB2 3.2.5.3.1): HMAC-SHA256 under the session key, or AES-CMAC
     // under the signing key a 3.x session derived from it. A reply that carries a
@@ -625,7 +713,7 @@ QByteArray Smb2Server::handleMessage(Connection *connection, const QByteArray &m
         qWarning("SMB2 out cmd=%d status=0x%08x bytes=%d body=%s",
                  command, status, int(reply.size()),
                  qPrintable(reply.mid(int(Smb2::kHeaderSize)).left(160).toHex()));
-    return nbtFrame(reply);
+    return nbtFrame(encrypted ? sealTransform(connection, reply) : reply);
 }
 
 QByteArray Smb2Server::negotiate(Connection *connection, const QByteArray &body, quint32 status)
@@ -660,6 +748,18 @@ QByteArray Smb2Server::negotiate(Connection *connection, const QByteArray &body,
         }
     }
     connection->dialect = dialect;
+    // A negotiate begins a new session negotiation, so nothing derived from a
+    // previous one may survive it — including the session itself, which a client
+    // that offers dialects has not established yet.
+    connection->sessionKey.clear();
+    connection->authenticated = false;
+    connection->user.clear();
+    connection->sessionId = 0;
+    connection->challenge.clear();
+    connection->preauth.clear();
+    connection->signingKey.clear();
+    connection->cipherKeyOut.clear();
+    connection->cipherKeyIn.clear();
 
     emit requestReceived(QStringLiteral("SMB2 negotiate dialect 0x%1").arg(dialect, 4, 16, QLatin1Char('0')));
 
@@ -693,6 +793,20 @@ QByteArray Smb2Server::negotiate(Connection *connection, const QByteArray &body,
         putLe16(signing, 1);      // CipherCount
         putLe16(signing, 0x0001); // AES-CMAC
         contexts.append(signing);
+
+        // ENCRYPTION_CAPABILITIES (MS-SMB2 2.2.3.2.3): the cipher a session may
+        // seal with. Without this context a 3.1.1 client concludes the server
+        // cannot encrypt at all and refuses to turn encryption on, whatever the
+        // capability bits say. Its data is four bytes, padded so the context
+        // keeps the 8-byte alignment the next one starts on.
+        QByteArray cipher;
+        putLe16(cipher, 0x0002); // ContextType
+        putLe16(cipher, 4);      // DataLength
+        cipher.append(QByteArray(4, '\0')); // Reserved
+        putLe16(cipher, 1);      // CipherCount
+        putLe16(cipher, 0x0001); // AES-128-CCM
+        cipher.append(QByteArray(4, '\0')); // pad to 8 bytes
+        contexts.append(cipher);
     }
 
     QByteArray out;
@@ -704,7 +818,9 @@ QByteArray Smb2Server::negotiate(Connection *connection, const QByteArray &body,
     putLe16(out, dialect);
     putLe16(out, quint16(contexts.size())); // NegotiateContextCount
     out.append(QByteArray::fromHex("8d9c2f4e6a1b4d7c9e0f1a2b3c4d5e6f")); // ServerGuid
-    putLe32(out, 0);         // Capabilities
+    // SMB2_GLOBAL_CAP_ENCRYPTION: 3.0 and 3.0.2 have no context to say it in, so
+    // a client reads the capability bits and would otherwise refuse to encrypt.
+    putLe32(out, dialect >= Smb2::Dialect300 ? 0x00000040u : 0u); // Capabilities
     putLe32(out, 65536);     // MaxTransactSize
     putLe32(out, 65536);     // MaxReadSize
     putLe32(out, 65536);     // MaxWriteSize

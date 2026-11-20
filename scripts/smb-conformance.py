@@ -78,6 +78,8 @@ CHECKS = [
     'an SMB 2.1 session opens SYSVOL and lists the domain directory',
     'an SMB 3.1.1 session signs with AES-CMAC and lists the domain directory',
     'an SMB 3.0.2 session signs with AES-CMAC and lists the domain directory',
+    'an SMB 3.1.1 session that requires encryption seals every message',
+    'an SMB 3.0.2 session that requires encryption seals every message',
     'smbclient -k opens SYSVOL on a Kerberos ticket alone',
     'a file read over SMB 2.1 matches the bytes on disk',
     'SYSVOL stores a file an administrator puts and serves it back',
@@ -99,6 +101,8 @@ CHECKS = [
     SESSION,
     SESSION_311,
     SESSION_302,
+    SEALED_311,
+    SEALED_302,
     KERBEROS_SESSION,
     FILE_BYTES,
     WRITE_STORED,
@@ -172,14 +176,14 @@ def smbclient(options, share, command):
     ])
 
 
-def smb3client(options, max_protocol, share, command):
+def smb3client(options, max_protocol, share, command, encrypt=False):
     """smbclient capped at a 3.x dialect. The minimum is lowered as well, because
     Samba refuses a maximum below its default minimum, and a client that is
     capped at 3.1.1 offers nothing older than it will accept: the dialect in the
     server's answer is what this measures, and the session that follows is signed
     with AES-CMAC — Samba fails the connection on a signature it cannot verify,
     so a listing is proof the key derivation matched."""
-    return run([
+    arguments = [
         options.smbclient,
         '//%s/%s' % (options.host, share),
         '--option=client min protocol=SMB2_02',
@@ -187,7 +191,10 @@ def smb3client(options, max_protocol, share, command):
         '-p', str(options.port),
         '-U', credential(options),
         '-c', command,
-    ])
+    ]
+    if encrypt:
+        arguments.append('--client-protection=encrypt')
+    return run(arguments)
 
 
 def kerberos_smbclient(options, share, command):
@@ -359,6 +366,20 @@ def main():
     for label, protocol in ((SESSION_311, 'SMB3_11'), (SESSION_302, 'SMB3_02')):
         try:
             result = smb3client(options, protocol, 'SYSVOL', 'ls')
+            listed = output(result)
+            ok = result.returncode == 0 and dns_domain.lower() in listed.lower()
+            check(label, ok, (listed.splitlines()[-1] if listed else 'no output') if not ok else '')
+        except Exception as error:  # noqa: BLE001
+            check(label, False, '%s: %s' % (type(error).__name__, error))
+
+    # The same two dialects with the client demanding encryption. Samba seals
+    # every message and fails the tree connect on the first reply it cannot
+    # authenticate, so a listing proves both cipher keys and the transform
+    # header: AES-128-CCM over the session key, the tag in the header's
+    # signature field, and the AD starting at the nonce.
+    for label, protocol in ((SEALED_311, 'SMB3_11'), (SEALED_302, 'SMB3_02')):
+        try:
+            result = smb3client(options, protocol, 'SYSVOL', 'ls', encrypt=True)
             listed = output(result)
             ok = result.returncode == 0 and dns_domain.lower() in listed.lower()
             check(label, ok, (listed.splitlines()[-1] if listed else 'no output') if not ok else '')

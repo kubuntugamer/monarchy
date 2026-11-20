@@ -313,6 +313,8 @@ private slots:
     void writesADiskShareForAnAdministratorOnly();
     void signsWithAesCmacAsTheStandardDoes();
     void answersSmb311WithThePreauthContext();
+    void sealsWithAesCcmAsTheStandardDoes();
+    void sealsAThreeOneOneSession();
 };
 
 void Smb2Test::negotiatesTheHighestOfferedDialect()
@@ -817,9 +819,11 @@ void Smb2Test::answersSmb311WithThePreauthContext()
     QCOMPARE(readLe16(answer, 0), quint16(65));                  // StructureSize
     QCOMPARE(readLe16(answer, 2), quint16(1));                   // signing enabled
     QCOMPARE(readLe16(answer, 4), quint16(Smb2::Dialect311));    // dialect
-    QCOMPARE(readLe16(answer, 6), quint16(2));                   // preauth and signing
+    QCOMPARE(readLe16(answer, 6), quint16(3));                   // preauth, signing, cipher
     QCOMPARE(readLe32(answer, 60), quint32(Smb2::kHeaderSize + 64)); // context offset
-    QCOMPARE(answer.size(), 64 + 46 + 2 + 12);                   // body, preauth, pad, signing
+    // body, preauth, pad to the next 8-byte boundary, signing, then the cipher
+    // context with its four bytes of padding.
+    QCOMPARE(answer.size(), 64 + 46 + 2 + 12 + 4 + 16);
     QCOMPARE(readLe16(answer, 64), quint16(0x0001));             // PREAUTH_INTEGRITY
     QCOMPARE(readLe16(answer, 66), quint16(38));                 // DataLength
     QCOMPARE(readLe16(answer, 72), quint16(1));                  // HashAlgorithmCount
@@ -829,6 +833,162 @@ void Smb2Test::answersSmb311WithThePreauthContext()
     QCOMPARE(readLe16(answer, 114), quint16(4));                 // DataLength
     QCOMPARE(readLe16(answer, 120), quint16(1));                 // one algorithm
     QCOMPARE(readLe16(answer, 122), quint16(0x0001));            // AES-CMAC
+    // ENCRYPTION_CAPABILITIES: without it a 3.1.1 client decides the server
+    // cannot encrypt and refuses to turn encryption on, whatever the capability
+    // bits say.
+    QCOMPARE(readLe16(answer, 128), quint16(0x0002));            // ENCRYPTION_CAPABILITIES
+    QCOMPARE(readLe16(answer, 130), quint16(4));                 // DataLength
+    QCOMPARE(readLe16(answer, 136), quint16(1));                 // one cipher
+    QCOMPARE(readLe16(answer, 138), quint16(0x0001));            // AES-128-CCM
+    // 3.0.x has no context to say it in, so it rides the capability bits.
+    QByteArray older = header(Smb2::CmdNegotiate, 0, 0, 0);
+    QByteArray olderBody;
+    putLe16(olderBody, 36);
+    putLe16(olderBody, 1);
+    putLe16(olderBody, 1);
+    putLe16(olderBody, 0);
+    putLe32(olderBody, 0);
+    olderBody.append(QByteArray(16, '\0'));
+    putLe64(olderBody, 0);
+    putLe16(olderBody, Smb2::Dialect302);
+    older.append(olderBody);
+    const QByteArray olderAnswer = bodyOf(server.feed(nbt(older)));
+    QCOMPARE(readLe16(olderAnswer, 4), quint16(Smb2::Dialect302));
+    QCOMPARE(readLe16(olderAnswer, 6), quint16(0));              // no contexts
+    QCOMPARE(readLe32(olderAnswer, 24) & 0x40u, quint32(0x40));   // CAP_ENCRYPTION
+}
+
+// RFC 3610 packet vector #1 — an 8-byte tag over eight bytes of associated data
+// and twenty-three bytes of message — is the published CCM vector that exercises
+// both the AAD encoding and a tag shorter than the block. The rest pins what SMB
+// actually uses: a 12-byte nonce, the 52-byte transform header as the associated
+// data and the whole 16-byte tag, and a tag that does not verify opening nothing
+// at all.
+void Smb2Test::sealsWithAesCcmAsTheStandardDoes()
+{
+    const QByteArray key = QByteArray::fromHex("c0c1c2c3c4c5c6c7c8c9cacbcccdcecf");
+    const QByteArray nonce = QByteArray::fromHex("00000003020100a0a1a2a3a4a5");
+    const QByteArray aad = QByteArray::fromHex("0001020304050607");
+    const QByteArray plain =
+        QByteArray::fromHex("08090a0b0c0d0e0f101112131415161718191a1b1c1d1e");
+    const QByteArray sealed = QByteArray::fromHex(
+        "588c979a61c663d2f066d0c2c0f989806d5f6b61dac38417e8d12cfdf926e0");
+    QCOMPARE(Smb3::ccmEncrypt(key, nonce, aad, plain, 8), sealed);
+    QCOMPARE(Smb3::ccmDecrypt(key, nonce, aad, sealed, 8), plain);
+
+    QByteArray transform(52, '\0');
+    transform[0] = char(0xfd);
+    transform.replace(1, 3, QByteArray("SMB", 3));
+    const QByteArray message = transform + QByteArray(60, 'm');
+    QByteArray small;
+    for (int i = 0; i < 12; ++i)
+        small.append(char(i + 1));
+    const QByteArray boxed = Smb3::ccmEncrypt(key, small, transform, message);
+    QCOMPARE(boxed.size(), message.size() + 16);
+    QCOMPARE(Smb3::ccmDecrypt(key, small, transform, boxed), message);
+    QByteArray tampered = boxed;
+    tampered[tampered.size() - 1] = char(quint8(tampered.at(tampered.size() - 1)) ^ 0x01);
+    QVERIFY(Smb3::ccmDecrypt(key, small, transform, tampered).isEmpty());
+}
+
+// A 3.1.1 session that turns encryption on: the client derives the same cipher
+// key the server did from the preauth chain, seals an echo in a transform header
+// and must get a sealed, signed answer back that opens.
+void Smb2Test::sealsAThreeOneOneSession()
+{
+    Smb2Server server;
+    server.setAuthenticator([](const Rpc::AuthRequest &, Ntlm::SessionKeys *keys) {
+        keys->sessionBaseKey = QByteArray(16, 'k');
+        return true;
+    });
+
+    QByteArray negotiate = header(Smb2::CmdNegotiate, 0, 0, 0);
+    QByteArray body;
+    putLe16(body, 36);
+    putLe16(body, 1);
+    putLe16(body, 1);
+    putLe16(body, 0);
+    putLe32(body, 0);
+    body.append(QByteArray(16, '\0'));
+    putLe64(body, 0);
+    putLe16(body, Smb2::Dialect311);
+    negotiate.append(body);
+    const QByteArray negotiateReply = server.feed(nbt(negotiate));
+    QCOMPARE(statusOf(negotiateReply), quint32(Smb2::StatusSuccess));
+
+    const QByteArray setupOne = sessionSetup(1, ntlmNegotiate());
+    const QByteArray replyOne = server.feed(nbt(setupOne));
+    QCOMPARE(statusOf(replyOne), quint32(Smb2::StatusMoreProcessingRequired));
+    const QByteArray setupTwo = sessionSetup(2, ntlmAuthenticate(
+        QStringLiteral("CYBERDYNE"), QStringLiteral("alice"),
+        QByteArray(16, 'r') + QByteArray(40, 'b')));
+    const QByteArray replyTwo = server.feed(nbt(setupTwo));
+    QCOMPARE(statusOf(replyTwo), quint32(Smb2::StatusSuccess));
+    const quint64 sessionId = readLe64(replyTwo, 4 + 40);
+
+    QByteArray preauth = Smb3::preauthUpdate(QByteArray(), negotiate);
+    preauth = Smb3::preauthUpdate(preauth, negotiateReply.mid(4));
+    preauth = Smb3::preauthUpdate(preauth, setupOne);
+    preauth = Smb3::preauthUpdate(preauth, replyOne.mid(4));
+    preauth = Smb3::preauthUpdate(preauth, setupTwo);
+
+    // The server's two directions, derived from the same session key and the
+    // same hash but different labels.
+    QByteArray toClient; // SMBS2CCipherKey
+    QByteArray fromClient; // SMBC2SCipherKey
+    Smb3::encryptionKeys(QByteArray(16, 'k'), Smb2::Dialect311, preauth, &toClient, &fromClient);
+    QCOMPARE(toClient.size(), 16);
+    QCOMPARE(fromClient.size(), 16);
+    QVERIFY(toClient != fromClient);
+    const QByteArray signingKey = Smb3::signingKey(QByteArray(16, 'k'), Smb2::Dialect311, preauth);
+
+    QByteArray echoBody;
+    putLe16(echoBody, 4);
+    putLe16(echoBody, 0);
+    const QByteArray echo = header(Smb2::CmdEcho, 3, sessionId, 0) + echoBody;
+
+    // The transform header's nonce field is 16 bytes; AES-CCM uses its first 11
+    // and what the tag covers starts at the nonce, not at the protocol id.
+    QByteArray nonce;
+    for (int i = 0; i < 11; ++i)
+        nonce.append(char(0xa0 + i));
+    QByteArray transform;
+    transform.append(char(0xfd));
+    transform.append(QByteArray("SMB", 3));
+    transform.append(QByteArray(16, '\0'));
+    transform.append(nonce);
+    transform.append(QByteArray(5, '\0'));
+    putLe32(transform, quint32(echo.size()));
+    putLe16(transform, 0);
+    putLe16(transform, 0x0001);
+    putLe64(transform, sessionId);
+    QCOMPARE(transform.size(), 52);
+
+    // The tag goes in the header's signature field; the ciphertext follows it.
+    const QByteArray sealedEcho = Smb3::ccmEncrypt(fromClient, nonce, transform.mid(20), echo);
+    transform.replace(4, 16, sealedEcho.right(16));
+    const QByteArray reply =
+        server.feed(nbt(transform + sealedEcho.left(sealedEcho.size() - 16)));
+    QVERIFY(reply.size() > 4 + 52 + 16);
+    QCOMPARE(quint8(reply.at(4)), quint8(0xfd));
+    const QByteArray replyHeader = reply.mid(4, 52);
+    QCOMPARE(readLe16(replyHeader, 42), quint16(0x0001)); // encrypted
+    QCOMPARE(readLe64(replyHeader, 44), sessionId);
+    const QByteArray opened =
+        Smb3::ccmDecrypt(toClient, replyHeader.mid(20, 11), replyHeader.mid(20),
+                         reply.mid(56) + replyHeader.mid(4, 16));
+    QVERIFY(!opened.isEmpty());
+    QCOMPARE(readLe32(replyHeader, 36), quint32(opened.size()));
+    QCOMPARE(readLe16(opened, 12), quint16(Smb2::CmdEcho));
+    QCOMPARE(readLe32(opened, 8), quint32(Smb2::StatusSuccess));
+    QByteArray zeroed = opened;
+    zeroed.replace(48, 16, QByteArray(16, '\0'));
+    QCOMPARE(opened.mid(48, 16), Smb3::cmac(signingKey, zeroed).left(16));
+
+    // A tag that does not verify is not a message.
+    QByteArray tampered = transform + sealedEcho.left(sealedEcho.size() - 16);
+    tampered[4] = char(quint8(tampered.at(4)) ^ 0x80); // a tag that does not verify
+    QVERIFY(server.feed(nbt(tampered)).isEmpty());
 }
 
 QTEST_MAIN(Smb2Test)

@@ -48,8 +48,8 @@ enum Command : quint16 {
 
 // The dialects this server answers. 3.1.1 and 3.0.2 are negotiated with the
 // preauth-integrity hash and sign with AES-CMAC; 3.1.1's negotiate reply carries
-// the two contexts that say so. Encryption is not advertised, so a client that
-// wants it negotiates a 2.x dialect instead of encrypting nothing.
+// the contexts that say so. 3.x also seals: AES-128-CCM, advertised as a
+// capability for 3.0/3.0.2 and as an ENCRYPTION_CAPABILITIES context for 3.1.1.
 enum Dialect : quint16 {
     Dialect202 = 0x0202,
     Dialect210 = 0x0210,
@@ -134,7 +134,11 @@ private slots:
 private:
     struct Connection;
 
-    QByteArray handleMessage(Connection *connection, const QByteArray &message);
+    QByteArray handleMessage(Connection *connection, QByteArray message);
+    // The SMB2 message inside a transform header, empty when it does not verify;
+    // and the transform header a reply is wrapped in (MS-SMB2 2.2.41).
+    QByteArray openTransform(Connection *connection, const QByteArray &message);
+    QByteArray sealTransform(Connection *connection, const QByteArray &reply);
     // SMB1 (MS-CIFS) for clients that never negotiate SMB2, such as Windows
     // 2000: it reuses this server's pipe map and authenticator.
     QByteArray handleSmb1(Connection *connection, const QByteArray &message);
