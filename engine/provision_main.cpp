@@ -32,8 +32,13 @@ int main(int argc, char *argv[])
                                     QStringLiteral("NetBIOS domain name (default: first realm label)."),
                                     QStringLiteral("domain"));
     QCommandLineOption passOption(QStringLiteral("adminpass"),
-                                  QStringLiteral("Administrator password."),
+                                  QStringLiteral("Administrator password. It is visible in the "
+                                                 "process table and in a sudo log; prefer "
+                                                 "--adminpass-stdin."),
                                   QStringLiteral("password"));
+    QCommandLineOption passStdinOption(
+        QStringLiteral("adminpass-stdin"),
+        QStringLiteral("Read the Administrator password from standard input."));
     QCommandLineOption dirOption(QStringLiteral("targetdir"),
                                  QStringLiteral("Target directory."),
                                  QStringLiteral("path"));
@@ -68,6 +73,7 @@ int main(int argc, char *argv[])
     parser.addOption(realmOption);
     parser.addOption(domainOption);
     parser.addOption(passOption);
+    parser.addOption(passStdinOption);
     parser.addOption(dirOption);
     parser.addOption(ipOption);
     parser.addOption(hostOption);
@@ -88,7 +94,19 @@ int main(int argc, char *argv[])
     config.netbiosDomain = parser.isSet(domainOption)
         ? parser.value(domainOption)
         : config.realm.section(QLatin1Char('.'), 0, 0).toUpper();
-    config.adminPassword = parser.value(passOption);
+    if (parser.isSet(passStdinOption)) {
+        QTextStream in(stdin);
+        config.adminPassword = in.readLine();
+        if (config.adminPassword.endsWith(QLatin1Char('\r')))
+            config.adminPassword.chop(1);
+    } else {
+        config.adminPassword = parser.value(passOption);
+        // An argument is recorded in the process table and in sudo's log; the
+        // environment is not, so a script that has the password already can
+        // hand it over this way instead.
+        if (config.adminPassword.isEmpty())
+            config.adminPassword = qEnvironmentVariable("MONARCHY_ADMINPASS");
+    }
     config.targetDir = parser.isSet(dirOption) ? parser.value(dirOption)
                                                : parser.positionalArguments().value(0);
     config.dcIp = parser.value(ipOption);
@@ -122,7 +140,8 @@ int main(int argc, char *argv[])
         return 2;
     }
     if (config.adminPassword.isEmpty()) {
-        err << "monarchy-provision: --adminpass is required\n";
+        err << "monarchy-provision: an Administrator password is required "
+               "(--adminpass, --adminpass-stdin or MONARCHY_ADMINPASS)\n";
         return 2;
     }
 

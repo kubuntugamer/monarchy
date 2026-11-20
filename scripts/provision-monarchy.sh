@@ -127,11 +127,15 @@ for arg in "${args[@]}"; do
     esac
 done
 
-if [[ "$have_pass" == false ]]; then
-    args+=("--adminpass=${MONARCHY_ADMINPASS:-$DEFAULT_PASS}")
-fi
 if [[ "$have_target" == false && "$have_positional" == false ]]; then
     args+=("$TARGETDIR")
 fi
 
-exec "$PROVISIONER" "${args[@]}"
+if [[ "$have_pass" == true ]]; then
+    exec "$PROVISIONER" "${args[@]}"
+fi
+
+# The password is handed over on standard input rather than as an argument, so
+# it is not left in the process table or in a sudo log.
+args+=("--adminpass-stdin")
+printf '%s\n' "${MONARCHY_ADMINPASS:-$DEFAULT_PASS}" | exec "$PROVISIONER" "${args[@]}"

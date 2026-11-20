@@ -312,21 +312,26 @@ provision_domain() {
     local provisioner="$PREFIX/bin/monarchy-provision"
     [[ -x "$provisioner" ]] || die "$provisioner was not installed"
 
-    local args=(--realm "$REALM" --adminpass "$ADMINPASS" --targetdir "$DCDIR")
+    local args=(--realm "$REALM" --adminpass-stdin --targetdir "$DCDIR")
     [[ -n "${DC_IP:-}" ]] && args+=(--dc-ip "$DC_IP")
     [[ -n "${DC_HOST:-}" ]] && args+=(--dc-host "$DC_HOST")
     [[ ${DEV_PORTS:-0} -eq 1 ]] && args+=(--dev-ports)
     [[ $FORCE -eq 1 ]] && args+=(--force)
 
     log "Provisioning $REALM in $DCDIR"
+    # The password goes in on standard input, never as an argument: an argument
+    # is recorded in the process table and in sudo's log, which is how a
+    # provisioned domain's Administrator credential was found in cleartext.
     if [[ $SERVICE -eq 1 ]]; then
         if command -v runuser >/dev/null 2>&1; then
-            runuser -u "$SERVICE_USER" -- "$provisioner" "${args[@]}"
+            printf '%s\n' "$ADMINPASS" | \
+                runuser -u "$SERVICE_USER" -- "$provisioner" "${args[@]}"
         else
-            su -s /bin/sh -c "$(printf '%q ' "$provisioner" "${args[@]}")" "$SERVICE_USER"
+            printf '%s\n' "$ADMINPASS" | \
+                su -s /bin/sh -c "$(printf '%q ' "$provisioner" "${args[@]}")" "$SERVICE_USER"
         fi
     else
-        "$provisioner" "${args[@]}"
+        printf '%s\n' "$ADMINPASS" | "$provisioner" "${args[@]}"
     fi
 }
 
