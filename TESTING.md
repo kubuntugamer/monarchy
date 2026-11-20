@@ -120,6 +120,24 @@ Every script exits non-zero on any failed check, so they are usable as a gate.
 did not bind — the failure mode a client reports as "the DC is down" while the
 DC believes it started.
 
+The drivers marshal with impacket, and `ci.sh --conformance` refuses to start
+without it, probing the `python3` on `PATH`. A distribution python that ships
+`/usr/lib/python3.*/EXTERNALLY-MANAGED` will not take `pip install impacket` at
+all, so install it into a venv — and activate that venv, because installed and
+reachable are different things and the check only sees the interpreter it runs
+under:
+
+```sh
+python3 -m venv /tmp/monarchy-impacket
+/tmp/monarchy-impacket/bin/pip install impacket
+source /tmp/monarchy-impacket/bin/activate    # ci.sh probes `python3` on PATH
+scripts/ci.sh --conformance
+```
+
+impacket 0.13.1 was enough for every driver here. It also carries no
+`__version__` attribute, so a `impacket.__version__` probe fails on an install
+that is fine; `import impacket.smbconnection` is the check that means something.
+
 ## 4. Known gaps in this matrix
 
 These are places where a change can pass everything and still be wrong. They are
