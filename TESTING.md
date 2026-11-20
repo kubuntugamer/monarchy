@@ -169,8 +169,9 @@ recorded, not hidden:
   client reads as the domain being unavailable. And the SMB1 endpoint answered
   a SPNEGO offer listing Kerberos first and NTLMSSP last with
   `STATUS_LOGON_FAILURE`; it now selects NTLMSSP from the client's own list and
-  continues. The interactive logon was not driven to completion after those
-  fixes, so a 2000 workstation's domain logon is still not claimed.
+  continues. The interactive logon was driven as far as this box can drive it
+  after those fixes, and it stops at one call — measured below — so a 2000
+  workstation's domain logon is still not claimed.
 
   The session setup on that path is also where AD's NTLM policy decides whether
   a 2000 client's answer can be checked at all. A machine whose policy has not
@@ -209,6 +210,33 @@ recorded, not hidden:
   `-O` is socket options, so smbclient splits the value on spaces and answers
   `Unknown socket option client` — the config never sees the setting, and the
   run reads as NTLMv1 while the client is still answering NTLMv2.
+
+  The logon itself was then driven with impacket on a throwaway `W2K` domain:
+  a machine account over SAMR, then a secure channel from
+  NetrServerReqChallenge and NetrServerAuthenticate3, then one
+  NetrLogonSamLogon per class. The password classes are answered — interactive
+  (1) and service (3) carry the password's own one-way function and come back
+  STATUS_SUCCESS with the account's SAM_INFO2, at `lmCompatibilityLevel` 2 and
+  at 3, over a channel that negotiated strong keys and over one that negotiated
+  no flags at all. The network class (2) is where it stops, and identically at
+  both levels: an NTLMv1 response is refused STATUS_WRONG_PASSWORD
+  (0xC000006A), while the NTLMv2 response on the same channel and the same
+  account succeeds. That v1 response was compared byte for byte with impacket's
+  own NTLMv1 computation and matched, so this is a correct answer being refused
+  rather than a client that got the arithmetic wrong. `Netlogon.cpp` does not
+  read the level on that path at all — the branch calls `Ntlm::verifyNtlmv2` and
+  nothing else — which is why the setting that decides session setup makes no
+  difference here.
+
+  The refusal is charged to the account, which is the part that would bite. With
+  one NTLMv1 logon and nothing else, the account's badPwdCount went from 0 to 1
+  while logonCount did not move, so repeated correct attempts by such a client
+  would lock the user out under a domain lockout policy.
+
+  Which class a given 2000 client uses for its user's logon is not settled
+  here — there is no such client on this box — so the claim stays where it was.
+  What changed is that the stop is now a named call with a named status instead
+  of "not driven".
 
 - **G11 — share enumeration is absent.** The probe that reaches the server is
   the pipe open: `rpcclient -c netshareenum` fails with
