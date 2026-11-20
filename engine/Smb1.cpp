@@ -371,10 +371,106 @@ QByteArray Session::negotiate(const QByteArray &message)
 QByteArray Session::sessionSetup(const QByteArray &message)
 {
     const Header header = parseHeader(message);
-    // Extended security: AndX (4), MaxBuffer (2), MaxMpx (2), Vc (2),
+    //    Extended security: AndX (4), MaxBuffer (2), MaxMpx (2), Vc (2),
     // SessionKey (4), SecurityBlobLength (2), Reserved (4), Capabilities (4).
     const quint16 blobLength = readLe16(header.words, 14);
     QByteArray token = header.data.left(blobLength);
+
+    // Before extended security existed the client put its LM and NT responses
+    // in the request itself, followed by the account and domain names as OEM
+    // strings, and answered no challenge beyond the one the negotiate reply
+    // carried (MS-CIFS 2.2.4.52.2). A Windows 2000 machine's Netlogon path and
+    // Samba's non-SPNEGO client both send this form, and reading it as an
+    // extended request with an empty blob turned every one of them into
+    // LOGON_FAILURE — the login never reached the pipe it came for.
+    // A GSS token is a SPNEGO message: 0x60 is an initial context token, 0xa1
+    // and 0xa2 the [1] and [2] choices of a NegTokenResp. Recognising only the
+    // first of those made Samba's own type-3 reply look like a legacy request.
+    const quint8 firstByte = token.isEmpty() ? 0 : quint8(token.at(0));
+    const bool gssToken = firstByte == 0x60 || firstByte == 0xa1 || firstByte == 0xa2;
+    const bool legacyForm = !token.startsWith("NTLMSSP") && !gssToken
+                            && header.words.size() >= 24
+                            && (readLe16(header.words, 14) != 0
+                                || readLe16(header.words, 16) != 0);
+    if (legacyForm) {
+        const int lmLength = readLe16(header.words, 14);
+        const int ntLength = readLe16(header.words, 16);
+        // The names follow the responses as terminated strings in the
+        // connection's string encoding — Samba sends them as UTF-16 here even
+        // though the form itself predates extended security, so reading a byte
+        // at a time would stop at the 'A' of "Administrator".
+        const auto oemString = [this, &header](int at, int *next) {
+            QString text;
+            int i = at;
+            if (m_unicode) {
+                while (i + 1 < header.data.size()
+                       && !(header.data.at(i) == '\0' && header.data.at(i + 1) == '\0')) {
+                    const quint16 unit = quint16(quint8(header.data.at(i)))
+                                         | quint16(quint16(quint8(header.data.at(i + 1))) << 8);
+                    text.append(QChar(unit));
+                    i += 2;
+                }
+                if (next)
+                    *next = i + 2;
+                return text;
+            }
+            while (i < header.data.size() && header.data.at(i) != '\0') {
+                text.append(QChar(quint8(header.data.at(i))));
+                ++i;
+            }
+            if (next)
+                *next = i + 1;
+            return text;
+        };
+        Rpc::AuthRequest request;
+        // The negotiate reply carried no challenge of its own (ChallengeLength
+        // zero), so these responses were computed over eight zero bytes.
+        request.challenge = QByteArray(8, '\0');
+        request.lmResponse = header.data.mid(0, lmLength);
+        request.ntResponse = header.data.mid(lmLength, ntLength);
+        int namesAt = lmLength + ntLength;
+        if (namesAt < header.data.size() && header.data.at(namesAt) == '\0')
+            ++namesAt; // the optional pad byte between the responses and the names
+        request.user = oemString(namesAt, &namesAt);
+        request.domain = oemString(namesAt, nullptr);
+        // No NTLM flags are exchanged in this form, so there is no 128-bit or
+        // key-exchange negotiation: the client signs with the 16-byte
+        // UserSessionKey — MD4 of the NT hash — whatever response it computed.
+        request.flags = 0;
+
+        Ntlm::SessionKeys keys;
+        quint32 legacyStatus = kStatusLogonFailure;
+        if (!m_uid)
+            m_uid = quint16(QRandomGenerator::system()->generate() | 1);
+        if (!request.user.isEmpty() && m_authenticator
+            && m_authenticator(request, &keys)) {
+            m_authenticated = true;
+            m_sessionKey = keys.userSessionKey;
+            m_user = request.domain.isEmpty()
+                         ? request.user
+                         : request.domain + QLatin1Char('\\') + request.user;
+            legacyStatus = kStatusSuccess;
+            if (m_notifier)
+                m_notifier(QStringLiteral("SMB1 logon %1").arg(m_user));
+        }
+        QByteArray words;
+        words.append(char(0xff)); // AndXCommand: none
+        words.append(char(0));    // AndXReserved
+        putLe16(words, 0);        // AndXOffset
+        putLe16(words, 0);        // Action
+        QByteArray data;
+        for (const QString &name : {QStringLiteral("Windows NT"), QStringLiteral("Monarchy")}) {
+            data.append(name.toLatin1());
+            data.append('\0');
+        }
+        if (m_notifier) {
+            m_notifier(QStringLiteral("SMB1 session setup (pre-extended security) user=%1 lm=%2 nt=%3")
+                           .arg(request.user.isEmpty() ? QStringLiteral("<none>") : request.user)
+                           .arg(request.lmResponse.size())
+                           .arg(request.ntResponse.size()));
+        }
+        return reply(message, legacyStatus, words, data, m_uid ? m_uid : -1);
+    }
 
     const int type = Ntlm::messageType(Ntlm::embeddedToken(token));
     // A client that sent a raw NTLMSSP token gets a raw one back. Windows 2000
@@ -436,6 +532,11 @@ QByteArray Session::sessionSetup(const QByteArray &message)
         status = kStatusMoreProcessingRequired;
     } else {
         status = kStatusLogonFailure;
+        if (m_notifier)
+            m_notifier(QStringLiteral("SMB1 session setup refused: no NTLMSSP message "
+                                       "(blob %1 bytes, %2 words)")
+                           .arg(blobLength)
+                           .arg(header.words.size() / 2));
     }
 
     QByteArray words;

@@ -454,6 +454,7 @@ private slots:
     void refusesTraversalOutOfTheShare();
     void refusesWrites();
     void answersARawNtlmTokenWithoutSpnego();
+    void acceptsPreExtendedSecuritySessionSetup();
     void setsTheStateOfAnOpenPipe();
     void signsAndVerifiesASignedSession();
 
@@ -686,6 +687,71 @@ void Smb1Test::refusesWrites()
     QFile after(path);
     QVERIFY(after.open(QIODevice::ReadOnly));
     QCOMPARE(after.readAll(), QByteArray("policy"));
+}
+
+// Before extended security, the client put its LM and NT responses in the
+// session-setup request itself and the account name behind them, with no
+// security blob of any kind. A Windows 2000 machine's Netlogon path and
+// Samba's non-SPNEGO client both send this form; reading it as an extended
+// request with an empty blob answered every one of them LOGON_FAILURE, so the
+// pipe they came for was never reached.
+void Smb1Test::acceptsPreExtendedSecuritySessionSetup()
+{
+    QByteArray words;
+    words.append(char(0xff)); // AndXCommand
+    words.append(char(0));    // AndXReserved
+    putLe16(words, 0);        // AndXOffset
+    putLe16(words, 4356);     // MaxBufferSize
+    putLe16(words, 50);       // MaxMpxCount
+    putLe16(words, 1);        // VcNumber
+    putLe32(words, 0);        // SessionKey
+    putLe16(words, 24);       // OEMPasswordLength
+    putLe16(words, 24);       // UnicodePasswordLength
+    putLe32(words, 0);        // Reserved
+    putLe32(words, 0);        // Capabilities
+
+    // The responses are computed over the challenge the negotiate reply
+    // carried, which is eight zero bytes because it advertised none. This
+    // test's authenticator accepts any proof, so their contents only have to
+    // be the right lengths.
+    QByteArray data(24, 'l');
+    data.append(QByteArray(24, 'n'));
+    const QByteArray user = utf16le(QStringLiteral("alice"));
+    data.append(user);
+    data.append(QByteArray(2, '\0'));
+    const QByteArray domain = utf16le(QStringLiteral("MONARCHY"));
+    data.append(domain);
+    data.append(QByteArray(2, '\0'));
+    data.append(QByteArray("Windows NT\0", 11));
+    data.append(QByteArray("Monarchy\0", 9));
+
+    QScopedPointer<Smb1::Session> session(plainSession());
+    QVERIFY(session);
+    session->feed(negotiateMessage());
+    const QByteArray reply =
+        session->feed(smb(Smb1::CmdSessionSetupAndX, 0, 0, words, data));
+    QCOMPARE(statusOf(reply), quint32(0));
+    const QByteArray payload = payloadOf(reply);
+    // AndX plus Action, and no security-blob word: this answer has to look
+    // like the request's own dialect, or the client parses the words after it
+    // as a length it never sent.
+    QCOMPARE(quint8(payload.at(32)), quint8(3));
+    QVERIFY(readLe16(payload, 33 + 6) > 0); // ByteCount: the native names
+
+    // The session is authenticated, so the pipe share opens.
+    const quint16 tid = connectShare(session.data(), QStringLiteral("IPC$"));
+    QVERIFY(tid != 0);
+
+    // A request whose responses say nothing is refused rather than treated as
+    // an anonymous logon.
+    QByteArray empty(words);
+    empty.replace(14, 2, QByteArray(2, '\0'));
+    empty.replace(16, 2, QByteArray(2, '\0'));
+    QScopedPointer<Smb1::Session> anonymous(plainSession());
+    QVERIFY(anonymous);
+    anonymous->feed(negotiateMessage());
+    QCOMPARE(statusOf(anonymous->feed(smb(Smb1::CmdSessionSetupAndX, 0, 0, empty, QByteArray()))),
+             Smb1::kStatusLogonFailure);
 }
 
 // Windows 2000 sends the session-setup token as raw NTLMSSP with no GSS

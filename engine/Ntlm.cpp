@@ -336,6 +336,7 @@ bool sessionKeys(const QByteArray &ntHash, const QString &user, const QString &d
     const QByteArray responseKey =
         hmacMd5(ntHash, utf16le(user.toUpper() + domain));
     out->sessionBaseKey = hmacMd5(responseKey, ntProofStr);
+    out->userSessionKey = QCryptographicHash::hash(ntHash, QCryptographicHash::Md4);
     deriveSessionKeys(out->sessionBaseKey, negotiateFlags, out);
     return true;
 }
@@ -345,6 +346,7 @@ bool v1SessionKeys(const QByteArray &ntHash, quint32 negotiateFlags, SessionKeys
     if (!out || ntHash.size() != 16)
         return false;
     out->sessionBaseKey = QCryptographicHash::hash(ntHash, QCryptographicHash::Md4);
+    out->userSessionKey = out->sessionBaseKey;
     deriveSessionKeys(out->sessionBaseKey, negotiateFlags, out);
     return true;
 }

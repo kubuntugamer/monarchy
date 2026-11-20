@@ -142,6 +142,10 @@ constexpr quint32 kNegotiateTargetInfo = 0x00800000u;
 // from it, and the MAC/RC4 operations per-message tokens use.
 struct SessionKeys {
     QByteArray sessionBaseKey;   // HMAC_MD5(ResponseKeyNT, NtProofStr)
+    // MD4(NTOWFv1): with NTLMv1 this is the session base key, and it is also
+    // the 16-byte key an SMB1 client signs with when extended security was
+    // never negotiated, which is the pre-extended-security session setup.
+    QByteArray userSessionKey;
     QByteArray clientSigningKey; // MD5(session key + client-to-server sign magic)
     QByteArray serverSigningKey;
     QByteArray clientSealingKey; // MD5(session key + client-to-server seal magic)
