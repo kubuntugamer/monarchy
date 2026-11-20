@@ -2170,6 +2170,7 @@ QByteArray LdapServer::handleSaslBind(ClientState *st, int msgId, const QByteArr
         return handleGssapiBind(st, msgId, credentials, true);
     }
 
+    st->ntlmSpnego = spnego;
     const QByteArray token = Ntlm::embeddedToken(credentials);
     const int type = Ntlm::messageType(token);
 
@@ -2179,7 +2180,15 @@ QByteArray LdapServer::handleSaslBind(ClientState *st, int msgId, const QByteArr
             st->ntlmChallenge[i] = char(QRandomGenerator::system()->generate() & 0xff);
         const QByteArray challenge = Ntlm::challengeToken(
             st->ntlmChallenge, ntlmDomainName(), ntlmServerName());
-        return makeBindResponse(msgId, 14, challenge); // saslBindInProgress
+        // A GSS-SPNEGO negotiation takes its answers as NegTokenResp tokens: a
+        // bare NTLMSSP CHALLENGE here is not a SPNEGO message at all, and
+        // Samba's client stops the whole bind on it with `Invalid SPNEGO
+        // request` followed by NT_STATUS_INVALID_PARAMETER. The mechanism was
+        // settled by the NegTokenInit, so supportedMech is not repeated.
+        const QByteArray reply = spnego
+                                     ? Gss::spnegoResponse(1, QString(), challenge)
+                                     : challenge;
+        return makeBindResponse(msgId, 14, reply); // saslBindInProgress
     }
 
     if (type == 3) { // AUTHENTICATE
@@ -2260,6 +2269,13 @@ QByteArray LdapServer::handleSaslBind(ClientState *st, int msgId, const QByteArr
                     st->raw.prepend(st->buffer);
                     st->buffer.clear();
                 }
+            }
+            // RFC 4178 §4.2.2: a GSS-SPNEGO exchange ends with a NegTokenResp
+            // whose negState is accept-completed, even when it carries no
+            // token of its own.
+            if (st->ntlmSpnego) {
+                st->ntlmSpnego = false;
+                return makeBindResponse(msgId, 0, Gss::spnegoResponse(0, QString(), QByteArray()));
             }
             return makeBindResponse(msgId, 0);
         }

@@ -249,6 +249,9 @@ private:
         // The bind response that completes the negotiation travels unwrapped;
         // only what follows it uses the layer.
         bool gssBindResponse = false;
+        // The NTLM SASL exchange arrived in a GSS-SPNEGO NegTokenInit, so its
+        // answers have to be NegTokenResp tokens rather than bare NTLMSSP.
+        bool ntlmSpnego = false;
         // NTLM session security (MS-NLMP §3.4): 0 none, 2 integrity, 4
         // confidentiality, with the keys and RC4 states the tokens use.
         int ntlmLayer = 0;

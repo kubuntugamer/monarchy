@@ -209,6 +209,27 @@ QByteArray saslBindRequest(int msgId, const QByteArray &token, const QByteArray 
     return packet;
 }
 
+// A GSS-SPNEGO NegTokenInit wrapping an NTLMSSP token: GSS-API envelope, SPNEGO
+// OID, [0] negTokenInit whose mechTypes lists NTLMSSP and whose [2] mechToken
+// is the NEGOTIATE a client offers.
+QByteArray spnegoInitToken(const QByteArray &token)
+{
+    QByteArray mechTypes;
+    putTLV(mechTypes, 0x30, QByteArray::fromHex("060a2b06010401823702020a")); // NTLMSSP
+    QByteArray init;
+    putTLV(init, 0xa0, mechTypes);
+    QByteArray mechToken;
+    putTLV(mechToken, 0x04, token);
+    putTLV(init, 0xa2, mechToken);
+    QByteArray negTokenInit;
+    putTLV(negTokenInit, 0x30, init);
+    QByteArray body = QByteArray::fromHex("06062b0601050502"); // SPNEGO 1.3.6.1.5.5.2
+    putTLV(body, 0xa0, negTokenInit);
+    QByteArray out;
+    putTLV(out, 0x60, body);
+    return out;
+}
+
 struct BindReply {
     int resultCode = -1;
     QByteArray saslCreds;
@@ -400,6 +421,7 @@ private slots:
     void challengePublishesDnsNames();
     void sessionSecurityMatchesReferenceImplementation();
     void authenticatesWithNtlmv2();
+    void spnegoWrapsTheNtlmChallenge();
     void signedSessionCarriesLdap();
     void sealedSessionCarriesLdap();
     void sealedSessionRejectsTampering();
@@ -656,6 +678,92 @@ void NtlmTest::authenticatesWithNtlmv2()
     const BindReply reply = exchange(socket, saslBindRequest(2, token));
     QVERIFY(reply.parsed);
     QCOMPARE(reply.resultCode, 0);
+}
+
+// A GSS-SPNEGO client reads its answers as NegTokenResp tokens (RFC 4178
+// §4.2.2). Samba's spnego_read_data refused a bare NTLMSSP CHALLENGE with
+// `Invalid SPNEGO request` and failed the whole bind with
+// NT_STATUS_INVALID_PARAMETER, which is exactly where `net ads join` stopped.
+void NtlmTest::spnegoWrapsTheNtlmChallenge()
+{
+    LdapServer server;
+    QVERIFY(server.listen(0));
+    server.setObjects(sampleObjects());
+
+    const QString aliceDn = QStringLiteral("CN=Alice Chen,CN=Users,DC=corp,DC=example,DC=com");
+    const QString password = QStringLiteral("Str0ng-Pass!");
+    LdapServer::ModifyChange setPassword;
+    setPassword.operation = 2;
+    setPassword.type = QStringLiteral("unicodePwd");
+    setPassword.values = QStringList{password};
+    setPassword.rawValue = password.toUtf8();
+    QCOMPARE(server.applyModify(aliceDn, {setPassword}), 0);
+
+    QTcpSocket socket;
+    socket.connectToHost(QHostAddress::LocalHost, server.serverPort());
+    QVERIFY(socket.waitForConnected(3000));
+
+    const BindReply challenge =
+        exchange(socket, saslBindRequest(1, spnegoInitToken(negotiateToken()), "GSS-SPNEGO"));
+    QVERIFY(challenge.parsed);
+    QCOMPARE(challenge.resultCode, 14); // saslBindInProgress
+
+    // The answer is a NegTokenResp carrying the CHALLENGE, not a bare NTLMSSP
+    // token that a SPNEGO client cannot read.
+    int pos = 0;
+    quint8 tag = 0;
+    QByteArray fields;
+    QVERIFY(takeTLV(challenge.saslCreds, pos, &tag, &fields));
+    QCOMPARE(tag, quint8(0xa1));
+    int outerPos = 0;
+    quint8 outerTag = 0;
+    QByteArray respFields;
+    QVERIFY(takeTLV(fields, outerPos, &outerTag, &respFields));
+    QCOMPARE(outerTag, quint8(0x30));
+
+    QByteArray negState;
+    QByteArray mechToken;
+    int fieldPos = 0;
+    while (fieldPos < respFields.size()) {
+        quint8 fieldTag = 0;
+        QByteArray fieldValue;
+        if (!takeTLV(respFields, fieldPos, &fieldTag, &fieldValue))
+            break;
+        if (fieldTag == 0xa0) { // negState
+            int innerPos = 0;
+            quint8 innerTag = 0;
+            QByteArray value;
+            if (takeTLV(fieldValue, innerPos, &innerTag, &value))
+                negState = value;
+        } else if (fieldTag == 0xa2) { // responseToken
+            int innerPos = 0;
+            quint8 innerTag = 0;
+            QByteArray value;
+            if (takeTLV(fieldValue, innerPos, &innerTag, &value))
+                mechToken = value;
+        }
+    }
+    QCOMPARE(negState, QByteArray(1, char(1))); // accept-incomplete
+    QVERIFY(mechToken.startsWith("NTLMSSP\0"));
+    QCOMPARE(Ntlm::messageType(mechToken), 2);
+
+    const QByteArray serverChallenge = mechToken.mid(24, 8);
+    const QByteArray targetInfo = field(mechToken, 40);
+    const QByteArray authenticate = authenticateToken(Ntlm::ntowfV1(password),
+                                                      QStringLiteral("alicechen"),
+                                                      QStringLiteral("CORP"), serverChallenge,
+                                                      targetInfo);
+    const BindReply done =
+        exchange(socket, saslBindRequest(2, authenticate, "GSS-SPNEGO"));
+    QVERIFY(done.parsed);
+    QCOMPARE(done.resultCode, 0);
+    // The completion is a NegTokenResp with negState accept-completed.
+    int donePos = 0;
+    quint8 doneTag = 0;
+    QByteArray doneBody;
+    QVERIFY(takeTLV(done.saslCreds, donePos, &doneTag, &doneBody));
+    QCOMPARE(doneTag, quint8(0xa1));
+    QVERIFY(done.saslCreds.contains(QByteArray::fromHex("a0030a0100")));
 }
 
 void NtlmTest::signedSessionCarriesLdap()
