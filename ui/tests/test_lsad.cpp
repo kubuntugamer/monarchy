@@ -130,23 +130,23 @@ QByteArray wireSid(const QString &sid)
     return out;
 }
 
-// LsarCreateTrustedDomainEx as Samba's pidl client marshals it: the policy
-// handle, the InfoEx referent with its fixed fields, the auth-info referent and
-// the access mask, then every deferred buffer in pointer order.
+// LsarCreateTrustedDomainEx as Samba's pidl client marshals it. Neither the
+// InfoEx nor the auth-info is a [unique] pointer, so neither carries a
+// referent, and each parameter's deferred buffers follow its own fixed fields:
+// policy handle, InfoEx fixed, InfoEx deferred, auth-info fixed, the secrets,
+// then the access mask. This shape was taken from a real client's stub, not
+// from reading the IDL, because the IDL alone does not say where the mask goes.
 QByteArray createTrustStub(const QByteArray &handle, const QString &partner,
                            const QString &flat, const QString &sid, quint32 direction,
                            quint32 type, bool internalBlob = false)
 {
     QByteArray stub = handle;
-    appendLe32(stub, 0x00020010); // InfoEx pointer
     appendStringHeader(stub, partner, 0x00020011);
     appendStringHeader(stub, flat, 0x00020012);
     appendLe32(stub, 0x00020013); // SID pointer
     appendLe32(stub, direction);
     appendLe32(stub, type);
     appendLe32(stub, 0); // trust attributes
-    appendLe32(stub, 0x00020020); // auth-info pointer
-    appendLe32(stub, 0x000f0fff); // access mask
 
     appendDeferredChars(stub, partner);
     appendDeferredChars(stub, flat);
@@ -160,6 +160,7 @@ QByteArray createTrustStub(const QByteArray &handle, const QString &partner,
         appendLe32(stub, quint32(blob.size()));
         stub.append(blob);
         alignTo(stub, 4);
+        appendLe32(stub, 0x000f0fff); // access mask, after the secrets
         return stub;
     }
 
@@ -181,6 +182,7 @@ QByteArray createTrustStub(const QByteArray &handle, const QString &partner,
     appendLe32(stub, quint32(secret.size()));
     stub.append(secret);
     alignTo(stub, 4);
+    appendLe32(stub, 0x000f0fff); // access mask, after the secrets
     return stub;
 }
 
@@ -212,7 +214,10 @@ QByteArray setTrustAuthStub(const QByteArray &handle, const QByteArray &secret)
 }
 
 // An lsa_String the way a client marshals it: the header, the varying buffer
-// it points at, and only then the following scalar.
+// it points at, and only then the following scalar. The buffer is a conformant
+// varying array of uint16, padded to its element alignment (2) and not to 4:
+// an odd-length name therefore puts the next scalar straight after the
+// characters.
 void appendInlineString(QByteArray &out, const QString &text, quint32 referent)
 {
     appendLe16(out, quint16(text.size() * 2));
@@ -222,7 +227,7 @@ void appendInlineString(QByteArray &out, const QString &text, quint32 referent)
     appendLe32(out, 0);
     appendLe32(out, quint32(text.size()));
     appendUtf16(out, text);
-    alignTo(out, 4);
+    alignTo(out, 2);
 }
 
 // LsarOpenTrustedDomainByName: the policy handle, an in-line lsa_String and
@@ -231,6 +236,7 @@ QByteArray openTrustByNameStub(const QByteArray &handle, const QString &name)
 {
     QByteArray stub = handle;
     appendInlineString(stub, name, 0x00020011);
+    alignTo(stub, 4); // the access mask is a uint32
     appendLe32(stub, 0x000f0fff);
     return stub;
 }
@@ -561,6 +567,15 @@ void LsadTest::createsQueriesEnumeratesAndDeletesATrust()
     QCOMPARE(lastWord(byNameReply), 0u);
     QCOMPARE(readLe32At(byNameReply, 28), 3u);
 
+    // An odd-length name ends on a 2-byte boundary, so the level follows the
+    // characters directly; reading it past a 4-byte pad would turn the query
+    // into an unsupported level instead of the answer the name deserves.
+    QByteArray oddName = policy;
+    appendInlineString(oddName, QStringLiteral("FABRIKAM.LOCALS"), 0x00020011);
+    appendLe16(oddName, 6);
+    QCOMPARE(lastWord(server.handleCall(Lsad::OpQueryTrustedDomainInfoByName, oddName)),
+             0xc0000034u); // STATUS_OBJECT_NAME_NOT_FOUND, not INVALID_PARAMETER
+
     // Open by name hands out a trust handle for the information calls.
     const QByteArray opened =
         server.handleCall(Lsad::OpOpenTrustedDomainByName,
@@ -575,8 +590,13 @@ void LsadTest::createsQueriesEnumeratesAndDeletesATrust()
     appendLe32(enumerate, 0);
     const QByteArray list = server.handleCall(Lsad::OpEnumTrustedDomainsEx, enumerate);
     QCOMPARE(lastWord(list), 0u);
+    // LsarEnumerateTrustedDomainsEx out, as Samba's NDR client reads it: the
+    // [in,out] resume handle as a plain value, the inline lsa_DomainListEx
+    // count, the array's referent, and the conformant maximum count.
+    QCOMPARE(readLe32At(list, 0), 1u); // resume, one past the last entry
     QCOMPARE(readLe32At(list, 4), 1u); // count
-    QVERIFY(readLe32At(list, 8) != 0); // array pointer
+    QVERIFY(readLe32At(list, 8) != 0); // domains referent
+    QCOMPARE(readLe32At(list, 12), 1u); // conformant maximum count
     QVERIFY(list.contains(utf16Bytes(QStringLiteral("fabrikam.local"))));
 
     // Level 7 returns the stored secret itself, inside the auth-info buffers,
@@ -618,7 +638,10 @@ void LsadTest::createsQueriesEnumeratesAndDeletesATrust()
     QVERIFY(store.isEmpty());
     const QByteArray gone = server.handleCall(Lsad::OpEnumTrustedDomainsEx, enumerate);
     QCOMPARE(lastWord(gone), 0x8000001au); // STATUS_NO_MORE_ENTRIES
-    QCOMPARE(readLe32At(gone, 4), 0u);
+    QCOMPARE(readLe32At(gone, 4), 0u); // count
+    // An empty list carries neither a referent nor a maximum count, so the
+    // status word follows the count directly.
+    QCOMPARE(gone.size(), 12); // resume, count, status
 }
 
 void LsadTest::refusesDuplicateAndUnknownTrusts()

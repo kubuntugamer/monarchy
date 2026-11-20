@@ -123,7 +123,10 @@ bool readVaryingChars(Ndr::Reader &reader, QString *text)
     QByteArray chars;
     if (!reader.bytes(int(actual * 2), &chars))
         return false;
-    reader.align(4);
+    // A conformant varying array of uint16 is padded to the element alignment
+    // (2), not to 4: a client that sends an odd-length trust name places the
+    // next enum right after the characters.
+    reader.align(2);
     *text = QString::fromUtf16(reinterpret_cast<const char16_t *>(chars.constData()),
                                qsizetype(chars.size() / 2));
     return true;
@@ -729,6 +732,16 @@ QByteArray LsadServer::handleCall(quint16 opnum, const QByteArray &stub,
         putLe32(fixed, status);
         return fixed;
     };
+    // Every out parameter travels in the reply whatever the status is, so a
+    // refused call still answers with the handle slot. A client decodes the
+    // whole out signature before it reads the status, and a reply that is short
+    // by those bytes surfaces as STATUS_BUFFER_TOO_SMALL instead of the error
+    // the DC meant to return — which is how a real pidl client reported a
+    // rejected LsarCreateTrustedDomainEx.
+    const auto resultWithHandle = [&fixed, &result](quint32 status) {
+        fixed.append(QByteArray(kHandleSize, '\0'));
+        return result(status);
+    };
 
     // A policy handle the client presented, or INVALID_HANDLE when it is not
     // one this server issued.
@@ -794,10 +807,9 @@ QByteArray LsadServer::handleCall(quint16 opnum, const QByteArray &stub,
         quint32 type = 0;
         quint32 attributes = 0;
     };
+    // A [ref] parameter is marshalled without a referent: a real client sends
+    // the two name headers straight after the policy handle.
     const auto readTrustInfo = [&](TrustInfoIn *info) {
-        bool present = false;
-        if (!reader.referent(&present) || !present)
-            return false;
         if (!readStringHeader(&info->domainName, &info->hasDomain)
             || !readStringHeader(&info->netbiosName, &info->hasNetbios))
             return false;
@@ -978,11 +990,26 @@ QByteArray LsadServer::handleCall(quint16 opnum, const QByteArray &stub,
     };
 
     const auto putTrustInformation = [&](const DirectoryObject &trust, quint16 level) {
-        if (level != 1 && level != 6 && level != 7 && level != 8)
+        if (level != 1 && level != 5 && level != 6 && level != 7 && level != 8)
             return false;
         putLe32(fixed, ++nextReferent);
         putLe16(fixed, level);
         alignFixed(fixed, 4);
+        // lsa_TrustDomainInfoBasic: the flat name and the partner's SID. It is
+        // what a client asks for first when it only needs to recognise a trust,
+        // and a real pidl client did ask for it.
+        if (level == 5) {
+            const QString flat = trust.attributes.value(QStringLiteral("flatName"));
+            const QString sid = trust.attributes.value(QStringLiteral("securityIdentifier"));
+            putStringHeader(fixed, flat, ++nextReferent, true);
+            putLe32(fixed, sid.isEmpty() ? 0u : ++nextReferent);
+            alignFixed(fixed, 4);
+            if (!flat.isEmpty())
+                appendVaryingChars(deferred, flat, true);
+            if (!sid.isEmpty())
+                appendSid(deferred, sid);
+            return true;
+        }
         if (level == 1) {
             const QString flat = trust.attributes.value(QStringLiteral("flatName"));
             putStringHeader(fixed, flat, ++nextReferent, true);
@@ -1443,13 +1470,25 @@ QByteArray LsadServer::handleCall(quint16 opnum, const QByteArray &stub,
         });
         const int start = int(qMin<qsizetype>(resume, all.size()));
         QList<DirectoryObject> page = all.mid(start);
-        putLe32(fixed, 0); // resume
-        putLe32(fixed, quint32(page.size()));
-        putLe32(fixed, page.isEmpty() ? 0u : ++nextReferent);
+        // [in,out] resume_handle travels as a plain uint32 and is answered
+        // first, as a value: pidl marshals it without a referent of its own.
+        // The [out] lsa_DomainListEx follows inline, so its count comes next
+        // and the [size_is(count)] array takes one referent before the
+        // conformant maximum count.
+        putLe32(fixed, quint32(start + page.size())); // resume_handle
+        putLe32(fixed, quint32(page.size())); // count
         if (opnum == Lsad::OpEnumTrustedDomainsEx) {
-            for (const DirectoryObject &trust : page)
-                putTrustInfo(fixed, deferred, trust, &nextReferent);
+            if (!page.isEmpty()) {
+                // Every element's fixed part comes first, then the deferred
+                // buffers in element order.
+                putLe32(fixed, ++nextReferent); // domains referent
+                putLe32(fixed, quint32(page.size())); // array maximum count
+                for (const DirectoryObject &trust : page)
+                    putTrustInfo(fixed, deferred, trust, &nextReferent);
+            }
         } else {
+            if (!page.isEmpty())
+                putLe32(fixed, quint32(page.size())); // array maximum count
             for (const DirectoryObject &trust : page) {
                 const QString flat = trust.attributes.value(QStringLiteral("flatName"));
                 const QString sid = trust.attributes.value(QStringLiteral("securityIdentifier"));
@@ -1684,30 +1723,30 @@ QByteArray LsadServer::handleCall(quint16 opnum, const QByteArray &stub,
             attributes.insert(QStringLiteral("trustAttributes"), QStringLiteral("0"));
         } else {
             TrustInfoIn info;
+            // Neither the InfoEx nor the auth-info is a [unique] pointer, so
+            // neither carries a referent; and each parameter's own deferred
+            // buffers follow its fixed fields before the next parameter
+            // starts. A real client therefore sends InfoEx-fixed,
+            // InfoEx-deferred, auth-info-fixed, auth-info-buffers, then the
+            // access mask last. Reading a referent for either pointer, or the
+            // mask before the secrets, misaligns the whole stub.
             if (!readTrustInfo(&info))
-                return result(kStatusInvalidParameter);
-            bool hasAuth = false;
-            if (!reader.referent(&hasAuth))
-                return {};
-            if (!reader.u32(&access))
-                return {};
+                return resultWithHandle(kStatusInvalidParameter);
             if (!readTrustInfoBuffers(&info, &attributes))
-                return result(kStatusInvalidParameter);
-            if (hasAuth && !readAuthInfo(&attributes, opnum == Lsad::OpCreateTrustedDomainEx2))
-                return {};
+                return resultWithHandle(kStatusInvalidParameter);
+            if (!readAuthInfo(&attributes, opnum == Lsad::OpCreateTrustedDomainEx2))
+                return resultWithHandle(kStatusInvalidParameter);
+            if (!reader.u32(&access))
+                return resultWithHandle(kStatusInvalidParameter);
         }
         Q_UNUSED(access)
         const QString flat = attributes.value(QStringLiteral("flatName"));
         if (flat.isEmpty())
-            return result(kStatusInvalidParameter);
-        if (!findTrustByName(flat).id.isEmpty()) {
-            fixed.append(QByteArray(kHandleSize, '\0'));
-            return result(kStatusObjectNameCollision);
-        }
-        if (!m_writes.createTrust) {
-            fixed.append(QByteArray(kHandleSize, '\0'));
-            return result(kStatusNotSupported);
-        }
+            return resultWithHandle(kStatusInvalidParameter);
+        if (!findTrustByName(flat).id.isEmpty())
+            return resultWithHandle(kStatusObjectNameCollision);
+        if (!m_writes.createTrust)
+            return resultWithHandle(kStatusNotSupported);
         DirectoryObject trust;
         trust.id = trustDn(flat, m_config.baseDn);
         trust.name = flat;
@@ -1736,9 +1775,8 @@ QByteArray LsadServer::handleCall(quint16 opnum, const QByteArray &stub,
         }
         QString error;
         if (!m_writes.createTrust(&trust, &error)) {
-            fixed.append(QByteArray(kHandleSize, '\0'));
             emit requestReceived(QStringLiteral("CreateTrustedDomain refused: %1").arg(error));
-            return result(kStatusObjectNameCollision);
+            return resultWithHandle(kStatusObjectNameCollision);
         }
         // The disabled `FABRIKAM$` account a Windows DC keeps beside the trust,
         // with the trust password, is the account NetrLogonGetTrustRid names and

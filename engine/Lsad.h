@@ -151,6 +151,12 @@ public:
     Samr::Config config() const { return m_config; }
     void setDomainNames(const QString &netbios, const QString &serverName,
                         const QString &dnsDomain, const QString &domainSid);
+    // The Kerberos realm this DC serves. A trust password derives the same
+    // inter-realm key on both sides from it, and the DNS domain is not it: the
+    // realm is the upper-case name the KDC publishes. Without it a trust
+    // created here is stored without keys, and the KDC answers a referral for
+    // it as if no trust existed.
+    void setRealm(const QString &realm) { m_config.realm = realm; }
     // The accounts names and SIDs resolve against: the same objects SAMR and
     // LDAP serve.
     void setObjectProvider(std::function<QList<DirectoryObject>()> provider);

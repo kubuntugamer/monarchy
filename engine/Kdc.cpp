@@ -186,7 +186,7 @@ QString decodeString(const Asn1::Element *tagged)
     return Asn1::toString(inner);
 }
 
-bool decodePrincipal(const Asn1::Element *tagged, QString *out, QString *realmOut = nullptr)
+bool decodePrincipal(const Asn1::Element *tagged, QString *out)
 {
     if (!tagged)
         return false;
@@ -208,12 +208,6 @@ bool decodePrincipal(const Asn1::Element *tagged, QString *out, QString *realmOu
         return false;
     if (out)
         *out = parts.join(QLatin1Char('/'));
-    if (realmOut) {
-        // A principal carries its own realm; TGS requests for another realm
-        // use it to name the service.
-        const Asn1::Element *realmTag = Asn1::child(sequence, 0xA2);
-        *realmOut = realmTag ? decodeString(realmTag) : QString();
-    }
     return true;
 }
 
@@ -516,7 +510,13 @@ bool Kdc::parseRequest(const QByteArray &der, quint8 expectedTag, KdcRequest *ou
     if (out->realm.isEmpty())
         out->realm = Krb5::canonicalRealm(m_config.realm);
     decodePrincipal(Asn1::child(body, 0xA1), &out->cname);
-    decodePrincipal(Asn1::child(body, 0xA3), &out->sname, &out->srealm);
+    decodePrincipal(Asn1::child(body, 0xA3), &out->sname);
+    // RFC 4120 5.4.1: the service realm is the request body's own field, not
+    // part of the principal name — a PrincipalName carries no realm at all. It
+    // is what a request for a service in a trusted realm is referred by when
+    // the service name itself does not name that realm.
+    if (const Asn1::Element *realmTag = Asn1::child(body, 0xA2))
+        out->srealm = decodeString(realmTag);
     out->nonce = quint32(decodeInteger(Asn1::child(body, 0xA7)));
     out->options = decodeBits(Asn1::child(body, 0xA0));
     out->till = decodeTime(Asn1::child(body, 0xA5));
@@ -820,7 +820,9 @@ QByteArray Kdc::handleTgsReq(const KdcRequest &request)
     bool opened = haveLocalKrbtgt && openTicket(ticketDer, krbtgt, &tgt, &error);
     if (!opened) {
         // A TGT issued by a trusted realm is sealed with the trust key, not
-        // with ours. Only an inbound trust (bit 1) accepts one.
+        // with ours; openTicket fills in the ticket's realm before it tries to
+        // decrypt, so that is the realm to look a trust up by. Only an inbound
+        // trust (bit 1) accepts one.
         const QString ticketRealm = Krb5::canonicalRealm(tgt.realm);
         if (!ticketRealm.isEmpty() && ticketRealm != realm) {
             const Krb5::Principal trust = trustPrincipal(ticketRealm);

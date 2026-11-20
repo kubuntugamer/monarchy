@@ -688,6 +688,9 @@ bool DcService::start(const QString &dcDir)
     m_lsadServer->setDomainNames(krbRealm.netbios,
                                  dcHost.section(QLatin1Char('.'), 0, 0).toUpper(),
                                  dnsDomain, krbRealm.domainSid);
+    // The realm is what a trust password derives its inter-realm keys from, so
+    // LSAD has to know it as well as the KDC does.
+    m_lsadServer->setRealm(krbRealm.realm);
     m_lsadServer->setObjectProvider([this]() { return m_ldapServer->objects(); });
     // Account rights are an attribute of the account, so a right granted over
     // lsarpc is the same object data LDAP serves and survives a restart.
