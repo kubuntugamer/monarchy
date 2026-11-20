@@ -10,6 +10,7 @@
 #include "Epm.h"
 #include "Ntlm.h"
 #include "Smb2.h"
+#include "Smb3Crypto.h"
 
 namespace {
 
@@ -310,6 +311,8 @@ private slots:
     void carriesADceBindThroughThePipe();
     void servesADiskShareReadOnly();
     void writesADiskShareForAnAdministratorOnly();
+    void signsWithAesCmacAsTheStandardDoes();
+    void answersSmb311WithThePreauthContext();
 };
 
 void Smb2Test::negotiatesTheHighestOfferedDialect()
@@ -758,6 +761,74 @@ void Smb2Test::writesADiskShareForAnAdministratorOnly()
                                           0x00120116u, 2)));
     QCOMPARE(statusOf(reply), quint32(Smb2::StatusAccessDenied));
     QVERIFY(!QFileInfo::exists(sysvol + QStringLiteral("/Policies/member.bat")));
+}
+
+// RFC 4493 §4: the AES-128 CMAC of four messages under one key. A 3.x session
+// is only as good as this, since every message it sends is signed with it.
+void Smb2Test::signsWithAesCmacAsTheStandardDoes()
+{
+    const QByteArray key = QByteArray::fromHex("2b7e151628aed2a6abf7158809cf4f3c");
+    QCOMPARE(Smb3::cmac(key, QByteArray()).toHex(),
+             QByteArray("bb1d6929e95937287fa37d129b756746"));
+    QCOMPARE(Smb3::cmac(key, QByteArray::fromHex("6bc1bee22e409f96e93d7e117393172a")).toHex(),
+             QByteArray("070a16b46b4d4144f79bdd9dd04a287c"));
+    QCOMPARE(Smb3::cmac(key, QByteArray::fromHex(
+                 "6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e51"
+                 "30c81c46a35ce411")).toHex(),
+             QByteArray("dfa66747de9ae63030ca32611497c827"));
+    QCOMPARE(Smb3::cmac(key, QByteArray::fromHex(
+                 "6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e51"
+                 "30c81c46a35ce411e5fbc1191a0a52eff69f2445df4f9b17ad2b417be66c3710"))
+                 .toHex(),
+             QByteArray("51f0bebf7e3b9d92fc49741779363cfe"));
+    // The 3.0.2 signing key is the session key expanded through the KDF whose
+    // context is the constant "SmbSign"; 2.x has no such step.
+    QCOMPARE(Smb3::signingKey(QByteArray(16, 'k'), Smb2::Dialect210, QByteArray()),
+             QByteArray(16, 'k'));
+    QCOMPARE(Smb3::signingKey(QByteArray(16, 'k'), Smb2::Dialect302, QByteArray()).size(), 16);
+}
+
+// A 3.1.1 negotiate answer is read by two clients that disagree about almost
+// everything, so its shape is pinned here: the dialect, the two contexts, and
+// the preauth one laid out as ContextType, DataLength, four reserved bytes, then
+// the hash count, the salt length, the algorithm and the salt — in that order,
+// which is what both Samba's client and smbprotocol parse.
+void Smb2Test::answersSmb311WithThePreauthContext()
+{
+    Smb2Server server;
+    QByteArray request = header(Smb2::CmdNegotiate, 0, 0, 0);
+    QByteArray body;
+    putLe16(body, 36); // StructureSize
+    putLe16(body, 4);  // DialectCount
+    putLe16(body, 1);  // SecurityMode
+    putLe16(body, 0);  // Reserved
+    putLe32(body, 0);  // Capabilities
+    body.append(QByteArray(16, '\0')); // ClientGuid
+    putLe64(body, 0);  // ClientStartTime
+    putLe16(body, Smb2::Dialect202);
+    putLe16(body, Smb2::Dialect210);
+    putLe16(body, Smb2::Dialect302);
+    putLe16(body, Smb2::Dialect311);
+    request.append(body);
+
+    const QByteArray reply = server.feed(nbt(request));
+    QCOMPARE(statusOf(reply), quint32(Smb2::StatusSuccess));
+    const QByteArray answer = bodyOf(reply);
+    QCOMPARE(readLe16(answer, 0), quint16(65));                  // StructureSize
+    QCOMPARE(readLe16(answer, 2), quint16(1));                   // signing enabled
+    QCOMPARE(readLe16(answer, 4), quint16(Smb2::Dialect311));    // dialect
+    QCOMPARE(readLe16(answer, 6), quint16(2));                   // preauth and signing
+    QCOMPARE(readLe32(answer, 60), quint32(Smb2::kHeaderSize + 64)); // context offset
+    QCOMPARE(answer.size(), 64 + 46 + 2 + 12);                   // body, preauth, pad, signing
+    QCOMPARE(readLe16(answer, 64), quint16(0x0001));             // PREAUTH_INTEGRITY
+    QCOMPARE(readLe16(answer, 66), quint16(38));                 // DataLength
+    QCOMPARE(readLe16(answer, 72), quint16(1));                  // HashAlgorithmCount
+    QCOMPARE(readLe16(answer, 74), quint16(32));                 // SaltLength
+    QCOMPARE(readLe16(answer, 76), quint16(1));                  // SHA-512
+    QCOMPARE(readLe16(answer, 112), quint16(0x0008));            // SIGNING_CAPABILITIES
+    QCOMPARE(readLe16(answer, 114), quint16(4));                 // DataLength
+    QCOMPARE(readLe16(answer, 120), quint16(1));                 // one algorithm
+    QCOMPARE(readLe16(answer, 122), quint16(0x0001));            // AES-CMAC
 }
 
 QTEST_MAIN(Smb2Test)

@@ -46,12 +46,16 @@ enum Command : quint16 {
     CmdSetInfo = 17
 };
 
-// The dialects this server answers. 2.1 is offered without 3.x, whose preauth
-// integrity would otherwise have to be computed for a session with no
-// encryption keys.
+// The dialects this server answers. 3.1.1 and 3.0.2 are negotiated with the
+// preauth-integrity hash and sign with AES-CMAC; 3.1.1's negotiate reply carries
+// the two contexts that say so. Encryption is not advertised, so a client that
+// wants it negotiates a 2.x dialect instead of encrypting nothing.
 enum Dialect : quint16 {
     Dialect202 = 0x0202,
-    Dialect210 = 0x0210
+    Dialect210 = 0x0210,
+    Dialect300 = 0x0300,
+    Dialect302 = 0x0302,
+    Dialect311 = 0x0311
 };
 
 enum Status : quint32 {

@@ -88,6 +88,7 @@ add_library(monarchy-ui-core STATIC
     ../engine/Smb1.cpp
     ../engine/Smb2.h
     ../engine/Smb2.cpp
+    ../engine/Smb3Crypto.cpp
     ../engine/Drs.h
     ../engine/Drs.cpp
     ../engine/DrsClient.h

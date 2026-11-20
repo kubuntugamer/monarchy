@@ -3,6 +3,8 @@
 
 #include "Smb2.h"
 
+#include "Smb3Crypto.h"
+
 #include <QCryptographicHash>
 #include <QDateTime>
 #include <QDebug>
@@ -177,6 +179,12 @@ struct Smb2Server::Connection {
     // SMB2 session key: the NTLM export, which signs every message once the
     // session is authenticated (MS-SMB2 3.2.5.3.1, MS-NLMP 3.4.5.3).
     QByteArray sessionKey;
+    // The dialect this connection settled on, and what 3.x derives from it: the
+    // preauth-integrity chain 3.1.1 binds its keys to, and the signing key the
+    // session key was expanded into (MS-SMB2 3.2.5.3.1).
+    quint16 dialect = Smb2::Dialect202;
+    QByteArray preauth;
+    QByteArray signingKey;
 
     struct Tree {
         QString name;
@@ -447,6 +455,22 @@ QByteArray Smb2Server::handleSmb1(Connection *connection, const QByteArray &mess
     return connection->smb1->feed(message);
 }
 
+// The signature a message carries, or must carry: the first 16 bytes of
+// HMAC-SHA256 keyed by the session key (2.x), or of AES-CMAC under the signing
+// key that key was expanded into (3.x, MS-SMB2 3.2.5.3.1), always over the whole
+// message with the signature field zeroed.
+QByteArray messageSignature(const QByteArray &message, quint16 dialect,
+                            const QByteArray &signingKey, const QByteArray &sessionKey)
+{
+    QByteArray zeroed = message;
+    zeroed.replace(48, 16, QByteArray(16, '\0'));
+    if (dialect >= Smb2::Dialect300)
+        return Smb3::cmac(signingKey, zeroed).left(16);
+    QMessageAuthenticationCode hmac(QCryptographicHash::Sha256, sessionKey);
+    hmac.addData(zeroed);
+    return hmac.result().left(16);
+}
+
 QByteArray Smb2Server::handleMessage(Connection *connection, const QByteArray &message)
 {
     if (Smb1::Session::isSmb1(message))
@@ -460,12 +484,9 @@ QByteArray Smb2Server::handleMessage(Connection *connection, const QByteArray &m
     // A signed request is verified before it is believed. The session key is only
     // known after session setup, which is itself unsigned.
     if ((readLe16(message, 16) & 0x0008) && !connection->sessionKey.isEmpty()) {
-        QByteArray expected = message;
         const QByteArray signature = message.mid(48, 16);
-        expected.replace(48, 16, QByteArray(16, '\0'));
-        QMessageAuthenticationCode hmac(QCryptographicHash::Sha256, connection->sessionKey);
-        hmac.addData(expected);
-        if (hmac.result().left(16) != signature) {
+        if (messageSignature(message, connection->dialect, connection->signingKey,
+                             connection->sessionKey) != signature) {
             QByteArray refused = message.left(int(Smb2::kHeaderSize));
             setLe32(refused, 8, 0xc0000022u); // STATUS_ACCESS_DENIED
             setLe16(refused, 14, 1);
@@ -559,16 +580,46 @@ QByteArray Smb2Server::handleMessage(Connection *connection, const QByteArray &m
     reply.replace(48, 16, QByteArray(16, '\0'));
     reply.append(body);
 
-    // Signing (MS-SMB2 3.2.5.3.1): HMAC-SHA256 over the whole message with the
-    // signature field zeroed, truncated to 16 bytes, keyed by the session key.
-    if (!connection->sessionKey.isEmpty()) {
+    // SMB 3.1.1 binds its keys to everything exchanged before them: the preauth
+    // hash is the running SHA-512 of each negotiate and session-setup request
+    // followed by its response, and the signing key is derived from the hash as
+    // it stands after the response that completed authentication.
+    if (connection->dialect == Smb2::Dialect311
+        && (command == Smb2::CmdNegotiate || command == Smb2::CmdSessionSetup)) {
+        connection->preauth = Smb3::preauthUpdate(connection->preauth, message);
+        // The response is part of the chain unless it is the one that completed
+        // authentication: a client derives its keys from the hash as it stands
+        // after the request that carried its credentials, so the success reply
+        // itself is not in what both sides hash (measured against smbprotocol
+        // and Samba, which both append a session-setup response only while the
+        // status is MORE_PROCESSING_REQUIRED).
+        if (command == Smb2::CmdNegotiate || status != Smb2::StatusSuccess)
+            connection->preauth = Smb3::preauthUpdate(connection->preauth, reply);
+    }
+    if (command == Smb2::CmdSessionSetup && connection->authenticated
+        && connection->signingKey.isEmpty() && connection->dialect >= Smb2::Dialect300) {
+        connection->signingKey =
+            Smb3::signingKey(connection->sessionKey, connection->dialect, connection->preauth);
+        if (connection->signingKey.isEmpty()) {
+            // 3.1.1 without a preauth hash cannot derive a key a client will
+            // accept, so the session is refused rather than signed wrongly.
+            return QByteArray();
+        }
+    }
+
+    // Signing (MS-SMB2 3.2.5.3.1): HMAC-SHA256 under the session key, or AES-CMAC
+    // under the signing key a 3.x session derived from it. A reply that carries a
+    // signature the session has no key for is worse than an unsigned one, so a
+    // 3.x session that has not derived its key yet answers unsigned.
+    const bool canSign = !connection->sessionKey.isEmpty()
+                         && (connection->dialect < Smb2::Dialect300
+                             || !connection->signingKey.isEmpty());
+    if (canSign) {
         // The SIGNED flag is part of what the signature covers, so it is set
         // before the hash rather than after it.
         setLe16(reply, 16, quint16(readLe16(reply, 16) | 0x0008)); // SMB2_FLAGS_SIGNED
-        reply.replace(48, 16, QByteArray(16, '\0'));
-        QMessageAuthenticationCode hmac(QCryptographicHash::Sha256, connection->sessionKey);
-        hmac.addData(reply);
-        reply.replace(48, 16, hmac.result().left(16));
+        reply.replace(48, 16, messageSignature(reply, connection->dialect,
+                                               connection->signingKey, connection->sessionKey));
     }
     if (!qEnvironmentVariableIsEmpty("MONARCHY_SMB_TRACE"))
         qWarning("SMB2 out cmd=%d status=0x%08x bytes=%d body=%s",
@@ -579,23 +630,79 @@ QByteArray Smb2Server::handleMessage(Connection *connection, const QByteArray &m
 
 QByteArray Smb2Server::negotiate(Connection *connection, const QByteArray &body, quint32 status)
 {
-    Q_UNUSED(connection)
     Q_UNUSED(status)
     const quint16 count = readLe16(body, 2);
+    // The highest dialect the client offered that this server answers. 3.1.1
+    // comes with the preauth-integrity context that says what it binds its keys
+    // to; 3.0.x needs none, since its key derivation has a constant for context.
+    // Encryption is not offered, so no dialect carries the global encryption
+    // capability and no encryption context is answered.
+    const auto rank = [](quint16 offered) {
+        if (offered == Smb2::Dialect311)
+            return 5;
+        if (offered == Smb2::Dialect302)
+            return 4;
+        if (offered == Smb2::Dialect300)
+            return 3;
+        if (offered == Smb2::Dialect210)
+            return 2;
+        if (offered == Smb2::Dialect202)
+            return 1;
+        return 0;
+    };
     quint16 dialect = Smb2::Dialect202;
+    int best = 0;
     for (int i = 0; i < int(count); ++i) {
         const quint16 offered = readLe16(body, 36 + i * 2);
-        if (offered == Smb2::Dialect210)
-            dialect = Smb2::Dialect210;
+        if (rank(offered) > best) {
+            best = rank(offered);
+            dialect = offered;
+        }
     }
+    connection->dialect = dialect;
 
     emit requestReceived(QStringLiteral("SMB2 negotiate dialect 0x%1").arg(dialect, 4, 16, QLatin1Char('0')));
 
+    // A 3.1.1 negotiate reply is not just a body: the contexts follow it and
+    // their offset is measured from the start of the header, 8-byte aligned.
+    QList<QByteArray> contexts;
+    if (dialect == Smb2::Dialect311) {
+        // PREAUTH_INTEGRITY_CAPABILITIES (MS-SMB2 2.2.3.1.1): SHA-512 and the
+        // salt the chain is keyed by. A negotiate context is ContextType,
+        // DataLength, four reserved bytes, then the data (MS-SMB2 2.2.3.4).
+        QByteArray salt(32, '\0');
+        for (int i = 0; i < salt.size(); ++i)
+            salt[i] = char(QRandomGenerator::system()->generate() & 0xff);
+        QByteArray preauth;
+        putLe16(preauth, 0x0001);                        // ContextType
+        putLe16(preauth, quint16(2 + 2 + 2 + salt.size())); // DataLength
+        preauth.append(QByteArray(4, '\0'));             // Reserved
+        putLe16(preauth, 1);                             // HashAlgorithmCount
+        putLe16(preauth, quint16(salt.size()));          // SaltLength
+        // The algorithms come before the salt, not after it: a client reads the
+        // selection at that offset and refuses anything that is not SHA-512.
+        putLe16(preauth, 0x0001);                        // SHA-512
+        preauth.append(salt);
+        contexts.append(preauth);
+
+        // SIGNING_CAPABILITIES: AES-CMAC, the only algorithm 3.x may sign with.
+        QByteArray signing;
+        putLe16(signing, 0x0008); // ContextType
+        putLe16(signing, 4);      // DataLength: count plus one algorithm
+        signing.append(QByteArray(4, '\0')); // Reserved
+        putLe16(signing, 1);      // CipherCount
+        putLe16(signing, 0x0001); // AES-CMAC
+        contexts.append(signing);
+    }
+
     QByteArray out;
     putLe16(out, 65);        // StructureSize
-    putLe16(out, 0x0000);    // SecurityMode: signing disabled
+    // SIGNING_ENABLED: signing is what this server does for every session it
+    // authenticates, and a 3.x client treats a server that disclaims it as
+    // malformed rather than as one that does not sign.
+    putLe16(out, 0x0001);    // SecurityMode
     putLe16(out, dialect);
-    putLe16(out, 0);         // NegotiateContextCount
+    putLe16(out, quint16(contexts.size())); // NegotiateContextCount
     out.append(QByteArray::fromHex("8d9c2f4e6a1b4d7c9e0f1a2b3c4d5e6f")); // ServerGuid
     putLe32(out, 0);         // Capabilities
     putLe32(out, 65536);     // MaxTransactSize
@@ -603,9 +710,18 @@ QByteArray Smb2Server::negotiate(Connection *connection, const QByteArray &body,
     putLe32(out, 65536);     // MaxWriteSize
     putLe64(out, quint64(0)); // SystemTime
     putLe64(out, quint64(0)); // ServerStartTime
-    putLe16(out, 128);       // SecurityBufferOffset
+    putLe16(out, quint16(Smb2::kHeaderSize + 64)); // SecurityBufferOffset
     putLe16(out, 0);         // SecurityBufferLength
-    putLe32(out, 0);         // NegotiateContextOffset
+    // The contexts begin where the fixed 64-byte body ends, measured from the
+    // start of the header, and each one starts on an 8-byte boundary.
+    putLe32(out, contexts.isEmpty() ? 0 : quint32(Smb2::kHeaderSize + 64));
+    for (int i = 0; i < contexts.size(); ++i) {
+        if (i > 0) {
+            while (out.size() % 8)
+                out.append('\0');
+        }
+        out.append(contexts.at(i));
+    }
     return out;
 }
 

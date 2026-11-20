@@ -76,6 +76,8 @@ CHECKS = [
     'negotiate settles on SMB 2.1 (0x0210) when the client offers it',
     'negotiate settles on SMB 2.0.2 (0x0202) when the client offers only that',
     'an SMB 2.1 session opens SYSVOL and lists the domain directory',
+    'an SMB 3.1.1 session signs with AES-CMAC and lists the domain directory',
+    'an SMB 3.0.2 session signs with AES-CMAC and lists the domain directory',
     'smbclient -k opens SYSVOL on a Kerberos ticket alone',
     'a file read over SMB 2.1 matches the bytes on disk',
     'SYSVOL stores a file an administrator puts and serves it back',
@@ -95,6 +97,8 @@ CHECKS = [
     NEGOTIATE_21,
     NEGOTIATE_202,
     SESSION,
+    SESSION_311,
+    SESSION_302,
     KERBEROS_SESSION,
     FILE_BYTES,
     WRITE_STORED,
@@ -162,6 +166,24 @@ def smbclient(options, share, command):
         options.smbclient,
         '//%s/%s' % (options.host, share),
         '-m', 'SMB2_10',
+        '-p', str(options.port),
+        '-U', credential(options),
+        '-c', command,
+    ])
+
+
+def smb3client(options, max_protocol, share, command):
+    """smbclient capped at a 3.x dialect. The minimum is lowered as well, because
+    Samba refuses a maximum below its default minimum, and a client that is
+    capped at 3.1.1 offers nothing older than it will accept: the dialect in the
+    server's answer is what this measures, and the session that follows is signed
+    with AES-CMAC — Samba fails the connection on a signature it cannot verify,
+    so a listing is proof the key derivation matched."""
+    return run([
+        options.smbclient,
+        '//%s/%s' % (options.host, share),
+        '--option=client min protocol=SMB2_02',
+        '-m', max_protocol,
         '-p', str(options.port),
         '-U', credential(options),
         '-c', command,
@@ -329,6 +351,19 @@ def main():
         check(SESSION, ok, (listed.splitlines()[0] if listed else 'no output') if not ok else '')
     except Exception as error:  # noqa: BLE001
         check(SESSION, False, '%s: %s' % (type(error).__name__, error))
+
+    # The same share at SMB 3.1.1 and 3.0.2: a 3.x session signs with AES-CMAC
+    # under a key derived from the session key, and 3.1.1 binds that key to the
+    # preauth-integrity chain, so a client that verifies its replies (Samba does,
+    # and refuses the connection otherwise) proves the derivation.
+    for label, protocol in ((SESSION_311, 'SMB3_11'), (SESSION_302, 'SMB3_02')):
+        try:
+            result = smb3client(options, protocol, 'SYSVOL', 'ls')
+            listed = output(result)
+            ok = result.returncode == 0 and dns_domain.lower() in listed.lower()
+            check(label, ok, (listed.splitlines()[-1] if listed else 'no output') if not ok else '')
+        except Exception as error:  # noqa: BLE001
+            check(label, False, '%s: %s' % (type(error).__name__, error))
 
     # The same share over Kerberos. `smbclient -k` has no password to fall back
     # on, so this only passes if the server accepted the AP-REQ in session setup
