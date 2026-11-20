@@ -20,6 +20,10 @@ MS-NRPC has two halves and this script exercises both:
 A machine account the directory does not hold must be refused with
 STATUS_NO_TRUST_SAM_ACCOUNT, so that path is checked with a name nothing serves.
 
+The domain's NTLM policy is checked as well: a network logon answered with
+NTLMv1 -- impacket computes that answer itself -- is refused at the default
+`lmCompatibilityLevel` and accepted against a DC configured at 2.
+
 A wrong password has to be refused with STATUS_WRONG_PASSWORD *and* counted:
 the account's badPwdCount goes up, the good logon clears it, and SAMR reports
 both counters back, so the last two checks read the account over SAMR.
@@ -35,6 +39,9 @@ Options:
   --user USER        Account to bind SAMR as and to validate. Default: Administrator
   --password PASS    Its password. Default: P@ssw0rd123!
   --domain DOMAIN    NetBIOS domain name. Default: MONARCHY
+  --lm-compat LEVEL  The domain's lmCompatibilityLevel: 0-2 mean a network logon
+                     may answer with NTLMv1, 3-5 (AD's default) mean it is
+                     refused. Default: 3
   --list             Only list the checks that would run.
 
 Exit status is 0 when every check passes or is skipped with a reason, 1 when a
@@ -92,6 +99,7 @@ CHECKS = [
     'NetrLogonSamLogon answers an interactive logon (class 1)',
     'NetrLogonSamLogon answers a service logon (class 3)',
     'a wrong one-way function is refused with STATUS_WRONG_PASSWORD',
+    'NetrLogonSamLogon honours lmCompatibilityLevel for NTLMv1',
 ]
 
 
@@ -402,6 +410,7 @@ def main():
     parser.add_argument('--user', default='Administrator')
     parser.add_argument('--password', default='P@ssw0rd123!')
     parser.add_argument('--domain', default='MONARCHY')
+    parser.add_argument('--lm-compat', type=int, default=3)
     parser.add_argument('--list', action='store_true')
     options = parser.parse_args()
 
@@ -457,11 +466,19 @@ def main():
         request['NegotiateFlags'] = NETLOGON_NEG_STRONG_KEYS
         return dce.request(request), session_key
 
-    def samlogon(server_credential, session_key, user, password):
-        """One NetrLogonSamLogon over an established channel."""
-        nt_hash = ntlm.compute_nthash(password)
-        challenge = b'ConfChlg'
-        nt_response = ntlmv2_response(nt_hash, user, options.domain, challenge)
+    def samlogon(server_credential, session_key, user, password, challenge=b'ConfChlg',
+                 nt_response=None, lm_response=None):
+        """One NetrLogonSamLogon over an established channel.
+
+        The NTLMv2 answer is computed from the account's password. A caller that
+        sends a different answer -- the NTLMv1 one a pre-NTLMv2 client sends --
+        passes it in together with the challenge it answered.
+        """
+        if nt_response is None:
+            nt_hash = ntlm.compute_nthash(password)
+            nt_response = ntlmv2_response(nt_hash, user, options.domain, challenge)
+        if lm_response is None:
+            lm_response = b'\x00' * 24
         request = nrpc.NetrLogonSamLogon()
         request['LogonServer'] = NULL
         request['ComputerName'] = computer
@@ -494,7 +511,7 @@ def main():
         # an empty one, which no client would put on the wire. A client that
         # answers only with NTLMv2 sends a zeroed 24-byte LMv2.
         network['NtChallengeResponse'] = nt_response
-        network['LmChallengeResponse'] = b'\x00' * 24
+        network['LmChallengeResponse'] = lm_response
         return dce.request(request)
 
     def password_logon(server_credential, session_key, user, password, logon_class):
@@ -578,6 +595,7 @@ def main():
             skip(CHECKS[13], 'no machine account to open a secure channel with')
             skip(CHECKS[14], 'no machine account to open a secure channel with')
             skip(CHECKS[15], 'no machine account to open a secure channel with')
+            skip(CHECKS[16], 'no machine account to open a secure channel with')
         else:
             account, password, rid = machine
             check(CHECKS[4], True, '%s rid %d' % (account, rid))
@@ -623,6 +641,7 @@ def main():
 
             if not channel:
                 skip(CHECKS[6], 'no secure channel')
+                skip(CHECKS[16], 'no secure channel to try NTLMv1 over')
             else:
                 try:
                     response = samlogon(server_credential, session_key, options.user,
@@ -772,6 +791,43 @@ def main():
                     lockout_policy(options, (0, 18000000000, 18000000000))
                 except Exception:  # noqa: BLE001
                     pass
+
+            # NTLMv1 under the domain's policy. A client that predates NTLMv2
+            # answers a challenge with three DES blocks and no blob, and the DC
+            # accepts that only when dc.conf lowers lmCompatibilityLevel to 2.
+            # impacket computes the answer, so neither half of this check comes
+            # from this repository. The logon is for an account of its own: the
+            # lockout check above deliberately leaves `account` locked, and a
+            # locked account is refused before its response is looked at.
+            try:
+                fresh, reason = create_account(
+                    options, getattr(samr, 'USER_NORMAL_ACCOUNT', 0x10),
+                    password_expired=False)
+                if fresh is None:
+                    raise RuntimeError(reason)
+                v1_user, v1_password, _ = fresh
+                key, seed, code = open_channel(account, password)
+                if code != STATUS_SUCCESS:
+                    raise RuntimeError('channel refused: 0x%08x' % code)
+                v1 = ntlm.get_ntlmv1_response(
+                    ntlm.compute_nthash(v1_password), client_challenge)
+                refused = None
+                try:
+                    samlogon(seed, key, v1_user, v1_password,
+                             challenge=client_challenge, nt_response=v1,
+                             lm_response=b'\x00' * 24)
+                except Exception as error:  # noqa: BLE001
+                    refused = getattr(error, 'error_code', None)
+                outcome = ('accepted' if refused is None
+                           else 'refused 0x%08x' % refused)
+                if options.lm_compat <= 2:
+                    check(CHECKS[16], refused is None,
+                          '%s at level %d' % (outcome, options.lm_compat))
+                else:
+                    check(CHECKS[16], refused == STATUS_WRONG_PASSWORD,
+                          '%s at level %d' % (outcome, options.lm_compat))
+            except Exception as error:  # noqa: BLE001
+                check(CHECKS[16], False, '%s: %s' % (type(error).__name__, error))
 
     print('\n%d failure(s): %s' % (len(failures), failures))
     if skipped:

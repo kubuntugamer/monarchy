@@ -770,7 +770,10 @@ NTLMv2 response only" needs that line; without it the session setup is refused
 `LOGON_FAILURE`, which is what this DC did before the setting existed. The
 session key such a session signs with is an HMAC keyed by MD4(NTOWFv1) —
 measured from Samba's client rather than assumed — and an LM response on its own
-is always refused, because this store keeps no LM hash to check one against.
+is always refused, because this store keeps no LM hash to check one against. The
+same policy decides whether Netlogon accepts an NTLMv1 answer in
+`NetrLogonSamLogon`, where the shape of the LM response is what identifies the
+variant, since a network logon carries no negotiated flags.
 
 **Endpoint mapper** (`engine/Epm.cpp`): `ept_lookup` and `ept_map` on `epmPort`
 (135 by default, `epmPort` in `dc.conf`), so a client that knows an interface

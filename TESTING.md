@@ -170,6 +170,17 @@ recorded, not hidden:
   MD4(NTOWFv1). An LM response on its own is still refused: this store keeps no
   LM hash to check one against.
 
+  The same policy governs the network logon Netlogon serves, which carries no
+  negotiated flags: the shape of the LM response says which v1 variant arrived —
+  a client challenge followed by sixteen zero bytes is NTLM2 session security,
+  and anything else, including the all-zero response of a client with no LM
+  hash, is plain NTLMv1 over the challenge as sent.
+  `scripts/netlogon-conformance.py --lm-compat N` drives that with impacket's own
+  NTLMv1 answer: against a DC left at the default the logon is refused
+  `STATUS_WRONG_PASSWORD`, and against one whose `dc.conf` sets
+  `lmCompatibilityLevel=2` it is accepted, with the rest of the suite green at
+  17 checks in both runs.
+
 - **G11 — share enumeration is absent.** The probe that reaches the server is
   the pipe open: `rpcclient -c netshareenum` fails with
   `Could not initialise srvsvc. Error was NT_STATUS_OBJECT_NAME_NOT_FOUND`, while

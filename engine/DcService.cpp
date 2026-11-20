@@ -766,6 +766,7 @@ bool DcService::start(const QString &dcDir)
     netlogonConfig.dcIp = dcIp;
     netlogonConfig.siteName = siteName;
     m_netlogonServer->setConfig(netlogonConfig);
+    m_netlogonServer->setLmCompatibilityLevel(lmCompatibilityLevel);
     m_netlogonServer->setObjectProvider([this]() { return m_ldapServer->objects(); });
     Netlogon::WriteBackend netlogonWrites;
     netlogonWrites.setNtHash = [this, persist](const QString &dn, const QByteArray &ntHash,

@@ -1381,8 +1381,30 @@ QByteArray NetlogonServer::samLogon(const QByteArray &stub, bool withAuthenticat
     } else {
         if (logon.challenge.size() != 8 || logon.ntResponse.size() < 24)
             return statusOnly(kStatusWrongPassword);
-        if (!Ntlm::verifyNtlmv2(ntHash, logonAccount, domain, logon.challenge,
-                                logon.ntResponse)) {
+        // The same helper the SMB, RPC and LDAP acceptors use, so a network
+        // logon from a client that predates NTLMv2 is judged by the domain's
+        // own policy rather than by this pipe having its own rule. The session
+        // keys go unused: nothing on this pipe signs with the logon's key.
+        //
+        // A network logon carries no negotiated flags, so the shape of the LM
+        // response is what says which v1 variant arrived: eight bytes of client
+        // challenge followed by sixteen zero bytes is NTLM2 session security,
+        // and anything else is plain NTLMv1 over the challenge as sent. A v2
+        // answer is unaffected by the bit either way.
+        // An all-zero LM response is what a client with no LM hash sends, not a
+        // client challenge of zero, so it stays on the plain v1 path; otherwise
+        // such a client would be checked against the wrong seed.
+        const bool sessionSecurity =
+            logon.lmResponse.size() == 24
+            && logon.lmResponse.mid(8) == QByteArray(16, '\0')
+            && logon.lmResponse.left(8) != QByteArray(8, '\0');
+        Ntlm::SessionKeys sessionKeys;
+        const quint32 sessionFlags =
+            Ntlm::kNegotiate128
+            | (sessionSecurity ? Ntlm::kNegotiateExtendedSessionSecurity : 0u);
+        if (!Ntlm::verifyResponse(ntHash, logonAccount, domain, logon.challenge,
+                                  logon.ntResponse, logon.lmResponse, sessionFlags,
+                                  m_lmCompatibilityLevel, &sessionKeys)) {
             countBadPassword();
             return statusOnly(kStatusWrongPassword);
         }

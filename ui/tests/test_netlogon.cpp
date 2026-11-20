@@ -185,7 +185,9 @@ void appendDeferredString(QByteArray &out, const QString &value, int align = 4)
 
 void appendNetworkLogon(QByteArray &out, quint16 validationLevel, const QByteArray &ntResponse,
                         quint32 extraFlags = 0,
-                        const QString &workstation = QStringLiteral("CLIENT"))
+                        const QString &workstation = QStringLiteral("CLIENT"),
+                        const QByteArray &lmResponse = QByteArray(),
+                        const QByteArray &challenge = QByteArray::fromHex("0102030405060708"))
 {
     while (out.size() % 4 != 0) out.append(char(0));
 
@@ -201,11 +203,20 @@ void appendNetworkLogon(QByteArray &out, quint16 validationLevel, const QByteArr
     const quint16 workstationBytes = quint16(workstation.size() * 2);
     appendLe16(out, workstationBytes); appendLe16(out, workstationBytes);
     appendLe32(out, 0x00020003u); // workstation
-    out.append(QByteArray::fromHex("0102030405060708")); // challenge
+    out.append(challenge); // challenge
     while (out.size() % 4 != 0) out.append(char(0));
     appendLe16(out, quint16(ntResponse.size())); appendLe16(out, quint16(ntResponse.size()));
     appendLe32(out, 0x00020004u);
-    appendLe16(out, 0); appendLe16(out, 0); appendLe32(out, 0);
+    // A NULL LM response is a zero referent and marshals no array at all; a
+    // client that sends one fills the header and defers the bytes after the NT
+    // response, in struct order.
+    if (lmResponse.isEmpty()) {
+        appendLe16(out, 0); appendLe16(out, 0); appendLe32(out, 0);
+    } else {
+        appendLe16(out, quint16(lmResponse.size()));
+        appendLe16(out, quint16(lmResponse.size()));
+        appendLe32(out, 0x00020005u);
+    }
 
     // Deferred unique-pointer referents are carried separately from the
     // conformant string payloads; the NDR pointer IDs were in the fixed struct.
@@ -217,8 +228,12 @@ void appendNetworkLogon(QByteArray &out, quint16 validationLevel, const QByteArr
     appendLe32(out, quint32(ntResponse.size()));
     out.append(ntResponse);
     while (out.size() % 4 != 0) out.append(char(0));
-    // The LM header above is all a NULL LM response marshals: its referent is
-    // zero, so there is no deferred array to write.
+    if (!lmResponse.isEmpty()) {
+        appendLe32(out, quint32(lmResponse.size())); appendLe32(out, 0);
+        appendLe32(out, quint32(lmResponse.size()));
+        out.append(lmResponse);
+        while (out.size() % 4 != 0) out.append(char(0));
+    }
 
     // validation_level follows the whole logon-information parameter, deferred
     // strings and responses included; extra_flags follows it.
@@ -462,6 +477,7 @@ private slots:
     void locksTheAccountAfterTheThreshold();
     void refusesALogonFromAnotherWorkstation();
     void allowsALogonFromAListedWorkstation();
+    void networkSamLogonHonoursNtlmv1Policy();
     void refusesAnExpiredPassword();
     void refusesAPasswordThatMustChange();
     void allowsAnAgedPasswordThatNeverExpires();
@@ -1692,6 +1708,105 @@ void NetlogonTest::answersTheLegacyLocatorCalls()
     QCOMPARE(readLe32(trusts, 0), quint32(0)); // count
     QCOMPARE(readLe32(trusts, 4), quint32(0)); // NULL array
     QCOMPARE(readLe32(trusts, 8), quint32(0)); // WERROR
+}
+
+void NetlogonTest::networkSamLogonHonoursNtlmv1Policy()
+{
+    // The answer a client that predates NTLMv2 sends: three DES blocks over the
+    // challenge 0123456789abcdef (the one appendNetworkLogon writes), from
+    // NTOWFv1("Password") — the vector an independent DES implementation
+    // produced, which test_ntlm pins. A network logon has to be judged by the
+    // domain's policy, not by this pipe keeping its own rule.
+    const QByteArray v1Response =
+        QByteArray::fromHex("67c43011f30298a2ad35ece64f16331c44bdbed927841f94");
+    const QByteArray userHash = Ntlm::ntowfV1(QStringLiteral("Password"));
+
+    // Each attempt needs its own channel: a SamLogon spends the authenticator
+    // it was sent with, whatever the answer turns out to be.
+    const auto attempt = [&](int lmCompatibilityLevel) -> quint32 {
+        NetlogonServer server;
+        Netlogon::Config config;
+        config.netbios = QStringLiteral("CORP");
+        config.realm = QStringLiteral("CORP.EXAMPLE.COM");
+        config.dnsDomain = QStringLiteral("corp.example.com");
+        config.dcName = QStringLiteral("DC1");
+        config.domainSid = QStringLiteral("S-1-5-21-1-2-3");
+        server.setConfig(config);
+        server.setLmCompatibilityLevel(lmCompatibilityLevel);
+
+        DirectoryObject machine;
+        machine.id = QStringLiteral("CN=DC1,OU=Domain Controllers,DC=corp,DC=example,DC=com");
+        machine.kind = ObjectKind::Computer;
+        machine.attributes.insert(QStringLiteral("sAMAccountName"), QStringLiteral("DC1$"));
+        machine.attributes.insert(QStringLiteral("objectSid"),
+                                  QStringLiteral("S-1-5-21-1-2-3-1000"));
+        const QByteArray machineHash = Ntlm::ntowfV1(QStringLiteral("Mach!neP@ss1"));
+        machine.attributes.insert(QStringLiteral("ntHash"),
+                                  QString::fromLatin1(machineHash.toHex()));
+
+        DirectoryObject user;
+        user.id = QStringLiteral("CN=alice,CN=Users,DC=corp,DC=example,DC=com");
+        user.kind = ObjectKind::User;
+        user.attributes.insert(QStringLiteral("sAMAccountName"), QStringLiteral("alice"));
+        user.attributes.insert(QStringLiteral("objectSid"),
+                               QStringLiteral("S-1-5-21-1-2-3-1100"));
+        user.attributes.insert(QStringLiteral("ntHash"),
+                               QString::fromLatin1(userHash.toHex()));
+        user.attributes.insert(QStringLiteral("primaryGroupID"), QStringLiteral("513"));
+        user.attributes.insert(QStringLiteral("userAccountControl"), QStringLiteral("512"));
+        user.attributes.insert(QStringLiteral("displayName"), QStringLiteral("Alice Example"));
+        server.setObjectProvider(
+            [machine, user]() { return QList<DirectoryObject>{machine, user}; });
+
+        Netlogon::WriteBackend writes;
+        writes.updateAccount = [](const QString &, const QMap<QString, QString> &, QString *) {
+            return true;
+        };
+        server.setWriteBackend(writes);
+
+        const QByteArray clientChallenge = QByteArray::fromHex("1112131415161718");
+        const QByteArray serverChallenge = server
+            .handleCall(Netlogon::OpServerReqChallenge,
+                        challengeRequest(QStringLiteral("DC1"), clientChallenge))
+            .left(8);
+        const quint32 flags = Netlogon::kNegStrongKeys | Netlogon::kNegSupportsAes;
+        const QByteArray sessionKey =
+            expectedSessionKey(machineHash, clientChallenge, serverChallenge, flags);
+        server.handleCall(Netlogon::OpServerAuthenticate3,
+                          authenticateRequest(
+                              QStringLiteral("DC1$"), QStringLiteral("DC1"),
+                              expectedCredential(clientChallenge, sessionKey, flags), flags));
+        const QByteArray channelSeed =
+            expectedCredential(clientChallenge, sessionKey, flags);
+        const quint32 timestamp = 42;
+        const QByteArray requestCredential =
+            nextCredential(channelSeed, timestamp, sessionKey, flags, false);
+
+        QByteArray request;
+        appendLe32(request, 0); // NULL LogonServer pointer
+        appendPointerString(request, QStringLiteral("DC1"), 0x00021000u);
+        appendLe32(request, 0x00021001u);
+        request.append(authenticatorRequest(requestCredential, timestamp));
+        appendLe32(request, 0x00021002u);
+        request.append(QByteArray(12, '\0'));
+        appendLe16(request, 2);
+        appendLe16(request, 2);
+        appendLe32(request, 0x00021003u);
+        // The LM half is the zeroed 24 bytes of a client that keeps no LM hash,
+        // which is not the client challenge NTLM2 session security would put
+        // there, so this is plain NTLMv1 over the challenge as sent.
+        appendNetworkLogon(request, 3, v1Response, 0, QStringLiteral("CLIENT"),
+                           QByteArray(24, '\0'), QByteArray::fromHex("0123456789abcdef"));
+        const QByteArray reply = server.handleCall(Netlogon::OpLogonSamLogon, request);
+        return readLe32(reply, 0);
+    };
+
+    // At the default the answer is refused before the password counts, which is
+    // what this pipe did before the policy was reachable from dc.conf...
+    QCOMPARE(attempt(Ntlm::kDefaultLmCompatibilityLevel), quint32(0xc000006au));
+    QCOMPARE(attempt(3), quint32(0xc000006au));
+    // ...and at 2 the same 24 bytes log alice on.
+    QCOMPARE(attempt(2), quint32(0x0002f210u));
 }
 
 void NetlogonTest::dcLocatorNamesThisDc()

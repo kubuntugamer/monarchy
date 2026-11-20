@@ -109,6 +109,11 @@ public:
     // same objects SAMR, LSAD and LDAP serve.
     void setObjectProvider(std::function<QList<DirectoryObject>()> provider);
     void setWriteBackend(Netlogon::WriteBackend backend);
+    // AD's LmCompatibilityLevel, exactly as every other acceptor reads it from
+    // dc.conf: 0-2 accept an NTLMv1 or NTLM2-session answer from a pre-NTLMv2
+    // client, 3-5 require NTLMv2. The default is 3, the policy this pipe
+    // enforced before the setting existed.
+    void setLmCompatibilityLevel(int level) { m_lmCompatibilityLevel = level; }
 
     bool listen(quint16 port = 0, const QHostAddress &address = QHostAddress::LocalHost);
     void close();
@@ -184,6 +189,7 @@ private:
     RpcServer *m_rpc = nullptr;
     std::function<QList<DirectoryObject>()> m_provider;
     Netlogon::WriteBackend m_writes;
+    int m_lmCompatibilityLevel = 3; // Ntlm::kDefaultLmCompatibilityLevel
     QHash<QString, Challenge> m_challenges; // by computer name, lower case
     QHash<QString, Channel> m_channels;     // by account name, lower case
 };
