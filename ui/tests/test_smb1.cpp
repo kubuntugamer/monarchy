@@ -233,6 +233,68 @@ QByteArray queryFileMessage(quint16 tid, quint16 fid, quint16 level)
     return smb(Smb1::CmdTrans2, tid, 0x1234, words, data);
 }
 
+QString decodeUtf16(const QByteArray &bytes)
+{
+    QString out;
+    for (int i = 0; i + 1 < bytes.size(); i += 2)
+        out.append(QChar(quint16(quint8(bytes.at(i)) | (quint16(quint8(bytes.at(i + 1))) << 8))));
+    return out;
+}
+
+// TRANS2 FIND_FIRST2: the search attributes, how many entries the client will
+// take, the flags, the information level, a storage type it does not use, and
+// the pattern. Setup[0] carries the subcommand.
+QByteArray findFirstMessage(quint16 tid, const QString &pattern, quint16 level,
+                            quint16 maxEntries, quint16 flags = 0)
+{
+    QByteArray parameters;
+    putLe16(parameters, 0x0016); // SearchAttributes: directory | archive | read-only
+    putLe16(parameters, maxEntries);
+    putLe16(parameters, flags);
+    putLe16(parameters, level);
+    putLe32(parameters, 0); // SearchStorageType, unused by this server
+    QByteArray name = utf16le(pattern);
+    name.append(QByteArray(2, '\0'));
+    parameters.append(name);
+
+    QByteArray words(28, '\0');
+    words[26] = char(1); // SetupCount
+    words[18] = char(parameters.size() & 0xff);
+    words[19] = char((parameters.size() >> 8) & 0xff);
+    const quint16 parameterOffset = quint16(32 + 1 + 30 + 2 + 1);
+    words[20] = char(parameterOffset & 0xff);
+    words[21] = char((parameterOffset >> 8) & 0xff);
+    putLe16(words, 0x0001); // FIND_FIRST2
+    QByteArray data(1, '\0');
+    data.append(parameters);
+    return smb(Smb1::CmdTrans2, tid, 0x1234, words, data);
+}
+
+// TRANS2 FIND_NEXT2: the search the client is continuing, how many more it will
+// take, and the level it asked with.
+QByteArray findNextMessage(quint16 tid, quint16 searchId, quint16 maxEntries, quint16 level)
+{
+    QByteArray parameters;
+    putLe16(parameters, searchId);
+    putLe16(parameters, maxEntries);
+    putLe16(parameters, level);
+    putLe32(parameters, 0); // ResumeKey
+    putLe16(parameters, 0); // Flags
+    parameters.append(QByteArray(2, '\0'));
+
+    QByteArray words(28, '\0');
+    words[26] = char(1);
+    words[18] = char(parameters.size() & 0xff);
+    words[19] = char((parameters.size() >> 8) & 0xff);
+    const quint16 parameterOffset = quint16(32 + 1 + 30 + 2 + 1);
+    words[20] = char(parameterOffset & 0xff);
+    words[21] = char((parameterOffset >> 8) & 0xff);
+    putLe16(words, 0x0002); // FIND_NEXT2
+    QByteArray data(1, '\0');
+    data.append(parameters);
+    return smb(Smb1::CmdTrans2, tid, 0x1234, words, data);
+}
+
 // SMB_COM_TRANSACTION to a pipe the client has already opened, addressed the
 // way Windows 2000 addresses it: the name field is `\PIPE\` with the pipe name
 // left empty, Setup[0] is the subcommand, Setup[1] the handle, and the
@@ -366,6 +428,7 @@ class Smb1Test : public QObject
 private slots:
     void readsAPolicyFileFromSysvol();
     void opensATerminatedNameAndReportsAttributes();
+    void listsADirectoryOverFindFirst2();
     void refusesAnAnonymousTreeConnect();
     void refusesAnUnknownShare();
     void refusesTraversalOutOfTheShare();
@@ -740,6 +803,142 @@ void Smb1Test::setsTheStateOfAnOpenPipe()
     QCOMPARE(readLe16(paramMessage, 45), quint16(0));          // DataCount
     QCOMPARE(paramMessage.mid(int(readLe16(paramMessage, 41)), 2),
              QByteArray("\x05\x00", 2)); // a DCE/RPC 5.0 PDU at ParameterOffset
+}
+
+// A directory listing, which is the first thing a 2000 workstation does after
+// it authenticates. Measured with Samba's client pinned to NT1: `ls` in SYSVOL
+// lists the domain directory, and a pattern that matches nothing in an empty
+// NETLOGON answers NO_SUCH_FILE, which is what Windows answers rather than an
+// empty success. The chain bytes matter as much as the names: the client walks
+// NextEntryOffset and reads the name at the offset its information level fixes.
+void Smb1Test::listsADirectoryOverFindFirst2()
+{
+    QDir root(m_root.path());
+    QVERIFY(root.mkpath(QStringLiteral("lsdir/nested")));
+    const auto writeFile = [&root](const QString &relative) {
+        QFile file(root.filePath(relative));
+        QVERIFY2(file.open(QIODevice::WriteOnly), qPrintable(relative));
+        file.write("x");
+    };
+    writeFile(QStringLiteral("lsdir/alpha.txt"));
+    writeFile(QStringLiteral("lsdir/beta.log"));
+    writeFile(QStringLiteral("lsdir/nested/inner.txt"));
+    writeFile(QStringLiteral("lsdir/nested/deeper.txt"));
+
+    QHash<QString, QString> shares;
+    shares.insert(QStringLiteral("sysvol"), m_root.path());
+    Smb1::Session session(
+        QHash<QString, RpcServer *>(),
+        [](const Rpc::AuthRequest &, Ntlm::SessionKeys *keys) {
+            *keys = Ntlm::SessionKeys();
+            return true;
+        },
+        QStringLiteral("MONARCHY"), QStringLiteral("DC1"), QStringLiteral("monarchy.test"),
+        shares);
+    session.feed(negotiateMessage());
+    QByteArray type1("NTLMSSP", 7);
+    type1.append(char(0));
+    putLe32(type1, 1);
+    putLe32(type1, 0x00008201u);
+    session.feed(sessionSetupMessage(type1));
+    QCOMPARE(statusOf(session.feed(sessionSetupMessage(
+                 authenticateToken(QStringLiteral("alice"), QStringLiteral("MONARCHY"))))),
+             quint32(0));
+    const QByteArray treeReply =
+        session.feed(treeConnectMessage(QStringLiteral("\\\\dc1\\SYSVOL")));
+    QCOMPARE(statusOf(treeReply), quint32(0));
+    const quint16 tid = readLe16(payloadOf(treeReply), 24);
+
+    // Ask for one entry per call, so the continuation is exercised the way a
+    // client that pages a big directory walks it.
+    quint16 searchId = 0;
+    QStringList seen;
+    bool endOfSearch = false;
+    for (int round = 0; round < 8 && !endOfSearch; ++round) {
+        const QByteArray reply = round == 0
+            ? session.feed(findFirstMessage(tid, QStringLiteral("\\lsdir\\*"), 0x0101, 1))
+            : session.feed(findNextMessage(tid, searchId, 1, 0x0101));
+        QCOMPARE(statusOf(reply), quint32(0));
+        const QByteArray message = payloadOf(reply);
+        const QByteArray parameters =
+            message.mid(int(readLe16(message, 41)), int(readLe16(message, 39)));
+        const QByteArray data =
+            message.mid(int(readLe16(message, 47)), int(readLe16(message, 45)));
+
+        if (round == 0) {
+            searchId = readLe16(parameters, 0);
+            QVERIFY2(searchId >= 0x200, "the search id is the session's, not the client's");
+        }
+        // FIND_FIRST2 answers SearchID first, and FIND_NEXT2 does not repeat it
+        // (MS-CIFS 2.2.6.4 against 2.2.6.6), so the same two fields sit two
+        // bytes earlier on a continuation.
+        const int countAt = round == 0 ? 2 : 0;
+        const int endAt = round == 0 ? 4 : 2;
+        QCOMPARE(readLe16(parameters, countAt), quint16(1)); // SearchCount
+        endOfSearch = readLe16(parameters, endAt) != 0;
+
+        // One record, so nothing follows it: NextEntryOffset is zero, the name
+        // length is a byte count, and SMB_FIND_FILE_DIRECTORY_INFO puts the
+        // name at offset 64.
+        QCOMPARE(readLe32(data, 0), quint32(0));
+        const quint32 nameBytes = readLe32(data, 60);
+        QVERIFY2(nameBytes > 0 && 64 + int(nameBytes) <= data.size(),
+                 qPrintable(QStringLiteral("name length %1, data %2")
+                                .arg(nameBytes).arg(data.size())));
+        seen.append(decodeUtf16(data.mid(64, int(nameBytes))));
+        // The attributes say which entry is a directory, and the directory's
+        // size is reported as zero rather than as the size of its inode.
+        // NextEntryOffset, FileIndex, four timestamps and two sizes come first,
+        // so FileAttributes sits at 56 and the name length at 60.
+        const quint32 attributes = readLe32(data, 56);
+        QCOMPARE((attributes & 0x10u) != 0, seen.last() == QStringLiteral("nested"));
+        if (seen.last() == QStringLiteral("nested"))
+            QCOMPARE(readLe32(data, 40), quint32(0));
+    }
+
+    // QDir answers in name order, and every entry is here exactly once.
+    QCOMPARE(seen, QStringList({QStringLiteral("alpha.txt"), QStringLiteral("beta.log"),
+                                QStringLiteral("nested")}));
+
+    // A wildcard narrows the same directory to one name, and the reply that
+    // carries the last entry says so in EndOfSearch.
+    const QByteArray txtReply =
+        session.feed(findFirstMessage(tid, QStringLiteral("\\lsdir\\*.txt"), 0x0101, 10));
+    QCOMPARE(statusOf(txtReply), quint32(0));
+    const QByteArray txtMessage = payloadOf(txtReply);
+    const QByteArray txtParams =
+        txtMessage.mid(int(readLe16(txtMessage, 41)), int(readLe16(txtMessage, 39)));
+    const QByteArray txtData =
+        txtMessage.mid(int(readLe16(txtMessage, 47)), int(readLe16(txtMessage, 45)));
+    QCOMPARE(readLe16(txtParams, 2), quint16(1)); // only alpha.txt
+    QCOMPARE(readLe16(txtParams, 4), quint16(1)); // EndOfSearch
+    QCOMPARE(decodeUtf16(txtData.mid(64, int(readLe32(txtData, 60)))),
+             QStringLiteral("alpha.txt"));
+
+    // A directory named without a wildcard lists what is inside it: this is
+    // what `ls nested` sends, and answering with the directory itself instead
+    // of its contents would make a client show one entry where there are two.
+    const QByteArray subReply =
+        session.feed(findFirstMessage(tid, QStringLiteral("\\lsdir\\nested"), 0x0101, 10));
+    QCOMPARE(statusOf(subReply), quint32(0));
+    const QByteArray subMessage = payloadOf(subReply);
+    const QByteArray subParams =
+        subMessage.mid(int(readLe16(subMessage, 41)), int(readLe16(subMessage, 39)));
+    QCOMPARE(readLe16(subParams, 2), quint16(2));
+
+    // A pattern that matches nothing is an error rather than an empty success,
+    // because a client parses the first record out of the data block.
+    QCOMPARE(statusOf(session.feed(
+                 findFirstMessage(tid, QStringLiteral("\\lsdir\\*.zzz"), 0x0101, 10))),
+             Smb1::kStatusNoSuchFile);
+    // A directory that does not exist is named as such.
+    QCOMPARE(statusOf(session.feed(
+                 findFirstMessage(tid, QStringLiteral("\\nosuch\\*"), 0x0101, 10))),
+             Smb1::kStatusObjectNameNotFound);
+    // Continuing a search this session never opened is refused, so a client
+    // cannot read another session's listing by guessing an id.
+    QCOMPARE(statusOf(session.feed(findNextMessage(tid, 0x9999, 1, 0x0101))),
+             Smb1::kStatusInvalidHandle);
 }
 
 // A client that signs has to get signed replies and have its own signatures

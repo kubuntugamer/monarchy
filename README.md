@@ -756,11 +756,12 @@ needs an authenticated session, names are resolved case-insensitively inside the
 share root, and `NT_CREATE_ANDX`, positional `READ_ANDX`, the TRANS2
 query-by-path and query-by-file-id that a client makes before reading, and close
 are served; every write, mkdir, delete and set-info is answered with access
-denied. Directory enumeration (`TRANS2 FIND_FIRST2`) is not implemented, so a
-client can read a named file but cannot list a directory. Live against a
-provisioned DC, `smbclient -m NT1` fetches a policy's `GPT.INI` and a NETLOGON
-logon script byte for byte, and an anonymous session is refused with logon
-failure.
+denied. Directory enumeration is served — `TRANS2 FIND_FIRST2`, `FIND_NEXT2` and
+`FIND_CLOSE2` at information levels 0x0101 to 0x0104, with a search handle per
+session so a resumed page returns the set the first page resolved. Live against
+a provisioned DC, `smbclient -m NT1` lists SYSVOL, fetches a policy's `GPT.INI`
+and a NETLOGON logon script byte for byte, and an anonymous session is refused
+with logon failure.
 
 NTLMv1 and NTLM2-session answers are accepted only when `dc.conf` sets
 `lmCompatibilityLevel` to 2 or lower (AD's scale: 0–2 accept it, 3–5 require

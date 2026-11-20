@@ -331,6 +331,12 @@ All seven original gaps are closed; their entries stay here so a reference in
   a bare path that names a directory treated as a listing of that directory, and
   `SMB_COM_QUERY_INFORMATION_DISK` (0x0080), which `smbclient` asks after a
   listing to print its free-space line and waits on when it gets no answer.
+  `monarchy-smb1-tests` pins that surface on the wire as well: a three-entry
+  directory walked one entry per call through `FIND_NEXT2`, the
+  `NextEntryOffset` chain and the name at the offset level 0x0101 fixes, a
+  wildcard narrowed to one name, a bare directory path listing its contents, an
+  empty match and a missing directory refused with their own statuses, and an
+  unknown search id refused rather than served.
 
   Two answers had to be measured rather than reasoned about. An empty match is
   an error, not an empty success: a client parses the first record out of the
