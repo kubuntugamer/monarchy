@@ -129,6 +129,11 @@ private:
         QList<int> etypes;
         bool hasEncTimestamp = false;
         QByteArray encTimestamp;
+        // The etype the client encrypted its timestamp with, which RFC 4120
+        // 5.2.7.1 carries in the EncryptedData itself and which need not be the
+        // etype it asked for as a session key.
+        int encTimestampEtype = 0;
+        quint32 encTimestampKvno = 0;
         bool hasApReq = false;
         QByteArray apReq;
     };

@@ -543,6 +543,10 @@ bool Kdc::parseRequest(const QByteArray &der, quint8 expectedTag, KdcRequest *ou
                     Asn1::Element encrypted;
                     if (Asn1::parse(value, &encrypted) && encrypted.tag == 0x30) {
                         out->encTimestamp = decodeOctets(Asn1::child(encrypted, 0xA2));
+                        out->encTimestampEtype =
+                            int(decodeInteger(Asn1::child(encrypted, 0xA0)));
+                        out->encTimestampKvno =
+                            quint32(decodeInteger(Asn1::child(encrypted, 0xA1)));
                         out->hasEncTimestamp = encrypted.tag == 0x30;
                     }
                 } else if (type == 1) { // PA-TGS-REQ: AP-REQ
@@ -552,7 +556,6 @@ bool Kdc::parseRequest(const QByteArray &der, quint8 expectedTag, KdcRequest *ou
             }
         }
     }
-
     return true;
 }
 
@@ -627,8 +630,18 @@ QByteArray Kdc::handleAsReq(const KdcRequest &request)
     if (etype == 0)
         return krbError(kErrEtypeNoSupp, realm, request.cname);
 
+    // PA-ENC-TIMESTAMP names the etype it was sealed with, and that is the key
+    // that opens it: a client may ask for AES as its session key and still seal
+    // the timestamp with RC4. Decrypting with the etype we picked for the
+    // session key refuses a pre-authentication that is perfectly valid, and the
+    // client can only report it as KDC_ERR_PREAUTH_FAILED.
+    int preauthEtype = request.encTimestampEtype;
+    if (preauthEtype == 0
+        || client.keyFor(preauthEtype).size() != Krb5::keySize(preauthEtype))
+        preauthEtype = etype;
     QByteArray timestamp;
-    if (!Krb5::decrypt(etype, 1, client.keyFor(etype), request.encTimestamp, &timestamp))
+    if (!Krb5::decrypt(preauthEtype, 1, client.keyFor(preauthEtype), request.encTimestamp,
+                       &timestamp))
         return krbError(kErrPreauthFailed, realm, request.cname);
 
     Asn1::Element encrypted;

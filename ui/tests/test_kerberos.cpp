@@ -185,7 +185,13 @@ QByteArray principalDer(const QString &name)
     return Asn1::sequence(content);
 }
 
-QByteArray asReq(const QString &realm, const QString &user)
+// `etypes` is the session-key list the client offers, which need not include
+// the etype it seals its timestamp with; `padata` is one encoded PA-DATA entry,
+// empty for a client that has not been told to pre-authenticate yet. The wire
+// puts it at [3] as SEQUENCE OF PA-DATA, which is the extra SEQUENCE below.
+QByteArray asReq(const QString &realm, const QString &user,
+                 const QList<int> &etypes = {Krb5::kRc4Hmac},
+                 const QByteArray &padata = QByteArray())
 {
     const qint64 now = QDateTime::currentSecsSinceEpoch();
     QByteArray body;
@@ -195,11 +201,16 @@ QByteArray asReq(const QString &realm, const QString &user)
     body.append(Asn1::tlv(0xA3, principalDer(QStringLiteral("krbtgt/") + realm)));
     body.append(Asn1::tlv(0xA5, Asn1::generalizedTime(0x18, now + 3600)));
     body.append(Asn1::tlv(0xA7, Asn1::integer(0x02, 42)));
-    body.append(Asn1::tlv(0xA8, Asn1::sequence(Asn1::integer(0x02, Krb5::kRc4Hmac))));
+    QList<QByteArray> etypeTags;
+    for (const int etype : etypes)
+        etypeTags.append(Asn1::integer(0x02, etype));
+    body.append(Asn1::tlv(0xA8, Asn1::sequenceOf(etypeTags)));
 
     QByteArray request;
     request.append(Asn1::tlv(0xA1, Asn1::integer(0x02, 5)));
     request.append(Asn1::tlv(0xA2, Asn1::integer(0x02, 10))); // AS-REQ
+    if (!padata.isEmpty())
+        request.append(Asn1::tlv(0xA3, Asn1::sequence(padata)));
     request.append(Asn1::tlv(0xA4, Asn1::sequence(body)));
     return Asn1::tlv(0x6A, Asn1::sequence(request));
 }
@@ -919,6 +930,7 @@ private slots:
     void rc4HmacRoundTrip();
     void knownStringToKey();
     void asReqRequiresPreauth();
+    void preauthUsesTheEtypeItWasSealedWith();
     void unknownAccountIsRejected();
     void aesEtypesRoundTrip();
     void aesStringToKeyVectors();
@@ -1000,6 +1012,46 @@ void KerberosTest::asReqRequiresPreauth()
     // PA-ETYPE-INFO2 (19) and PA-PW-SALT (3) are both advertised.
     QVERIFY(octets.value.contains(QByteArray::fromHex("a103020113")));
     QVERIFY(octets.value.contains(QByteArray::fromHex("a103020103")));
+}
+
+// A client may offer AES as its session key and still seal PA-ENC-TIMESTAMP
+// with RC4-HMAC. The EncryptedData names the etype that opens it (RFC 4120
+// 5.2.7.1), so that is the key the KDC has to use; decrypting with the etype
+// chosen for the session key refuses a correct pre-authentication and all the
+// client can report is KDC_ERR_PREAUTH_FAILED.
+void KerberosTest::preauthUsesTheEtypeItWasSealedWith()
+{
+    Fixture fixture;
+    QVERIFY(fixture.start());
+
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
+    // RC4-HMAC's key is the account's NT hash, which is what provisioning set
+    // the administrator password to.
+    const QByteArray rc4Key = Ntlm::ntowfV1(QStringLiteral("Str0ng-Pass!"));
+    QByteArray paEncTsEnc;
+    paEncTsEnc.append(Asn1::tlv(0xA0, Asn1::generalizedTime(0x18, now)));
+    const QByteArray cipher =
+        Krb5::encrypt(Krb5::kRc4Hmac, 1, rc4Key, Asn1::sequence(paEncTsEnc));
+    QVERIFY(!cipher.isEmpty());
+
+    QByteArray encryptedData;
+    encryptedData.append(Asn1::tlv(0xA0, Asn1::integer(0x02, Krb5::kRc4Hmac))); // etype
+    encryptedData.append(Asn1::tlv(0xA2, Asn1::octets(0x04, cipher)));
+    QByteArray paData;
+    paData.append(Asn1::tlv(0xA1, Asn1::integer(0x02, 2))); // PA-ENC-TIMESTAMP
+    paData.append(Asn1::tlv(0xA2, Asn1::octets(0x04, Asn1::sequence(encryptedData))));
+
+    const QByteArray reply = kdcExchange(
+        fixture.service->port,
+        asReq(QStringLiteral("CORP.EXAMPLE.COM"), QStringLiteral("Administrator"),
+              {Krb5::kAes256, Krb5::kAes128, Krb5::kRc4Hmac}, Asn1::sequence(paData)));
+    QVERIFY(!reply.isEmpty());
+    // An AS-REP, not a KRB-ERROR: the AES session key it carries and the RC4
+    // timestamp it was proved with are independent choices.
+    QCOMPARE(krbErrorCode(reply), -1);
+    Asn1::Element outer;
+    QVERIFY(Asn1::parse(reply, &outer));
+    QCOMPARE(int(outer.tag), 0x6B);
 }
 
 void KerberosTest::unknownAccountIsRejected()
