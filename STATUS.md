@@ -111,17 +111,20 @@ failure) |
   change there returns `STATUS_NOT_SUPPORTED`, because AD keeps that domain in a
   naming context of its own and this server derives it from the SID table Lsad
   already resolves rather than storing it.
-- **LSAD trusted domains beyond the object and its secret**: the trust, its
-  SID, direction, names and the inter-realm keys derived from its clear secret
-  are stored, reported and rewritable, but a trust still is not a working
-  secure channel: `LsarQueryForestTrustInfo` has nothing to return, the
-  the internal-encryption query levels are refused with
-  `STATUS_INVALID_INFO_CLASS` rather than guessed at, nothing rolls the password
-  automatically the way a DC does every 30 days, and no Windows or Samba DC has
-  been driven through
-  establishing a trust against this endpoint. Authentication through a trust
-  therefore rests on the keys and the partner's own trust, not on a channel
-  this DC has proved. `LsarSetInformationPolicy`
+- **Trusts are a working inter-realm channel, with these edges**: the trust,
+  its SID, direction, names and the inter-realm keys derived from its clear
+  secret are stored, reported and rewritable, and two DCs that both hold the
+  trust now authenticate across it — `scripts/trust-conformance.py` creates it
+  over lsarpc from Samba's pidl client, reads it back at levels 5 and 6,
+  enumerates it and opens it by name, then MIT walks the trust on its own:
+  `kinit Administrator@<peer>` in one realm, `kvno ldap/<host>@<this realm>`
+  from the other. What is still missing: `LsarQueryForestTrustInfo` has nothing
+  to return (no forest trust, no transited realms beyond one hop, no SID
+  filtering or selective authentication), the internal-encryption query levels
+  are refused with `STATUS_INVALID_INFO_CLASS` rather than guessed at, nothing
+  rolls the trust password automatically the way a DC does every 30 days, and
+  the channel has been driven against Samba's client and MIT's KDC, not against
+  a Windows DC. `LsarSetInformationPolicy`
   sets the modification time and the audit-full flag and refuses the rest (the
   domain name and SID are reported, not settable), as does
   `LsarSetDomainInformationPolicy` (the Kerberos lifetimes are reported, not
@@ -258,7 +261,8 @@ The gaps above are not independent. Working outward from what exists:
 5. ~~LSAD~~ — the policy calls, both translation directions, account rights,
    privileges, secrets and the policy security descriptor, verified against
    Samba's reference NDR decoder and impacket by `scripts/lsad-conformance.py`.
-   Remaining here: trust-password rotation and the Netlogon trust channel.
+   Remaining here: trust-password rotation and the trust channel's
+   `NetrSetTrustedDomainAuthInfo` write.
 6. ~~Netlogon~~ — secure channel, machine-password write, SamLogon validation
    and the DC locator calls are served and verified (§1). The locator's
    **CLDAP ping over UDP** is answered too: both shapes real clients send —
