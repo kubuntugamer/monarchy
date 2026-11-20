@@ -515,6 +515,66 @@ check_dns_port_conflict() {
     configure_resolved_stub_listener || true
 }
 
+# --- firewall ---------------------------------------------------------------
+# A DC that runs but cannot be reached is indistinguishable from a DC that is
+# down. A Windows 2000 client in the field reported `error 1355 (no such
+# domain)` with the daemon healthy and every service bound, because the host's
+# ufw was default-deny and provisioned nothing. The ports come from dc.conf
+# rather than from a fixed list, so a domain provisioned on the development set
+# opens what it really binds.
+dc_firewall_ports() {
+    local conf="$DCDIR/dc.conf"
+    [[ -r $conf ]] || return 0
+    sed -n 's/^[A-Za-z]*Port=\([1-9][0-9]*\)$/\1/p' "$conf" | sort -un | tr '\n' ' '
+}
+
+open_dc_firewall() {
+    local ports
+    ports="$(dc_firewall_ports)"
+    [[ -n $ports ]] || return 0
+    if [[ $EUID -ne 0 || $DEV_PORTS -eq 1 ]]; then
+        log "A client reaches the DC on tcp and udp: $ports"
+        return 0
+    fi
+
+    local manager=""
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+        manager=ufw
+    elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+        manager=firewalld
+    fi
+
+    local port failed=0
+    case $manager in
+    ufw)
+        for port in $ports; do
+            ufw allow "$port/tcp" comment 'monarchy DC' >/dev/null 2>&1 || failed=1
+            ufw allow "$port/udp" comment 'monarchy DC' >/dev/null 2>&1 || failed=1
+        done
+        if [[ $failed -eq 0 ]]; then
+            log "opened $ports (tcp and udp) in ufw for the DC"
+        else
+            warn "ufw refused some of the DC's ports; a client may not reach it"
+        fi
+        ;;
+    firewalld)
+        for port in $ports; do
+            firewall-cmd --permanent --add-port="$port/tcp" >/dev/null 2>&1 || failed=1
+            firewall-cmd --permanent --add-port="$port/udp" >/dev/null 2>&1 || failed=1
+        done
+        firewall-cmd --reload >/dev/null 2>&1 || failed=1
+        if [[ $failed -eq 0 ]]; then
+            log "opened $ports (tcp and udp) in firewalld for the DC"
+        else
+            warn "firewalld refused some of the DC's ports; a client may not reach it"
+        fi
+        ;;
+    *)
+        log "no active firewall manager; a client reaches the DC on tcp and udp: $ports"
+        ;;
+    esac
+}
+
 provision_domain() {
     [[ $PROVISION -eq 1 ]] || { log "Skipping domain provisioning"; return 0; }
 
@@ -844,6 +904,7 @@ install_binaries
 check_dns_port_conflict
 provision_domain
 record_dc_conf_forwarders
+open_dc_firewall
 start_service
 
 cat <<EOF
