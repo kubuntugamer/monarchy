@@ -776,6 +776,20 @@ same policy decides whether Netlogon accepts an NTLMv1 answer in
 `NetrLogonSamLogon`, where the shape of the LM response is what identifies the
 variant, since a network logon carries no negotiated flags.
 
+**Share enumeration** (`engine/Srvsvc.cpp`): `NetrShareEnum` and
+`NetrShareEnumSticky` (opnums 15 and 36) on `srvsvcPort` (1039 by default) and on
+`\\pipe\\srvsvc`, so a client asking which shares a server offers gets a list
+instead of `NT_STATUS_OBJECT_NAME_NOT_FOUND`. Levels 1 (name, type, comment) and
+2 (plus the local path) are served, over the shares SMB2 serves plus `IPC$`; the
+stub is pinned byte for byte against Samba's own NDR encoder, including the
+present-but-empty buffer an empty list carries, because the first attempt at
+this endpoint was the one Samba's decoder rejected as a bad array size. Live
+against a provisioned DC, `rpcclient -c netshareenum` over `\\pipe\\srvsvc`
+answers `SYSVOL`, `NETLOGON` and `IPC$` with remarks and paths, and
+`smbclient -L` lists the same three over both NT1 and SMB2. Levels above 2
+answer `ERROR_INVALID_LEVEL`; `NetrShareGetInfo`, `NetrShareAdd` and
+`NetrShareDel` are not implemented, and neither is the SMB1 RAP browse list.
+
 **Endpoint mapper** (`engine/Epm.cpp`): `ept_lookup` and `ept_map` on `epmPort`
 (135 by default, `epmPort` in `dc.conf`), so a client that knows an interface
 UUID and a protocol can ask which port it lives on instead of being told.

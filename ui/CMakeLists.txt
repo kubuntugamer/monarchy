@@ -82,6 +82,8 @@ add_library(monarchy-ui-core STATIC
     ../engine/Schannel.cpp
     ../engine/Epm.h
     ../engine/Epm.cpp
+    ../engine/Srvsvc.h
+    ../engine/Srvsvc.cpp
     ../engine/Smb1.h
     ../engine/Smb1.cpp
     ../engine/Smb2.h
@@ -370,6 +372,21 @@ if(BUILD_TESTING)
 
     add_test(NAME monarchy-drs-tests COMMAND monarchy-drs-tests)
     set_tests_properties(monarchy-drs-tests PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+    )
+
+    # The srvsvc share enumeration, pinned against Samba's own NDR encoding.
+    add_executable(monarchy-srvsvc-tests
+        tests/test_srvsvc.cpp
+    )
+
+    target_link_libraries(monarchy-srvsvc-tests PRIVATE
+        monarchy-ui-core
+        Qt6::Test
+    )
+
+    add_test(NAME monarchy-srvsvc-tests COMMAND monarchy-srvsvc-tests)
+    set_tests_properties(monarchy-srvsvc-tests PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
     )
 

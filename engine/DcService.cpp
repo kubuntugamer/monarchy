@@ -12,6 +12,7 @@
 #include "LdapServer.h"
 #include "Lsad.h"
 #include "Netlogon.h"
+#include "Srvsvc.h"
 #include "Rpc.h"
 #include "Ntlm.h"
 #include "Samr.h"
@@ -833,6 +834,24 @@ bool DcService::start(const QString &dcDir)
                                .arg(m_drsServer->serverPort()));
     }
 
+    // Share enumeration (srvsvc): what a client lists when it asks which
+    // shares this server offers, over \pipe\srvsvc or the TCP endpoint. The
+    // shares are the same ones SMB2 serves, so they are filled in once the
+    // SYSVOL tree's paths are resolved below.
+    m_srvsvcServer = new SrvsvcServer(this);
+    m_srvsvcServer->setAuthenticator(authenticator);
+    connect(m_srvsvcServer, &SrvsvcServer::requestReceived, this,
+            [this](const QString &operation) { emit statusMessage(operation); });
+    const int srvsvcPort = dcConfig.value(QStringLiteral("srvsvcPort"), 1039).toInt();
+    if (!m_srvsvcServer->listen(quint16(srvsvcPort), rpcAddress)) {
+        emit statusMessage(tr("srvsvc endpoint failed to listen on port %1.")
+                               .arg(srvsvcPort));
+    } else {
+        emit statusMessage(tr("srvsvc served on %1:%2.")
+                               .arg(rpcLabel)
+                               .arg(m_srvsvcServer->serverPort()));
+    }
+
     // Pull replication: when dc.conf names a partner, this DC takes changes from
     // it on its own schedule instead of waiting for an administrator to ask. The
     // cursor lives in the agent, so each pull asks only for what is new, and a
@@ -1037,6 +1056,21 @@ bool DcService::start(const QString &dcDir)
         netlogonPipe.pipe = QStringLiteral("netlogon");
         entries.append(netlogonPipe);
 
+        // srvsvc: the share list, advertised on the TCP endpoint and on the
+        // pipe a Windows client opens as \pipe\srvsvc.
+        const Rpc::Interface srvsvc = Srvsvc::interface();
+        Epm::Entry srvsvcEntry;
+        srvsvcEntry.uuid = srvsvc.uuid;
+        srvsvcEntry.major = srvsvc.major;
+        srvsvcEntry.minor = srvsvc.minor;
+        srvsvcEntry.port = m_srvsvcServer->serverPort();
+        srvsvcEntry.annotation = QStringLiteral("srvsvc");
+        entries.append(srvsvcEntry);
+        Epm::Entry srvsvcPipe = srvsvcEntry;
+        srvsvcPipe.port = 0;
+        srvsvcPipe.pipe = QStringLiteral("srvsvc");
+        entries.append(srvsvcPipe);
+
         // DRSUAPI, where a replication partner asks which port to pull
         // changes on. Advertised as TCP only: there is no drsuapi pipe.
         if (m_drsServer->isListening()) {
@@ -1112,6 +1146,7 @@ bool DcService::start(const QString &dcDir)
     m_smbServer->addPipe(QStringLiteral("lsarpc"), m_lsadServer->rpc());
     m_smbServer->addPipe(QStringLiteral("epmapper"), m_epmServer->rpc());
     m_smbServer->addPipe(QStringLiteral("netlogon"), m_netlogonServer->rpc());
+    m_smbServer->addPipe(QStringLiteral("srvsvc"), m_srvsvcServer->rpc());
 
     // The domain's SYSVOL tree and the NETLOGON scripts it contains, served as
     // the disk shares a member reads its GPOs and logon scripts from. The
@@ -1130,6 +1165,27 @@ bool DcService::start(const QString &dcDir)
     m_smbServer->addShare(QStringLiteral("SYSVOL"), sysvolShare);
     m_smbServer->addShare(QStringLiteral("NETLOGON"), domainSysvol + QStringLiteral("/scripts"));
     emit statusMessage(tr("SYSVOL and NETLOGON shared from %1.").arg(sysvolShare));
+
+    // What NetrShareEnum reports: the two shares above, plus IPC$, which is not
+    // a file share but is what every Windows server lists. Level 2 answers
+    // carry the local path SMB2 serves the share from.
+    QList<Srvsvc::Share> shareList;
+    Srvsvc::Share sysvolReported;
+    sysvolReported.name = QStringLiteral("SYSVOL");
+    sysvolReported.comment = QStringLiteral("Logon server share");
+    sysvolReported.path = sysvolShare;
+    shareList.append(sysvolReported);
+    Srvsvc::Share netlogonReported;
+    netlogonReported.name = QStringLiteral("NETLOGON");
+    netlogonReported.comment = QStringLiteral("Logon server share");
+    netlogonReported.path = domainSysvol + QStringLiteral("/scripts");
+    shareList.append(netlogonReported);
+    Srvsvc::Share ipcReported;
+    ipcReported.name = QStringLiteral("IPC$");
+    ipcReported.type = Srvsvc::kTypeIpc;
+    ipcReported.comment = QStringLiteral("Remote IPC");
+    shareList.append(ipcReported);
+    m_srvsvcServer->setShares(shareList);
 
     connect(m_smbServer, &Smb2Server::requestReceived, this,
             [this](const QString &operation) { emit statusMessage(operation); });

@@ -88,6 +88,7 @@ when you want the narrow loop first.
 | `Netlogon.cpp` | `monarchy-netlogon-tests` `monarchy-logonhours-tests` `monarchy-workstation-tests` | `netlogon-conformance.py` |
 | `Schannel.cpp`, the auth type it registers in `Rpc.cpp` | `monarchy-netlogon-tests` (`sealsThePipeWithTheChannelKey`) | **Samba** `net ads join` — impacket has no Netlogon security provider, so the independent client for this is the one that seals with it. The suite's bind verifier is the 17-byte one Samba sends, and every sealed byte is checked against Samba's own layout: header, sequence, HMAC, confounder, the CFB8 IV `seq‖seq`, and the AES key `sessionKey ^ 0xf0` |
 | `Epm.cpp` | `monarchy-epm-tests` | `epm-conformance.py` — a tower naming a dead port, or the wrong address, is the failure this catches |
+| `Srvsvc.cpp` | `monarchy-srvsvc-tests` | `rpcclient -c netshareenum` and `smbclient -L` — the suite pins the stub against Samba's encoder, but only a client shows the endpoint is reachable on `\pipe\srvsvc` |
 | `DcService.cpp` (which address a listener binds) | `monarchy-dcservice-tests` `monarchy-epm-tests` | `epm-conformance.py --host <lan>` — a loopback bind passes every probe made on this host |
 | `DnsServer.cpp` | `monarchy-dns-tests` | `scripts/check-dc-health.sh` — the locators *and* the two negative answers |
 | `Smb1.cpp`, `Smb2.cpp` | `monarchy-smb-tests` `monarchy-smb1-tests` | `smb-conformance.py` for SMB2 and for SMB1 (dialect pinned to NT1 in a second set of checks) |
@@ -245,21 +246,39 @@ recorded, not hidden:
   What changed is that the refusal at the default is a named call with a named
   status instead of "not driven".
 
-- **G11 — share enumeration is absent.** The probe that reaches the server is
-  the pipe open: `rpcclient -c netshareenum` fails with
-  `Could not initialise srvsvc. Error was NT_STATUS_OBJECT_NAME_NOT_FOUND`, while
-  `rpcclient -c enumdomusers` on the same `IPC$` connection answers (box B,
-  live domain, with the Administrator credential) — so one endpoint is missing,
-  not the IPC path. There is no `srvsvc` pipe and no RAP `NetShareEnum`
-  handler anywhere in `engine/`; the only pipes it serves are `lsarpc`,
-  `netlogon` and `samr`. `smbclient -L` is **not** evidence here: it browses over
-  SMB1/RAP only, so over SMB2 it declines on the client side
-  (`SMB1 disabled -- no workgroup available`) without asking the server, and
-  over NT1 it ends in `NT_STATUS_CONNECTION_DISCONNECTED`. Nothing in the tree
-  claims enumeration and no driver asserts it, which is how it stayed quiet.
-  **Deferred** by decision on #7 (box B): a new endpoint rather than a fix,
-  named shares already work, and nothing we run asks for a browse list. Revisit
-  only if a real client needs it — the entry stays so the absence is stated.
+- **G11 — share enumeration over `srvsvc` is served; the RAP browse list is
+  still absent.** The pipe open was the probe that failed
+  (`rpcclient -c netshareenum` → `NT_STATUS_OBJECT_NAME_NOT_FOUND`). The
+  endpoint now exists: `\pipe\srvsvc` and `srvsvcPort` (1039), serving
+  `NetrShareEnum` (opnum 15) and `NetrShareEnumSticky` (opnum 36) at levels 1
+  and 2, with the shares SMB2 serves plus `IPC$`.
+
+  The reply layout is not a reading of MS-SRVS: it is pinned byte for byte
+  against Samba's own NDR encoder (`samba.dcerpc.srvsvc.NetShareEnum`'s
+  `__ndr_pack_out__`) for a one-share list, an empty list and a level-2 list,
+  which is what `monarchy-srvsvc-tests` compares. That matters because the
+  first attempt at this endpoint answered level 1 but was rejected by Samba's
+  decoder with `ndr_pull_array_length: ndr_pull_error(Bad Array Size)`.
+  Measured on a provisioned tree with this build:
+
+  - `rpcclient -p <smb> -U N7\\Administrator -c netshareenum` over
+    `\pipe\srvsvc` answers three shares with their remarks and level-2 paths:
+    `SYSVOL` (`…/sysvol`), `NETLOGON` (`…/sysvol/<domain>/scripts`), `IPC$`.
+  - `smbclient -L` lists the same three over SMB2 and over NT1.
+
+  A correction to the earlier entry: the NT1 failure recorded there was the
+  local client's policy, not this server. Samba's `smbclient` here has
+  `client min protocol = SMB2_02`, so `-m NT1` was refused before a byte was
+  sent; with `--option='client min protocol=NT1'` it lists over NT1. The
+  `SMB1 disabled` line that ended a `-L` over SMB2 is likewise the client's
+  browse mechanism (RAP over NetBIOS), not a reply from the DC.
+
+  Still absent, and stated so nothing wider is claimed: information levels 3,
+  4, 5, 100, 501 and 502 answer `ERROR_INVALID_LEVEL`, `NetrShareGetInfo`,
+  `NetrShareAdd` and `NetrShareDel` answer `ERROR_NOT_SUPPORTED`, and the SMB1
+  RAP `NetShareEnum` that fills a browse list (`\MAILSLOT\BROWSE`) is not
+  implemented — so "My Network Places" style browsing still has no answer
+  here, even though every client that asks `srvsvc` gets one.
 
 - **G10 — closed.** SYSVOL and NETLOGON accept no writes, which is deliberate,
   but over SMB1 the refusal was wrong twice over. A create answered

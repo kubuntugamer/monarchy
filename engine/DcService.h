@@ -15,6 +15,7 @@ class KpasswdServer;
 class SamrServer;
 class LsadServer;
 class NetlogonServer;
+class SrvsvcServer;
 class DrsServer;
 class EpmServer;
 class Smb2Server;
@@ -24,7 +25,7 @@ class QSettings;
 
 // The domain controller as a standalone unit: loads the provisioned domain's
 // dc.conf, owns every service endpoint (LDAP, KDC, DNS, SAMR, LSAD, Netlogon,
-// DRSUAPI, EPM, SMB2) and their wiring, and reports what happened to clients
+// srvsvc, DRSUAPI, EPM, SMB2) and their wiring, and reports what happened to clients
 // of the directory. The headless daemon is its only permanent host — exactly
 // as LSASS hosts the directory on a Windows DC — so the directory lives as
 // long as the service does, not as long as a console window is open; the
@@ -96,6 +97,7 @@ private:
     SamrServer *m_samrServer = nullptr;
     LsadServer *m_lsadServer = nullptr;
     NetlogonServer *m_netlogonServer = nullptr;
+    SrvsvcServer *m_srvsvcServer = nullptr;
     DrsServer *m_drsServer = nullptr;
     EpmServer *m_epmServer = nullptr;
     Smb2Server *m_smbServer = nullptr;
