@@ -6,9 +6,11 @@
 
 #include <QByteArray>
 #include <QDateTime>
+#include <QHash>
 #include <QList>
 #include <QObject>
 #include <QString>
+#include <QStringList>
 
 #include <functional>
 
@@ -36,10 +38,17 @@ public:
     void setEpmPort(quint16 port) { m_epmPort = port; }
     void setCredentials(const QString &domain, const QString &user, const QString &password);
     void setNamingContext(const QString &dn);
+    // A DC replicates three naming contexts — the domain it holds and the
+    // forest's configuration and schema partitions — and each has its own USN
+    // space, so each keeps its own cursor. Pulling one of them and calling that
+    // replication is what leaves a partner without the topology that names it.
+    void setNamingContexts(const QStringList &dns);
     void setSink(Sink sink) { m_sink = std::move(sink); }
 
     QString source() const;
-    quint64 lastUsn() const { return m_lastUsn; }
+    QStringList namingContexts() const { return m_ncs; }
+    quint64 lastUsn() const { return m_cursors.value(m_ncs.value(0), 0); }
+    quint64 lastUsnFor(const QString &nc) const { return m_cursors.value(nc, 0); }
     quint32 cycles() const { return m_cycles; }
 
     // REPLTIMES (MS-DRSR 5.165, the field REPS_FROM calls rtSchedule): 84 bytes,
@@ -80,9 +89,9 @@ private:
     QString m_user;
     QString m_password;
     bool m_credentialsSet = false;
-    QString m_nc;
+    QStringList m_ncs;
     Sink m_sink;
-    quint64 m_lastUsn = 0;
+    QHash<QString, quint64> m_cursors;
     quint32 m_cycles = 0;
 };
 

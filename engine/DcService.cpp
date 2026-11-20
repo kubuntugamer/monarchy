@@ -891,8 +891,26 @@ bool DcService::start(const QString &dcDir)
     m_replicationAgent->setCredentials(
         dcConfig.value(QStringLiteral("replicaDomain"), krbRealm.netbios).toString(),
         dcConfig.value(QStringLiteral("replicaUser")).toString(), replicaPassword);
-    m_replicationAgent->setNamingContext(
-        dcConfig.value(QStringLiteral("replicaNamingContext"), m_baseDn).toString());
+    // A DC holds three naming contexts and replicates all of them: its own
+    // domain, and the forest's configuration and schema partitions. The roots
+    // are in the store's root DSE attributes, so the list follows the tree
+    // rather than being spelled out here.
+    {
+        QStringList namingContexts;
+        const QString configured = dcConfig.value(QStringLiteral("replicaNamingContext")).toString();
+        namingContexts.append(configured.isEmpty() ? m_baseDn : configured);
+        for (const DirectoryObject &object : m_ldapServer->objects()) {
+            if (!object.id.isEmpty())
+                continue;
+            for (const QString &key : {QStringLiteral("configurationNamingContext"),
+                                       QStringLiteral("schemaNamingContext")}) {
+                const QString root = object.attributes.value(key);
+                if (!root.isEmpty() && !namingContexts.contains(root, Qt::CaseInsensitive))
+                    namingContexts.append(root);
+            }
+        }
+        m_replicationAgent->setNamingContexts(namingContexts);
+    }
     m_replicationAgent->setSink([this](const QList<DirectoryObject> &objects) {
         return m_ldapServer->applyReplication(objects);
     });

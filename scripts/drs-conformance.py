@@ -287,6 +287,47 @@ def run(args):
 
     step('DRSGetNCChanges V6 batch with attribute walk', getnc_batch)
 
+    # --- DRSGetNCChanges, the configuration partition ----------------------
+    # A DC holds the forest's configuration as a naming context of its own, and
+    # a partner's DRA asks for it by name. It hangs off the same root DN as the
+    # domain, so the suffix test that finds it also finds it during a domain
+    # cycle; a server that never separates the two answers the configuration
+    # request with nothing and the domain one with another NC's objects. Both
+    # halves are measured here.
+    def getnc_configuration():
+        assert args.configdn, 'no configuration DN derived from --basedn'
+        resp = getnc(args.configdn, 1000)
+        arm = resp['pmsgOut']['V6' if resp['pmsgOut']['tag'] == 6 else 'V1']
+        count = int(arm['cNumObjects'])
+        assert count >= 5, 'cNumObjects %d' % count
+        objects = walk_chain(arm)
+        assert args.configdn in objects, 'configuration NC head missing: %r' \
+            % sorted(objects)
+        sites = 'CN=Sites,' + args.configdn
+        assert sites in objects, 'CN=Sites missing: %r' % sorted(objects)
+        for dn in objects:
+            assert dn == args.configdn or dn.endswith(',' + args.configdn), \
+                'a configuration cycle carried %r, which is another NC' % dn
+
+        # The configuration cycle's own naming context, echoed back on the arm.
+        pnc = arm['pNC']
+        assert pnc is not None, 'pNC is NULL'
+        echoed = _text(pnc['StringName']).rstrip('\x00')
+        assert echoed == args.configdn, 'pNC %r' % echoed
+
+    step('DRSGetNCChanges answers the configuration NC', getnc_configuration)
+
+    def getnc_domain_excludes_configuration():
+        resp = getnc(args.basedn, 1000)
+        arm = resp['pmsgOut']['V6' if resp['pmsgOut']['tag'] == 6 else 'V1']
+        objects = walk_chain(arm)
+        for dn in objects:
+            assert not dn.endswith(',' + args.configdn), \
+                'a domain cycle carried %r from the configuration NC' % dn
+
+    step('a domain cycle does not carry the configuration partition',
+         getnc_domain_excludes_configuration)
+
     # --- DRSGetNCChanges, targeted EXOP_REPL_OBJ ---------------------------
     def getnc_target():
         admin_dn = 'CN=Administrator,CN=Users,' + args.basedn
@@ -319,6 +360,7 @@ def main():
     parser.add_argument('--host', default='127.0.0.1')
     parser.add_argument('--port', type=int, default=1038)
     parser.add_argument('--basedn', default='DC=corp,DC=example,DC=com')
+    parser.add_argument('--config-dn', dest='configdn', default=None)
     parser.add_argument('--dnsdomain', default='corp.example.com')
     parser.add_argument('--netbios', default='CORP')
     parser.add_argument('--user', default='')
@@ -327,6 +369,8 @@ def main():
     args = parser.parse_args()
     if args.domain is None:
         args.domain = args.netbios
+    if args.configdn is None and args.basedn:
+        args.configdn = 'CN=Configuration,' + args.basedn
 
     try:
         run(args)

@@ -1048,6 +1048,98 @@ private slots:
         QCOMPARE(user->firstValue.value(0x00090002u).size(), 16);
     }
 
+    // A DC holds the forest's configuration and schema partitions as naming
+    // contexts of their own, and a partner's DRA asks for them by name. Both
+    // hang off the domain's root DN, so the suffix test that finds them also
+    // finds them when the domain NC was asked for — which is why a cycle has to
+    // be told which root it is answering for. Getting this wrong is silent: a
+    // configuration cycle comes back empty and the partner keeps a directory
+    // with no servers, sites or connections in it.
+    void aConfigurationCycleServesTheConfigurationPartition()
+    {
+        DrsServer server;
+        server.setConfig(config());
+        const QString configDn = QStringLiteral("CN=Configuration,DC=corp,DC=example,DC=com");
+        const QString schemaDn = QStringLiteral("CN=Schema,%1").arg(configDn);
+        server.setObjectProvider([this, configDn, schemaDn]() {
+            QList<DirectoryObject> objects = fixture();
+            // The two roots are published on the root DSE — the store's
+            // id-less object — which is where the server reads them from.
+            DirectoryObject rootDse;
+            rootDse.attributes.insert(QStringLiteral("configurationNamingContext"), configDn);
+            rootDse.attributes.insert(QStringLiteral("schemaNamingContext"), schemaDn);
+            objects.append(rootDse);
+            DirectoryObject configuration;
+            configuration.id = configDn;
+            configuration.name = QStringLiteral("Configuration");
+            configuration.type = QStringLiteral("Container");
+            configuration.attributes.insert(QStringLiteral("objectGUID"),
+                                            QStringLiteral("0f0f0f0f-1111-2222-3333-444444444444"));
+            DirectoryObject sites;
+            sites.id = QStringLiteral("CN=Sites,%1").arg(configDn);
+            sites.name = QStringLiteral("Sites");
+            sites.type = QStringLiteral("Container");
+            objects.append(configuration);
+            objects.append(sites);
+            return objects;
+        });
+
+        const QByteArray handle = server.handleCall(0, bindRequest()).mid(64, 20);
+
+        const QByteArray reply = server.handleCall(3, getNcChangesRequest(handle, configDn));
+        QCOMPARE(readLe32(reply, 112), quint32(2)); // cNumObjects: the root and Sites
+        Ndr::Reader reader(reply);
+        QVERIFY(reader.skip(148));
+        QString pNcDn;
+        QVERIFY(walkDsName(&reader, &pNcDn));
+        QCOMPARE(pNcDn, configDn); // the reply names the NC it answered for
+
+        // Walk past the uptodate vector and the prefix table to the chain.
+        quint32 ignored = 0;
+        for (int i = 0; i < 5; ++i)
+            QVERIFY(reader.u32(&ignored));
+        QVERIFY(reader.skip(16));
+        reader.align(8);
+        quint64 high = 0, last = 0;
+        QVERIFY(reader.u64(&high));
+        QVERIFY(reader.u64(&last));
+        quint32 prefixCount = 0;
+        QVERIFY(reader.u32(&prefixCount));
+        QVector<quint32> lengths;
+        for (quint32 i = 0; i < prefixCount; ++i) {
+            quint32 ndx = 0, length = 0, ref = 0;
+            QVERIFY(reader.u32(&ndx));
+            QVERIFY(reader.u32(&length));
+            QVERIFY(reader.u32(&ref));
+            lengths.append(length);
+        }
+        for (quint32 length : lengths) {
+            quint32 maxCount = 0;
+            QVERIFY(reader.u32(&maxCount));
+            QByteArray oid;
+            QVERIFY(reader.bytes(int(length), &oid));
+        }
+        QList<ChainEntry> entries;
+        QVERIFY(walkChain(&reader, &entries));
+        QStringList dns;
+        for (const ChainEntry &entry : entries)
+            dns.append(entry.dn);
+        QCOMPARE(dns.size(), 2);
+        QVERIFY(dns.contains(configDn));
+        QVERIFY(dns.contains(QStringLiteral("CN=Sites,%1").arg(configDn)));
+        // The domain's own objects stay out of a configuration cycle.
+        for (const QString &dn : dns) {
+            QVERIFY(!dn.contains(QStringLiteral("CN=Users")));
+            QVERIFY(dn != QStringLiteral("DC=corp,DC=example,DC=com"));
+        }
+
+        // And a domain cycle still does not sweep the configuration in: the two
+        // domain objects, not the two configuration ones as well.
+        const QByteArray domainReply = server.handleCall(
+            3, getNcChangesRequest(handle, QStringLiteral("DC=corp,DC=example,DC=com")));
+        QCOMPARE(readLe32(domainReply, 112), quint32(2));
+    }
+
     void domainControllerInfoDescribesThisDc()
     {
         DrsServer server;

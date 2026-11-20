@@ -655,6 +655,63 @@ private slots:
         QVERIFY(peer.wait(5000));
     }
 
+    // A DC holds three naming contexts and the DRA pulls each: a partner that
+    // only ever takes the domain NC leaves the other DC's configuration empty —
+    // no servers, no sites, none of the topology that names it — and no error is
+    // raised, because every pull succeeds. The cursors have to be separate too:
+    // each NC numbers its own changes, so one shared counter either skips
+    // changes or asks for them forever.
+    void aPullAgentCarriesEveryNamingContext()
+    {
+        const QString configDn = QStringLiteral("CN=Configuration,") + kBaseDn;
+        DirectoryObject configuration;
+        configuration.id = configDn;
+        configuration.name = QStringLiteral("Configuration");
+        configuration.type = QStringLiteral("Container");
+        configuration.attributes.insert(QStringLiteral("uSNChanged"), QStringLiteral("3"));
+        DirectoryObject sites;
+        sites.id = QStringLiteral("CN=Sites,") + configDn;
+        sites.name = QStringLiteral("Sites");
+        sites.type = QStringLiteral("Container");
+        sites.attributes.insert(QStringLiteral("objectGUID"),
+                                QStringLiteral("{44444444-4444-4444-4444-444444444444}"));
+        sites.attributes.insert(QStringLiteral("uSNChanged"), QStringLiteral("4"));
+
+        QList<DirectoryObject> objects = fixture();
+        objects.append(configuration);
+        objects.append(sites);
+
+        SharedObjects shared;
+        shared.set(objects);
+        DrsServerThread peer([&shared]() { return shared.snapshot(); }, config());
+        peer.start();
+        peer.waitUntilListening();
+
+        LdapServer target;
+        ReplicationAgent agent;
+        agent.setSource(QStringLiteral("127.0.0.1"), peer.port());
+        agent.setNamingContexts({kBaseDn, configDn});
+        agent.setSink([&target](const QList<DirectoryObject> &pulled) {
+            return target.applyReplication(pulled);
+        });
+
+        QString error;
+        const int applied = agent.pullOnce(&error);
+        QVERIFY2(applied >= 0, qPrintable(error));
+        QCOMPARE(applied, 4); // the domain NC's two and the configuration's two
+        QVERIFY(liveObject(target, QStringLiteral("alice")).has_value());
+        QVERIFY(liveObject(target, QStringLiteral("Sites")).has_value());
+        QVERIFY(agent.lastUsnFor(kBaseDn) > 0);
+        QVERIFY(agent.lastUsnFor(configDn) > 0);
+
+        // Each cursor sits at its own NC's high-water mark, and a second pull
+        // over the same pair takes nothing.
+        QCOMPARE(agent.pullOnce(&error), 0);
+
+        peer.quit();
+        QVERIFY(peer.wait(5000));
+    }
+
     // A deletion reaches the other store through the same agent, and the store
     // keeps it as a tombstone rather than forgetting the object ever existed.
     void aPullAgentCarriesDeletions()

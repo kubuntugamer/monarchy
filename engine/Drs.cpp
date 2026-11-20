@@ -1056,6 +1056,10 @@ QByteArray DrsServer::drsGetNCChanges(const QByteArray &stub)
     // The configuration and schema partitions are naming contexts of their own
     // in AD. Their objects hang off the same root DN, so a suffix test alone
     // would sweep them into the domain NC and replicate them as domain data.
+    // Only the roots that are *not* the one asked for are foreign: a request
+    // for the configuration NC has to be answered with it rather than emptied,
+    // which is the difference between a second DC learning the topology and a
+    // second DC that never receives a single configuration object.
     QStringList foreignNcs;
     for (const DirectoryObject &object : all) {
         if (!object.id.isEmpty())
@@ -1063,9 +1067,34 @@ QByteArray DrsServer::drsGetNCChanges(const QByteArray &stub)
         for (const QString &key : {QStringLiteral("configurationNamingContext"),
                                    QStringLiteral("schemaNamingContext")}) {
             const QString root = object.attributes.value(key);
-            if (!root.isEmpty() && root.compare(ncDn, Qt::CaseInsensitive) != 0
-                && !foreignNcs.contains(root, Qt::CaseInsensitive))
+            if (root.isEmpty() || (!ncDn.isEmpty() && root.compare(ncDn, Qt::CaseInsensitive) == 0))
+                continue;
+            if (!foreignNcs.contains(root, Qt::CaseInsensitive))
                 foreignNcs.append(root);
+        }
+    }
+    // The two roots are published on the root DSE, but a store is not required
+    // to carry that object for the tree to have the partitions in it: AD names
+    // them by convention under the forest root, so they are also recognised by
+    // name. Without this a partner that publishes no root DSE has its
+    // configuration partition served as domain data to every domain cycle and
+    // still never receives it as the NC it is.
+    if (!baseDn().isEmpty()) {
+        const QString configurationRoot = QStringLiteral("CN=Configuration,%1").arg(baseDn());
+        const QString schemaRoot = QStringLiteral("CN=Schema,%1").arg(configurationRoot);
+        for (const QString &root : {configurationRoot, schemaRoot}) {
+            if (!ncDn.isEmpty() && root.compare(ncDn, Qt::CaseInsensitive) == 0)
+                continue;
+            if (foreignNcs.contains(root, Qt::CaseInsensitive))
+                continue;
+            for (const DirectoryObject &object : all) {
+                if (!object.id.isEmpty()
+                    && (object.id.compare(root, Qt::CaseInsensitive) == 0
+                        || object.id.endsWith(QLatin1Char(',') + root, Qt::CaseInsensitive))) {
+                    foreignNcs.append(root);
+                    break;
+                }
+            }
         }
     }
 
@@ -1151,7 +1180,10 @@ QByteArray DrsServer::drsGetNCChanges(const QByteArray &stub)
     Node chain;
     quint32 numBytes = 0;
     if (!batch.isEmpty()) {
-        chain = chainElement(0, batch, QString(baseDn()), refs);
+        // The chain is rooted at the NC the request named, not always at the
+        // domain: a configuration-NC cycle lists configuration objects under
+        // the configuration root.
+        chain = chainElement(0, batch, ncDn.isEmpty() ? QString(baseDn()) : ncDn, refs);
         QByteArray chainBytes;
         flatten(chain, chainBytes, 0);
         numBytes = quint32(chainBytes.size());

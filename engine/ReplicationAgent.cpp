@@ -53,7 +53,21 @@ void ReplicationAgent::setCredentials(const QString &domain, const QString &user
 
 void ReplicationAgent::setNamingContext(const QString &dn)
 {
-    m_nc = dn;
+    setNamingContexts(dn.isEmpty() ? QStringList() : QStringList{dn});
+}
+
+void ReplicationAgent::setNamingContexts(const QStringList &dns)
+{
+    m_ncs = dns;
+    // A cursor belongs to the naming context whose USN space it counts, so one
+    // dropped from the list takes its position with it rather than leaving a
+    // value that a later re-add would resume from wrongly.
+    for (auto it = m_cursors.begin(); it != m_cursors.end();) {
+        if (!m_ncs.contains(it.key()))
+            it = m_cursors.erase(it);
+        else
+            ++it;
+    }
 }
 
 QString ReplicationAgent::source() const
@@ -115,7 +129,7 @@ int ReplicationAgent::pullOnce(QString *error)
 
     if (m_host.isEmpty())
         return fail(QStringLiteral("no replication source configured"));
-    if (m_nc.isEmpty())
+    if (m_ncs.isEmpty())
         return fail(QStringLiteral("no naming context configured"));
     if (!m_sink)
         return fail(QStringLiteral("no store to apply the changes to"));
@@ -139,33 +153,38 @@ int ReplicationAgent::pullOnce(QString *error)
     }
 
     int applied = 0;
-    quint64 from = m_lastUsn;
     quint32 cycles = 0;
-    bool moreData = true;
-    while (moreData && cycles < 1000) {
-        QList<DirectoryObject> objects;
-        quint64 usnHigh = 0;
-        QString cycleError;
-        if (!client.getNCChanges(m_nc, from, &objects, &usnHigh, &moreData, &cycleError)) {
-            client.close();
-            return fail(cycleError);
+    // One bind serves every naming context: they are the same DSA, and the
+    // cursor that matters is per NC because each numbers its own changes.
+    for (const QString &nc : m_ncs) {
+        quint64 from = m_cursors.value(nc, 0);
+        bool moreData = true;
+        while (moreData && cycles < 1000) {
+            QList<DirectoryObject> objects;
+            quint64 usnHigh = 0;
+            QString cycleError;
+            if (!client.getNCChanges(nc, from, &objects, &usnHigh, &moreData, &cycleError)) {
+                client.close();
+                return fail(cycleError);
+            }
+            applied += m_sink(objects);
+            // The cursor moves over this cycle's high-water mark only after the
+            // store has taken it.
+            from = usnHigh;
+            ++cycles;
         }
-        applied += m_sink(objects);
-        // The cursor moves over this cycle's high-water mark only after the
-        // store has taken it.
-        from = usnHigh;
-        ++cycles;
+        m_cursors.insert(nc, from);
     }
 
-    m_lastUsn = from;
     m_cycles += cycles;
 
     client.dsUnbind();
     client.close();
 
-    emit pulled(QStringLiteral("pulled %1 object(s) from %2 in %3 cycle(s)")
+    emit pulled(QStringLiteral("pulled %1 object(s) from %2 in %3 cycle(s) over %4 naming context(s)")
                     .arg(applied)
                     .arg(source())
-                    .arg(cycles));
+                    .arg(cycles)
+                    .arg(m_ncs.size()));
     return applied;
 }
