@@ -181,6 +181,17 @@ recorded, not hidden:
   `lmCompatibilityLevel=2` it is accepted, with the rest of the suite green at
   17 checks in both runs.
 
+  Reproducing that measurement needs both halves of the client pin, and getting
+  either wrong reads like the server refusing. `-m NT1` sets only the maximum
+  protocol, so a current Samba declines the negotiation itself — `Max protocol
+  NT1 is less than min protocol SMB2_02`, then
+  `NT_STATUS_INVALID_PARAMETER_MIX` — and sends nothing; G8 records the same
+  trap, and `--option='client min protocol=NT1'` is the half easy to leave out.
+  The policy parameter has to arrive as `--option='client ntlmv2 auth=no'` too:
+  `-O` is socket options, so smbclient splits the value on spaces and answers
+  `Unknown socket option client` — the config never sees the setting, and the
+  run reads as NTLMv1 while the client is still answering NTLMv2.
+
 - **G11 — share enumeration is absent.** The probe that reaches the server is
   the pipe open: `rpcclient -c netshareenum` fails with
   `Could not initialise srvsvc. Error was NT_STATUS_OBJECT_NAME_NOT_FOUND`, while
