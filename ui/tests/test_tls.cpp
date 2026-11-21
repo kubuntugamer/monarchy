@@ -321,10 +321,11 @@ void TlsTest::upgradesAndServesLdapOverTls()
     QCOMPARE(operationTag(entry), 0x64); // SearchResultEntry
 }
 
-// RFC 4511 §4.14.1 resets the session to anonymous on StartTLS. Since anonymous
-// may read only the root DSE, that reset is observable: a connection that bound
-// and read before the upgrade is refused on the same base afterwards, and works
-// again once it re-binds inside TLS.
+// RFC 4511 §4.14.1 resets the session to anonymous on StartTLS. With reads
+// restricted to the root DSE — AD's Server 2003 default, opted into here because
+// the Windows 2000 default would answer the unbound read — that reset is
+// observable: a connection that bound and read before the upgrade is refused on
+// the same base afterwards, and works again once it re-binds inside TLS.
 void TlsTest::startTlsDropsTheReadPermission()
 {
     if (!QSslSocket::supportsSsl())
@@ -337,6 +338,7 @@ void TlsTest::startTlsDropsTheReadPermission()
     QVERIFY2(provisioned.tlsEnabled, qPrintable(provisioned.tlsError));
 
     LdapServer server;
+    server.setRestrictAnonymous(1);
     QVERIFY(server.loadFromFile(provisioned.storePath));
     QVERIFY(server.loadSecretsFromFile(provisioned.secretsPath));
     QVERIFY(server.loadTlsCredentials(provisioned.tlsCertPath, provisioned.tlsKeyPath));

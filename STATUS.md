@@ -354,9 +354,13 @@ change.
 
 Development directory service, not a hardened DC. LDAP is plaintext unless the
 client asks for StartTLS (there is no dedicated LDAPS port, and no client
-certificate is requested), and an unbound session may read only the root DSE:
-a search with a non-empty base answers `insufficientAccessRights(50)`, a failed
-bind leaves the connection anonymous, and StartTLS resets it (RFC 4511 §4.14.1).
+certificate is requested), and an unbound session is answered the way Windows 2000
+answers it: the read is served, because `restrictAnonymous` in `dc.conf` defaults
+to 0 and a 2000 DC restricts anonymous reads only to what `Anonymous Logon` may
+see (`1` is AD's Server 2003 default, where a search with a non-empty base answers
+`insufficientAccessRights(50)`). Password material never leaves the server at
+either level, a failed bind leaves the connection anonymous, and StartTLS resets
+it (RFC 4511 §4.14.1).
 DNS updates and zone transfers can be authenticated with a TSIG key (RFC 8945,
 hmac-sha256) when `dnsTsigName`/`dnsTsigSecret` are set in `dc.conf` — an
 unsigned, wrong-key or wrong-MAC message is then refused `NOTAUTH` with the

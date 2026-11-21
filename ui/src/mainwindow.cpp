@@ -21,6 +21,7 @@
 #include <QComboBox>
 #include <QDialogButtonBox>
 #include <QFormLayout>
+#include <QFutureWatcher>
 #include <QDir>
 #include <QFileDialog>
 #include <QIcon>
@@ -403,6 +404,10 @@ void MainWindow::createMenus()
     auto *resetPasswordAction = new QAction(tr("Reset &Password..."), this);
     connect(resetPasswordAction, &QAction::triggered, this, &MainWindow::onResetPassword);
     actionMenu->addAction(resetPasswordAction);
+
+    auto *passwordPolicyAction = new QAction(tr("Domain Password &Policy..."), this);
+    connect(passwordPolicyAction, &QAction::triggered, this, &MainWindow::onPasswordPolicy);
+    actionMenu->addAction(passwordPolicyAction);
 
     actionMenu->addSeparator();
     actionMenu->addAction(m_actExport);
@@ -1369,7 +1374,8 @@ void MainWindow::onConnectToDirectory()
 
     QSpinBox *portSpin = new QSpinBox(&dialog);
     portSpin->setRange(1, 65535);
-    portSpin->setValue(QSettings().value(QStringLiteral("connection/port"), 1389).toInt());
+    portSpin->setValue(QSettings().value(QStringLiteral("connection/port"),
+                                       domainDefaults().ldapPort).toInt());
     form->addRow(tr("Port:"), portSpin);
 
     QLineEdit *baseDnEdit = new QLineEdit(&dialog);
@@ -1431,10 +1437,11 @@ void MainWindow::onConnectToDirectory()
                              4000);
 }
 
-// An anonymous session may read only the root DSE, so the console's own
-// auto-connect is enough to establish a connection and not enough to browse.
-// When a read comes back insufficientAccessRights, ask for a bind in place
-// rather than leaving an empty results pane and a status-bar line.
+// The console's auto-connect is anonymous, so whether it can browse depends on
+// the server: a store that follows the Windows 2000 default answers the read,
+// and one that restricts anonymous access to the root DSE refuses it. When a
+// read comes back insufficientAccessRights, ask for a bind in place rather than
+// leaving an empty results pane and a status-bar line.
 void MainWindow::onAuthorizationRequired()
 {
     if (m_credentialsPromptOpen || m_credentialsDeclined || !m_connectionService)
@@ -1450,7 +1457,8 @@ void MainWindow::onAuthorizationRequired()
 
     auto *message = new QLabel(
         tr("The directory refused the read because this session is not signed in.\n\n"
-           "An anonymous session may read only the root DSE. Sign in to browse %1.")
+           "This directory allows an anonymous session to read only the root DSE. "
+           "Sign in to browse %1.")
             .arg(namingContext()),
         &dialog);
     message->setWordWrap(true);
@@ -1587,6 +1595,84 @@ void MainWindow::onResetPassword()
 
     m_adminService->resetPassword(obj.id, password, true);
     statusBar()->showMessage(tr("Password reset for %1.").arg(obj.name), 4000);
+}
+
+void MainWindow::onPasswordPolicy()
+{
+    // The policy belongs to the domain object, exactly as AD stores it in
+    // minPwdLength/pwdHistoryLength/pwdProperties. Whoever administers this
+    // directory decides it here; the server enforces whatever it is set to.
+    if (!m_directoryService || !m_connectionService || !m_connectionService->isConnected()
+        || namingContext().isEmpty()) {
+        statusBar()->showMessage(
+            tr("Connect to a directory before editing its password policy."), 5000);
+        return;
+    }
+
+    const QString domainDn = namingContext();
+    QFuture<QMap<QString, QString>> read = m_directoryService->getAttributes(domainDn);
+    auto *watcher = new QFutureWatcher<QMap<QString, QString>>(this);
+    connect(watcher, &QFutureWatcher<QMap<QString, QString>>::finished, this,
+            [this, watcher, domainDn]() {
+                watcher->deleteLater();
+                const QMap<QString, QString> attributes = watcher->result();
+
+                QDialog dialog(this);
+                dialog.setWindowTitle(tr("Domain Password Policy - %1").arg(domainDn));
+                auto *layout = new QVBoxLayout(&dialog);
+                auto *form = new QFormLayout;
+
+                auto *minLengthSpin = new QSpinBox(&dialog);
+                minLengthSpin->setRange(0, 255);
+                minLengthSpin->setValue(
+                    attributes.value(QStringLiteral("minPwdLength"), QStringLiteral("7")).toInt());
+                form->addRow(tr("Minimum password length:"), minLengthSpin);
+
+                auto *historySpin = new QSpinBox(&dialog);
+                historySpin->setRange(0, 24);
+                historySpin->setValue(attributes.value(QStringLiteral("pwdHistoryLength"),
+                                                       QStringLiteral("24"))
+                                          .toInt());
+                form->addRow(tr("Remember this many passwords:"), historySpin);
+
+                const quint32 properties =
+                    attributes.value(QStringLiteral("pwdProperties"), QStringLiteral("1")).toUInt();
+                auto *complexityCheck =
+                    new QCheckBox(tr("Password must meet complexity requirements"), &dialog);
+                complexityCheck->setChecked((properties & 0x1u) != 0);
+                form->addRow(QString(), complexityCheck);
+
+                layout->addLayout(form);
+                auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok
+                                                     | QDialogButtonBox::Cancel, &dialog);
+                connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+                connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+                layout->addWidget(buttons);
+
+                if (dialog.exec() != QDialog::Accepted)
+                    return;
+
+                QMap<QString, QString> changes;
+                changes.insert(QStringLiteral("minPwdLength"),
+                               QString::number(minLengthSpin->value()));
+                changes.insert(QStringLiteral("pwdHistoryLength"),
+                               QString::number(historySpin->value()));
+                changes.insert(QStringLiteral("pwdProperties"),
+                               QString::number(complexityCheck->isChecked()
+                                                   ? (properties | 0x1u)
+                                                   : (properties & ~0x1u)));
+
+                QFuture<bool> write = m_directoryService->modifyObject(domainDn, changes);
+                auto *writeWatcher = new QFutureWatcher<bool>(this);
+                connect(writeWatcher, &QFutureWatcher<bool>::finished, this,
+                        [this, writeWatcher]() {
+                            writeWatcher->deleteLater();
+                            if (writeWatcher->result())
+                                statusBar()->showMessage(tr("Password policy updated."), 5000);
+                        });
+                writeWatcher->setFuture(write);
+            });
+    watcher->setFuture(read);
 }
 
 void MainWindow::onAbout()

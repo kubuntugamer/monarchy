@@ -47,6 +47,8 @@ private slots:
     void groupMembershipRoundTrip();
     void passwordSetAndBind();
     void asksForCredentialsWhenAReadIsRefused();
+    void connectsWithASavedProfileThatHasNoPassword();
+    void administratorDecidesThePasswordPolicy();
     void evaluatesCompositeFilters();
     void dnsZoneLoaded();
 
@@ -433,12 +435,15 @@ void BackendTest::passwordSetAndBind()
     QVERIFY(bindAs(QStringLiteral("N3w-Passw0rd!")));
 }
 
-// An anonymous session may read only the root DSE. A refused read is not an
-// empty container: the service has to say so, because that signal is what the
-// console turns into a sign-in prompt.
+// A store that restricts anonymous reads to the root DSE refuses the console's
+// first search. A refused read is not an empty container: the service has to say
+// so, because that signal is what the console turns into a sign-in prompt. The
+// restriction is opt-in (AD's Server 2003 default); this test is about the
+// prompt, so it asks for it.
 void BackendTest::asksForCredentialsWhenAReadIsRefused()
 {
     LdapServer server;
+    server.setRestrictAnonymous(1);
     QVERIFY(server.listen(0));
     server.setObjects(sampleObjects());
     QVERIFY(giveAdministratorAVerifier(server));
@@ -477,6 +482,119 @@ void BackendTest::asksForCredentialsWhenAReadIsRefused()
     QCOMPARE(authenticated.result().size(), 12);
     QTest::qWait(50); // let any queued signal arrive before counting
     QCOMPARE(refused.count(), 1);
+}
+
+void BackendTest::connectsWithASavedProfileThatHasNoPassword()
+{
+    LdapServer server;
+    QVERIFY(server.listen(0));
+    server.setObjects(sampleObjects());
+    QVERIFY(giveAdministratorAVerifier(server));
+
+    // What the console finds on every launch: the settings remember the bind DN
+    // but never the password, and dc.conf is not readable by the account the
+    // console runs as, so no base DN was ever saved either.
+    ConnectionService connection;
+    ConnectionProfile profile;
+    profile.server = QStringLiteral("127.0.0.1");
+    profile.port = server.serverPort();
+    profile.baseDn.clear();
+    profile.bindDn = QString::fromLatin1(kAdministratorDn);
+
+    auto connectFuture = connection.connect(profile);
+    QTRY_VERIFY_WITH_TIMEOUT(connectFuture.isFinished(), 5000);
+    QVERIFY(connectFuture.result());
+    QVERIFY(connection.isConnected());
+    // The naming context came from the root DSE, because the empty base DN no
+    // longer leaves the console with nothing to browse.
+    QCOMPARE(connection.baseDn(), QStringLiteral("DC=corp,DC=example,DC=com"));
+
+    // And a write goes through on that anonymous session instead of failing on a
+    // credential the console does not hold.
+    DirectoryService directory(&connection);
+    QSignalSpy errors(&directory, &DirectoryService::error);
+    DirectoryObject user;
+    user.id = QStringLiteral("CN=No Password,CN=Users,DC=corp,DC=example,DC=com");
+    user.name = QStringLiteral("No Password");
+    user.kind = ObjectKind::User;
+    user.attributes.insert(QStringLiteral("objectClass"), QStringLiteral("user"));
+    user.attributes.insert(QStringLiteral("sAMAccountName"), QStringLiteral("nopassword"));
+
+    auto addFuture = directory.addObject(user);
+    QTRY_VERIFY_WITH_TIMEOUT(addFuture.isFinished(), 5000);
+    QVERIFY(addFuture.result());
+    QCOMPARE(errors.count(), 0);
+}
+
+void BackendTest::administratorDecidesThePasswordPolicy()
+{
+    // The policy lives on the domain object, as in AD.
+    DirectoryObject domain;
+    domain.id = QStringLiteral("DC=corp,DC=example,DC=com");
+    domain.name = QStringLiteral("CORP");
+    domain.type = QStringLiteral("domainDNS");
+    domain.kind = ObjectKind::Domain;
+    domain.attributes.insert(QStringLiteral("objectSid"), QStringLiteral("S-1-5-21-1-2-3"));
+    domain.attributes.insert(QStringLiteral("minPwdLength"),
+                             QString::number(LdapServer::kPasswordMinLength));
+    domain.attributes.insert(QStringLiteral("pwdHistoryLength"),
+                             QString::number(LdapServer::kPasswordHistoryLength));
+    domain.attributes.insert(QStringLiteral("pwdProperties"),
+                             QString::number(LdapServer::kPasswordComplex));
+
+    QList<DirectoryObject> objects = sampleObjects();
+    objects.append(domain);
+
+    LdapServer server;
+    QVERIFY(server.listen(0));
+    server.setObjects(objects);
+    QVERIFY(giveAdministratorAVerifier(server));
+
+    ConnectionService connection;
+    ConnectionProfile profile;
+    profile.server = QStringLiteral("127.0.0.1");
+    profile.port = server.serverPort();
+    profile.baseDn = QStringLiteral("DC=corp,DC=example,DC=com");
+
+    auto connectFuture = connection.connect(profile);
+    QTRY_VERIFY_WITH_TIMEOUT(connectFuture.isFinished(), 5000);
+    QVERIFY(connectFuture.result());
+
+    DirectoryService directory(&connection);
+    QSignalSpy rejected(&directory, &DirectoryService::creationRejected);
+    auto addUser = [&directory](const QString &name, const QString &password) {
+        DirectoryObject user;
+        user.id = QStringLiteral("CN=%1,CN=Users,DC=corp,DC=example,DC=com").arg(name);
+        user.name = name;
+        user.kind = ObjectKind::User;
+        user.attributes.insert(QStringLiteral("objectClass"), QStringLiteral("user"));
+        user.attributes.insert(QStringLiteral("sAMAccountName"), name.toLower());
+        user.attributes.insert(QStringLiteral("unicodePwd"), password);
+        auto future = directory.addObject(user);
+        for (int i = 0; i < 200 && !future.isFinished(); ++i)
+            QTest::qWait(10);
+        return future.isFinished() && future.result();
+    };
+
+    // The domain's policy is the domain object's, and it is the administrator's
+    // to set: the shipped defaults refuse a short, simple password...
+    QVERIFY(!addUser(QStringLiteral("Weak User"), QStringLiteral("password1")));
+    // And a refused create says why, so the console can put it in a dialog
+    // instead of leaving the user staring at an unchanged list.
+    QCOMPARE(rejected.count(), 1);
+    const QString reason = rejected.first().at(1).toString();
+    QVERIFY2(reason.contains(QStringLiteral("password policy")), qPrintable(reason));
+
+    // ...until they relax it, which is what Action > Domain Password Policy
+    // writes back.
+    QMap<QString, QString> policy;
+    policy.insert(QStringLiteral("minPwdLength"), QStringLiteral("0"));
+    policy.insert(QStringLiteral("pwdProperties"), QStringLiteral("0"));
+    auto modifyFuture = directory.modifyObject(profile.baseDn, policy);
+    QTRY_VERIFY_WITH_TIMEOUT(modifyFuture.isFinished(), 5000);
+    QVERIFY(modifyFuture.result());
+
+    QVERIFY(addUser(QStringLiteral("Weak User"), QStringLiteral("password1")));
 }
 
 void BackendTest::evaluatesCompositeFilters()

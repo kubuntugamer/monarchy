@@ -10,6 +10,7 @@
 #include <QFutureWatcher>
 #include <QHeaderView>
 #include <QMenu>
+#include <QMessageBox>
 #include <QIODevice>
 #include <QItemSelectionModel>
 #include <QListView>
@@ -640,6 +641,22 @@ void ConsoleView::refresh()
 void ConsoleView::setDirectoryService(DirectoryService *service)
 {
     m_directoryService = service;
+    if (service) {
+        // A refused create has to be visible: the status bar clears itself, and a
+        // New > User that silently does nothing reads as a console bug.
+        connect(service, &DirectoryService::creationRejected, this,
+                [this](const QString &name, const QString &reason) {
+                    // Open, not exec: the refusal arrives from the worker's future,
+                    // and a nested event loop here would block the console.
+                    auto *box = new QMessageBox(QMessageBox::Warning,
+                                                tr("Cannot Create Object"),
+                                                tr("The directory did not create %1.\n\n%2")
+                                                    .arg(name, reason),
+                                                QMessageBox::Ok, this);
+                    box->setAttribute(Qt::WA_DeleteOnClose);
+                    box->open();
+                });
+    }
 }
 
 void ConsoleView::setAdminService(AdminService *service)

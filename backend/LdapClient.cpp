@@ -615,5 +615,8 @@ bool LdapClient::waitResult(quint8 expectTag, int *resultCode, int timeoutMs, QS
     for (int i = 0; i < rl; i++)
         code = (code << 8) | quint8(frame[pos + i]);
     *resultCode = code;
+    // Callers inspect lastResultCode() after a failed write to tell a policy
+    // refusal (19) from a lost connection.
+    m_lastResultCode = code;
     return true;
 }

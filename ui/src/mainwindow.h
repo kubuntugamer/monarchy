@@ -48,6 +48,7 @@ private slots:
     void onNewComputer();
     void onNewOu();
     void onResetPassword();
+    void onPasswordPolicy();
     void onOpenConsole();
     void onSaveConsole();
     void onSaveConsoleAs();

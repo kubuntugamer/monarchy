@@ -153,6 +153,14 @@ public:
     // default refuses it, as this store did before the policy existed.
     void setLmCompatibilityLevel(int level) { m_lmCompatibilityLevel = level; }
 
+    // AD's RestrictAnonymous, which decides what a session that never bound may
+    // read. 0 is the Windows 2000 default: an unbound search is answered, and
+    // what it may see is the anonymous logon's permissions. 1 is the Server 2003
+    // default, where only the root DSE answers and anything below it is
+    // insufficientAccessRights. Password material never leaves the server at
+    // either level.
+    void setRestrictAnonymous(int level) { m_restrictAnonymous = level; }
+
     // A request control (RFC 4511 §4.1.11). Only paged results is implemented;
     // an unknown control that a client marks critical is refused with
     // unavailableCriticalExtension rather than silently ignored.
@@ -385,6 +393,7 @@ private:
     Identity m_identity;
     Kdc *m_kdc = nullptr;
     int m_lmCompatibilityLevel = Ntlm::kDefaultLmCompatibilityLevel;
+    int m_restrictAnonymous = 0; // Windows 2000's default, not Server 2003's
     QSslCertificate m_tlsCertificate;
     QSslKey m_tlsKey;
     bool m_tlsAvailable = false;

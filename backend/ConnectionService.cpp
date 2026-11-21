@@ -39,12 +39,18 @@ QFuture<bool> ConnectionService::connect(const ConnectionProfile &profile)
 
         if (profile.useKerberos) {
             rc = ldap_sasl_bind_s(ld, nullptr, "GSSAPI", nullptr, nullptr, nullptr, nullptr);
-        } else if (!profile.bindDn.isEmpty()) {
+        } else if (!profile.bindDn.isEmpty() && !profile.password.isEmpty()) {
             QByteArray dn = profile.bindDn.toUtf8();
             QByteArray pw = profile.password.toUtf8();
             struct berval cred = { (ber_len_t)pw.size(), pw.data() };
             rc = ldap_sasl_bind_s(ld, dn.constData(), LDAP_SASL_SIMPLE, &cred, nullptr, nullptr, nullptr);
         } else {
+            // A DN with no password is AD's "unauthenticated bind", which the DC
+            // refuses with invalid credentials (49). A profile that remembers the
+            // bind DN but not the password — every launch, since the password is
+            // never written to disk — would then never connect at all. Bind
+            // anonymously instead, the way AD's own tools fall back to the
+            // logged-on session.
             rc = ldap_sasl_bind_s(ld, nullptr, LDAP_SASL_SIMPLE, nullptr, nullptr, nullptr, nullptr);
         }
 
@@ -55,6 +61,37 @@ QFuture<bool> ConnectionService::connect(const ConnectionProfile &profile)
             }, Qt::QueuedConnection);
             if (ld) ldap_unbind_ext_s(ld, nullptr, nullptr);
             return false;
+        }
+
+        // The naming context the way AD's own tools find it: ask the root DSE
+        // instead of guessing a DN. dc.conf is not readable by the account the
+        // console runs as, so on a real install this is the only source of the
+        // browse base.
+        if (baseDn.isEmpty()) {
+            char *attrs[] = { const_cast<char *>(\"defaultNamingContext\"), nullptr };
+            LDAPMessage *res = nullptr;
+            if (ldap_search_ext_s(ld, \"\", LDAP_SCOPE_BASE, \"(objectClass=*)\", attrs, 0,
+                                  nullptr, nullptr, nullptr, 0, &res) == LDAP_SUCCESS) {
+                struct berval **values = ldap_get_values_len(
+                    ld, ldap_first_entry(ld, res), \"defaultNamingContext\");
+                if (values && values[0] && values[0]->bv_len > 0)
+                    baseDn = QString::fromUtf8(values[0]->bv_val, int(values[0]->bv_len));
+                if (values)
+                    ldap_value_free_len(values);
+            }
+            if (res)
+                ldap_msgfree(res);
+            if (baseDn.isEmpty()) {
+                const QString message =
+                    QStringLiteral(\"The server at %1:%2 publishes no naming context; \"
+                                   \"enter a base DN to browse it.\")
+                        .arg(profile.server)
+                        .arg(profile.port);
+                QMetaObject::invokeMethod(this, [this, message] { emit error(message); },
+                                          Qt::QueuedConnection);
+                ldap_unbind_ext_s(ld, nullptr, nullptr);
+                return false;
+            }
         }
 
         m_ld = ld;
@@ -86,7 +123,13 @@ QFuture<bool> ConnectionService::connect(const ConnectionProfile &profile)
                                           Qt::QueuedConnection);
                 return false;
             }
-            if (!client.bind(profile.bindDn, profile.password, &err)) {
+            // A DN with no password is AD's "unauthenticated bind", refused with
+            // invalid credentials (49); the password is never written to disk, so
+            // a saved profile always looks like that on launch. Bind anonymously
+            // instead, the way AD's own tools fall back to the logged-on session.
+            const bool useBindDn = !profile.bindDn.isEmpty() && !profile.password.isEmpty();
+            if (!client.bind(useBindDn ? profile.bindDn : QString(),
+                             useBindDn ? profile.password : QString(), &err)) {
                 QMetaObject::invokeMethod(this, [this, err] { emit error(err); },
                                           Qt::QueuedConnection);
                 client.close();

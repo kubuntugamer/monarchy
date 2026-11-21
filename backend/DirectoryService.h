@@ -39,12 +39,22 @@ public:
 
 signals:
     void error(const QString &message);
+    // A create was refused by the server. The console cannot leave that in the
+    // status bar: a rejected New > User looks exactly like nothing happening.
+    void creationRejected(const QString &name, const QString &reason);
     // A read was refused with insufficientAccessRights (50): the session is
     // anonymous or lacks the right. The console answers this with a sign-in
     // prompt instead of an empty container.
     void authorizationRequired();
 
 private:
+#ifdef MONARCHY_WITH_LDAP
+    // Turns a failed write's LDAP result into the status-bar explanation. A
+    // handle outlives the server it was opened on: when this DC is restarted the
+    // console's connection dies, and every write then fails on this side without
+    // reaching the directory, so "nothing happened" has to come with a reason.
+    void reportLdapFailure(int rc);
+#endif
     ConnectionService *m_connection = nullptr;
     QString m_baseDn = QStringLiteral("DC=corp,DC=example,DC=com");
 };

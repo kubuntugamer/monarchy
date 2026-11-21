@@ -260,6 +260,7 @@ private slots:
     void rejectsCookieItDidNotIssue();
     void searchOnMissingBaseIsNoSuchObject();
     void anonymousSearchesOnlyTheRootDse();
+    void anonymousReadsTheDirectoryByDefault();
     void simpleBindRecordsTheConnectionIdentity();
     void whoAmIReportsTheBoundIdentity();
     void searchMissingRequiredFieldsIsProtocolError();
@@ -958,13 +959,14 @@ void LdapTest::searchOnMissingBaseIsNoSuchObject()
     }
 }
 
-// Anonymous may read the root DSE and nothing else: every non-empty base, at
-// every scope, is an explicit refusal rather than an empty success, and zero
-// entries precede the done message. AD has behaved this way since Server 2003,
-// and an empty success let a stranger count the directory.
+// RestrictAnonymous=1 is the Server 2003 default: only the root DSE answers, and
+// every non-empty base, at every scope, is an explicit refusal rather than an
+// empty success, with zero entries preceding the done message. An empty success
+// would let a stranger count the directory.
 void LdapTest::anonymousSearchesOnlyTheRootDse()
 {
     LdapServer server;
+    server.setRestrictAnonymous(1);
     server.setObjects(sampleObjects());
     QVERIFY(server.listen(0));
 
@@ -989,6 +991,42 @@ void LdapTest::anonymousSearchesOnlyTheRootDse()
     QCOMPARE(operationTag(rootDse.first()), 0x64);
     QVERIFY(entryDn(rootDse.first()).isEmpty());
     QCOMPARE(resultCode(rootDse.last()), 0);
+}
+
+// Out of the box this DC answers an unbound search the way Windows 2000 does:
+// the Anonymous Logon permissions decide what is visible, so the entries come
+// back without a bind. Server 2003's narrower default is the opt-in above, and a
+// client that needs the old rule asks the store for it, not the protocol.
+void LdapTest::anonymousReadsTheDirectoryByDefault()
+{
+    LdapServer server;
+    server.setObjects(sampleObjects());
+    QVERIFY(server.listen(0));
+
+    QTcpSocket client;
+    client.connectToHost(QHostAddress::LocalHost, server.serverPort());
+    QVERIFY(client.waitForConnected(3000));
+    Reader reader(&client);
+
+    const QList<QByteArray> reply =
+        runSearch(client, reader, 10, "DC=corp,DC=example,DC=com", 2);
+
+    // Entries first, then the done message: the read is answered, not refused.
+    QVERIFY(reply.size() > 1);
+    QCOMPARE(resultCode(reply.last()), 0);
+    const QByteArray entry = reply.first();
+    QCOMPARE(operationTag(entry), 0x64); // SearchResultEntry
+    QVERIFY(!entryDn(entry).isEmpty());
+
+    // Anonymous is a permission, not a password: every entry still goes through
+    // the same attribute filter, so no password material comes back. Searched
+    // over the raw octets because entries carry binary attributes (objectSid).
+    QByteArray wire;
+    for (const QByteArray &message : reply)
+        wire.append(message);
+    QVERIFY(!wire.contains("userPassword"));
+    QVERIFY(!wire.contains("ntHash"));
+    QVERIFY(!wire.contains("unicodePwd"));
 }
 
 // A simple bind has to record the connection's identity, or gating reads on it
@@ -1019,7 +1057,11 @@ void LdapTest::simpleBindRecordsTheConnectionIdentity()
     alice.attributes.insert(QStringLiteral("pwdLastSet"),
                             QString::number(QDateTime::currentSecsSinceEpoch()));
 
+    // The refused read is the observable of the connection's identity, so this
+    // store takes AD's Server 2003 rule: at the Windows 2000 default every read
+    // below would be answered whether or not the session had bound.
     LdapServer server;
+    server.setRestrictAnonymous(1);
     server.setObjects({domain, alice});
     QVERIFY(server.listen(0));
 

@@ -2931,19 +2931,25 @@ QByteArray LdapServer::handleSearch(ClientState *st, int msgId, const QByteArray
 
     const QString searchBase = base.trimmed();
 
-    // Anonymous sessions may read the root DSE and nothing else. A connection
-    // that never bound — or whose bind was reset by StartTLS or replaced by a
-    // failed re-bind — has no identity, and a non-empty base is a directory
-    // read. Answer 50 insufficientAccessRights rather than an empty success, so
-    // "you may not see it" is distinguishable from "it has no children".
+    // Anonymous reads follow AD's RestrictAnonymous, whose default is the
+    // version's: Windows 2000 answers an unbound search and lets the Anonymous
+    // Logon permissions decide what comes back, and Server 2003 narrowed that to
+    // the root DSE (dsHeuristics digit 7 = 2 restores the 2000 behaviour). A
+    // 2000-era client expects the first, so level 0 is the default and level 1 is
+    // the stricter rule.
     //
-    // This check sits before the base-existence guard on purpose: an
-    // unauthenticated caller that got 32 for a missing DN and 50 for an
-    // existing one could use search to enumerate the directory, which is the
-    // exposure this closes. The empty base is the root DSE (RFC 4512 §5.1) and
-    // stays answerable, which is how a client discovers the naming context
-    // before it has credentials.
-    if (!searchBase.isEmpty() && st->authenticatedDn.isEmpty())
+    // What may come back is not decided here: makeSearchEntry drops password
+    // material for every caller, authenticated or not, so opening reads to an
+    // unbound session exposes the directory's contents and never its secrets.
+    // 50 insufficientAccessRights is the refusal rather than an empty success,
+    // so "you may not see it" stays distinguishable from "it has no children".
+    //
+    // At level 1 the check sits before the base-existence guard on purpose: an
+    // unauthenticated caller that got 32 for a missing DN and 50 for an existing
+    // one could use search to enumerate the directory. The empty base is the root
+    // DSE (RFC 4512 §5.1) and stays answerable at every level, which is how a
+    // client discovers the naming context before it has credentials.
+    if (m_restrictAnonymous != 0 && !searchBase.isEmpty() && st->authenticatedDn.isEmpty())
         return makeSearchDone(msgId, 50); // insufficientAccessRights
 
     // RFC 4511 §4.5.1: a base that names no entry is noSuchObject, not an empty

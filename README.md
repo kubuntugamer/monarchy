@@ -364,9 +364,12 @@ on **3268**, the KDC on
 `epmPort` and SMB2 on `smbPort`. The console is a pure client: it reads the
 provisioned domain's `dc.conf` (or `MONARCHY_DCDIR`) for the port, asks the
 server's root DSE for the naming context when none is configured, and connects
-automatically. An unbound session may read only the root DSE, so when a read is
-refused with `insufficientAccessRights` the console asks for a bind DN and
-password in place; the same credential fields are in **Connect to Directory…**,
+automatically. An unbound session is answered the way Windows 2000 answers it —
+the `Anonymous Logon` permissions decide what it sees, and password material is
+withheld from every caller — so the console browses without signing in. Set
+`restrictAnonymous=1` in `dc.conf` for AD's Server 2003 default, where only the
+root DSE is readable and the console asks for a bind DN and password in place
+when a read is refused with `insufficientAccessRights`; the same credential fields are in **Connect to Directory…**,
 which also points the console at a remote LDAP server. **File → Disconnect** clears the console; no sample objects are
 invented in their place. Outbound LDAPS and Kerberos/GSSAPI binds to a *remote* server require
 the `MONARCHY_WITH_LDAP=ON` build; the default build reports an error instead of

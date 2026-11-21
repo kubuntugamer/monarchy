@@ -37,9 +37,10 @@ bool giveAdministratorAVerifier(LdapServer &server)
 
 } // namespace
 
-// The console window itself, driven through the profile-taking constructor: an
-// anonymous session is refused the directory, the credential prompt appears,
-// and accepting it loads the objects. This is the end-to-end half that
+// The console window itself, driven through the profile-taking constructor: with
+// the store restricting anonymous reads (AD's Server 2003 default, set below),
+// the session is refused the directory, the credential prompt appears, and
+// accepting it loads the objects. This is the end-to-end half that
 // monarchy-backend-tests cannot cover — the signal and the reconnect path are
 // tested there, the dialog only exists here.
 class MainWindowTest : public QObject
@@ -74,6 +75,7 @@ void MainWindowTest::initTestCase()
 void MainWindowTest::promptsForCredentialsAndThenLoadsTheDirectory()
 {
     LdapServer server;
+    server.setRestrictAnonymous(1);
     QVERIFY(server.listen(0));
     server.setObjects(sampleObjects());
     QVERIFY(giveAdministratorAVerifier(server));

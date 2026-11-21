@@ -16,6 +16,18 @@
 
 namespace {
 
+// The stored profile keeps the bind DN but never the password, and a simple bind
+// with a DN and an empty password is AD's "unauthenticated bind", which the
+// server refuses (49). Every operation would then fail on a credential the
+// console does not have, so bind anonymously in that case — the session the
+// console really holds.
+bool bindSession(LdapClient &client, ConnectionService *connection, QString *error)
+{
+    if (connection && !connection->bindDn().isEmpty() && !connection->password().isEmpty())
+        return client.bind(connection->bindDn(), connection->password(), error);
+    return client.bind(QString(), QString(), error);
+}
+
 // Build the attribute set for a newly created entry. Callers often set the
 // display fields (name/description/kind) rather than duplicating them in the
 // attribute map, so fill in the schema-required values here.
@@ -210,7 +222,7 @@ QFuture<QList<DirectoryObject>> DirectoryService::search(const QString &baseDn, 
             emit error(err);
             return result;
         }
-        if (!client.bind(m_connection->bindDn(), m_connection->password(), &err)) {
+        if (!bindSession(client, m_connection, &err)) {
             emit error(err);
             client.close();
             return result;
@@ -325,7 +337,7 @@ QFuture<bool> DirectoryService::modifyValues(const QString &dn, const QString &a
         LdapClient client;
         QString err;
         if (!client.open(m_connection->server(), quint16(m_connection->port()), &err)
-            || !client.bind(m_connection->bindDn(), m_connection->password(), &err)) {
+            || !bindSession(client, m_connection, &err)) {
             emit error(err);
             client.close();
             return false;
@@ -368,7 +380,7 @@ QFuture<QMap<QString, QString>> DirectoryService::getAttributes(const QString &d
             emit error(err);
             return attrs;
         }
-        if (!client.bind(m_connection->bindDn(), m_connection->password(), &err)) {
+        if (!bindSession(client, m_connection, &err)) {
             emit error(err);
             client.close();
             return attrs;
@@ -423,20 +435,23 @@ QFuture<bool> DirectoryService::addObject(const DirectoryObject &object)
                 free(mods[j]);
             }
             free(mods);
+            reportLdapFailure(rc);
             return rc == LDAP_SUCCESS;
         });
     }
 #endif
     return QtConcurrent::run([this, object]() {
-        if (!m_connection || !m_connection->isConnected())
+        if (!m_connection || !m_connection->isConnected()) {
+            emit error(QStringLiteral("Not connected to a directory server."));
             return false;
+        }
         LdapClient client;
         QString err;
         if (!client.open(m_connection->server(), quint16(m_connection->port()), &err)) {
             emit error(err);
             return false;
         }
-        if (!client.bind(m_connection->bindDn(), m_connection->password(), &err)) {
+        if (!bindSession(client, m_connection, &err)) {
             emit error(err);
             client.close();
             return false;
@@ -446,12 +461,37 @@ QFuture<bool> DirectoryService::addObject(const DirectoryObject &object)
         for (auto it = attributes.constBegin(); it != attributes.constEnd(); ++it)
             attrs.insert(it.key(), it.value().split(QStringLiteral("; ")));
         const bool ok = client.add(object.id, attrs, &err);
-        if (!ok)
-            emit error(err);
+        if (!ok) {
+            // constraintViolation on an add that carries a password is the
+            // domain's policy refusing it; say so instead of "result 19".
+            QString reason = err;
+            if (client.lastResultCode() == 19
+                && attributes.contains(QStringLiteral("unicodePwd")))
+                reason = tr("The password does not meet the domain's password policy. "
+                            "Change it with Action > Domain Password Policy..., or "
+                            "choose a password that meets the current policy.");
+            emit error(reason);
+            emit creationRejected(object.name, reason);
+        }
         client.close();
         return ok;
     });
 }
+
+#ifdef MONARCHY_WITH_LDAP
+void DirectoryService::reportLdapFailure(int rc)
+{
+    if (rc == LDAP_SUCCESS)
+        return;
+    if (rc == LDAP_SERVER_DOWN || rc == LDAP_CONNECT_ERROR) {
+        emit error(tr("The connection to %1 was lost. Reconnect with "
+                      "File > Connect to Directory... and try again.")
+                       .arg(m_connection ? m_connection->server() : QString()));
+        return;
+    }
+    emit error(QString::fromUtf8(ldap_err2string(rc)));
+}
+#endif
 
 QFuture<bool> DirectoryService::removeObject(const QString &dn)
 {
@@ -460,20 +500,24 @@ QFuture<bool> DirectoryService::removeObject(const QString &dn)
         return QtConcurrent::run([this, dn]() {
             LDAP *ld = m_connection->ldapHandle();
             QByteArray d = dn.toUtf8();
-            return ldap_delete_ext_s(ld, d.constData(), nullptr, nullptr) == LDAP_SUCCESS;
+            const int rc = ldap_delete_ext_s(ld, d.constData(), nullptr, nullptr);
+            reportLdapFailure(rc);
+            return rc == LDAP_SUCCESS;
         });
     }
 #endif
     return QtConcurrent::run([this, dn]() {
-        if (!m_connection || !m_connection->isConnected())
+        if (!m_connection || !m_connection->isConnected()) {
+            emit error(QStringLiteral("Not connected to a directory server."));
             return false;
+        }
         LdapClient client;
         QString err;
         if (!client.open(m_connection->server(), quint16(m_connection->port()), &err)) {
             emit error(err);
             return false;
         }
-        if (!client.bind(m_connection->bindDn(), m_connection->password(), &err)) {
+        if (!bindSession(client, m_connection, &err)) {
             emit error(err);
             client.close();
             return false;
@@ -525,20 +569,23 @@ QFuture<bool> DirectoryService::modifyObject(const QString &dn, const QMap<QStri
                 free(mods[j]);
             }
             free(mods);
+            reportLdapFailure(rc);
             return rc == LDAP_SUCCESS;
         });
     }
 #endif
     return QtConcurrent::run([this, dn, attributes]() {
-        if (!m_connection || !m_connection->isConnected())
+        if (!m_connection || !m_connection->isConnected()) {
+            emit error(QStringLiteral("Not connected to a directory server."));
             return false;
+        }
         LdapClient client;
         QString err;
         if (!client.open(m_connection->server(), quint16(m_connection->port()), &err)) {
             emit error(err);
             return false;
         }
-        if (!client.bind(m_connection->bindDn(), m_connection->password(), &err)) {
+        if (!bindSession(client, m_connection, &err)) {
             emit error(err);
             client.close();
             return false;
