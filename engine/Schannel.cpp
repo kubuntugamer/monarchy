@@ -127,9 +127,19 @@ QByteArray seal(quint32 negotiateFlags, const QByteArray &sessionKey, const QByt
         const QByteArray iv = sequence + sequence;
         return cfb8(key, iv, confounder + data, forward);
     }
-    const QByteArray digest = Ntlm::hmacMd5(sessionKey, QByteArray(4, '\0'));
+    // MS-NRPC 3.3.4.2.1 step 8: the RC4 sealing key is derived from the session
+    // key with every byte XORed with 0xf0 — the same mask the AES profile uses —
+    // and the confounder is then encrypted on its own stream, the cipher state
+    // reset before the payload. The spec text says to initialize RC4 once, but
+    // every Windows DC resets after the confounder, and a signature sealed the
+    // other way does not verify: measured against a Windows 2000 logon, where
+    // the reset form reproduced the client's checksum byte for byte.
+    QByteArray masked = sessionKey;
+    for (int i = 0; i < masked.size(); ++i)
+        masked[i] = char(quint8(masked.at(i)) ^ 0xf0);
+    const QByteArray digest = Ntlm::hmacMd5(masked, QByteArray(4, '\0'));
     const QByteArray sealingKey = Ntlm::hmacMd5(digest, sequence);
-    return Krb5::rc4(sealingKey, confounder + data);
+    return Krb5::rc4(sealingKey, confounder) + Krb5::rc4(sealingKey, data);
 }
 
 quint32 readLe32(const QByteArray &data, int pos)
@@ -261,12 +271,31 @@ bool open(quint32 negotiateFlags, const QByteArray &sessionKey, quint64 sequence
 
     const QByteArray expected = checksum(negotiateFlags, sessionKey, header(negotiateFlags, sealedSignature),
                                          plainConfounder, plain);
-    if (!Ntlm::secureEquals(expected, wireChecksum))
+    const auto traceOpen = [&]() {
+        if (qEnvironmentVariableIsEmpty("MONARCHY_RPC_TRACE")
+            && qEnvironmentVariableIsEmpty("MONARCHY_RPC_TRACE_ONLY"))
+            return;
+        qWarning("Schannel open: flags=0x%x size=%d seq=%llu initiator=%d header=%s",
+                 negotiateFlags, size, static_cast<unsigned long long>(sequence), int(initiator),
+                 headerBytes.toHex().constData());
+        qWarning("Schannel open: wireSeq=%s wireChecksum=%s confounder=%s plainLen=%d",
+                 wireSequence.toHex().constData(), wireChecksum.toHex().constData(),
+                 plainConfounder.toHex().constData(), int(plain.size()));
+        qWarning("Schannel open: expectedChecksum=%s expectedWireSeq=%s",
+                 expected.toHex().constData(),
+                 transformSequence(negotiateFlags, sessionKey, wireChecksum, expectedSequence)
+                     .toHex().constData());
+    };
+    if (!Ntlm::secureEquals(expected, wireChecksum)) {
+        traceOpen();
         return false;
+    }
     const QByteArray expectedWire =
         transformSequence(negotiateFlags, sessionKey, wireChecksum, expectedSequence);
-    if (!Ntlm::secureEquals(expectedWire, wireSequence))
+    if (!Ntlm::secureEquals(expectedWire, wireSequence)) {
+        traceOpen();
         return false;
+    }
 
     *data = plain;
     return true;
