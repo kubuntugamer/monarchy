@@ -154,6 +154,18 @@ int bufferOffset(const QByteArray &pac, quint32 type)
     return -1;
 }
 
+// Size of the payload a PAC_INFO_BUFFER of a given type points at, or -1.
+int bufferPayloadSize(const QByteArray &pac, quint32 type)
+{
+    const quint32 count = readLe32(pac, 0);
+    for (quint32 i = 0; i < count; ++i) {
+        const int entry = 8 + int(i) * 16;
+        if (int(readLe32(pac, entry)) == int(type))
+            return int(readLe32(pac, entry + 4));
+    }
+    return -1;
+}
+
 // Zeroes the signature bytes of a checksum buffer (leaving the checksum type
 // in place) so the checksum can be computed over the PAC, as MS-PAC 2.8.1 and
 // MIT's zero_signature() require.
@@ -172,6 +184,54 @@ void clearSignature(QByteArray &pac, quint32 type)
             pac[offset + b] = '\0';
         return;
     }
+}
+
+// Re-lays a PAC out with signature buffers of the given lengths. AES signatures
+// are 12 bytes and RC4-HMAC's 16, so re-signing a PAC for a service whose key
+// type differs from the one it was built with needs the two checksum buffers
+// resized; every other buffer keeps its payload and gets a new offset.
+QByteArray resizeSignatures(const QByteArray &pac, int serverLength, int kdcLength,
+                            quint32 serverChecksum, quint32 kdcChecksum)
+{
+    const quint32 count = readLe32(pac, 0);
+    if (count == 0 || count > 64 || 8 + int(count) * 16 > pac.size())
+        return {};
+
+    QList<QPair<quint32, QByteArray>> buffers;
+    for (quint32 i = 0; i < count; ++i) {
+        const int entry = 8 + int(i) * 16;
+        const quint32 type = readLe32(pac, entry);
+        const int size = int(readLe32(pac, entry + 4));
+        const int offset = int(readLe32(pac, entry + 8));
+        if (size < 0 || offset < 0 || offset + size > pac.size())
+            return {};
+        QByteArray payload = pac.mid(offset, size);
+        if (type == kServerChecksumType) {
+            payload = QByteArray(4 + serverLength, '\0');
+            putLe32(payload, serverChecksum);
+        } else if (type == kKdcChecksumType) {
+            payload = QByteArray(4 + kdcLength, '\0');
+            putLe32(payload, kdcChecksum);
+        }
+        buffers.append({type, payload});
+    }
+
+    QByteArray out;
+    putLe32(out, count);
+    putLe32(out, readLe32(pac, 4)); // Version, as the original carried it
+    for (int i = 0; i < int(count); ++i)
+        out.append(QByteArray(16, '\0'));
+    for (int i = 0; i < buffers.size(); ++i) {
+        while (out.size() % 8 != 0)
+            out.append('\0');
+        const quint32 offset = quint32(out.size());
+        out.append(buffers.at(i).second);
+        const int entry = 8 + i * 16;
+        setLe32(out, entry, buffers.at(i).first);
+        setLe32(out, entry + 4, quint32(buffers.at(i).second.size()));
+        setLe32(out, entry + 8, offset);
+    }
+    return out;
 }
 
 } // namespace
@@ -414,6 +474,19 @@ QByteArray resign(const QByteArray &pac, const Keys &keys)
     if (pac.isEmpty())
         return {};
     QByteArray out = pac;
+    // A PAC built under AES carries 12-byte signatures and one built under
+    // RC4-HMAC 16-byte ones. When the signature type changes the buffers have to
+    // be resized first, or the signature is truncated and will not verify.
+    const int serverLength = signatureLength(keys.serviceEtype);
+    const int kdcLength = signatureLength(keys.kdcEtype);
+    if (bufferPayloadSize(out, kServerChecksumType) != 4 + serverLength
+        || bufferPayloadSize(out, kKdcChecksumType) != 4 + kdcLength) {
+        out = resizeSignatures(out, serverLength, kdcLength,
+                               checksumTypeFor(keys.serviceEtype),
+                               checksumTypeFor(keys.kdcEtype));
+        if (out.isEmpty())
+            return {};
+    }
     const int serverOffset = bufferOffset(out, kServerChecksumType);
     const int kdcOffset = bufferOffset(out, kKdcChecksumType);
     if (serverOffset < 0 || kdcOffset < 0)

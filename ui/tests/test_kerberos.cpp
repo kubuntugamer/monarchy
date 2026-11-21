@@ -938,6 +938,7 @@ private slots:
     void cfxUnwrapsARotatedToken();
     void saltsAComputerAccountByItsHostName();
     void pacIsSignedAndVerifiable();
+    void pacResignsAcrossSignatureSizes();
 #ifdef MONARCHY_WITH_KRB5
     void pacVerifiesWithMitKrb5();
     void kerberosBindOverLdap();
@@ -1802,6 +1803,50 @@ void KerberosTest::pacIsSignedAndVerifiable()
     const QByteArray resigned = Pac::resign(pac, wrong);
     QVERIFY(!resigned.isEmpty());
     QVERIFY(Pac::verify(resigned, wrong));
+}
+
+void KerberosTest::pacResignsAcrossSignatureSizes()
+{
+    DirectoryObject client;
+    client.id = QStringLiteral("CN=Administrator,CN=Users,DC=corp,DC=example,DC=com");
+    client.name = QStringLiteral("Administrator");
+    client.type = QStringLiteral("User");
+    client.attributes.insert(QStringLiteral("sAMAccountName"), QStringLiteral("Administrator"));
+    client.attributes.insert(QStringLiteral("objectSid"), QStringLiteral("S-1-5-21-1-2-3-500"));
+    client.attributes.insert(QStringLiteral("userAccountControl"), QStringLiteral("512"));
+    client.attributes.insert(QStringLiteral("pwdLastSet"),
+                             QString::number(QDateTime::currentSecsSinceEpoch()));
+
+    Pac::Keys aes;
+    aes.serviceKey = Krb5::randomKey(Krb5::kAes256);
+    aes.serviceEtype = Krb5::kAes256;
+    aes.kdcKey = Krb5::randomKey(Krb5::kAes256);
+    aes.kdcEtype = Krb5::kAes256;
+
+    const QByteArray pac = Pac::build(client, QStringLiteral("CORP.EXAMPLE.COM"),
+                                      QStringLiteral("CORP"), QStringLiteral("S-1-5-21-1-2-3"),
+                                      {client}, aes);
+    QVERIFY(!pac.isEmpty());
+    // 12-byte AES signatures in the PAC a TGT carries.
+    QCOMPARE(pac.size() % 8, 0);
+
+    // A Windows 2000 client offers RC4 only, so its service ticket is sealed with
+    // a key whose signature is 16 bytes. The PAC has to be re-laid out for that:
+    // overwriting the 12 AES bytes in place leaves a truncated signature that no
+    // service can verify.
+    Pac::Keys rc4 = aes;
+    rc4.serviceKey = Krb5::randomKey(Krb5::kRc4Hmac);
+    rc4.serviceEtype = Krb5::kRc4Hmac;
+
+    const QByteArray resigned = Pac::resign(pac, rc4);
+    QVERIFY(!resigned.isEmpty());
+    QVERIFY(Pac::verify(resigned, rc4));
+    QVERIFY(!Pac::verify(resigned, aes));
+
+    // Re-signing back to AES must work from the wider form too.
+    const QByteArray back = Pac::resign(resigned, aes);
+    QVERIFY(!back.isEmpty());
+    QVERIFY(Pac::verify(back, aes));
 }
 
 QTEST_GUILESS_MAIN(KerberosTest)

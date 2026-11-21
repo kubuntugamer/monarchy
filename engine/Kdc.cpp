@@ -726,9 +726,14 @@ QByteArray Kdc::issueAsRep(const KdcRequest &request, const Krb5::Principal &cli
     const Krb5::Principal ticketPrincipal = forService ? service : krbtgt;
     const QString sname = forService ? serviceName
                                      : QStringLiteral("krbtgt/%1").arg(realm);
-    const int ticketEtype = preferredEtype(ticketPrincipal);
+    // Same rule as the TGS path: a ticket the client has to open must use one
+    // of the encryption types it offered. A TGT is sealed for krbtgt, which no
+    // client can open, so the strongest krbtgt key stays correct there.
+    const int ticketEtype = forService ? ticketPrincipal.chooseEtype(request.etypes)
+                                       : preferredEtype(ticketPrincipal);
     if (ticketEtype == 0)
-        return krbError(kErrSPrincipalUnknown, realm, request.cname);
+        return krbError(forService ? kErrEtypeNoSupp : kErrSPrincipalUnknown, realm,
+                        request.cname);
     const int kdcEtype = preferredEtype(krbtgt);
     if (kdcEtype == 0)
         return krbError(kErrSPrincipalUnknown, realm, request.cname);
@@ -878,12 +883,15 @@ QByteArray Kdc::issueTgsRep(const KdcRequest &request, const OpenedTicket &tgt,
         return krbError(kErrSPrincipalUnknown, realm, tgt.client);
     }
 
-    // The service ticket is sealed with the service account's strongest key;
-    // the reply itself travels under the TGT's session key type, and the new
-    // session key uses whatever both sides asked for there.
-    const int serviceEtype = preferredEtype(service);
+    // RFC 4120 §3.1.3: the ticket may only be sealed with an encryption type
+    // the client asked for. A Windows 2000 client offers RC4 and DES only, so
+    // sealing its ticket with the service's AES key leaves it undecryptable and
+    // the logon fails although authentication itself succeeded. The reply
+    // travels under the TGT's session key type, and the new session key uses
+    // whatever both sides asked for there.
+    const int serviceEtype = service.chooseEtype(request.etypes);
     if (serviceEtype == 0)
-        return krbError(kErrSPrincipalUnknown, realm, tgt.client);
+        return krbError(kErrEtypeNoSupp, realm, tgt.client);
     const int sessionEtype = tgt.sessionEtype;
     if (!request.etypes.isEmpty() && !request.etypes.contains(sessionEtype))
         return krbError(kErrEtypeNoSupp, realm, tgt.client);
@@ -1203,12 +1211,29 @@ bool Kdc::readAuthenticator(const QByteArray &apReqDer, const OpenedTicket &tick
         else
             ++it;
     }
-    if (m_replay.contains(replayKey)) {
-        if (error)
-            *error = QStringLiteral("replayed authenticator");
-        return false;
+    // Windows reuses the authenticator it has already built when it opens a
+    // second connection with the same credential: its machine channel and the
+    // pipes it opens for the same logon each present the same AP-REQ, seconds
+    // apart, on separate connections. The repeat is a retransmission, not an
+    // attack, and refusing it fails the logon the client is still waiting on.
+    // A repeat inside the window a client can retry in is accepted; one after
+    // it is the replay this check exists to stop.
+    constexpr qint64 kRetransmissionSeconds = 5;
+    const auto seen = m_replay.constFind(replayKey);
+    if (seen != m_replay.constEnd()) {
+        if (now - seen.value() > kRetransmissionSeconds) {
+            trace(QStringLiteral("authenticator refused as a replay: %1").arg(replayKey));
+            if (error)
+                *error = QStringLiteral("replayed authenticator (%1)").arg(replayKey);
+            return false;
+        }
+        // The first acceptance stands, and its time is what ages the entry out:
+        // re-inserting would let a client keep the same authenticator alive.
+        trace(QStringLiteral("authenticator retransmitted, accepted again: %1").arg(replayKey));
+    } else {
+        trace(QStringLiteral("authenticator accepted: %1").arg(replayKey));
+        m_replay.insert(replayKey, now);
     }
-    m_replay.insert(replayKey, now);
 
     if (out)
         *out = result;
