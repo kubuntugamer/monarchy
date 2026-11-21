@@ -435,7 +435,29 @@ QFuture<bool> DirectoryService::addObject(const DirectoryObject &object)
                 free(mods[j]);
             }
             free(mods);
-            reportLdapFailure(rc);
+            if (rc != LDAP_SUCCESS) {
+                // The console shows a refused create through creationRejected, so
+                // the OpenLDAP path has to send one too -- otherwise a policy
+                // refusal is an error signal nobody displays and the list just
+                // does not change.
+                QString reason = QString::fromUtf8(ldap_err2string(rc));
+                char *diagnostic = nullptr;
+                if (ldap_get_option(ld, LDAP_OPT_DIAGNOSTIC_MESSAGE, &diagnostic) == LDAP_SUCCESS
+                    && diagnostic) {
+                    if (*diagnostic)
+                        reason = QString::fromUtf8(diagnostic);
+                    ldap_memfree(diagnostic);
+                }
+                // Constraint violation on an add that carries a password is the
+                // domain's policy refusing it; say so instead of "result 19".
+                if (rc == LDAP_CONSTRAINT_VIOLATION
+                    && attributes.contains(QStringLiteral("unicodePwd")))
+                    reason = tr("The password does not meet the domain's password policy. "
+                                "Change it with Action > Domain Password Policy..., or "
+                                "choose a password that meets the current policy.");
+                emit error(reason);
+                emit creationRejected(object.name, reason);
+            }
             return rc == LDAP_SUCCESS;
         });
     }
