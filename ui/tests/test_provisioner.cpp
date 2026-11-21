@@ -149,6 +149,11 @@ void ProvisionerTest::buildsDomainFromScratch()
     QCOMPARE(dc->attributes.value(QStringLiteral("ntHash")).size(), 32);
     const QString spns = dc->attributes.value(QStringLiteral("servicePrincipalName"));
     QVERIFY(spns.contains(QStringLiteral("ldap/testdc1.test.example.org")));
+    // The domain-qualified form is what a member asks the KDC for when it needs
+    // an LDAP ticket for a named domain; without it the request is answered
+    // S_PRINCIPAL_UNKNOWN.
+    QVERIFY(spns.contains(
+        QStringLiteral("ldap/testdc1.test.example.org/test.example.org")));
     QVERIFY(spns.contains(QStringLiteral("HOST/testdc1.test.example.org")));
     QVERIFY(spns.contains(QStringLiteral("GC/testdc1.test.example.org")));
     QVERIFY(spns.contains(QStringLiteral("cifs/testdc1.test.example.org")));

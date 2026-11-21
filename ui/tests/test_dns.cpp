@@ -535,6 +535,7 @@ class DnsTest : public QObject
 
 private slots:
     void publishesAdServiceRecords();
+    void publishesTheDomainGuidLocator();
     void repairsAdZoneLocators();
     void withdrawsLocatorsForUnboundServices();
     void followsConfiguredAddressOnDiskZone();
@@ -631,6 +632,49 @@ void DnsTest::publishesAdServiceRecords()
         QCOMPARE(srvTarget(records.first().rdata),
                  QStringLiteral("monarchydc1.monarchy.example.com"));
     }
+}
+
+void DnsTest::publishesTheDomainGuidLocator()
+{
+    // A member confirms the controller it found by asking for the locators under
+    // the domain's own GUID, and a client answered NXDOMAIN there stops trusting
+    // DNS discovery. The GUID is the one Netlogon hands out: the MD5 of the
+    // domain SID with the first three fields written little-endian.
+    const QString zone = QStringLiteral("cyberdyne.lan");
+    const QString host = QStringLiteral("minerva.cyberdyne.lan");
+    const QString guid =
+        DnsServer::domainGuidFor(QStringLiteral("S-1-5-21-5926014-2702479734-3490867515"));
+    QCOMPARE(guid, QStringLiteral("385867b2-0f2e-4ea5-d5a1-91dfbd86d1cc"));
+
+    DnsServer server;
+    server.loadAdZone(zone, host, QStringLiteral("10.0.0.10"), 389, 3268,
+                      QStringLiteral("Default-First-Site-Name"), 464, 88, guid);
+
+    struct Expectation {
+        QString owner;
+        quint16 port;
+    };
+    const QList<Expectation> expectations = {
+        {QStringLiteral("_ldap._tcp.") + guid + QStringLiteral(".domains._msdcs.") + zone, 389},
+        {QStringLiteral("_gc._tcp.") + guid + QStringLiteral(".domains._msdcs.") + zone, 3268},
+    };
+    for (const Expectation &expectation : expectations) {
+        const QList<DnsServer::Record> records =
+            server.records(expectation.owner, DnsServer::TypeSrv);
+        QCOMPARE(records.size(), 1);
+        int pos = 4; // priority + weight
+        quint16 port = 0;
+        QVERIFY(take16(records.first().rdata, pos, &port));
+        QCOMPARE(port, expectation.port);
+        QCOMPARE(srvTarget(records.first().rdata), host);
+    }
+
+    // A zone loaded without a GUID publishes nothing at that owner, which is
+    // what a zone that is not AD's gets.
+    DnsServer plain;
+    plain.loadAdZone(zone, host, QStringLiteral("10.0.0.10"), 389, 3268,
+                     QStringLiteral("Default-First-Site-Name"), 464, 88);
+    QVERIFY(plain.records(expectations.first().owner, DnsServer::TypeSrv).isEmpty());
 }
 
 void DnsTest::repairsAdZoneLocators()

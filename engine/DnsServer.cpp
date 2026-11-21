@@ -650,14 +650,15 @@ struct AdSrvSpec {
 // them. loadAdZone() and repairAdZoneLocators() share it so the set a new
 // domain gets and the set an existing one is held to cannot drift apart.
 QList<AdSrvSpec> adSrvSpecs(const QString &zoneName, const QString &site, quint16 ldapPort,
-                            quint16 gcPort, quint16 kpasswdPort, quint16 kdcPort)
+                            quint16 gcPort, quint16 kpasswdPort, quint16 kdcPort,
+                            const QString &domainGuid)
 {
     const QString siteLower = site.toLower();
     const QString siteDomain = siteLower + QLatin1String("._sites.") + zoneName;
     const QString msdcs = QStringLiteral("dc._msdcs.") + zoneName;
     const QString siteMsdcs = siteLower + QLatin1String("._sites.") + msdcs;
     const QString gcMsdcs = QStringLiteral("gc._msdcs.") + zoneName;
-    return {
+    QList<AdSrvSpec> specs = {
         {QStringLiteral("_ldap._tcp.") + zoneName, ldapPort},
         {QStringLiteral("_ldap._tcp.") + msdcs, ldapPort},
         {QStringLiteral("_ldap._tcp.") + siteDomain, ldapPort},
@@ -678,6 +679,18 @@ QList<AdSrvSpec> adSrvSpecs(const QString &zoneName, const QString &site, quint1
         {QStringLiteral("_ldap._tcp.") + siteLower + QLatin1String("._sites.") + gcMsdcs, gcPort},
         {QStringLiteral("_ldap._tcp.pdc._msdcs.") + zoneName, ldapPort},
     };
+    // AD also publishes the same locators keyed on the domain's own GUID: a
+    // member asks for `_ldap._tcp.<guid>.domains._msdcs.<zone>` to confirm that
+    // the DC it found is a controller of this domain. A client answered
+    // NXDOMAIN here gives up on DNS discovery and falls back to NetBIOS name
+    // resolution, so the name it asks for has to exist.
+    if (!domainGuid.isEmpty()) {
+        const QString guid = domainGuid.toLower();
+        const QString guidZone = QStringLiteral(".domains._msdcs.") + zoneName;
+        specs.append({QStringLiteral("_ldap._tcp.") + guid + guidZone, ldapPort});
+        specs.append({QStringLiteral("_gc._tcp.") + guid + guidZone, gcPort});
+    }
+    return specs;
 }
 
 // HMAC-SHA256 (RFC 2104). TSIG's hmac-sha256 is the one algorithm this server
@@ -938,9 +951,27 @@ QString ptrOwnerFor(const QString &ip)
 
 } // namespace
 
+QString DnsServer::domainGuidFor(const QString &domainSid)
+{
+    if (domainSid.isEmpty())
+        return QString();
+    const QByteArray digest = QCryptographicHash::hash(domainSid.toUpper().toUtf8(),
+                                                       QCryptographicHash::Md5);
+    if (digest.size() != 16)
+        return QString();
+    // AD writes the first three fields of a GUID little-endian and the last
+    // eight bytes as they are, so the text a member asks for is the digest with
+    // the first four bytes reversed and the next two pairs swapped.
+    const QString hex = QString::fromLatin1(digest.toHex());
+    return QStringLiteral("%1-%2-%3-%4-%5")
+        .arg(hex.mid(6, 2) + hex.mid(4, 2) + hex.mid(2, 2) + hex.mid(0, 2),
+             hex.mid(10, 2) + hex.mid(8, 2), hex.mid(14, 2) + hex.mid(12, 2), hex.mid(16, 4),
+             hex.mid(20, 12));
+}
+
 void DnsServer::loadAdZone(const QString &zone, const QString &host, const QString &ip,
                            quint16 ldapPort, quint16 gcPort, const QString &site,
-                           quint16 kpasswdPort, quint16 kdcPort) {
+                           quint16 kpasswdPort, quint16 kdcPort, const QString &domainGuid) {
     m_records.clear();
     m_zone = zone.toLower();
     // AD style serial: yyyymmdd00. Every applied update bumps it.
@@ -975,7 +1006,7 @@ void DnsServer::loadAdZone(const QString &zone, const QString &host, const QStri
         addRecord(zoneName, TypeA, 600, address);
 
     for (const AdSrvSpec &spec :
-         adSrvSpecs(zoneName, siteName, ldapPort, gcPort, kpasswdPort, kdcPort)) {
+         adSrvSpecs(zoneName, siteName, ldapPort, gcPort, kpasswdPort, kdcPort, domainGuid)) {
         // A port of 0 means the service did not bind. No locator is published
         // for it, so a client is never sent to a port nothing answers.
         if (spec.port == 0)
@@ -985,7 +1016,8 @@ void DnsServer::loadAdZone(const QString &zone, const QString &host, const QStri
 }
 
 bool DnsServer::repairAdZoneLocators(const QString &host, quint16 ldapPort, quint16 gcPort,
-                                     const QString &site, quint16 kpasswdPort, quint16 kdcPort)
+                                     const QString &site, quint16 kpasswdPort, quint16 kdcPort,
+                                     const QString &domainGuid)
 {
     if (m_zone.isEmpty())
         return false;
@@ -993,7 +1025,7 @@ bool DnsServer::repairAdZoneLocators(const QString &host, quint16 ldapPort, quin
     const QString siteName = site.isEmpty() ? QStringLiteral("Default-First-Site-Name") : site;
     bool changed = false;
     for (const AdSrvSpec &spec :
-         adSrvSpecs(m_zone, siteName, ldapPort, gcPort, kpasswdPort, kdcPort)) {
+         adSrvSpecs(m_zone, siteName, ldapPort, gcPort, kpasswdPort, kdcPort, domainGuid)) {
         const QList<Record> existing = records(spec.owner, TypeSrv);
         // A port of 0 is a service this DC is not serving. Its locator is
         // withdrawn rather than repointed: advertising a dead port is the

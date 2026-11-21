@@ -84,12 +84,21 @@ public:
     void setZone(const QString &zone);
     QString zone() const;
 
+    // The domain's GUID in the textual form AD publishes it under
+    // `domains._msdcs`: derived from the domain SID, so it is the GUID the
+    // DC's own answers carry and a restart does not change it. A member asks
+    // for the locators under this name to confirm that the DC it found serves
+    // this domain.
+    static QString domainGuidFor(const QString &domainSid);
+
     // Loads an empty zone: SOA, NS, the apex A record and the complete set of
     // domain-controller SRV records for `host`/`ip`. `site` is the AD site the
-    // DC belongs to, which decides the _sites._msdcs record names.
+    // DC belongs to, which decides the _sites._msdcs record names, and
+    // `domainGuid` adds the names AD keys on the domain GUID.
     void loadAdZone(const QString &zone, const QString &host, const QString &ip,
                     quint16 ldapPort, quint16 gcPort, const QString &site,
-                    quint16 kpasswdPort = 464, quint16 kdcPort = 88);
+                    quint16 kpasswdPort = 464, quint16 kdcPort = 88,
+                    const QString &domainGuid = QString());
 
     // Legacy entry point: builds the zone for `dc1.<zone>` on 127.0.0.1.
     void loadDefaultZone(const QString &zone);
@@ -101,7 +110,7 @@ public:
     // already right are left untouched. Returns true when the zone changed.
     bool repairAdZoneLocators(const QString &host, quint16 ldapPort, quint16 gcPort,
                              const QString &site, quint16 kpasswdPort = 464,
-                             quint16 kdcPort = 88);
+                             quint16 kdcPort = 88, const QString &domainGuid = QString());
 
     // Holds the DC's own A records (host, ns1 and the zone apex) to the address
     // it is configured with. A zone loaded from disk can carry the address of a

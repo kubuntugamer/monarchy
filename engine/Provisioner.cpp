@@ -595,8 +595,8 @@ ProvisionResult provisionDomain(const ProvisionConfig &config)
     // member's own dynamic update cannot start.
     dc.attributes.insert(
         QStringLiteral("servicePrincipalName"),
-        QStringLiteral("ldap/%1; ldap/%1.%2; HOST/%1; HOST/%1.%2; GC/%1.%2; "
-                       "cifs/%1.%2; DNS/%1.%2; DNS/ns1.%2; RestrictedKrbHost/%1; "
+        QStringLiteral("ldap/%1; ldap/%1.%2; ldap/%1.%2/%2; HOST/%1; HOST/%1.%2; "
+                       "GC/%1.%2; cifs/%1.%2; DNS/%1.%2; DNS/ns1.%2; RestrictedKrbHost/%1; "
                        "RestrictedKrbHost/%1.%2")
             .arg(b.dcName.toLower(), b.dnsDomain));
 
@@ -849,7 +849,8 @@ ProvisionResult provisionDomain(const ProvisionConfig &config)
     {
         DnsServer dns;
         dns.loadAdZone(b.dnsDomain, result.dcHost, dcIp, ldapPort, gcPort,
-                       QStringLiteral("Default-First-Site-Name"), kpasswdPort, kdcPort);
+                       QStringLiteral("Default-First-Site-Name"), kpasswdPort, kdcPort,
+                       DnsServer::domainGuidFor(b.sid));
         QString zoneError;
         if (!dns.saveZone(result.zonePath, &zoneError)) {
             result.error = zoneError;
