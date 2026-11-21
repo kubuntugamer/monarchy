@@ -47,10 +47,9 @@ QByteArray scopedSearch(int id, const QByteArray &base, int scope)
     return ldapMessage(id, char(0x63), inner);
 }
 
-// A search with an equality filter, which is the shape a client uses when it
-// asks for one kind of object: (objectCategory=user), (sAMAccountType=...).
-QByteArray equalitySearch(int id, const QByteArray &base, const QByteArray &type,
-                          const QByteArray &value)
+// A search over the whole subtree with an arbitrary filter, which is the shape a
+// client uses when it asks for one kind of object.
+QByteArray searchWith(int id, const QByteArray &base, const QByteArray &filter)
 {
     QByteArray inner = tlv(0x04, base);
     inner += tlv(char(0x0a), QByteArray(1, char(2))); // scope: wholeSubtree
@@ -58,9 +57,31 @@ QByteArray equalitySearch(int id, const QByteArray &base, const QByteArray &type
     inner += tlv(char(0x02), QByteArray(1, char(0))); // sizeLimit: no limit
     inner += tlv(char(0x02), QByteArray(1, char(0))); // timeLimit: no limit
     inner += tlv(char(0x01), QByteArray(1, char(0))); // typesOnly: FALSE
-    inner += tlv(char(0xa3), tlv(0x04, type) + tlv(0x04, value)); // equalityMatch
+    inner += filter;
     inner += tlv(char(0x30), QByteArray());
     return ldapMessage(id, char(0x63), inner);
+}
+
+QByteArray equalitySearch(int id, const QByteArray &base, const QByteArray &type,
+                          const QByteArray &value)
+{
+    return searchWith(id, base, tlv(char(0xa3), tlv(0x04, type) + tlv(0x04, value)));
+}
+
+// extensibleMatch: [1] matchingRule, [2] type, [3] matchValue.
+QByteArray extensibleMatch(const QByteArray &attr, const QByteArray &rule,
+                           const QByteArray &value)
+{
+    QByteArray body;
+    body += tlv(char(0x81), rule);
+    body += tlv(char(0x82), attr);
+    body += tlv(char(0x83), value);
+    return tlv(char(0xa5), body);
+}
+
+QByteArray notOf(const QByteArray &filter)
+{
+    return tlv(char(0xa2), filter);
 }
 
 // Sends one search and collects its reply up to and including the done message.
@@ -233,6 +254,7 @@ private slots:
     void acceptsPermissiveModifyControl();
     void objectSidIsBinaryOnTheWire();
     void derivesTheCategoryAndAccountTypeClientsFilterOn();
+    void understandsTheBitwiseFiltersAducSends();
     void storesAQuotedUtf16MachinePassword();
     void ignoresUnknownOptionalControl();
     void rejectsCookieItDidNotIssue();
@@ -619,6 +641,99 @@ void LdapTest::derivesTheCategoryAndAccountTypeClientsFilterOn()
                   "CN=Domain-DNS,CN=Schema,CN=Configuration,DC=example,DC=com");
     QCOMPARE(hits.size(), 1);
     QCOMPARE(entryDn(hits.first()), base);
+}
+
+// ADUC's own user list ends with a negation of a bitwise extensible match:
+//   (&(objectCategory=person)(objectClass=user)
+//      (!userAccountControl:1.2.840.113556.1.4.803:=2))
+// The extensible match used to fall through to the parser's match-everything
+// default, so the negation rejected every user and the page came up empty.
+void LdapTest::understandsTheBitwiseFiltersAducSends()
+{
+    const QByteArray uac = QByteArray("userAccountControl");
+    const QByteArray andRule = QByteArray("1.2.840.113556.1.4.803");
+    const QByteArray orRule = QByteArray("1.2.840.113556.1.4.804");
+    const QString base = QStringLiteral("DC=example,DC=com");
+
+    DirectoryObject domain;
+    domain.id = base;
+    domain.kind = ObjectKind::Domain;
+    domain.attributes.insert(QStringLiteral("objectClass"),
+                             QStringLiteral("top;domain;domainDNS"));
+    DirectoryObject alice;
+    alice.id = QStringLiteral("CN=Alice,CN=Users,%1").arg(base);
+    alice.name = QStringLiteral("Alice");
+    alice.kind = ObjectKind::User;
+    alice.attributes.insert(QStringLiteral("objectClass"),
+                            QStringLiteral("top;person;organizationalPerson;user"));
+    alice.attributes.insert(QStringLiteral("userAccountControl"), QStringLiteral("512"));
+    DirectoryObject bob;
+    bob.id = QStringLiteral("CN=Bob,CN=Users,%1").arg(base);
+    bob.name = QStringLiteral("Bob");
+    bob.kind = ObjectKind::User;
+    bob.attributes.insert(QStringLiteral("objectClass"),
+                          QStringLiteral("top;person;organizationalPerson;user"));
+    bob.attributes.insert(QStringLiteral("userAccountControl"), QStringLiteral("514"));
+
+    LdapServer server;
+    server.setObjects({domain, alice, bob});
+    QVERIFY(server.listen(0));
+
+    QTcpSocket client;
+    client.connectToHost(QHostAddress::LocalHost, server.serverPort());
+    QVERIFY(client.waitForConnected(3000));
+    Reader reader(&client);
+    authenticate(client, reader, alice.id.toUtf8());
+
+    const auto searchFilter = [&](int id, const QByteArray &filter) {
+        client.write(searchWith(id, base.toUtf8(), filter));
+        QList<QByteArray> hits;
+        while (true) {
+            const QByteArray message = reader.next();
+            if (message.isEmpty())
+                break;
+            if (operationTag(message) == 0x64)
+                hits.append(message);
+            if (operationTag(message) == 0x65)
+                break;
+        }
+        return hits;
+    };
+
+    // The disabled accounts, which is the positive form of the same filter.
+    QList<QByteArray> hits = searchFilter(6, extensibleMatch(uac, andRule, "2"));
+    QCOMPARE(hits.size(), 1);
+    QCOMPARE(entryDn(hits.first()), bob.id);
+
+    // The enabled list as ADUC writes it: users, minus the disabled bit.
+    const QByteArray aduc =
+        tlv(char(0xa0), tlv(char(0xa3), tlv(0x04, QByteArray("objectClass"))
+                                          + tlv(0x04, QByteArray("user")))
+                           + notOf(extensibleMatch(uac, andRule, "2")));
+    hits = searchFilter(7, aduc);
+    QCOMPARE(hits.size(), 1);
+    QCOMPARE(entryDn(hits.first()), alice.id);
+
+    // The OR rule is the other one AD sends: any of the asserted bits set. The
+    // disabled account has bit 2 of 3, the enabled one has none of them.
+    hits = searchFilter(8, extensibleMatch(uac, orRule, "3"));
+    QCOMPARE(hits.size(), 1);
+    QCOMPARE(entryDn(hits.first()), bob.id);
+
+    // Range filters are evaluated, not widened to the whole subtree.
+    hits = searchFilter(9, tlv(char(0xa8), tlv(0x04, uac) + tlv(0x04, QByteArray("512"))));
+    QCOMPARE(hits.size(), 1);
+    QCOMPARE(entryDn(hits.first()), alice.id);
+    hits = searchFilter(10, tlv(char(0xa6), tlv(0x04, uac) + tlv(0x04, QByteArray("513"))));
+    QCOMPARE(hits.size(), 1);
+    QCOMPARE(entryDn(hits.first()), bob.id);
+
+    // An approximate match is an equality to AD, and a client that writes one
+    // for an attribute the store cannot approximate used to get everything.
+    hits = searchFilter(11, tlv(char(0xa9), tlv(0x04, QByteArray("cn"))
+                                            + tlv(0x04, QByteArray("alice"))));
+    QCOMPARE(hits.size(), 1);
+    QCOMPARE(entryDn(hits.first()), alice.id);
 }
 
 // The same control without the critical flag is ignored, and the search runs.

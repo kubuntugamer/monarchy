@@ -409,6 +409,75 @@ Pred parseFilter(const QByteArray &d, int &pos) {
             return true;
         };
     }
+    case 0xa5: { // extensibleMatch: rule [1], type [2], value [3], dnAttrs [4]
+        int cpos = 0;
+        QString rule;
+        QString attr;
+        QString val;
+        bool dnAttributes = false;
+        while (cpos < content.size()) {
+            const int partTag = readTag(content, cpos);
+            const int partLen = readLength(content, cpos);
+            if (partLen < 0 || cpos + partLen > content.size())
+                break;
+            const QByteArray part = content.mid(cpos, partLen);
+            cpos += partLen;
+            if (partTag == 0x81)
+                rule = QString::fromUtf8(part);
+            else if (partTag == 0x82)
+                attr = QString::fromUtf8(part);
+            else if (partTag == 0x83)
+                val = QString::fromUtf8(part);
+            else if (partTag == 0x84)
+                dnAttributes = !part.isEmpty() && part.at(0) != 0;
+        }
+        return [rule, attr, val, dnAttributes](const DirectoryObject &o) {
+            // The two matching rules AD puts on integer attributes in its own
+            // filters: a bitwise AND (1.2.840.113556.1.4.803) and a bitwise OR
+            // (1.2.840.113556.1.4.804) of the stored value against the
+            // assertion. ADUC's user list is why this exists:
+            //   (&(objectCategory=person)(objectClass=user)
+            //      (!userAccountControl:1.2.840.113556.1.4.803:=2))
+            // It hides a user by setting that bit, so the negative filter is the
+            // enabled list — and every extensible match used to fall through to
+            // the parser's match-everything default, which made the negation
+            // reject every user on the page.
+            QStringList candidates = attributeValue(o, attr).split(QLatin1Char(';'),
+                                                                   Qt::SkipEmptyParts);
+            if (dnAttributes) {
+                const QStringList rdns = o.id.split(QLatin1Char(','), Qt::SkipEmptyParts);
+                for (const QString &rdn : rdns) {
+                    const int eq = rdn.indexOf(QLatin1Char('='));
+                    if (eq > 0 && rdn.left(eq).trimmed().compare(attr, Qt::CaseInsensitive) == 0)
+                        candidates.append(rdn.mid(eq + 1));
+                }
+            }
+            bool wantedOk = false;
+            const quint32 wanted = val.trimmed().toUInt(&wantedOk);
+            for (const QString &candidate : candidates) {
+                if (candidate.trimmed().isEmpty())
+                    continue;
+                if (rule.isEmpty())
+                    return valueEquals(o, attr, val);
+                if (!wantedOk)
+                    continue;
+                bool haveOk = false;
+                const quint32 have = candidate.trimmed().toUInt(&haveOk);
+                if (!haveOk)
+                    continue;
+                if (rule == QLatin1String("1.2.840.113556.1.4.803")) {
+                    if ((have & wanted) == wanted)
+                        return true;
+                } else if (rule == QLatin1String("1.2.840.113556.1.4.804")) {
+                    if ((have & wanted) != 0)
+                        return true;
+                }
+            }
+            // A rule this store does not implement has no match to offer; it
+            // must not widen the result set the way matching everything did.
+            return false;
+        };
+    }
     case 0x87: { // present
         const QString attr = QString::fromUtf8(content);
         return [attr](const DirectoryObject &o) {
@@ -417,11 +486,50 @@ Pred parseFilter(const QByteArray &d, int &pos) {
             return !attributeValue(o, attr).isEmpty();
         };
     }
+    case 0xa6:   // greaterOrEqual
+    case 0xa8: { // lessOrEqual
+        int cpos = 0;
+        const QString attr = readString(content, cpos);
+        const QString val = readString(content, cpos);
+        const bool greater = (t == 0xa6);
+        return [attr, val, greater](const DirectoryObject &o) {
+            // Integers compare numerically, everything else as text. A range
+            // filter used to fall through to match-everything, so any bound
+            // returned the whole subtree and a client's "changed since" filter
+            // could not be told apart from "everything".
+            const QString value = attributeValue(o, attr);
+            if (value.isEmpty())
+                return false;
+            for (const QString &candidate : value.split(QLatin1Char(';'), Qt::SkipEmptyParts)) {
+                bool haveNum = false;
+                bool wantNum = false;
+                const qlonglong have = candidate.trimmed().toLongLong(&haveNum);
+                const qlonglong want = val.trimmed().toLongLong(&wantNum);
+                if (haveNum && wantNum) {
+                    if (greater ? have >= want : have <= want)
+                        return true;
+                    continue;
+                }
+                const int cmp = candidate.trimmed().compare(val.trimmed(), Qt::CaseInsensitive);
+                if (greater ? cmp >= 0 : cmp <= 0)
+                    return true;
+            }
+            return false;
+        };
+    }
+    case 0xa9: { // approxMatch: AD answers an approximation as an equality
+        int cpos = 0;
+        const QString attr = readString(content, cpos);
+        const QString val = readString(content, cpos);
+        return [attr, val](const DirectoryObject &o) { return valueEquals(o, attr, val); };
+    }
     default:
         break;
     }
-    // Unsupported filter types match everything, as before.
-    return [](const DirectoryObject &){ return true; };
+    // A filter type this store cannot evaluate has no matches to offer. Matching
+    // everything, which is what this used to do, silently widened every such
+    // query to the whole subtree — including the negation of one.
+    return [](const DirectoryObject &){ return false; };
 }
 
 QString parentDn(const QString &dn) {
