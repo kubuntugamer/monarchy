@@ -261,7 +261,24 @@ either dialect: a GPO is delivered but not edited over the SMB1 path.
   replication (the
   KCC), DNSP, schema LDF import, ADWS.
 
-## 3. Distance to 1:1, in dependency order
+## 3. The order of the remaining work, inside a boundary
+
+What this server is for is narrower than AD's feature list, on purpose. The
+audience is a homelab, a small business on a tight budget, a family: they
+already own a backup product, a monitoring system, a PKI, a DNS and DHCP
+server, a hypervisor and a file server, and they should keep them. The boundary
+is the directory — LDAP, Kerberos, DRS replication, SMB and NETLOGON, SAMR and
+LSAD, the GPO files and the shares that serve them. What already exists as a
+mature, freely available product stays out of this tree: backup and restore,
+upgrade and migration tooling, monitoring and alerting, a certificate authority
+or PKINIT, a full DNS or DHCP server, file serving beyond SYSVOL and NETLOGON,
+ADWS, AD LDS/CS/FS/RMS, and mail or database glue. Matching Microsoft's breadth
+is not the goal and is the wrong measure — that breadth is how the platform
+vendor squeezed out the tools these customers had already chosen, and imitating
+it here would put the same squeeze on the same tools. Parity is claimed only
+where a Windows DC's behaviour is what makes an existing client or an existing
+tool work; a closing item that exists only to make a count match is dropped
+rather than built, WINS-era name resolution being the example.
 
 The gaps above are not independent. Working outward from what exists:
 
