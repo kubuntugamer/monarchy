@@ -218,6 +218,16 @@ void ProvisionerTest::buildsDomainFromScratch()
              QStringLiteral("top;crossRefContainer"));
     QCOMPARE(partitions->attributes.value(QStringLiteral("fSMORoleOwner")), ntdsDn);
 
+    // All five FSMO roles name the DSA, not three of them: a client that reads
+    // fSMORoleOwner across the store finds an owner for the RID master and the
+    // infrastructure master too.
+    for (const QString &dn : {QStringLiteral("CN=RID Manager$,CN=System,%1").arg(result.baseDn),
+                              QStringLiteral("CN=Infrastructure,%1").arg(result.baseDn)}) {
+        const DirectoryObject *role = findByDn(objects, dn);
+        QVERIFY2(role, qPrintable(dn));
+        QCOMPARE(role->attributes.value(QStringLiteral("fSMORoleOwner")), ntdsDn);
+    }
+
     for (const QString &guid : {domainPolicyGuid, dcPolicyGuid}) {
         const QString policyDir = result.sysvolPath + QStringLiteral("/Policies/") + guid;
         QFile gpt(policyDir + QStringLiteral("/GPT.INI"));

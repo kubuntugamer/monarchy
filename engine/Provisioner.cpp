@@ -693,6 +693,34 @@ ProvisionResult provisionDomain(const ProvisionConfig &config)
         partitions.attributes.insert(QStringLiteral("fSMORoleOwner"), ntdsSettingsDn);
     }
 
+    // The two FSMO roles that live in the account NC rather than the
+    // configuration NC. A forest has five role owners, and a client reads them
+    // the same way an administrator checks a domain: one search for
+    // fSMORoleOwner. Naming only three of them leaves the RID master and the
+    // infrastructure master pointing at nothing, which is indistinguishable
+    // from a domain where those roles were seized away.
+    {
+        const QString systemDn = QStringLiteral("CN=System,%1").arg(b.baseDn);
+        DirectoryObject &ridManager =
+            b.add(QStringLiteral("CN=RID Manager$,%1").arg(systemDn),
+                  QStringLiteral("RID Manager$"), QStringLiteral("RID Manager"),
+                  ObjectKind::Container, systemDn);
+        b.objectClass(ridManager, {QStringLiteral("top"), QStringLiteral("rIDManager")});
+        ridManager.attributes.insert(QStringLiteral("cn"), QStringLiteral("RID Manager$"));
+        ridManager.attributes.insert(QStringLiteral("fSMORoleOwner"), ntdsSettingsDn);
+    }
+    {
+        DirectoryObject &infrastructure =
+            b.add(QStringLiteral("CN=Infrastructure,%1").arg(b.baseDn),
+                  QStringLiteral("Infrastructure"), QStringLiteral("Infrastructure"),
+                  ObjectKind::Container, b.baseDn);
+        b.objectClass(infrastructure,
+                      {QStringLiteral("top"), QStringLiteral("infrastructureUpdate")});
+        infrastructure.attributes.insert(QStringLiteral("cn"),
+                                         QStringLiteral("Infrastructure"));
+        infrastructure.attributes.insert(QStringLiteral("fSMORoleOwner"), ntdsSettingsDn);
+    }
+
     // --- Group Policy -----------------------------------------------------
     // The two policies every domain is created with, linked from the domain
     // and the Domain Controllers OU by the gPLink values set above.
