@@ -407,6 +407,13 @@ bool DcService::start(const QString &dcDir)
         dcConfig.value(QStringLiteral("lmCompatibilityLevel"),
                        Ntlm::kDefaultLmCompatibilityLevel).toInt();
     m_ldapServer->setLmCompatibilityLevel(lmCompatibilityLevel);
+    // AD's RestrictAnonymous. Its default is the version's: 0 on Windows 2000,
+    // where an unbound search is answered with what Anonymous Logon may read,
+    // and 1 from Server 2003, where only the root DSE answers. This DC emulates
+    // the 2000 default; the stricter rule stays available for a store that wants
+    // credentials before any read.
+    m_ldapServer->setRestrictAnonymous(
+        dcConfig.value(QStringLiteral("restrictAnonymous"), 0).toInt());
     m_storePath = dcConfig.value(QStringLiteral("storePath"),
                                  resolvedDcDir + QStringLiteral("/directory.json")).toString();
     m_baseDn = dcConfig.value(QStringLiteral("baseDn"),
@@ -573,6 +580,44 @@ bool DcService::start(const QString &dcDir)
                 if (!m_storePath.isEmpty())
                     m_ldapServer->saveToFile(m_storePath);
                 emit statusMessage(tr("Added the kadmin/changepw service principal."));
+            }
+        }
+    }
+
+    // Windows registers a DC's service principal names in both the short and the
+    // domain-qualified shape: `ldap/<dc fqdn>` and `ldap/<dc fqdn>/<domain>`. A
+    // member asks the KDC for the qualified one when it needs a ticket for LDAP
+    // in a named domain, and a KDC that answers S_PRINCIPAL_UNKNOWN to it leaves
+    // the client without a DC. A domain provisioned before this existed carries
+    // only the short form, so the qualified one is added here, once.
+    {
+        const QString account =
+            dcHost.section(QLatin1Char('.'), 0, 0).toUpper() + QLatin1Char('$');
+        const QString qualified =
+            QStringLiteral("ldap/%1/%2").arg(dcHost.toLower(), dnsDomain.toLower());
+        for (const DirectoryObject &object : m_ldapServer->objects()) {
+            if (object.attributes.value(QStringLiteral("sAMAccountName"))
+                    .compare(account, Qt::CaseInsensitive) != 0)
+                continue;
+            QStringList spns = Krb5::servicePrincipalNames(object);
+            bool haveQualified = false;
+            for (const QString &spn : spns) {
+                if (spn.compare(qualified, Qt::CaseInsensitive) == 0)
+                    haveQualified = true;
+            }
+            if (haveQualified)
+                continue;
+            spns.append(qualified);
+            QMap<QString, QString> attributes;
+            attributes.insert(QStringLiteral("servicePrincipalName"),
+                              spns.join(QStringLiteral("; ")));
+            if (!m_ldapServer->modifyObject(object.id, attributes)) {
+                emit statusMessage(
+                    tr("Could not add the %1 service principal.").arg(qualified));
+            } else {
+                if (!m_storePath.isEmpty())
+                    m_ldapServer->saveToFile(m_storePath);
+                emit statusMessage(tr("Added the %1 service principal.").arg(qualified));
             }
         }
     }
@@ -1342,6 +1387,21 @@ bool DcService::start(const QString &dcDir)
             tr("SMB2 served on %1:%2.").arg(QHostAddress(QHostAddress::Any).toString())
                 .arg(m_smbServer->serverPort()));
     }
+    // Windows 2000 and other NetBIOS-first clients open their machine channel
+    // and logon over TCP 139; without this they connect, get a reset from the
+    // kernel, and report only "the system could not log you on".
+    const int netbiosPort =
+        dcConfig.value(QStringLiteral("netbiosPort"), 139).toInt();
+    if (netbiosPort > 0 && netbiosPort != smbPort) {
+        if (!m_smbServer->listenNetbios(quint16(netbiosPort))) {
+            emit statusMessage(tr("NetBIOS session service failed to listen on port %1 "
+                                  "(port 139 needs root).")
+                                   .arg(netbiosPort));
+        } else {
+            emit statusMessage(tr("NetBIOS session service served on port %1.")
+                                   .arg(netbiosPort));
+        }
+    }
 
     // The zone belongs to the domain: a provisioned DC ships one in private/,
     // and an unprovisioned console synthesises the same AD service records for
@@ -1401,9 +1461,13 @@ bool DcService::start(const QString &dcDir)
     // while the master is also restarting.
     applyDnsMaster(m_dnsServer, dcConfig);
     m_dnsServer->refreshSecondaryZones();
+    // The GUID a member asks for under domains._msdcs comes off the domain SID,
+    // so the zone and the DC's own answers name the same domain.
+    const QString domainGuid =
+        DnsServer::domainGuidFor(dcConfig.value(QStringLiteral("domainSid"), QString()).toString());
     if (!m_dnsServer->loadZone(m_zonePath)) {
         m_dnsServer->loadAdZone(dnsDomain, dcHost, dcIp, boundLdapPort, boundGcPort, siteName,
-                                boundKpasswdPort, boundKdcPort);
+                                boundKpasswdPort, boundKdcPort, domainGuid);
     }
     // A zone loaded from disk may predate a service this build serves — the
     // kpasswd locators, for one — or name an address this machine no longer
@@ -1414,7 +1478,7 @@ bool DcService::start(const QString &dcDir)
     // address records rather than whatever the zone was written with.
     const bool addressRepaired = m_dnsServer->repairAdZoneAddresses(dcHost, dcIp);
     const bool locatorsRepaired = m_dnsServer->repairAdZoneLocators(
-        dcHost, boundLdapPort, boundGcPort, siteName, boundKpasswdPort, boundKdcPort);
+        dcHost, boundLdapPort, boundGcPort, siteName, boundKpasswdPort, boundKdcPort, domainGuid);
     // AD publishes a reverse zone for the DC's own address; `dig -x` against a
     // domain controller is answered from it, so this DC holds one too.
     const bool reverseRepaired = m_dnsServer->repairReverseZone(dcHost, dcIp);
