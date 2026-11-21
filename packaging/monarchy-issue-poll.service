@@ -1,0 +1,51 @@
+[Unit]
+# SPDX-FileCopyrightText: 2026 Monarchy contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Detection half of the two-box protocol (TESTING.md section 7): journal every
+# new or edited comment so a reply is visible without anyone asking the API by
+# hand. This unit starts no turn - only scripts/agent-trigger.sh does that - so it
+# is safe to run on a box where nothing may wake.
+#
+# The state directory holds feed.log (what was reported), seen.json (the issue
+# baseline) and etag (the conditional request), so detection survives a restart
+# without re-announcing the whole tracker.
+Description=Journal new and edited issue comments
+Documentation=https://github.com/kubuntugamer/monarchy/blob/main/TESTING.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=chazz
+Group=chazz
+# No session bus is handed to this unit, and that is a measurement rather than an
+# omission. A sandboxed unit cannot connect to the user bus at all: `strace -e
+# connect` on notify-send under ProtectHome= alone returns EACCES on
+# /run/user/1000/bus, while the identical call outside the sandbox succeeds and
+# AppArmor reports `unconfined`. The bus is therefore not this unit's credential
+# path - gh reads its stored token with a clean environment and no bus variable,
+# measured at 5000 requests/hour under ProtectSystem=strict. With
+# DBUS_SESSION_BUS_ADDRESS unset the poller skips its desktop notification by its
+# own check, instead of logging a failure every time the tracker moves; the
+# journal and feed.log are the signal a reader acts on.
+ExecStart=/home/chazz/monarchy/scripts/poll-issues.sh
+TimeoutStartSec=120
+
+# One state directory is writable. The repository is read, never written: a poll
+# that changed the worktree would leave a box looking mid-edit.
+ReadWritePaths=/home/chazz/.local/state/monarchy-issues
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+UMask=0077
+Nice=10

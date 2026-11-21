@@ -1,0 +1,19 @@
+[Unit]
+# SPDX-FileCopyrightText: 2026 Monarchy contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Two minutes, the floor TESTING.md section 7 measured: comments posted 05:45:53
+# and 05:53:03 were journalled 37s and 1m58s later. Anything faster spends
+# requests re-reading an unchanged tracker - the poll replays its ETag and costs
+# one 304 when nothing moved.
+Description=Poll the issue tracker for new comments
+Documentation=https://github.com/kubuntugamer/monarchy/blob/main/TESTING.md
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+AccuracySec=15s
+Unit=monarchy-issue-poll.service
+
+[Install]
+WantedBy=timers.target
