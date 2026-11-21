@@ -51,6 +51,7 @@ private slots:
     void administratorDecidesThePasswordPolicy();
     void evaluatesCompositeFilters();
     void dnsZoneLoaded();
+    void findsTheNamingContextWhenNoneIsGiven();
 
 private:
     static DirectoryObject findByName(const QList<DirectoryObject> &objects, const QString &name)
@@ -524,6 +525,38 @@ void BackendTest::connectsWithASavedProfileThatHasNoPassword()
     QTRY_VERIFY_WITH_TIMEOUT(addFuture.isFinished(), 5000);
     QVERIFY(addFuture.result());
     QCOMPARE(errors.count(), 0);
+}
+
+// A saved profile need not carry a base DN: on a real install dc.conf is not
+// readable by the account the console runs as, so the console asks the server's
+// root DSE. Nothing else exercises that path, which is how a stray escape in the
+// attribute name could leave it returning no naming context unseen.
+void BackendTest::findsTheNamingContextWhenNoneIsGiven()
+{
+    LdapServer server;
+    QVERIFY(server.listen(0));
+    server.setObjects(sampleObjects());
+    QVERIFY(giveAdministratorAVerifier(server));
+
+    ConnectionService connection;
+    ConnectionProfile profile;
+    profile.server = QStringLiteral("127.0.0.1");
+    profile.port = server.serverPort();
+    profile.baseDn.clear();
+    profile.bindDn = QString::fromLatin1(kAdministratorDn);
+    profile.password = QString::fromLatin1(kAdministratorPassword);
+
+    auto connectFuture = connection.connect(profile);
+    QTRY_VERIFY_WITH_TIMEOUT(connectFuture.isFinished(), 5000);
+    QVERIFY(connectFuture.result());
+    QCOMPARE(connection.baseDn(), QStringLiteral("DC=corp,DC=example,DC=com"));
+
+    // The discovered DN is usable, not just reported.
+    DirectoryService directory(&connection);
+    auto found = directory.search(connection.baseDn(), QStringLiteral("(objectClass=*)"),
+                                  QStringList(), 100);
+    QTRY_VERIFY_WITH_TIMEOUT(found.isFinished(), 5000);
+    QVERIFY(!found.result().isEmpty());
 }
 
 void BackendTest::administratorDecidesThePasswordPolicy()

@@ -68,12 +68,12 @@ QFuture<bool> ConnectionService::connect(const ConnectionProfile &profile)
         // console runs as, so on a real install this is the only source of the
         // browse base.
         if (baseDn.isEmpty()) {
-            char *attrs[] = { const_cast<char *>(\"defaultNamingContext\"), nullptr };
+            char *attrs[] = { const_cast<char *>("defaultNamingContext"), nullptr };
             LDAPMessage *res = nullptr;
-            if (ldap_search_ext_s(ld, \"\", LDAP_SCOPE_BASE, \"(objectClass=*)\", attrs, 0,
+            if (ldap_search_ext_s(ld, "", LDAP_SCOPE_BASE, "(objectClass=*)", attrs, 0,
                                   nullptr, nullptr, nullptr, 0, &res) == LDAP_SUCCESS) {
                 struct berval **values = ldap_get_values_len(
-                    ld, ldap_first_entry(ld, res), \"defaultNamingContext\");
+                    ld, ldap_first_entry(ld, res), "defaultNamingContext");
                 if (values && values[0] && values[0]->bv_len > 0)
                     baseDn = QString::fromUtf8(values[0]->bv_val, int(values[0]->bv_len));
                 if (values)
@@ -83,8 +83,8 @@ QFuture<bool> ConnectionService::connect(const ConnectionProfile &profile)
                 ldap_msgfree(res);
             if (baseDn.isEmpty()) {
                 const QString message =
-                    QStringLiteral(\"The server at %1:%2 publishes no naming context; \"
-                                   \"enter a base DN to browse it.\")
+                    QStringLiteral("The server at %1:%2 publishes no naming context; "
+                                   "enter a base DN to browse it.")
                         .arg(profile.server)
                         .arg(profile.port);
                 QMetaObject::invokeMethod(this, [this, message] { emit error(message); },
