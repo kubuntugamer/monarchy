@@ -47,6 +47,22 @@ QByteArray scopedSearch(int id, const QByteArray &base, int scope)
     return ldapMessage(id, char(0x63), inner);
 }
 
+// A search with an equality filter, which is the shape a client uses when it
+// asks for one kind of object: (objectCategory=user), (sAMAccountType=...).
+QByteArray equalitySearch(int id, const QByteArray &base, const QByteArray &type,
+                          const QByteArray &value)
+{
+    QByteArray inner = tlv(0x04, base);
+    inner += tlv(char(0x0a), QByteArray(1, char(2))); // scope: wholeSubtree
+    inner += tlv(char(0x0a), QByteArray(1, char(0))); // derefAliases: never
+    inner += tlv(char(0x02), QByteArray(1, char(0))); // sizeLimit: no limit
+    inner += tlv(char(0x02), QByteArray(1, char(0))); // timeLimit: no limit
+    inner += tlv(char(0x01), QByteArray(1, char(0))); // typesOnly: FALSE
+    inner += tlv(char(0xa3), tlv(0x04, type) + tlv(0x04, value)); // equalityMatch
+    inner += tlv(char(0x30), QByteArray());
+    return ldapMessage(id, char(0x63), inner);
+}
+
 // Sends one search and collects its reply up to and including the done message.
 QList<QByteArray> runSearch(QTcpSocket &client, Reader &reader, int id,
                             const QByteArray &base, int scope)
@@ -216,6 +232,7 @@ private slots:
     void refusesUnknownCriticalControl();
     void acceptsPermissiveModifyControl();
     void objectSidIsBinaryOnTheWire();
+    void derivesTheCategoryAndAccountTypeClientsFilterOn();
     void storesAQuotedUtf16MachinePassword();
     void ignoresUnknownOptionalControl();
     void rejectsCookieItDidNotIssue();
@@ -516,6 +533,92 @@ void LdapTest::objectSidIsBinaryOnTheWire()
     QCOMPARE(values.size(), 1);
     QCOMPARE(values.first(), Ndr::sidFromString(sidText));
     QVERIFY(values.first().startsWith(QByteArray("\x01\x05", 2)));
+}
+
+// AD computes a handful of attributes instead of storing them, and its own
+// tooling filters on them: `(objectCategory=user)` is what ADUC, realmd and most
+// scripts send, and `(sAMAccountType=805306368)` is the principal filter. A
+// directory that answers only what it stores returns nothing for either, which
+// reads to the client as an empty domain rather than as an unanswerable filter.
+void LdapTest::derivesTheCategoryAndAccountTypeClientsFilterOn()
+{
+    const QString base = QStringLiteral("DC=example,DC=com");
+    DirectoryObject domain;
+    domain.id = base;
+    domain.kind = ObjectKind::Domain;
+    domain.attributes.insert(QStringLiteral("objectClass"),
+                             QStringLiteral("top;domain;domainDNS"));
+    DirectoryObject alice;
+    alice.id = QStringLiteral("CN=Alice,%1").arg(base);
+    alice.name = QStringLiteral("Alice");
+    alice.kind = ObjectKind::User;
+    alice.attributes.insert(QStringLiteral("objectClass"),
+                            QStringLiteral("top;person;organizationalPerson;user"));
+    alice.attributes.insert(QStringLiteral("sAMAccountName"), QStringLiteral("alice"));
+    alice.attributes.insert(QStringLiteral("objectSid"), QStringLiteral("S-1-5-21-1-2-3-1105"));
+    DirectoryObject staff;
+    staff.id = QStringLiteral("CN=Staff,%1").arg(base);
+    staff.name = QStringLiteral("Staff");
+    staff.kind = ObjectKind::Group;
+    staff.attributes.insert(QStringLiteral("objectClass"), QStringLiteral("top;group"));
+    staff.attributes.insert(QStringLiteral("sAMAccountName"), QStringLiteral("staff"));
+    staff.attributes.insert(QStringLiteral("objectSid"), QStringLiteral("S-1-5-21-1-2-3-513"));
+
+    LdapServer server;
+    server.setObjects({domain, alice, staff});
+    QVERIFY(server.listen(0));
+
+    QTcpSocket client;
+    client.connectToHost(QHostAddress::LocalHost, server.serverPort());
+    QVERIFY(client.waitForConnected(3000));
+    Reader reader(&client);
+    authenticate(client, reader, alice.id.toUtf8());
+
+    const auto search = [&](int id, const QByteArray &type, const QByteArray &value) {
+        client.write(equalitySearch(id, base.toUtf8(), type, value));
+        QList<QByteArray> hits;
+        while (true) {
+            const QByteArray message = reader.next();
+            if (message.isEmpty())
+                break;
+            if (operationTag(message) == 0x64)
+                hits.append(message);
+            if (operationTag(message) == 0x65)
+                break;
+        }
+        return hits;
+    };
+
+    // A client that asks for a user by category finds exactly the user, and the
+    // account type it reads back is the one AD reports for a normal account.
+    QList<QByteArray> hits = search(2, "objectCategory",
+                                    "CN=Person,CN=Schema,CN=Configuration,DC=example,DC=com");
+    QCOMPARE(hits.size(), 1);
+    QCOMPARE(entryDn(hits.first()), alice.id);
+    QCOMPARE(entryAttribute(hits.first(), QByteArray("sAMAccountType")).value(0),
+             QByteArray("805306368"));
+    QVERIFY(entryAttribute(hits.first(), QByteArray("primaryGroupToken")).isEmpty());
+
+    // ADUC and Get-ADUser name the category by its CN alone rather than by the
+    // schema DN, so the same filter written the short way finds the same user.
+    hits = search(5, "objectCategory", "person");
+    QCOMPARE(hits.size(), 1);
+    QCOMPARE(entryDn(hits.first()), alice.id);
+
+    // The group answers the group type, and its own RID is the primary group
+    // token a member's token list names.
+    hits = search(3, "sAMAccountType", "268435456");
+    QCOMPARE(hits.size(), 1);
+    QCOMPARE(entryDn(hits.first()), staff.id);
+    QCOMPARE(entryAttribute(hits.first(), QByteArray("primaryGroupToken")).value(0),
+             QByteArray("513"));
+
+    // The domain is a domain, not a container, so a client that asks for the
+    // domain by category finds it.
+    hits = search(4, "objectCategory",
+                  "CN=Domain-DNS,CN=Schema,CN=Configuration,DC=example,DC=com");
+    QCOMPARE(hits.size(), 1);
+    QCOMPARE(entryDn(hits.first()), base);
 }
 
 // The same control without the critical flag is ignored, and the search runs.

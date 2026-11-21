@@ -199,6 +199,83 @@ const char kPagedResultsOid[] = "1.2.840.113556.1.4.319";
 // asks for.
 const char kPermissiveModifyOid[] = "1.2.840.113556.1.4.1413";
 
+// Attributes AD computes rather than stores. Its own tooling filters on them:
+// `(objectCategory=user)` is what ADUC, realmd and most scripts send, and
+// `(sAMAccountType=805306368)` is the principal filter. A directory that answers
+// only what it stores returns nothing for either, which reads to the client as
+// an empty domain rather than as an attribute it will not get. The filter
+// matcher and the entry builder both answer from here, and nothing is written
+// to the store.
+QList<QPair<QString, QString>> derivedAttributes(const DirectoryObject &o)
+{
+    QList<QPair<QString, QString>> out;
+    if (o.id.isEmpty())
+        return out;
+    const QStringList classes = o.attributes.value(QStringLiteral("objectClass"))
+                                    .split(QLatin1Char(';'), Qt::SkipEmptyParts);
+    const auto hasClass = [&classes](const char *name) {
+        for (const QString &c : classes) {
+            if (c.trimmed().compare(QLatin1String(name), Qt::CaseInsensitive) == 0)
+                return true;
+        }
+        return false;
+    };
+
+    // The schema the categories live in is in the forest's configuration NC, and
+    // the forest root is the run of DC= components at the end of the object's
+    // own DN.
+    QString ncDn;
+    const QStringList rdns = o.id.split(QLatin1Char(','), Qt::SkipEmptyParts);
+    for (int i = 0; i < rdns.size(); ++i) {
+        if (rdns.at(i).trimmed().startsWith(QLatin1String("DC="), Qt::CaseInsensitive)) {
+            ncDn = rdns.mid(i).join(QLatin1Char(','));
+            break;
+        }
+    }
+
+    QString category;
+    quint32 accountType = 0;
+    if (hasClass("computer")) {
+        category = QStringLiteral("Computer");
+        accountType = 0x30000001u; // WORKSTATION_TRUST_ACCOUNT
+    } else if (hasClass("group")) {
+        category = QStringLiteral("Group");
+        accountType = 0x10000000u; // GROUP
+    } else if (hasClass("user")) {
+        category = QStringLiteral("Person");
+        accountType = 0x30000000u; // NORMAL_ACCOUNT
+    } else if (hasClass("organizationalUnit")) {
+        category = QStringLiteral("Organizational-Unit");
+    } else if (hasClass("builtinDomain")) {
+        category = QStringLiteral("Builtin-Domain");
+    } else if (hasClass("domainDNS") || hasClass("domain")) {
+        category = QStringLiteral("Domain-DNS");
+    } else if (hasClass("nTDSDSA")) {
+        category = QStringLiteral("NTDS-DSA");
+    } else if (hasClass("container")) {
+        category = QStringLiteral("Container");
+    }
+
+    if (!category.isEmpty() && !ncDn.isEmpty()) {
+        out.append({QStringLiteral("objectCategory"),
+                    QStringLiteral("CN=%1,CN=Schema,CN=Configuration,%2")
+                        .arg(category, ncDn)});
+    }
+    if (accountType != 0)
+        out.append({QStringLiteral("sAMAccountType"), QString::number(accountType)});
+    if (accountType == 0x10000000u) {
+        // A group's primary group token is its own RID, which is what a member's
+        // tokenGroups names when the group is the primary one.
+        const QString rid =
+            o.attributes.value(QStringLiteral("objectSid")).section(QLatin1Char('-'), -1);
+        bool ok = false;
+        const uint token = rid.toUInt(&ok);
+        if (ok)
+            out.append({QStringLiteral("primaryGroupToken"), QString::number(token)});
+    }
+    return out;
+}
+
 QString attributeValue(const DirectoryObject &o, const QString &attr)
 {
     const QString value = o.attributes.value(attr);
@@ -207,6 +284,10 @@ QString attributeValue(const DirectoryObject &o, const QString &attr)
     // Objects built without an explicit cn fall back to their RDN name.
     if (attr.compare(QLatin1String("cn"), Qt::CaseInsensitive) == 0)
         return o.name;
+    for (const auto &derived : derivedAttributes(o)) {
+        if (derived.first.compare(attr, Qt::CaseInsensitive) == 0)
+            return derived.second;
+    }
     return QString();
 }
 
@@ -218,6 +299,16 @@ bool valueEquals(const DirectoryObject &o, const QString &attr, const QString &w
     // Multi-valued attributes are stored as ';'-joined lists.
     for (const QString &candidate : value.split(QLatin1Char(';'), Qt::SkipEmptyParts)) {
         if (candidate.trimmed().compare(wanted.trimmed(), Qt::CaseInsensitive) == 0)
+            return true;
+    }
+    // objectCategory is a DN, and a client names the category either in full or
+    // by its CN alone: `(objectCategory=person)` is what ADUC and Get-ADUser
+    // send, and `(objectCategory=CN=Person,CN=Schema,...)` is the long form.
+    if (attr.compare(QLatin1String("objectCategory"), Qt::CaseInsensitive) == 0) {
+        QString category = value.section(QLatin1Char(','), 0, 0).trimmed();
+        if (category.startsWith(QLatin1String("CN="), Qt::CaseInsensitive))
+            category = category.mid(3);
+        if (category.compare(wanted.trimmed(), Qt::CaseInsensitive) == 0)
             return true;
     }
     return false;
@@ -3368,6 +3459,15 @@ QByteArray LdapServer::makeSearchEntry(int msgId, const DirectoryObject &o,
     if (!o.memberOf.isEmpty() && wanted(QStringLiteral("memberOf"))) {
         addAttr(QStringLiteral("memberOf"), o.memberOf);
         emitted.append(QStringLiteral("memberof"));
+    }
+    // The attributes AD computes rather than stores, under the same selection
+    // rule every stored attribute follows: asked for by name, or by "*".
+    for (const auto &derived : derivedAttributes(o)) {
+        const QString key = derived.first.toLower();
+        if (emitted.contains(key) || !wanted(derived.first))
+            continue;
+        addAttr(derived.first, {derived.second});
+        emitted.append(key);
     }
     if (!emitted.contains(QStringLiteral("cn")) && !o.name.isEmpty()
         && wanted(QStringLiteral("cn")))
