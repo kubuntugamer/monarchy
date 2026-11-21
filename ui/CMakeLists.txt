@@ -43,6 +43,8 @@ add_library(monarchy-ui-core STATIC
     ../engine/Ntlm.h
     ../engine/Ntlm.cpp
     ../engine/NtlmClient.cpp
+    ../engine/ReplicaTopology.h
+    ../engine/ReplicaTopology.cpp
     ../engine/ReplicationAgent.h
     ../engine/ReplicationAgent.cpp
     ../engine/Aes.h
@@ -258,6 +260,23 @@ if(BUILD_TESTING)
 
     add_test(NAME monarchy-dcservice-tests COMMAND monarchy-dcservice-tests)
     set_tests_properties(monarchy-dcservice-tests PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+    )
+
+    # A registered replication partner is a connection object in the directory,
+    # so these cases drive the round trip through LdapServer: what is asserted
+    # is what a directory search would find after a restart.
+    add_executable(monarchy-replicatopology-tests
+        tests/test_replicatopology.cpp
+    )
+
+    target_link_libraries(monarchy-replicatopology-tests PRIVATE
+        monarchy-ui-core
+        Qt6::Test
+    )
+
+    add_test(NAME monarchy-replicatopology-tests COMMAND monarchy-replicatopology-tests)
+    set_tests_properties(monarchy-replicatopology-tests PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
     )
 

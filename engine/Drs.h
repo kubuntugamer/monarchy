@@ -86,6 +86,13 @@ public:
     // agent can start using one without a restart.
     QList<ReplicaSource> replicaSources() const { return m_replicaSources; }
 
+    // Register a link. DsReplicaAdd calls this for a link that arrived over the
+    // wire; the daemon calls it at start-up for one it read back from the
+    // directory, where it is kept as a connection object so a registered
+    // partner survives a restart. An address already registered for the same
+    // naming context is not added twice.
+    void addReplicaSource(const ReplicaSource &source);
+
 signals:
     void requestReceived(const QString &operation);
     void replicaSourceAdded(const QString &address, const QString &ncDn);

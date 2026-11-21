@@ -4,6 +4,8 @@
 #ifndef DCSERVICE_H
 #define DCSERVICE_H
 
+#include "Drs.h"
+
 #include <QByteArray>
 #include <QObject>
 #include <QStringList>
@@ -89,6 +91,16 @@ private:
     // Says who a moved serial is announced to, so a dnsNotify= line that does
     // nothing is visible at startup rather than as a secondary that stays stale.
     void reportSecondaries();
+    // A replication link lives in the directory, the way AD keeps its topology:
+    // DsReplicaAdd writes a connection object under this DC's NTDS Settings and
+    // DsReplicaDel removes it, so a partner an administrator registered is still
+    // there after a restart instead of living only in the running process.
+    bool storeReplicaLink(const ReplicaSource &link);
+    void removeReplicaLink(const QString &address);
+    void loadReplicaLinks();
+    // The NTDS Settings object of this DSA: the parent a connection object is
+    // written under, found in the store rather than spelled out from dc.conf.
+    QString ntdsSettingsDn() const;
 
     LdapServer *m_ldapServer = nullptr;
     DnsServer *m_dnsServer = nullptr;

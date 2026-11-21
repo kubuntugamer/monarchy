@@ -15,6 +15,8 @@
 #include <unistd.h>
 
 #include "DcService.h"
+#include "Drs.h"
+#include "Ndr.h"
 #include "Provisioner.h"
 
 namespace {
@@ -67,6 +69,90 @@ QStringList spokenMessages(const QSignalSpy &spy)
     return spoken;
 }
 
+// Provisioning picks the documented ports, so two of these suites can collide
+// on a host that already serves them. Move only what is already taken: what a
+// test proves is that the daemon follows its own dc.conf, not which numbers
+// provisioning picked.
+void moveTakenPorts(const QString &dcDir)
+{
+    const QString confPath = dcDir + QStringLiteral("/dc.conf");
+    QSettings conf(confPath, QSettings::IniFormat);
+    QStringList moved;
+    for (const QString &key : conf.allKeys()) {
+        if (!key.endsWith(QStringLiteral("Port")))
+            continue;
+        const quint16 port = static_cast<quint16>(conf.value(key).toUInt());
+        if (port == 0 || !accepts(port))
+            continue;
+        const quint16 replacement = freePort();
+        if (replacement == 0)
+            continue;
+        conf.setValue(key, replacement);
+        moved.append(QStringLiteral("%1 %2->%3").arg(key).arg(port).arg(replacement));
+    }
+    conf.sync();
+    if (!moved.isEmpty())
+        qInfo("ports already held by another process: %s", qPrintable(moved.join(", ")));
+}
+
+void appendLe32(QByteArray &out, quint32 value)
+{
+    out.append(char(value & 0xff));
+    out.append(char((value >> 8) & 0xff));
+    out.append(char((value >> 16) & 0xff));
+    out.append(char((value >> 24) & 0xff));
+}
+
+quint32 readLe32(const QByteArray &data, int offset)
+{
+    return quint32(quint8(data.at(offset)))
+           | (quint32(quint8(data.at(offset + 1))) << 8)
+           | (quint32(quint8(data.at(offset + 2))) << 16)
+           | (quint32(quint8(data.at(offset + 3))) << 24);
+}
+
+// The DsBind arm the wire accepts, and the DsReplicaAdd level-1 arm from the
+// reference IDL (MS-DRSR 4.1.28, `drsuapi_DsReplicaAddRequest1`).
+QByteArray bindRequest()
+{
+    QByteArray stub;
+    appendLe32(stub, 0x00020000u);   // puuidClientDsa referent
+    stub.append(QByteArray(16, '\x11'));
+    appendLe32(stub, 0x00020001u);   // pextClient referent
+    appendLe32(stub, 52);            // DRS_EXTENSIONS.cb
+    appendLe32(stub, 52);            // rgb conformant count
+    stub.append(QByteArray(52, '\0'));
+    return stub;
+}
+
+QByteArray replicaAddRequest(const QByteArray &handle, const QString &ncDn,
+                             const QString &address)
+{
+    QByteArray out = handle;
+    appendLe32(out, 1u);              // level
+    appendLe32(out, 0x00020004u);     // naming_context referent
+    appendLe32(out, 0x00020008u);     // source_dsa_address referent
+    out.append(QByteArray(84, '\0')); // schedule[84]
+    appendLe32(out, 0u);              // options
+
+    const quint32 units = quint32(ncDn.size() + 1);
+    appendLe32(out, units);
+    appendLe32(out, 0u);
+    appendLe32(out, 0u);
+    out.append(QByteArray(16 + 28, '\0'));
+    appendLe32(out, units * 2);
+    out.append(Ndr::utf16le(ncDn + QChar(u'\0')));
+    while (out.size() % 4 != 0)
+        out.append('\0');
+
+    const quint32 addressUnits = quint32(address.size() + 1);
+    appendLe32(out, addressUnits);
+    out.append(Ndr::utf16le(address + QChar(u'\0')));
+    while (out.size() % 4 != 0)
+        out.append('\0');
+    return out;
+}
+
 } // namespace
 
 class DcServiceTest : public QObject
@@ -77,6 +163,7 @@ private slots:
     void ownsEveryPortItAdvertises();
     void readsEveryShapeOfForwardersKey();
     void writerAndReaderAgreeOnForwarders();
+    void keepsReplicaLinkAsAConnectionObject();
 };
 
 // The writer and the reader of `forwarders=` met nowhere in a test before this:
@@ -329,30 +416,9 @@ void DcServiceTest::ownsEveryPortItAdvertises()
 
     // The provisioner pins the catalog at 3268 in every port set, and netlogon
     // and DRSUAPI keep one number in both, so a host that already serves a
-    // domain holds them. Move only what is already taken: what this suite
-    // proves is that the daemon follows dc.conf, not which numbers provisioning
-    // picked, and every key left alone still proves the normal mapping.
-    const QString confPath = dir.path() + QStringLiteral("/dc.conf");
-    {
-        QSettings conf(confPath, QSettings::IniFormat);
-        QStringList moved;
-        for (const QString &key : conf.allKeys()) {
-            if (!key.endsWith(QStringLiteral("Port")))
-                continue;
-            const quint16 port = static_cast<quint16>(conf.value(key).toUInt());
-            if (port == 0 || !accepts(port))
-                continue;
-            const quint16 replacement = freePort();
-            QVERIFY2(replacement != 0,
-                     qPrintable(QStringLiteral("the kernel offered no port to replace %1")
-                                    .arg(key)));
-            conf.setValue(key, replacement);
-            moved.append(QStringLiteral("%1 %2->%3").arg(key).arg(port).arg(replacement));
-        }
-        conf.sync();
-        if (!moved.isEmpty())
-            qInfo("ports already held by another process: %s", qPrintable(moved.join(", ")));
-    }
+    // domain holds them. Move only what is already taken: every key left alone
+    // still proves the normal mapping.
+    moveTakenPorts(dir.path());
 
     DcService service;
     QSignalSpy messages(&service, &DcService::statusMessage);
@@ -407,6 +473,75 @@ void DcServiceTest::ownsEveryPortItAdvertises()
              "the provisioned ldapPort accepted no connection");
 
     service.stop();
+}
+
+// The link an administrator registers with DsReplicaAdd is a connection object
+// under this DC's NTDS Settings, and that object is what a restarted daemon
+// reads back. Without it the partner would live only in the process that
+// registered it, which is exactly what AD does not do.
+void DcServiceTest::keepsReplicaLinkAsAConnectionObject()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+
+    ProvisionConfig config;
+    config.realm = QStringLiteral("LINKS.EXAMPLE.ORG");
+    config.netbiosDomain = QStringLiteral("LINKS");
+    config.adminPassword = QStringLiteral("Secret123!");
+    config.targetDir = dir.path();
+    config.devPorts = true;
+    const ProvisionResult result = provisionDomain(config);
+    QVERIFY2(result.ok, qPrintable(result.error));
+    moveTakenPorts(dir.path());
+
+    const QString address = QStringLiteral("127.0.0.1:1038");
+
+    // The first service is scoped: a restart is a new process owning the same
+    // directory, and the listeners of the old one have to be gone for the new
+    // one to take the ports the store's dc.conf names.
+    {
+        DcService service;
+        QVERIFY2(service.start(dir.path()),
+                 "the daemon refused to start on a domain it had just provisioned");
+
+        DrsServer *drs = service.findChild<DrsServer *>();
+        QVERIFY2(drs, "the running service has no DRSUAPI endpoint");
+        const QByteArray handle = drs->handleCall(0, bindRequest()).mid(64, 20);
+        QCOMPARE(readLe32(drs->handleCall(5, replicaAddRequest(handle, service.baseDn(), address)),
+                          0),
+                 quint32(0));
+
+        const QString storePath = dir.path() + QStringLiteral("/private/directory.json");
+        QFile store(storePath);
+        QVERIFY2(store.open(QIODevice::ReadOnly), qPrintable(storePath));
+        const QByteArray saved = store.readAll();
+        store.close();
+        QVERIFY2(saved.contains("nTDSConnection"),
+                 "DsReplicaAdd left no connection object in the store");
+        QVERIFY2(saved.contains("CN=127.0.0.1_1038,"),
+                 "the connection object is not named after the address it pulls from");
+        service.stop();
+    }
+
+    DcService restarted;
+    QSignalSpy messages(&restarted, &DcService::statusMessage);
+    QVERIFY2(restarted.start(dir.path()),
+             "the daemon refused to start again on the directory it had just written");
+
+    bool restored = false;
+    bool pulled = false;
+    for (const QString &line : spokenMessages(messages)) {
+        QVERIFY2(!line.contains(QStringLiteral("No replication partner")),
+                 "the restarted daemon forgot the link the store held");
+        if (line.contains(QStringLiteral("Restored"))
+            && line.contains(QStringLiteral("from the directory")))
+            restored = true;
+        if (line.contains(address) && line.contains(QStringLiteral("registered")))
+            pulled = true;
+    }
+    QVERIFY2(restored, "the restarted daemon did not report reading the link back");
+    QVERIFY2(pulled, "the restarted daemon did not pull from the link it read back");
+    restarted.stop();
 }
 
 QTEST_GUILESS_MAIN(DcServiceTest)

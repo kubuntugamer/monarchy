@@ -1438,16 +1438,20 @@ QByteArray DrsServer::drsReplicaAdd(const QByteArray &stub)
     if (nc.compare(baseDn(), Qt::CaseInsensitive) != 0)
         return stubReply(kWerrNotSupported); // only this NC is served here
 
-    for (const ReplicaSource &known : m_replicaSources) {
-        if (known.address.compare(address, Qt::CaseInsensitive) == 0
-            && known.ncDn.compare(nc, Qt::CaseInsensitive) == 0)
-            return stubReply(kWerrOk);
-    }
-    m_replicaSources.append(
-        ReplicaSource{nc, address, options, sourceDsa, sourceDsaDn, schedule});
+    addReplicaSource(ReplicaSource{nc, address, options, sourceDsa, sourceDsaDn, schedule});
     emit requestReceived(QStringLiteral("DsReplicaAdd(%1) for %2").arg(address, nc));
-    emit replicaSourceAdded(address, nc);
     return stubReply(kWerrOk);
+}
+
+void DrsServer::addReplicaSource(const ReplicaSource &source)
+{
+    for (const ReplicaSource &known : m_replicaSources) {
+        if (known.address.compare(source.address, Qt::CaseInsensitive) == 0
+            && known.ncDn.compare(source.ncDn, Qt::CaseInsensitive) == 0)
+            return;
+    }
+    m_replicaSources.append(source);
+    emit replicaSourceAdded(source.address, source.ncDn);
 }
 
 // The deferred `[string]` octet array DsReplicaDel carries (MS-DRSR 4.1.20,

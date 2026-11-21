@@ -32,6 +32,7 @@
 
 #include <QTimer>
 
+#include "ReplicaTopology.h"
 #include "ReplicationAgent.h"
 #include "resultsmodel.h"
 
@@ -53,6 +54,77 @@ void DcService::runReplicaCycle()
                                .arg(m_replicationAgent->source(), error));
     }
     armReplicaTimer();
+}
+
+// This DSA's own vertex in the configuration NC and the links kept under it.
+QString DcService::ntdsSettingsDn() const
+{
+    return m_ldapServer ? ReplicaTopology::ntdsSettingsDn(m_ldapServer->objects()) : QString();
+}
+
+bool DcService::storeReplicaLink(const ReplicaSource &link)
+{
+    if (!m_ldapServer)
+        return false;
+    QString error;
+    if (!ReplicaTopology::store(m_ldapServer, link, &error)) {
+        emit statusMessage(
+            tr("The replication link to %1 is not kept across a restart: %2.")
+                .arg(link.address, error));
+        return false;
+    }
+    if (!m_storePath.isEmpty())
+        m_ldapServer->saveToFile(m_storePath);
+    emit statusMessage(tr("Replication link to %1 kept as %2 in the directory.")
+                           .arg(link.address, ReplicaTopology::linkDn(ntdsSettingsDn(), link.address)));
+    return true;
+}
+
+void DcService::removeReplicaLink(const QString &address)
+{
+    if (!m_ldapServer)
+        return;
+    QString error;
+    if (!ReplicaTopology::remove(m_ldapServer, address, &error)) {
+        emit statusMessage(
+            tr("The replication link to %1 was retired but its connection object stayed: %2.")
+                .arg(address, error));
+        return;
+    }
+    if (!m_storePath.isEmpty())
+        m_ldapServer->saveToFile(m_storePath);
+    emit statusMessage(tr("Replication link to %1 retired from the directory.").arg(address));
+}
+
+void DcService::loadReplicaLinks()
+{
+    if (!m_ldapServer || !m_drsServer)
+        return;
+
+    // A connection object in AD names the source DSA and applies to every naming
+    // context that DSA holds, so one link becomes one source per naming context
+    // this DC replicates — the same list the agent was given above.
+    QStringList namingContexts{m_baseDn};
+    for (const DirectoryObject &object : m_ldapServer->objects()) {
+        if (!object.id.isEmpty())
+            continue;
+        for (const QString &key : {QStringLiteral("configurationNamingContext"),
+                                   QStringLiteral("schemaNamingContext")}) {
+            const QString root = object.attributes.value(key);
+            if (!root.isEmpty() && !namingContexts.contains(root, Qt::CaseInsensitive))
+                namingContexts.append(root);
+        }
+    }
+
+    const QList<ReplicaSource> restored =
+        ReplicaTopology::links(m_ldapServer->objects(), namingContexts);
+    for (const ReplicaSource &link : restored)
+        m_drsServer->addReplicaSource(link);
+    if (!restored.isEmpty()) {
+        emit statusMessage(tr("Restored %1 replication link%2 from the directory.")
+                               .arg(restored.size())
+                               .arg(restored.size() == 1 ? QString() : QStringLiteral("s")));
+    }
 }
 
 void DcService::armReplicaTimer()
@@ -923,30 +995,8 @@ bool DcService::start(const QString &dcDir)
     m_replicaTimer->setSingleShot(true);
     connect(m_replicaTimer, &QTimer::timeout, this, &DcService::runReplicaCycle);
 
-    // When dc.conf names no partner, the agent stays idle (empty source) and
-    // no timer is armed. Report that so the administrator can tell the difference
-    // between "no partner yet" and "a partner was removed".
-    if (m_replicationAgent->source().isEmpty()) {
-        emit statusMessage(
-            tr("No replication partner configured; add one with DsReplicaAdd or set "
-               "replicaHost in dc.conf."));
-    }
-
-    // A DRS address is a bare host, host:port, or an ncacn_ip_tcp binding; the
-    // agent needs the host and the port separately.
     const auto parseAddress = [](const QString &address, QString *host, quint16 *port) {
-        *host = address;
-        *port = 0;
-        if (host->startsWith(QStringLiteral("ncacn_ip_tcp:")))
-            host->remove(0, 13);
-        const int bracket = host->indexOf(QLatin1Char('['));
-        if (bracket >= 0) {
-            *port = quint16(host->mid(bracket + 1).remove(QLatin1Char(']')).toUShort());
-            host->truncate(bracket);
-        } else if (host->count(QLatin1Char(':')) == 1) {
-            *port = quint16(host->section(QLatin1Char(':'), 1).toUShort());
-            *host = host->section(QLatin1Char(':'), 0, 0);
-        }
+        ReplicaTopology::splitAddress(address, host, port);
     };
 
     connect(m_drsServer, &DrsServer::replicaSourceAdded, this,
@@ -962,6 +1012,11 @@ bool DcService::start(const QString &dcDir)
                     m_replicaFlags = link.options;
                 }
                 armReplicaTimer();
+                // The link goes into the directory as a connection object, so the
+                // next start of this daemon pulls from the partner again without
+                // anyone re-registering it.
+                if (!m_drsServer->replicaSources().isEmpty())
+                    storeReplicaLink(m_drsServer->replicaSources().last());
                 emit statusMessage(tr("Replication source %1 registered.").arg(address));
             });
 
@@ -1000,6 +1055,9 @@ bool DcService::start(const QString &dcDir)
     // keeps its cursor, so re-adding the same partner resumes where it left off.
     connect(m_drsServer, &DrsServer::replicaSourceRemoved, this,
             [this, parseAddress](const QString &address, const QString &) {
+                // Retiring a link retires its connection object too, whether or
+                // not it is the one currently being pulled from.
+                removeReplicaLink(address);
                 QString host;
                 quint16 port = 0;
                 parseAddress(address, &host, &port);
@@ -1024,6 +1082,22 @@ bool DcService::start(const QString &dcDir)
         emit statusMessage(tr("Pulling replication from %1 every %2s.")
                                .arg(m_replicationAgent->source())
                                .arg(m_replicaIntervalSeconds));
+    }
+
+    // Links an administrator registered earlier are connection objects in the
+    // directory, so they are read back here and pulled from again instead of
+    // being forgotten with the process that registered them.
+    loadReplicaLinks();
+
+    // When neither dc.conf nor the store names a partner, the agent stays idle
+    // (empty source) and no timer is armed. Report that so the administrator can
+    // tell the difference between "no partner yet" and "a partner was removed"
+    // — and so a restored link is not announced next to a line saying there is
+    // none.
+    if (m_replicationAgent->source().isEmpty()) {
+        emit statusMessage(
+            tr("No replication partner configured; add one with DsReplicaAdd or set "
+               "replicaHost in dc.conf."));
     }
 
     // The endpoint mapper: the answer a client gets when it knows an interface
