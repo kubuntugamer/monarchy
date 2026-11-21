@@ -6,6 +6,7 @@
 #include "Asn1.h"
 #include "Kdc.h"
 #include "Krb5.h"
+#include "PasswordAge.h"
 
 #include <QDateTime>
 #include <QElapsedTimer>
@@ -499,6 +500,44 @@ KpasswdServer::Outcome KpasswdServer::changePassword(const QString &clientDn,
         if (clientDn.isEmpty())
             return {kAuthError, QStringLiteral("the client principal has no account")};
         targetDn = clientDn;
+    }
+
+    // The minimum password age: a user changing their own password proves the
+    // old one, and AD refuses the change until the domain's minPwdAge has run
+    // out since the last one. An administrator setting another account's
+    // password is a reset, which AD exempts — that branch never gets here.
+    if (targetDn.compare(clientDn, Qt::CaseInsensitive) == 0 && m_provider) {
+        qint64 pwdLastSet = -1;
+        qint64 minAge = 0;
+        bool haveMinAge = false;
+        for (const DirectoryObject &object : m_provider()) {
+            const auto number = [&object](const char *name, bool *ok) {
+                return object.attributes.value(QString::fromLatin1(name)).toLongLong(ok);
+            };
+            bool ok = false;
+            if (object.id.compare(targetDn, Qt::CaseInsensitive) == 0
+                && object.attributes.contains(QStringLiteral("pwdLastSet"))) {
+                const qint64 value = number("pwdLastSet", &ok);
+                if (ok)
+                    pwdLastSet = value;
+            }
+            // The policy is the domain object's own state, as it is everywhere
+            // else: the only object carrying the ages is the domain.
+            if (!haveMinAge && object.attributes.contains(QStringLiteral("minPwdAge"))) {
+                const qint64 value = number("minPwdAge", &ok);
+                if (ok) {
+                    minAge = value;
+                    haveMinAge = true;
+                }
+            }
+        }
+        if (haveMinAge && PasswordAge::tooYoung(pwdLastSet, minAge)) {
+            const qint64 hours = (-minAge) / 10000000LL / 3600;
+            return {kSoftError,
+                    QStringLiteral("the password was changed less than %1 hours ago, which is "
+                                   "the least this domain allows")
+                        .arg(hours)};
+        }
     }
 
     QString error;

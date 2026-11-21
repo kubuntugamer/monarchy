@@ -29,6 +29,14 @@ enum class State {
 State state(qint64 pwdLastSet, quint32 userAccountControl, qint64 maxPasswordAge,
             qint64 now = QDateTime::currentSecsSinceEpoch());
 
+// The other age AD enforces: a user changing their own password (the only form
+// that proves the old one) is refused until the domain's minPwdAge has elapsed
+// since the last change, which a Windows client reports as "You cannot change
+// your password at this time". An administrator's reset is exempt and does not
+// come here, because AD exempts it too.
+bool tooYoung(qint64 pwdLastSet, qint64 minPasswordAge,
+              qint64 now = QDateTime::currentSecsSinceEpoch());
+
 // The same check against an account object and the directory that holds the
 // domain object carrying the policy. An account the directory does not describe
 // (no pwdLastSet at all) is left to the caller's other checks.

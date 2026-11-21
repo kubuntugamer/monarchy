@@ -294,6 +294,18 @@ struct Fixture {
         return true;
     }
 
+    // Moves an account's pwdLastSet back, so its next change is old enough for
+    // the domain's minPwdAge (provisioning sets a day, as AD does).
+    bool agePassword(const QString &dn, int days)
+    {
+        LdapServer::ModifyChange aged;
+        aged.operation = 2;
+        aged.type = QStringLiteral("pwdLastSet");
+        aged.values = QStringList{
+            QString::number(QDateTime::currentSecsSinceEpoch() - qint64(days) * 86400)};
+        return server->applyModify(dn, {aged}) == 0;
+    }
+
     // A second account with a known password, so setting someone else's
     // password has a real target.
     bool giveGuestPassword(const QString &password)
@@ -340,6 +352,7 @@ private slots:
     void changesOwnPassword();
     void changesOwnPasswordWithInitialServiceTicket();
     void changesAnExpiredPassword();
+    void refusesAChangeYoungerThanTheDomainMinimumAge();
     void refusesWeakPassword();
     void setsAnotherAccountsPassword();
     void refusesUnauthorizedSet();
@@ -355,6 +368,9 @@ void KpasswdTest::changesOwnPassword()
 {
     Fixture fixture;
     QVERIFY(fixture.start());
+    const QString adminDn = QStringLiteral("CN=Administrator,CN=Users,")
+                            + fixture.provisioned.baseDn;
+    QVERIFY(fixture.agePassword(adminDn, 2));
 
     PasswordClient client;
     client.mode = PasswordClient::ChangeOwn;
@@ -440,6 +456,9 @@ void KpasswdTest::changesOwnPasswordWithInitialServiceTicket()
 
     // The `kpasswd` command's own path: an AS-REQ that names kadmin/changepw,
     // which the KDC answers with a service ticket instead of a TGT.
+    const QString adminDn = QStringLiteral("CN=Administrator,CN=Users,")
+                            + fixture.provisioned.baseDn;
+    QVERIFY(fixture.agePassword(adminDn, 2));
     PasswordClient client;
     client.mode = PasswordClient::ChangeOwn;
     client.initialServiceTicket = true;
@@ -458,10 +477,50 @@ void KpasswdTest::changesOwnPasswordWithInitialServiceTicket()
     QVERIFY2(again.outcome.kinitOk, qPrintable(again.outcome.error));
 }
 
+// AD's other age: a user who just set a password cannot change it again until
+// the domain's minPwdAge has elapsed, whatever the new one looks like. A client
+// reports it as "You cannot change your password at this time"; an
+// administrator resetting the account is exempt and is covered by the test
+// above.
+void KpasswdTest::refusesAChangeYoungerThanTheDomainMinimumAge()
+{
+    Fixture fixture;
+    QVERIFY(fixture.start());
+    const QString adminDn = QStringLiteral("CN=Administrator,CN=Users,")
+                            + fixture.provisioned.baseDn;
+
+    PasswordClient client;
+    client.mode = PasswordClient::ChangeOwn;
+    client.principal = QStringLiteral("Administrator@CORP.EXAMPLE.COM");
+    client.password = QStringLiteral("Str0ng-Pass!");
+    client.newPassword = QStringLiteral("N3w-Pass!early");
+    QVERIFY(Fixture::run(client));
+    QVERIFY2(client.outcome.callOk, qPrintable(client.outcome.error));
+    QCOMPARE(client.outcome.resultCode, 4); // KRB5_KPASSWD_SOFTERROR
+    QVERIFY(client.outcome.resultString.contains(QStringLiteral("hours")));
+
+    // The refusal left the old password alone...
+    PasswordClient unchanged;
+    unchanged.principal = client.principal;
+    unchanged.password = client.password;
+    QVERIFY(Fixture::run(unchanged));
+    QVERIFY2(unchanged.outcome.kinitOk, qPrintable(unchanged.outcome.error));
+
+    // ...and it is the age, not the account: a day later the same change is
+    // accepted.
+    QVERIFY(fixture.agePassword(adminDn, 2));
+    QVERIFY(Fixture::run(client));
+    QVERIFY2(client.outcome.callOk, qPrintable(client.outcome.error));
+    QCOMPARE(client.outcome.resultCode, 0);
+}
+
 void KpasswdTest::refusesWeakPassword()
 {
     Fixture fixture;
     QVERIFY(fixture.start());
+    const QString adminDn = QStringLiteral("CN=Administrator,CN=Users,")
+                            + fixture.provisioned.baseDn;
+    QVERIFY(fixture.agePassword(adminDn, 2));
 
     PasswordClient client;
     client.mode = PasswordClient::ChangeOwn;

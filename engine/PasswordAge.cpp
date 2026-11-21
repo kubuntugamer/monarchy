@@ -36,6 +36,19 @@ PasswordAge::State PasswordAge::state(qint64 pwdLastSet, quint32 userAccountCont
     return now >= pwdLastSet + lifetime ? State::Expired : State::Valid;
 }
 
+bool PasswordAge::tooYoung(qint64 pwdLastSet, qint64 minPasswordAge, qint64 now)
+{
+    // No last change to measure from: the account must change at its next logon
+    // (pwdLastSet zero), and AD lets that happen whatever the minimum age is.
+    if (pwdLastSet <= 0)
+        return false;
+    // Zero days, a positive value or AD's "never" are all no minimum at all.
+    if (minPasswordAge >= 0 || minPasswordAge == std::numeric_limits<qint64>::min())
+        return false;
+    const qint64 minimum = (-minPasswordAge) / 10000000LL;
+    return now < pwdLastSet + minimum;
+}
+
 PasswordAge::State PasswordAge::stateFor(const DirectoryObject &account,
                                          const QList<DirectoryObject> &directory, qint64 now)
 {

@@ -26,6 +26,7 @@ clients, so a reply only this tree's encoder understands fails the check.
 | **Filter matching**: and/or/not, equality, substrings and presence, plus the two bitwise extensible-match rules AD puts in its own filters (`1.2.840.113556.1.4.803` AND, `1.2.840.113556.1.4.804` OR), so ADUC's user list — `(&(objectCategory=person)(objectClass=user)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))` — lists the enabled accounts instead of none; ranges (`>=`, `<=`) compare numerically or, for text, case-insensitively; an approximate match (`~=`) is answered as an equality; and a filter shape the store cannot evaluate matches nothing instead of silently widening the query to the whole subtree | `engine/LdapServer.cpp` (`parseFilter()`) | `understandsTheBitwiseFiltersAducSends` in `monarchy-ldap-tests` |
 | Group membership (`member` DNs, derived `memberOf`) | `engine/LdapServer.cpp`, `backend/AdminService.cpp` | `monarchy-backend-tests` |
 | Password policy and credential storage (salted verifier, NT hash, AES keys), never returned by search | `engine/LdapServer.cpp`, `engine/Krb5.cpp` | `monarchy-backend-tests`, `monarchy-ntlm-tests` |
+| **Both password ages**: an expired password is refused at logon and `maxPwdAge` is reported as `passwordCanChange`; and the domain's minimum age is enforced where AD enforces it — a user changing their own password (the kpasswd path, the only one that proves the old one) is refused `KRB5_KPASSWD_SOFTERROR` until `minPwdAge` has elapsed, which is the "You cannot change your password at this time" a Windows client shows. An administrator setting another account's password is a reset and stays exempt, as it is on AD | `engine/PasswordAge.cpp`, `engine/Kpasswd.cpp` | `refusesAChangeYoungerThanTheDomainMinimumAge` in `monarchy-kpasswd-tests`, driven by MIT's client |
 | NTLMv2 over LDAP SASL (NEGOTIATE/CHALLENGE/AUTHENTICATE) | `engine/Ntlm.cpp`, `engine/LdapServer.cpp` | `monarchy-ntlm-tests` (11 cases) |
 | **NTLM message signing and sealing** (MS-NLMP §3.4) over LDAP, RFC 4422 framing | `engine/Ntlm.cpp`, `engine/LdapServer.cpp` | byte-exact vs impacket; signed, sealed and tamper-rejected sessions |
 | Kerberos KDC: RC4-HMAC + AES-128/256, pre-auth, TGT/TGS, subkey-sealed replies, AP-REQ/AP-REP, and the RFC 4120 §5.3 ticket flags a client acts on — initial and pre-authenticated on every TGT, forwardable and proxiable only when the request asks for them, and inherited by the service ticket | `engine/Kdc.cpp`, `engine/Krb5.cpp`, `engine/Aes.cpp` | `monarchy-kerberos-tests` (18 cases), driven by MIT krb5 |
@@ -297,8 +298,8 @@ The gaps above are not independent. Working outward from what exists:
    information class including the aggregate 21/23/25 writes and the logon
    week, the domain password and lockout policies, the `BUILTIN` domain with
    its sixteen well-known aliases. Remaining   here: the general and logon
-   information classes, fine-grained (per-user) password policies, the minimum
-   password age, and writing to `BUILTIN`.
+   information classes, fine-grained (per-user) password policies, and writing
+   to `BUILTIN`.
 3. ~~Endpoint mapper~~ — `ept_lookup`/`ept_map` answer on `epmPort`, so a client
    can now discover a port instead of being told one.
 4. ~~SMB2 server + named pipes + SYSVOL/NETLOGON shares~~ — `\\dc\pipe\samr`,
