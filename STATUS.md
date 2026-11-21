@@ -271,8 +271,13 @@ is the directory — LDAP, Kerberos, DRS replication, SMB and NETLOGON, SAMR and
 LSAD, the GPO files and the shares that serve them. What already exists as a
 mature, freely available product stays out of this tree: backup and restore,
 upgrade and migration tooling, monitoring and alerting, a certificate authority
-or PKINIT, a full DNS or DHCP server, file serving beyond SYSVOL and NETLOGON,
-ADWS, AD LDS/CS/FS/RMS, and mail or database glue. Matching Microsoft's breadth
+or PKINIT, DHCP, file serving beyond SYSVOL and NETLOGON, ADWS,
+AD LDS/CS/FS/RMS, and mail or database glue. DNS is not on that list and is
+not an exception to it: a Windows 2000 DC answered DNS itself — the domain's
+own zone, forwarding to an upstream resolver, and the cache in front of that
+forwarding — and a client that cannot resolve through its logon server is a
+client AD does not work for. What stays out is being the network's
+general-purpose resolver, or hosting zones nobody asked this DC for. Matching Microsoft's breadth
 is not the goal and is the wrong measure — that breadth is how the platform
 vendor squeezed out the tools these customers had already chosen, and imitating
 it here would put the same squeeze on the same tools. Parity is claimed only
