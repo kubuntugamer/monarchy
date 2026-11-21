@@ -1111,6 +1111,102 @@ QByteArray NetlogonServer::logonGetCapabilities(const QByteArray &stub)
     return out;
 }
 
+// NetrLogonGetDomainInfo (MS-NRPC 3.5.4.4.10): what a workstation asks when its
+// netlogon service starts and again when a user logs on — level 1 registers the
+// machine's own hostname and site and returns the domain's identity, level 2
+// returns only the LSA policy. The answer the logon needs is the level it asks:
+// the client reads the arm its own discriminant names, so a reply built for the
+// other level is a marshalling failure rather than a lenient one.
+QByteArray NetlogonServer::logonGetDomainInfo(const QByteArray &stub)
+{
+    Ndr::Reader reader(stub);
+    QString serverName;
+    QString computerName;
+    if (!readStringArray(reader, &serverName) || !readUniqueString(reader, &computerName))
+        return statusOnly(kStatusInvalidParameter);
+    QByteArray credential;
+    quint32 timestamp = 0;
+    if (!reader.bytes(8, &credential) || !reader.u32(&timestamp))
+        return statusOnly(kStatusInvalidParameter);
+    if (!reader.skip(12)) // return_authenticator, in place on the way in
+        return statusOnly(kStatusInvalidParameter);
+    quint32 level = 0;
+    if (!reader.u32(&level))
+        return statusOnly(kStatusInvalidParameter);
+
+    // The authenticator is stepped only when the answer is the success the
+    // client will read: a refusal carries no reply credential, and advancing
+    // this side's chain alone would desync every call after it.
+    const QString key = computerName.isEmpty() ? serverName : computerName;
+    auto channel = m_channels.find(key.toLower());
+    if (channel == m_channels.end())
+        return statusOnly(kStatusNoTrustSamAccount);
+    if (level != 1)
+        return statusOnly(kStatusInvalidInfoClass);
+    QByteArray reply;
+    if (!stepAuthenticator(&channel.value(), timestamp, credential, &reply))
+        return statusOnly(kStatusAccessDenied);
+
+    QByteArray out = reply;
+    putLe32(out, timestamp);   // return_authenticator, twelve octets with the credential
+    putLe32(out, level);       // the union's discriminant, which the client reads
+    quint32 referent = 1;
+    putLe32(out, referent++);  // domain_info: the arm is a pointer of its own
+
+    // netr_DomainInformation, level 1. Everything a Windows 2000 workstation
+    // does not need travels as an empty lsa_StringLarge and a NULL pointer, so
+    // the only deferred buffers are the three domain names, the SID and the DC's
+    // own DNS name — in the order the pointers appeared.
+    QByteArray fixed;
+    QByteArray deferred;
+    const QString dnsDomain = m_config.dnsDomain.isEmpty() ? m_config.realm : m_config.dnsDomain;
+    const QByteArray sid = Ndr::sidFromString(m_config.domainSid);
+
+    headerString(fixed, deferred, m_config.netbios, referent++, true); // domainname
+    headerString(fixed, deferred, dnsDomain, referent++, true);        // dns_domainname
+    headerString(fixed, deferred, dnsDomain, referent++, true);        // dns_forestname
+    fixed.append(domainGuid(m_config.domainSid));
+    putLe32(fixed, sid.isEmpty() ? 0u : referent++); // domain_sid
+    if (!sid.isEmpty())
+        deferred.append(sidArray(sid));
+    putLe16(fixed, 0); // trust_extension.length
+    putLe16(fixed, 0); // trust_extension.size
+    putLe32(fixed, 0); // trust_extension.info: no trust, so NULL
+    for (int i = 0; i < 3; ++i) { // dummy_string2..4 of the primary domain
+        putLe16(fixed, 0);
+        putLe16(fixed, 0);
+        putLe32(fixed, 0);
+    }
+    for (int i = 0; i < 4; ++i) // dummy_long1..4
+        putLe32(fixed, 0);
+
+    putLe32(fixed, 0); // trusted_domain_count
+    putLe32(fixed, 0); // trusted_domains: a [size_is(0)] pointer, so NULL
+    putLe32(fixed, 0); // lsa_policy.policy_size
+    putLe32(fixed, 0); // lsa_policy.policy
+    headerString(fixed, deferred, m_config.dcHost, referent++, true); // dns_hostname
+    for (int i = 0; i < 3; ++i) { // dummy_string2..4
+        putLe16(fixed, 0);
+        putLe16(fixed, 0);
+        putLe32(fixed, 0);
+    }
+    putLe32(fixed, 0); // workstation_flags: this DC handles inbound trusts or SPN updates
+    // The encryption types this DC holds keys for ([MS-KILE] 2.2.6): every
+    // account is stored with an NT hash and AES128/AES256 keys, so the KDC can
+    // issue RC4-HMAC, AES128 and AES256 tickets. A zero here says the domain
+    // supports no type at all, which is not true of this DC.
+    putLe32(fixed, 0x1cu); // supported_enc_types: RC4-HMAC | AES128 | AES256
+    putLe32(fixed, 0); // dummy_long3
+    putLe32(fixed, 0); // dummy_long4
+
+    out.append(fixed);
+    out.append(deferred);
+    putLe32(out, kStatusSuccess);
+    emit requestReceived(
+        QStringLiteral("LogonGetDomainInfo(%1): %2, %3").arg(key, m_config.netbios, dnsDomain));
+    return out;
+}
+
 QByteArray NetlogonServer::serverPasswordSet2(const QByteArray &stub)
 {
     Ndr::Reader reader(stub);
@@ -1786,6 +1882,8 @@ QByteArray NetlogonServer::handleCall(quint16 opnum, const QByteArray &stub,
         return samLogon(stub, true, false);
     case Netlogon::OpLogonSamLogonWithFlags:
         return samLogon(stub, true, true);
+    case Netlogon::OpLogonGetDomainInfo:
+        return logonGetDomainInfo(stub);
     default:
         emit requestReceived(QStringLiteral("opnum %1 unsupported").arg(opnum));
         return statusOnly(kStatusNotSupported);

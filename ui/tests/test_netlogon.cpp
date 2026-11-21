@@ -469,6 +469,7 @@ private slots:
     void secureChannelNegotiatesCrypto_data();
     void secureChannelNegotiatesCrypto();
     void logonGetCapabilitiesReportsTheChannelFlags();
+    void logonGetDomainInfoAnswersTheDomainIdentity();
     void sealsThePipeWithTheChannelKey();
     void legacySamLogonAuthenticatesSecureChannel_data();
     void legacySamLogonAuthenticatesSecureChannel();
@@ -1256,6 +1257,87 @@ void NetlogonTest::logonGetCapabilitiesReportsTheChannelFlags()
                             timestamp, 3));
     QCOMPARE(unknownLevel.size(), 4);
     QCOMPARE(readLe32(unknownLevel, 0), quint32(0xc000000du)); // STATUS_INVALID_PARAMETER
+}
+
+// MS-NRPC 3.5.4.4.10 (opnum 29). A Windows 2000 workstation calls this with
+// level 1 as its netlogon service starts and again when a user logs on, and does
+// not go on to NetrLogonSamLogon until it has the domain's identity back: the
+// NetBIOS and DNS names, the domain GUID and SID, and the DC's own DNS name.
+void NetlogonTest::logonGetDomainInfoAnswersTheDomainIdentity()
+{
+    NetlogonServer server;
+    Netlogon::Config config;
+    config.netbios = QStringLiteral("CORP");
+    config.realm = QStringLiteral("CORP.EXAMPLE.COM");
+    config.dnsDomain = QStringLiteral("corp.example.com");
+    config.dcName = QStringLiteral("DC1");
+    config.dcHost = QStringLiteral("dc1.corp.example.com");
+    config.domainSid = QStringLiteral("S-1-5-21-1-2-3");
+    server.setConfig(config);
+
+    const QByteArray ntHash = Ntlm::ntowfV1(QStringLiteral("Mach!neP@ss1"));
+    const DirectoryObject machine = machineAccount(ntHash);
+    server.setObjectProvider([machine]() { return QList<DirectoryObject>{machine}; });
+
+    const ChannelFixture channel = openChannel(
+        server, ntHash, Netlogon::kNegStrongKeys | Netlogon::kNegGetDomainInfo);
+    QVERIFY(channel.ok);
+
+    const quint32 timestamp = 77;
+    QByteArray stub;
+    appendStringArray(stub, QStringLiteral("\\\\DC1"));
+    appendPointerString(stub, QStringLiteral("DC1"), 0x00020000u + quint32(stub.size()));
+    stub.append(nextCredential(channel.seed, timestamp, channel.sessionKey, channel.flags, false));
+    appendLe32(stub, timestamp);
+    stub.append(QByteArray(12, '\0')); // the client's own return_authenticator
+    appendLe32(stub, 1);              // level
+    appendLe32(stub, 1);              // the query union's discriminant
+    appendLe32(stub, 1);              // netr_WorkstationInformation it registers
+
+    const QByteArray reply = server.handleCall(Netlogon::OpLogonGetDomainInfo, stub);
+    QVERIFY(reply.size() > 200);
+    QCOMPARE(reply.left(8), nextCredential(channel.seed, timestamp, channel.sessionKey,
+                                          channel.flags, true));
+    QCOMPARE(readLe32(reply, 8), timestamp);
+    // level 1, then the pointer to the arm: the client switches on the
+    // discriminant it reads here and would report `Bad switch value` otherwise.
+    QCOMPARE(readLe32(reply, 12), quint32(1));
+    QVERIFY(readLe32(reply, 16) != 0);
+    // The primary domain's names lead the arm, each an lsa_StringLarge: Length in
+    // bytes, then a maximum that counts the terminator.
+    QCOMPARE(readLe32(reply, 20), quint32(0x000a0008u));  // "CORP"
+    QCOMPARE(readLe32(reply, 28), quint32(0x00220020u));  // "corp.example.com"
+    QCOMPARE(readLe32(reply, 36), quint32(0x00220020u));  // its forest
+    QVERIFY(readLe32(reply, 60) != 0); // domain_sid, after the GUID
+    QCOMPARE(readLe32(reply, 128), quint32(0x002a0028u)); // dns_hostname, 20 characters
+    // workstation_flags, then the encryption types this DC can issue. A zero
+    // there tells the client the domain supports none at all.
+    QCOMPARE(readLe32(reply, 160), quint32(0));
+    QCOMPARE(readLe32(reply, 164), quint32(0x1cu)); // RC4-HMAC | AES128 | AES256
+    QCOMPARE(readLe32(reply, reply.size() - 4), quint32(0)); // STATUS_SUCCESS
+
+    const auto utf16 = [](const QString &text) {
+        return QByteArray(reinterpret_cast<const char *>(text.utf16()), int(text.size() * 2));
+    };
+    QVERIFY(reply.contains(utf16(QStringLiteral("CORP"))));
+    QVERIFY(reply.contains(utf16(QStringLiteral("corp.example.com"))));
+    QVERIFY(reply.contains(utf16(QStringLiteral("dc1.corp.example.com"))));
+
+    // A credential the channel did not produce is refused, and the channel is
+    // left where it was so the next call still steps from the same seed.
+    QByteArray bad = stub;
+    bad.replace(bad.size() - 36, 8, QByteArray(8, '\0'));
+    const QByteArray refused = server.handleCall(Netlogon::OpLogonGetDomainInfo, bad);
+    QCOMPARE(refused.size(), 4);
+    QCOMPARE(readLe32(refused, 0), quint32(0xc0000022u)); // STATUS_ACCESS_DENIED
+
+    // Only level 1 has an arm this server builds; another level is refused
+    // before the authenticator is stepped.
+    QByteArray level2 = stub;
+    level2.replace(level2.size() - 12, 4, QByteArray::fromHex("02000000"));
+    const QByteArray unsupported = server.handleCall(Netlogon::OpLogonGetDomainInfo, level2);
+    QCOMPARE(unsupported.size(), 4);
+    QCOMPARE(readLe32(unsupported, 0), quint32(0xc0000003u)); // STATUS_INVALID_INFO_CLASS
 }
 
 // The DCE/RPC framing a Netlogon client uses once its channel exists: a bind

@@ -70,6 +70,7 @@ enum Opnum : quint16 {
     OpGetAnyDCName = 13,
     OpLogonGetCapabilities = 21,
     OpLogonGetTrustRid = 23,
+    OpLogonGetDomainInfo = 29,
     OpDsRGetSiteName = 28,
     OpDsRGetDcNameEx2 = 34,
     OpLogonSamLogonEx = 39,
@@ -182,6 +183,7 @@ private:
     // Applies the next authenticator in the chain to `channel` and returns the
     // server's reply credential, or an empty array when the proof is wrong.
     QByteArray logonGetCapabilities(const QByteArray &stub);
+    QByteArray logonGetDomainInfo(const QByteArray &stub);
     bool stepAuthenticator(Channel *channel, quint32 timestamp, const QByteArray &credential,
                            QByteArray *reply);
 
