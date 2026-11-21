@@ -1005,18 +1005,20 @@ bool DcService::start(const QString &dcDir)
                 quint16 port = 0;
                 parseAddress(address, &host, &port);
                 m_replicationAgent->setSource(host, port);
+                // One copy for both reads: replicaSources() hands back a list by
+                // value, so a reference taken from a temporary would dangle.
+                const QList<ReplicaSource> links = m_drsServer->replicaSources();
                 // The link just registered carries the cadence it asked for.
-                if (!m_drsServer->replicaSources().isEmpty()) {
-                    const ReplicaSource &link = m_drsServer->replicaSources().last();
-                    m_replicaSchedule = link.schedule;
-                    m_replicaFlags = link.options;
+                if (!links.isEmpty()) {
+                    m_replicaSchedule = links.last().schedule;
+                    m_replicaFlags = links.last().options;
                 }
                 armReplicaTimer();
                 // The link goes into the directory as a connection object, so the
                 // next start of this daemon pulls from the partner again without
                 // anyone re-registering it.
-                if (!m_drsServer->replicaSources().isEmpty())
-                    storeReplicaLink(m_drsServer->replicaSources().last());
+                if (!links.isEmpty())
+                    storeReplicaLink(links.last());
                 emit statusMessage(tr("Replication source %1 registered.").arg(address));
             });
 
