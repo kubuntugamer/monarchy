@@ -153,6 +153,37 @@ QByteArray replicaAddRequest(const QByteArray &handle, const QString &ncDn,
     return out;
 }
 
+// The DsReplicaDel arm (MS-DRSR 4.1.20), whose address is a UTF-8 octet string
+// rather than the wide string DsReplicaAdd takes.
+QByteArray replicaDelRequest(const QByteArray &handle, const QString &ncDn,
+                             const QString &address)
+{
+    QByteArray out = handle;
+    appendLe32(out, 1u);          // level
+    appendLe32(out, 0x00020004u); // naming_context referent
+    appendLe32(out, 0x00020008u); // source_dsa_address referent
+    appendLe32(out, 0u);          // options
+
+    const quint32 units = quint32(ncDn.size() + 1);
+    appendLe32(out, units);
+    appendLe32(out, 0u);
+    appendLe32(out, 0u);
+    out.append(QByteArray(16 + 28, '\0'));
+    appendLe32(out, units * 2);
+    out.append(Ndr::utf16le(ncDn + QChar(u'\0')));
+    while (out.size() % 4 != 0)
+        out.append('\0');
+
+    const QByteArray utf8 = (address + QChar(u'\0')).toUtf8();
+    appendLe32(out, quint32(utf8.size())); // max count, terminator included
+    appendLe32(out, 0u);                   // offset
+    appendLe32(out, quint32(utf8.size())); // actual count
+    out.append(utf8);
+    while (out.size() % 4 != 0)
+        out.append('\0');
+    return out;
+}
+
 } // namespace
 
 class DcServiceTest : public QObject
@@ -523,25 +554,60 @@ void DcServiceTest::keepsReplicaLinkAsAConnectionObject()
         service.stop();
     }
 
-    DcService restarted;
-    QSignalSpy messages(&restarted, &DcService::statusMessage);
-    QVERIFY2(restarted.start(dir.path()),
-             "the daemon refused to start again on the directory it had just written");
+    const QString storePath = dir.path() + QStringLiteral("/private/directory.json");
+    {
+        DcService restarted;
+        QSignalSpy messages(&restarted, &DcService::statusMessage);
+        QVERIFY2(restarted.start(dir.path()),
+                 "the daemon refused to start again on the directory it had just written");
 
-    bool restored = false;
-    bool pulled = false;
-    for (const QString &line : spokenMessages(messages)) {
-        QVERIFY2(!line.contains(QStringLiteral("No replication partner")),
-                 "the restarted daemon forgot the link the store held");
-        if (line.contains(QStringLiteral("Restored"))
-            && line.contains(QStringLiteral("from the directory")))
-            restored = true;
-        if (line.contains(address) && line.contains(QStringLiteral("registered")))
-            pulled = true;
+        bool restored = false;
+        bool pulled = false;
+        for (const QString &line : spokenMessages(messages)) {
+            QVERIFY2(!line.contains(QStringLiteral("No replication partner")),
+                     "the restarted daemon forgot the link the store held");
+            if (line.contains(QStringLiteral("Restored"))
+                && line.contains(QStringLiteral("from the directory")))
+                restored = true;
+            if (line.contains(address) && line.contains(QStringLiteral("registered")))
+                pulled = true;
+        }
+        QVERIFY2(restored, "the restarted daemon did not report reading the link back");
+        QVERIFY2(pulled, "the restarted daemon did not pull from the link it read back");
+
+        // DsReplicaDel retires the link, so the connection object it was kept as
+        // has to go with it rather than being restored for ever.
+        DrsServer *drs = restarted.findChild<DrsServer *>();
+        QVERIFY2(drs, "the restarted service has no DRSUAPI endpoint");
+        const QByteArray handle = drs->handleCall(0, bindRequest()).mid(64, 20);
+        QCOMPARE(readLe32(drs->handleCall(6, replicaDelRequest(handle, restarted.baseDn(), address)),
+                          0),
+                 quint32(0));
+        restarted.stop();
     }
-    QVERIFY2(restored, "the restarted daemon did not report reading the link back");
-    QVERIFY2(pulled, "the restarted daemon did not pull from the link it read back");
-    restarted.stop();
+
+    QFile retired(storePath);
+    QVERIFY2(retired.open(QIODevice::ReadOnly), qPrintable(storePath));
+    QVERIFY2(!retired.readAll().contains("nTDSConnection"),
+             "DsReplicaDel retired the source but left its connection object behind");
+    retired.close();
+
+    {
+        DcService again;
+        QSignalSpy messages(&again, &DcService::statusMessage);
+        QVERIFY2(again.start(dir.path()),
+                 "the daemon refused to start on the directory after the link was retired");
+        bool none = false;
+        for (const QString &line : spokenMessages(messages)) {
+            QVERIFY2(!(line.contains(QStringLiteral("Restored"))
+                       && line.contains(QStringLiteral("from the directory"))),
+                     "the retired link was restored again");
+            if (line.contains(QStringLiteral("No replication partner")))
+                none = true;
+        }
+        QVERIFY2(none, "the daemon did not report that no partner is left after the deletion");
+        again.stop();
+    }
 }
 
 QTEST_GUILESS_MAIN(DcServiceTest)
