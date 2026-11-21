@@ -19,6 +19,7 @@
 namespace {
 
 const QString kNtlmMech = QStringLiteral("1.3.6.1.4.1.311.2.2.10");
+const QString kKrb5Mech = QStringLiteral("1.2.840.113554.1.2.2");
 
 void putLe16(QByteArray &out, quint16 value)
 {
@@ -82,6 +83,16 @@ QByteArray nbtFrame(const QByteArray &message)
 
 // The fields of an NTLMSSP AUTHENTICATE the RPC authenticator verifies,
 // read at the offsets MS-NLMP 2.2.1.3 defines.
+// MS-NLMP 2.2.1.3 without credentials: no user and no NT response.
+bool isNullSession(const QByteArray &token)
+{
+    const QByteArray ntlm = Ntlm::embeddedToken(token);
+    if (Ntlm::messageType(ntlm) != 3 || ntlm.size() < 64)
+        return false;
+    const int lmLength = readLe16(ntlm, 12);
+    return readLe16(ntlm, 20) == 0 && readLe16(ntlm, 36) == 0 && lmLength <= 1;
+}
+
 bool parseAuthenticate(const QByteArray &token, Rpc::AuthRequest *request,
                        QByteArray *encryptedSessionKey)
 {
@@ -492,6 +503,18 @@ QByteArray Session::sessionSetup(const QByteArray &message)
                                                           m_serverName, m_dnsDomain);
         replyToken = spnegoWrapped ? Gss::spnegoResponse(1, kNtlmMech, challenge) : challenge;
         status = kStatusMoreProcessingRequired;
+    } else if (type == 3 && isNullSession(token)) {
+        // A Windows 2000 member opens its machine channel with a null session
+        // first: a Type 3 that names no user and carries no response. Refusing
+        // that aborts the whole logon (LOGON_FAILURE, logoff) before the machine
+        // account is ever authenticated, so it is answered as the anonymous
+        // session it is. The session stays unauthenticated for the disk shares.
+        m_user.clear();
+        replyToken = spnegoWrapped ? Gss::spnegoResponse(0, kNtlmMech, QByteArray())
+                                   : QByteArray();
+        status = kStatusSuccess;
+        if (m_notifier)
+            m_notifier(QStringLiteral("SMB1 null session"));
     } else if (type == 3) {
         Rpc::AuthRequest request;
         request.challenge = m_challenge;
@@ -521,13 +544,45 @@ QByteArray Session::sessionSetup(const QByteArray &message)
             replyToken = spnegoWrapped ? Gss::spnegoResponse(2, kNtlmMech, QByteArray())
                                        : QByteArray();
             status = kStatusLogonFailure;
+            if (m_notifier)
+                m_notifier(QStringLiteral("SMB1 logon refused %1 (nt %2 bytes, flags 0x%3)")
+                               .arg(request.user.isEmpty() ? QStringLiteral("?")
+                                                           : request.user)
+                               .arg(request.ntResponse.size())
+                               .arg(request.flags, 8, 16, QLatin1Char('0')));
+        }
+    } else if (m_kerberosAcceptor && Gss::carriesKerberos(token)) {
+        // SPNEGO lets the acceptor choose any mechanism the initiator listed, and
+        // a Windows 2000 member offers Kerberos first on its machine channel. It
+        // holds a ticket for this server, so the AP-REQ is accepted and answered
+        // with the AP-REP; there is nothing left to ask for.
+        Rpc::KerberosContext context;
+        QString error;
+        const QByteArray apReq = Gss::kerberosToken(token);
+        if (!apReq.isEmpty() && m_kerberosAcceptor(apReq, &context, &error)) {
+            if (!m_uid)
+                m_uid = quint16(QRandomGenerator::system()->generate() | 1);
+            m_authenticated = true;
+            m_user = context.user;
+            // A Kerberos session signs with the GSS context key, not with NTLM's
+            // MAC, so no NTLM session key is set: signing stays off for it as it
+            // does for an unsigned NTLM session.
+            replyToken = Gss::spnegoResponse(0, QString(), context.replyToken);
+            status = kStatusSuccess;
+            if (m_notifier)
+                m_notifier(QStringLiteral("SMB1 logon %1 (kerberos)").arg(m_user));
+        } else {
+            replyToken = Gss::spnegoResponse(2, kKrb5Mech, QByteArray());
+            status = kStatusLogonFailure;
+            if (m_notifier)
+                m_notifier(QStringLiteral("SMB1 kerberos refused: %1")
+                               .arg(apReq.isEmpty() ? QStringLiteral("no AP-REQ token") : error));
         }
     } else if (spnegoWrapped && Gss::carriesKerberos(token)) {
-        // SPNEGO lets the acceptor choose any mechanism the initiator listed.
-        // This endpoint authenticates SMB1 with NTLMSSP only; a Windows 2000
-        // member offers Kerberos first and NTLMSSP last, so select NTLMSSP and
-        // let it continue rather than dropping the session with LOGON_FAILURE
-        // and never reaching the Netlogon pipe.
+        // No Kerberos acceptor is installed, so the offer cannot be honoured.
+        // SPNEGO lets the acceptor pick any listed mechanism, and a Windows 2000
+        // member lists NTLMSSP last: select it and let the exchange go on rather
+        // than dropping the session with LOGON_FAILURE.
         replyToken = Gss::spnegoResponse(1, kNtlmMech, QByteArray());
         status = kStatusMoreProcessingRequired;
     } else {
@@ -546,16 +601,14 @@ QByteArray Session::sessionSetup(const QByteArray &message)
     putLe16(words, action);   // Action
     putLe16(words, quint16(replyToken.size())); // SecurityBlobLength
 
+    // CAP_EXTENDED_SECURITY was negotiated in the negotiate reply, and in that
+    // mode the response carries the security blob and nothing else: Windows 2000
+    // reads the trailing Native OS / LAN Manager strings of the legacy form as a
+    // malformed reply and drops the session (LOGON_FAILURE then logoff) instead
+    // of sending its Type 3 message. Samba omits them for the same reason.
     QByteArray data = replyToken;
     if (data.size() % 2 == 0)
         data.append(char(0));
-    const auto appendUtf16 = [&data](const QString &text) {
-        const QByteArray bytes = toUtf16Bytes(text);
-        data.append(bytes);
-        data.append(QByteArray(2, '\0'));
-    };
-    appendUtf16(QStringLiteral("Windows NT"));
-    appendUtf16(QStringLiteral("Monarchy"));
 
     if (m_notifier)
         m_notifier(QStringLiteral("SMB1 session setup type %1").arg(type));

@@ -67,6 +67,15 @@ public:
             QString domain, QString serverName, QString dnsDomain,
             QHash<QString, QString> shares = QHash<QString, QString>());
 
+    // A 2000 member authenticates to the pipe share with Kerberos: it holds a
+    // ticket for the server and offers an AP-REQ in SPNEGO, and only falls back
+    // to NTLMSSP when the server declines. Declining is what made its machine
+    // channel fail, so the AP-REQ is accepted here exactly as SMB2 accepts it.
+    void setKerberosAcceptor(Rpc::KerberosAcceptor acceptor)
+    {
+        m_kerberosAcceptor = std::move(acceptor);
+    }
+
     static bool isSmb1(const QByteArray &message);
 
     QByteArray feed(const QByteArray &message);
@@ -125,6 +134,7 @@ private:
     QHash<QString, RpcServer *> m_pipes;
     QHash<QString, QString> m_shares;
     Rpc::Authenticator m_authenticator;
+    Rpc::KerberosAcceptor m_kerberosAcceptor;
     QString m_domain;
     QString m_serverName;
     QString m_dnsDomain;

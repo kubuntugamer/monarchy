@@ -115,6 +115,11 @@ public:
                         const QString &dnsDomain = QString());
 
     bool listen(quint16 port = 445, const QHostAddress &address = QHostAddress::Any);
+    // Windows 2000 reaches SMB over NetBIOS session service (TCP 139) rather
+    // than the direct-TCP 445 port, and does its machine channel and logon
+    // there. The same sessions serve both, after the session request is
+    // acknowledged.
+    bool listenNetbios(quint16 port = 139, const QHostAddress &address = QHostAddress::Any);
     void close();
     bool isListening() const;
     quint16 serverPort() const;
@@ -139,6 +144,9 @@ private:
     // and the transform header a reply is wrapped in (MS-SMB2 2.2.41).
     QByteArray openTransform(Connection *connection, const QByteArray &message);
     QByteArray sealTransform(Connection *connection, const QByteArray &reply);
+    // Answers the NetBIOS session request (0x81) a TCP 139 client opens with,
+    // and reports whether one was consumed.
+    static bool consumeNetbiosSessionRequest(Connection *connection, QByteArray *out);
     // SMB1 (MS-CIFS) for clients that never negotiate SMB2, such as Windows
     // 2000: it reuses this server's pipe map and authenticator.
     QByteArray handleSmb1(Connection *connection, const QByteArray &message);
@@ -163,6 +171,7 @@ private:
     QByteArray closeHandle(Connection *connection, const QByteArray &body, quint32 *status);
 
     QTcpServer *m_server = nullptr;
+    QTcpServer *m_netbiosServer = nullptr;
     QList<Connection *> m_connections;
     QHash<QString, RpcServer *> m_pipes;
     struct Share {

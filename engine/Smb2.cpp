@@ -232,6 +232,9 @@ struct Smb2Server::Connection {
     // Windows 2000 and other SMB1-only clients keep their own session state on
     // the same connection; created on the first SMB1 message.
     Smb1::Session *smb1 = nullptr;
+    // True once this connection came in on TCP 139 and its NetBIOS session
+    // request has been accepted.
+    bool netbiosSession = false;
 
     quint64 nextSession = 0x00010000;
     quint64 nextTree = 0x00020000;
@@ -291,6 +294,15 @@ bool Smb2Server::listen(quint16 port, const QHostAddress &address)
     return m_server->listen(address, port);
 }
 
+bool Smb2Server::listenNetbios(quint16 port, const QHostAddress &address)
+{
+    if (!m_netbiosServer) {
+        m_netbiosServer = new QTcpServer(this);
+        connect(m_netbiosServer, &QTcpServer::newConnection, this, &Smb2Server::onNewConnection);
+    }
+    return m_netbiosServer->listen(address, port);
+}
+
 void Smb2Server::close()
 {
     for (Connection *connection : m_connections) {
@@ -304,6 +316,8 @@ void Smb2Server::close()
     m_connections.clear();
     if (m_server)
         m_server->close();
+    if (m_netbiosServer)
+        m_netbiosServer->close();
 }
 
 bool Smb2Server::isListening() const
@@ -318,8 +332,11 @@ quint16 Smb2Server::serverPort() const
 
 void Smb2Server::onNewConnection()
 {
-    while (m_server->hasPendingConnections()) {
-        QTcpSocket *socket = m_server->nextPendingConnection();
+    auto *server = qobject_cast<QTcpServer *>(sender());
+    if (!server)
+        return;
+    while (server->hasPendingConnections()) {
+        QTcpSocket *socket = server->nextPendingConnection();
         auto *connection = new Connection;
         connection->socket = socket;
         m_connections.append(connection);
@@ -346,6 +363,8 @@ void Smb2Server::onReadyRead()
     connection->buffer.append(socket->readAll());
     QByteArray out;
     while (connection->buffer.size() >= 4) {
+        if (consumeNetbiosSessionRequest(connection, &out))
+            continue;
         const quint32 length = (quint32(quint8(connection->buffer.at(1))) << 16)
                                | (quint32(quint8(connection->buffer.at(2))) << 8)
                                | quint32(quint8(connection->buffer.at(3)));
@@ -393,6 +412,8 @@ QByteArray Smb2Server::feed(const QByteArray &nbss)
     QByteArray out;
     scratch.buffer.append(nbss);
     while (scratch.buffer.size() >= 4) {
+        if (consumeNetbiosSessionRequest(&scratch, &out))
+            continue;
         const quint32 length = (quint32(quint8(scratch.buffer.at(1))) << 16)
                                | (quint32(quint8(scratch.buffer.at(2))) << 8)
                                | quint32(quint8(scratch.buffer.at(3)));
@@ -408,6 +429,27 @@ QByteArray Smb2Server::feed(const QByteArray &nbss)
         out.append(!wildcard.isEmpty() ? wildcard : handleMessage(&scratch, message));
     }
     return out;
+}
+
+bool Smb2Server::consumeNetbiosSessionRequest(Connection *connection, QByteArray *out)
+{
+    if (!connection || connection->netbiosSession || connection->buffer.size() < 4)
+        return false;
+    // 0x81 is a NetBIOS session request: type, a 17-bit-or-less length, then the
+    // called/calling names. Only a client on TCP 139 sends it before SMB.
+    if (quint8(connection->buffer.at(0)) != 0x81)
+        return false;
+    const int length = (int(quint8(connection->buffer.at(1))) << 16)
+                       | (int(quint8(connection->buffer.at(2))) << 8)
+                       | int(quint8(connection->buffer.at(3)));
+    if (connection->buffer.size() < 4 + length)
+        return false;
+    connection->buffer.remove(0, 4 + length);
+    // POSITIVE SESSION RESPONSE: type 0x82, no error, zero length.
+    if (out)
+        out->append(QByteArray("\202\000\000\000", 4));
+    connection->netbiosSession = true;
+    return true;
 }
 
 QByteArray Smb2Server::wildcardAnswer(Connection *connection, const QByteArray &message)
@@ -455,6 +497,7 @@ QByteArray Smb2Server::handleSmb1(Connection *connection, const QByteArray &mess
             shares.insert(it.key().toLower(), it.value().path);
         connection->smb1 = new Smb1::Session(m_pipes, m_authenticator, m_domain, m_serverName,
                                              m_dnsDomain, shares);
+        connection->smb1->setKerberosAcceptor(m_kerberosAcceptor);
         connection->smb1->setNotifier(
             [this](const QString &operation) { emit requestReceived(operation); });
     }

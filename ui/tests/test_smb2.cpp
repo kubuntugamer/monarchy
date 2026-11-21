@@ -82,6 +82,27 @@ QByteArray nbt(const QByteArray &message)
     return framed;
 }
 
+// An SMB1 negotiate, the first message Windows 2000 sends once a NetBIOS
+// session (TCP 139) has been accepted.
+QByteArray smb1Negotiate()
+{
+    QByteArray message = QByteArray("\377SMB", 4);
+    message.append(char(0x72));          // SMB_COM_NEGOTIATE
+    message.append(QByteArray(4, '\0')); // Status
+    message.append(char(0x18));          // Flags
+    message.append(QByteArray(2, '\0')); // Flags2
+    message.append(QByteArray(12, '\0')); // PID high, signature, reserved
+    message.append(QByteArray(2, '\0')); // TID
+    message.append(QByteArray(2, '\0')); // PID
+    message.append(QByteArray(2, '\0')); // UID
+    message.append(QByteArray(2, '\0')); // MID
+    message.append(char(0));             // WordCount
+    const QByteArray dialects = QByteArray("\002NT LM 0.12\0", 12);
+    putLe16(message, quint16(dialects.size()));
+    message.append(dialects);
+    return message;
+}
+
 // One reply, unframed.
 QByteArray bodyOf(const QByteArray &framed)
 {
@@ -315,7 +336,36 @@ private slots:
     void answersSmb311WithThePreauthContext();
     void sealsWithAesCcmAsTheStandardDoes();
     void sealsAThreeOneOneSession();
+    void acceptsASessionOverTheNetbiosSessionService();
 };
+
+// Windows 2000 does not use TCP 445: it opens a NetBIOS session to the server
+// name on 139, and only then speaks SMB1 on that socket. The session request has
+// to be acknowledged before anything else, or the client resets the connection
+// and reports only that it could not log on.
+void Smb2Test::acceptsASessionOverTheNetbiosSessionService()
+{
+    Smb2Server server;
+
+    QByteArray request(1, char(0x81)); // SESSION REQUEST
+    QByteArray body;
+    body.append(char(0));                 // session request
+    body.append(QByteArray(32, ' '));     // called name, space padded
+    body.append(QByteArray(32, ' '));     // calling name
+    request.append(char((body.size() >> 16) & 0xff));
+    request.append(char((body.size() >> 8) & 0xff));
+    request.append(char(body.size() & 0xff));
+    request.append(body);
+
+    const QByteArray reply = server.feed(request + nbt(smb1Negotiate()));
+
+    QVERIFY(reply.size() > 4);
+    QCOMPARE(reply.left(4), QByteArray("\202\000\000\000", 4)); // POSITIVE SESSION RESPONSE
+    // What follows is the SMB1 negotiate answer, in its own NBSS frame.
+    QCOMPARE(quint8(reply.at(4)), quint8(0));
+    QCOMPARE(reply.mid(8, 4), QByteArray("\377SMB", 4));
+    QCOMPARE(quint8(reply.at(12)), quint8(0x72)); // SMB_COM_NEGOTIATE
+}
 
 void Smb2Test::negotiatesTheHighestOfferedDialect()
 {

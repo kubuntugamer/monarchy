@@ -7,6 +7,7 @@
 #include <QFile>
 #include <QTemporaryDir>
 
+#include "Gss.h"
 #include "Ntlm.h"
 #include "Rpc.h"
 #include "Smb1.h"
@@ -163,7 +164,9 @@ QByteArray spnegoKerberosToken()
     init.append(mechList);
     init.append(QByteArray::fromHex("a2050403aabbcc")); // dummy mechToken
     QByteArray token(1, char(0x60));
-    token.append(char(init.size() + 8));
+    // The outer body is the SPNEGO OID (8 bytes), the [0] header (2 bytes) and
+    // the NegTokenInit itself.
+    token.append(char(init.size() + 10));
     token.append(QByteArray::fromHex("06062b0601050502")); // SPNEGO OID
     token.append(QByteArray(1, char(0xa0)));
     token.append(char(init.size()));
@@ -450,11 +453,13 @@ private slots:
     void opensATerminatedNameAndReportsAttributes();
     void listsADirectoryOverFindFirst2();
     void refusesAnAnonymousTreeConnect();
+    void acceptsTheNullSessionAWindows2000LogonStartsWith();
     void refusesAnUnknownShare();
     void refusesTraversalOutOfTheShare();
     void refusesWrites();
     void answersARawNtlmTokenWithoutSpnego();
     void acceptsPreExtendedSecuritySessionSetup();
+    void acceptsTheKerberosTicketAWindows2000MemberOffers();
     void setsTheStateOfAnOpenPipe();
     void signsAndVerifiesASignedSession();
 
@@ -642,6 +647,53 @@ void Smb1Test::refusesAnAnonymousTreeConnect()
     QCOMPARE(statusOf(reply), Smb1::kStatusAccessDenied);
 }
 
+// Windows 2000 opens its machine channel with a Type 3 message that names no
+// user and carries no response. Refusing it makes the client log off and gives
+// up on the whole logon, so the null session is accepted — and stays anonymous.
+void Smb1Test::acceptsTheNullSessionAWindows2000LogonStartsWith()
+{
+    QHash<QString, QString> shares;
+    shares.insert(QStringLiteral("sysvol"), m_root.path());
+    Smb1::Session session(QHash<QString, RpcServer *>(),
+                          [](const Rpc::AuthRequest &, Ntlm::SessionKeys *) {
+                              return true;
+                          },
+                          QStringLiteral("MONARCHY"), QStringLiteral("DC1"),
+                          QStringLiteral("monarchy.test"), shares);
+    session.feed(negotiateMessage());
+
+    QByteArray nullSession("NTLMSSP", 7);
+    nullSession.append(char(0));
+    putLe32(nullSession, 3);
+    putLe16(nullSession, 1);          // LM response length
+    putLe16(nullSession, 1);
+    putLe32(nullSession, 64);
+    putLe16(nullSession, 0);          // NT response length
+    putLe16(nullSession, 0);
+    putLe32(nullSession, 64);
+    putLe16(nullSession, 0);          // domain length
+    putLe16(nullSession, 0);
+    putLe32(nullSession, 64);
+    putLe16(nullSession, 0);          // user length
+    putLe16(nullSession, 0);
+    putLe32(nullSession, 64);
+    putLe16(nullSession, 0);          // workstation length
+    putLe16(nullSession, 0);
+    putLe32(nullSession, 64);
+    putLe16(nullSession, 0);          // session key length
+    putLe16(nullSession, 0);
+    putLe32(nullSession, 64);
+    putLe32(nullSession, 0x00008201u); // flags
+    nullSession.append(char(0));       // the empty LM response
+
+    QCOMPARE(statusOf(session.feed(sessionSetupMessage(nullSession))),
+             Smb1::kStatusSuccess);
+    // An anonymous session is not the machine account: the domain's files stay
+    // closed to it, exactly as they are to any other unknown caller.
+    QCOMPARE(statusOf(session.feed(treeConnectMessage(QStringLiteral("\\\\dc1\\SYSVOL")))),
+             Smb1::kStatusAccessDenied);
+}
+
 void Smb1Test::refusesAnUnknownShare()
 {
     QScopedPointer<Smb1::Session> session(authenticatedSession());
@@ -811,6 +863,41 @@ void Smb1Test::answersARawNtlmTokenWithoutSpnego()
     QVERIFY(readLe16(kerberosBlob, 33 + 6) > 0);
     QCOMPARE(kerberosBlob.at(43), char(0xa1)); // NegTokenResp
     QVERIFY(kerberosBlob.contains(QByteArray::fromHex("2b06010401823702020a")));
+}
+
+// The other half of that choice: when the session can accept Kerberos, it does,
+// because the member holds a ticket for this server. The exchange finishes in
+// one round trip and the session is usable at once.
+void Smb1Test::acceptsTheKerberosTicketAWindows2000MemberOffers()
+{
+    const QByteArray acceptorReply = QByteArray::fromHex("6b05020300000001");
+    Smb1::Session session(QHash<QString, RpcServer *>(),
+                          [](const Rpc::AuthRequest &, Ntlm::SessionKeys *) { return false; },
+                          QStringLiteral("MONARCHY"), QStringLiteral("DC1"),
+                          QStringLiteral("monarchy.test"));
+    session.setKerberosAcceptor([&acceptorReply](const QByteArray &apReq,
+                                                 Rpc::KerberosContext *context, QString *) {
+        if (apReq != QByteArray::fromHex("aabbcc"))
+            return false;
+        context->user = QStringLiteral("NEURALNODE0$@MONARCHY.TEST");
+        context->replyToken = acceptorReply;
+        return true;
+    });
+    session.feed(negotiateMessage());
+    QVERIFY(Gss::carriesKerberos(spnegoKerberosToken()));
+    QCOMPARE(Gss::kerberosToken(spnegoKerberosToken()), QByteArray::fromHex("aabbcc"));
+
+    const QByteArray reply = session.feed(sessionSetupMessage(spnegoKerberosToken()));
+    QCOMPARE(statusOf(reply), quint32(0));
+    const QByteArray blob = payloadOf(reply);
+    QCOMPARE(blob.at(43), char(0xa1));            // NegTokenResp
+    QCOMPARE(quint8(blob.at(43 + 8)), quint8(0)); // negState accept-completed
+    QVERIFY(blob.contains(acceptorReply));        // the AP-REP the acceptor built
+
+    // The ticket named the principal, so the session opens the pipe share the
+    // Netlogon channel rides on.
+    QCOMPARE(statusOf(session.feed(treeConnectMessage(QStringLiteral("\\\\dc1\\IPC$")))),
+             quint32(0));
 }
 
 // Windows 2000 sets a named pipe's handle state on the handle it has already
