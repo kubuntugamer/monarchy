@@ -14,6 +14,8 @@
 #include <QMap>
 #include <QString>
 
+#include <functional>
+
 #include "Ntlm.h"
 #include "Pac.h"
 #include "resultsmodel.h"
@@ -99,6 +101,11 @@ public:
     QList<DirectoryObject> tombstones() const { return m_tombstones; }
     bool loadFromFile(const QString &path);
     bool saveToFile(const QString &path) const;
+    // Called after a client write has been applied to the store, so the process
+    // that owns the directory can commit it: a DC persists what a client
+    // changes before the response goes back, which is also what makes a file
+    // copy of the store taken while this process runs a usable backup.
+    void setPersistHook(std::function<void()> hook) { m_persistHook = std::move(hook); }
 
     // Simple-bind credentials from a provisioned `private/secrets.json`.
     // While no credentials are loaded every bind succeeds (legacy behaviour).
@@ -358,6 +365,9 @@ private:
                               bool *startTls);
     QByteArray makeBindResponse(int msgId, int resultCode, const QByteArray &saslCreds = {});
     QByteArray makeLdapResult(int msgId, int opTag, int resultCode);
+    // Commit the store through the owner's hook, if one is set.
+    void persistNow();
+    std::function<void()> m_persistHook;
     QByteArray makeExtendedResponse(int msgId, int resultCode, const QString &name, const QByteArray &value);
     QByteArray makeSearchEntry(int msgId, const DirectoryObject &o,
                                const QStringList &requested);

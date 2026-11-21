@@ -392,6 +392,13 @@ bool DcService::start(const QString &dcDir)
     // provisioned domain the service either falls back to the sample
     // directory (console) or refuses to serve one (daemon).
     m_ldapServer = new LdapServer(this);
+    // A client write is committed before it is answered, as a DC persists what
+    // it accepted: a backup tool that copies the store while this process runs
+    // then captures the change instead of yesterday's state.
+    m_ldapServer->setPersistHook([this]() {
+        if (!m_storePath.isEmpty())
+            m_ldapServer->saveToFile(m_storePath);
+    });
     const QSettings dcConfig(resolvedDcDir + QStringLiteral("/dc.conf"), QSettings::IniFormat);
     // AD's LmCompatibilityLevel decides whether an NTLMv1 challenge response is
     // answered at all: 0-2 accept it, 3-5 require NTLMv2. The default is 3,

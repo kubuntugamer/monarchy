@@ -98,6 +98,16 @@ authenticator path SAMR and LSAD use (8 checks, including both halves of the
 naming-context split, non-zero exit on any failure) |`
 | **Replication, both halves** — the serving side above, and a DRA that pulls: `ReplicationAgent` takes the partner from `dc.conf` or a wire `DsReplicaAdd` on a timer, and pulls **all three naming contexts** a DC holds — its own domain, and the forest's configuration and schema partitions — each with its own USN cursor, because each numbers its changes in its own space. The partitions hang off the same root DN as the domain, so a suffix match alone finds them during a domain cycle too: the server names them by convention (`CN=Configuration,<forest root>` and the schema under it) and by what the store publishes on its root DSE, excludes the roots that are not the one asked for, and roots the returned object chain at the requested NC rather than always at the domain. What that buys is measurable: a second DC asked for the configuration NC gets that partition instead of an empty reply, and an object added to it after the peer was created reaches the peer in a later cycle | `engine/ReplicationAgent.{h,cpp}`, `engine/Drs.cpp`, `engine/DcService.cpp` | `monarchy-drsclient-tests` (12 cases) pins the client marshal layer and, over loopback, a pull that converges two stores, carries a deletion as a tombstone, and carries **both** NCs in one cycle with independent cursors; `monarchy-replication-tests` (13 cases) pins the apply half. Live against two provisioned DCs: an account created on the first arrives on the second exactly once and a deletion removes it, and a site added to the **configuration** partition on the first is readable on the second after its next cycle |
 
+- **Writes are committed before they are answered**: an LDAP add, modify,
+  modify-DN or delete from a client reaches `private/directory.json` before its
+  response goes back, and the file is replaced atomically (written aside and
+  renamed, `QSaveFile`) rather than truncated and rewritten in place. That is
+  what a DC does, and it is what makes the backups these customers actually run
+  work: a tape or CD-R job that copies the store while the daemon is up sees
+  the change instead of the state at the last `stop()`. `monarchy-dcservice-tests`
+  adds an account over LDAP and reads the store back with the service still
+  running. `DcServiceTest::commitsClientWritesWhileItRuns`
+
 ## 2. Not implemented — not claimed, not stubbed
 
 - **SAMR beyond the calls above**: `SamrSetInformationDomain` beyond classes 1

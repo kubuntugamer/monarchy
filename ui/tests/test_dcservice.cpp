@@ -18,6 +18,7 @@
 #include "Drs.h"
 #include "Ndr.h"
 #include "Provisioner.h"
+#include "ldap_wire_helpers.h"
 
 namespace {
 
@@ -184,6 +185,19 @@ QByteArray replicaDelRequest(const QByteArray &handle, const QString &ncDn,
     return out;
 }
 
+// One LDAP request and the one response it produces. The daemon runs in this
+// thread, so the wait has to return to the event loop (ldapwire::Reader spins
+// it) instead of blocking the socket: a blocking read here would deadlock
+// against the server it is waiting for.
+QByteArray ldapRoundTrip(QTcpSocket &socket, ldapwire::Reader &reader,
+                         const QByteArray &request)
+{
+    if (socket.write(request) != request.size())
+        return QByteArray();
+    socket.flush();
+    return reader.next();
+}
+
 } // namespace
 
 class DcServiceTest : public QObject
@@ -195,6 +209,7 @@ private slots:
     void readsEveryShapeOfForwardersKey();
     void writerAndReaderAgreeOnForwarders();
     void keepsReplicaLinkAsAConnectionObject();
+    void commitsClientWritesWhileItRuns();
 };
 
 // The writer and the reader of `forwarders=` met nowhere in a test before this:
@@ -608,6 +623,73 @@ void DcServiceTest::keepsReplicaLinkAsAConnectionObject()
         QVERIFY2(none, "the daemon did not report that no partner is left after the deletion");
         again.stop();
     }
+}
+
+// A DC persists what a client changed before it answers. This matters to the
+// customers who back up with their own tools: a tape or CD-R job copies
+// private/directory.json while the daemon runs, so a write that lives only in
+// memory is silently missing from the backup. The store is read back here with
+// the service still running, which is exactly what that job sees.
+void DcServiceTest::commitsClientWritesWhileItRuns()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+
+    ProvisionConfig config;
+    config.realm = QStringLiteral("BACKUP.EXAMPLE.ORG");
+    config.netbiosDomain = QStringLiteral("BACKUP");
+    config.adminPassword = QStringLiteral("Secret123!");
+    config.targetDir = dir.path();
+    config.devPorts = true;
+    const ProvisionResult result = provisionDomain(config);
+    QVERIFY2(result.ok, qPrintable(result.error));
+    moveTakenPorts(dir.path());
+
+    DcService service;
+    QVERIFY2(service.start(dir.path()),
+             "the daemon refused to start on a domain it had just provisioned");
+
+    const quint16 ldapPort = declaredPorts(dir.path()).value(QStringLiteral("ldapPort"));
+    QVERIFY2(ldapPort != 0, "dc.conf declares no ldapPort");
+
+    QTcpSocket socket;
+    socket.connectToHost(QHostAddress::LocalHost, ldapPort);
+    QVERIFY2(socket.waitForConnected(5000), "the LDAP port accepted no connection");
+    ldapwire::Reader reader(&socket);
+
+    const QByteArray adminDn = QStringLiteral("CN=Administrator,CN=Users,%1")
+                                   .arg(service.baseDn())
+                                   .toUtf8();
+    const QByteArray bind = ldapRoundTrip(
+        socket, reader, ldapwire::bindRequest(1, adminDn, QByteArrayLiteral("Secret123!")));
+    QVERIFY2(!bind.isEmpty(), "the DC answered no bind");
+    QCOMPARE(ldapwire::resultCode(bind), 0);
+
+    const QString dn = QStringLiteral("CN=TapeCopy,CN=Users,%1").arg(service.baseDn());
+    const QByteArray add = ldapRoundTrip(
+        socket, reader,
+        ldapwire::addRequest(
+                    2, dn.toUtf8(),
+                    {{QByteArrayLiteral("objectClass"),
+                      {QByteArrayLiteral("top"), QByteArrayLiteral("person"),
+                       QByteArrayLiteral("organizationalPerson"), QByteArrayLiteral("user")}},
+                     {QByteArrayLiteral("cn"), {QByteArrayLiteral("TapeCopy")}},
+                     {QByteArrayLiteral("sAMAccountName"), {QByteArrayLiteral("tapecopy")}}}));
+    QVERIFY2(!add.isEmpty(), "the DC answered no add");
+    QCOMPARE(ldapwire::resultCode(add), 0);
+
+    // Read the store the way a backup job does: while this process still runs,
+    // with no stop() in between.
+    QFile store(dir.path() + QStringLiteral("/private/directory.json"));
+    QVERIFY2(store.open(QIODevice::ReadOnly), "the store is not where the provisioner put it");
+    const QByteArray saved = store.readAll();
+    store.close();
+    QVERIFY2(saved.contains("TapeCopy"),
+             "the add was answered but the store a backup would copy does not have the entry");
+    QVERIFY2(saved.contains("tapecopy"),
+             "the account name the client added is missing from the store on disk");
+
+    service.stop();
 }
 
 QTEST_GUILESS_MAIN(DcServiceTest)

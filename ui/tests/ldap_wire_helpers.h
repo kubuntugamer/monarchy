@@ -117,6 +117,21 @@ inline QByteArray modifyRequest(int id, const QByteArray &dn, const QByteArray &
     return ldapMessage(id, char(0x66), inner, controls);
 }
 
+// AddRequest (RFC 4511 §4.7) for one entry, attributes in the order given.
+inline QByteArray addRequest(int id,
+                             const QByteArray &dn,
+                             const QList<QPair<QByteArray, QList<QByteArray>>> &attributes)
+{
+    QByteArray attrs;
+    for (const auto &attribute : attributes) {
+        QByteArray vals;
+        for (const QByteArray &value : attribute.second)
+            vals += tlv(0x04, value);
+        attrs += tlv(0x30, tlv(0x04, attribute.first) + tlv(0x31, vals));
+    }
+    return ldapMessage(id, char(0x68), tlv(0x04, dn) + tlv(0x30, attrs));
+}
+
 inline QByteArray controlsField(const QList<QByteArray> &controls)
 {
     QByteArray inner;

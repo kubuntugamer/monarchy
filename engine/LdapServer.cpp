@@ -12,6 +12,8 @@
 #include "Ntlm.h"
 #include "Ndr.h"
 
+#include <QSaveFile>
+
 #include <QtNetwork/QTcpSocket>
 #include <QtNetwork/QUdpSocket>
 #include <QtNetwork/QHostAddress>
@@ -788,11 +790,22 @@ bool LdapServer::saveToFile(const QString &path) const {
         arr.append(jo);
     }
     QJsonDocument doc(arr);
-    QFile f(path);
+    // QSaveFile writes a temporary and renames it into place, so a copy of the
+    // store taken while a client write lands sees either the whole old file or
+    // the whole new one, never a torn one.
+    QSaveFile f(path);
     if (!f.open(QIODevice::WriteOnly)) return false;
-    f.write(doc.toJson());
-    f.close();
-    return true;
+    if (f.write(doc.toJson()) < 0) {
+        f.cancelWriting();
+        return false;
+    }
+    return f.commit();
+}
+
+void LdapServer::persistNow()
+{
+    if (m_persistHook)
+        m_persistHook();
 }
 
 bool LdapServer::loadFromFile(const QString &path) {
@@ -2899,6 +2912,8 @@ QByteArray LdapServer::handleModify(int msgId, const QByteArray &payload) {
     }
     const int rcode = applyModify(dn, changes);
     emit requestReceived(QStringLiteral("Modify: %1").arg(dn));
+    if (rcode == 0)
+        persistNow();
     return makeLdapResult(msgId, 0x67, rcode);
 }
 
@@ -3017,6 +3032,7 @@ QByteArray LdapServer::handleAdd(int msgId, const QByteArray &payload) {
         addObject(obj);
     }
     emit requestReceived(QStringLiteral("Add: %1").arg(dn));
+    persistNow();
     return makeLdapResult(msgId, 0x69, 0);
 }
 
@@ -3032,6 +3048,8 @@ QByteArray LdapServer::handleDelete(int msgId, const QByteArray &payload) {
     }
     const bool removed = removeObject(dn);
     emit requestReceived(QStringLiteral("Delete: %1").arg(dn));
+    if (removed)
+        persistNow();
     return makeLdapResult(msgId, 0x4b, removed ? 0 : 32); // noSuchObject
 }
 
@@ -3078,6 +3096,7 @@ QByteArray LdapServer::handleModifyDn(int msgId, const QByteArray &payload) {
     ensureRootDse();
 
     emit requestReceived(QStringLiteral("ModifyDN: %1 -> %2").arg(entry, newDn));
+    persistNow();
     return makeLdapResult(msgId, 0x6d, 0);
 }
 
