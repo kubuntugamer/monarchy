@@ -275,6 +275,9 @@ private:
     QByteArray acceptSchannelBind(Client *client, const Verifier &verifier);
     // Verifies one sealed PDU against the channel key and opens its stub.
     bool verifySchannelRequest(Client *client, const Verifier &verifier, QByteArray *stub);
+    // MONARCHY_RPC_TRACE traces every interface; MONARCHY_RPC_TRACE_ONLY=<name>
+    // traces just one, which is what diagnosing a single client needs.
+    bool trace() const;
 
     void handlePdu(Client *client, const QByteArray &pdu);
     QByteArray handleBind(Client *client, const QByteArray &pdu, bool alterContext);

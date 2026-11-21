@@ -427,9 +427,19 @@ void RpcServer::onDisconnected()
     socket->deleteLater();
 }
 
-void RpcServer::handlePdu(Client *client, const QByteArray &pdu)
+bool RpcServer::trace() const
 {
     if (!qEnvironmentVariableIsEmpty("MONARCHY_RPC_TRACE"))
+        return true;
+    // One interface at a time: tracing every RPC on a DC buries the one session
+    // that is being diagnosed under the console's polling.
+    const QString only = qEnvironmentVariable("MONARCHY_RPC_TRACE_ONLY");
+    return !only.isEmpty() && m_interface.name.contains(only, Qt::CaseInsensitive);
+}
+
+void RpcServer::handlePdu(Client *client, const QByteArray &pdu)
+{
+    if (trace())
         qWarning("RPC pdu type=%u size=%d pdu=%s", quint8(pdu.at(2)), int(pdu.size()),
                  pdu.toHex().constData());
     const quint8 type = quint8(pdu.at(2));
@@ -481,7 +491,7 @@ void RpcServer::handlePdu(Client *client, const QByteArray &pdu)
             return;
         }
 
-        if (!qEnvironmentVariableIsEmpty("MONARCHY_RPC_TRACE"))
+        if (trace())
             qWarning("RPC request auth active=%d level=%d verifier=%d token=%d stub=%d",
                      int(client->security.active), int(client->security.level),
                      int(verifier.present), int(verifier.token.size()), int(stub.size()));
@@ -934,6 +944,12 @@ bool RpcServer::verifySchannelRequest(Client *client, const Verifier &verifier, 
     if (!Schannel::open(client->security.schannelFlags, client->security.schannelKey,
                         client->security.schannelSeq, true /* the client is the initiator */,
                         verifier.token, stub)) {
+        if (trace())
+            qWarning("RPC Netlogon signature: flags=0x%x seq=%llu key=%s sig=%s",
+                     client->security.schannelFlags,
+                     static_cast<unsigned long long>(client->security.schannelSeq),
+                     client->security.schannelKey.toHex().constData(),
+                     verifier.token.toHex().constData());
         if (!qEnvironmentVariableIsEmpty("MONARCHY_RPC_TRACE"))
             qWarning("RPC Netlogon signature refused at seq %llu",
                      static_cast<unsigned long long>(client->security.schannelSeq));
