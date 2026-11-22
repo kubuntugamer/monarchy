@@ -564,9 +564,14 @@ QByteArray Session::sessionSetup(const QByteArray &message)
                 m_uid = quint16(QRandomGenerator::system()->generate() | 1);
             m_authenticated = true;
             m_user = context.user;
-            // A Kerberos session signs with the GSS context key, not with NTLM's
-            // MAC, so no NTLM session key is set: signing stays off for it as it
-            // does for an unsigned NTLM session.
+            // The session key of a Kerberos session is the GSS context key, and
+            // SMB1 signs with it exactly as it signs with NTLM's session key:
+            // MD5(key || message). Windows 2000 signs a Kerberos session from
+            // its first message on — answering unsigned made the client drop
+            // the connection right after the IPC$ tree connect, which is where
+            // the domain join dies with "the specified network name is no
+            // longer available".
+            m_sessionKey = context.key.left(16);
             replyToken = Gss::spnegoResponse(0, QString(), context.replyToken);
             status = kStatusSuccess;
             if (m_notifier)
@@ -662,8 +667,10 @@ QByteArray Session::treeConnect(const QByteArray &message)
     data.append(char(0));
     data.append(char(0)); // pad so the Unicode name starts on an even offset
     // The native file system string is empty for IPC$: the Windows 2000 DC
-    // answers that way (seven-byte body). Naming a disk file system on a pipe
-    // share is not what a 2000 client expects to read there.
+    // answers that way (seven-byte body), and naming a disk file system on a
+    // pipe share makes a 2000 client read the tree as a malformed reply — it
+    // closes the connection right after the tree connect, before the first
+    // NT Create AndX for \lsarpc that the join needs.
     if (isIpc) {
         data.append(QByteArray(2, '\0'));
     } else {
