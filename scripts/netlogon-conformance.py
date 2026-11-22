@@ -14,8 +14,9 @@ MS-NRPC has two halves and this script exercises both:
     validated at NETLOGON_VALIDATION_SAM_INFO2; this script checks the returned
     status and the account the validation names. The interactive (1) and
     service (3) classes are driven too: they carry the password's own one-way
-    functions instead of a challenge and its responses, so the same account
-    proves itself without NTLMv2, and a wrong one-way function is refused.
+    functions, RC4-ciphered under the channel's session key rather than a
+    challenge and its responses, so the same account proves itself without
+    NTLMv2, and a wrong one-way function is refused.
 
 A machine account the directory does not hold must be refused with
 STATUS_NO_TRUST_SAM_ACCOUNT, so that path is checked with a name nothing serves.
@@ -536,10 +537,14 @@ def main():
         arm['Identity']['ParameterControl'] = 3
         arm['Identity']['UserName'] = user
         arm['Identity']['Workstation'] = computer
-        # The server stores no LM hash and ignores this half rather than
-        # trusting it; the NT half is what it compares to the account's hash.
-        set_owf(arm, 'LmOwfPassword', b'\x00' * 16)
-        set_owf(arm, 'NtOwfPassword', ntlm.compute_nthash(password))
+        # Neither half travels in the clear: MS-NRPC 3.1.4.4.1 has the client
+        # RC4-cipher each one under the channel's session key, with a fresh
+        # RC4 state per field, so that is what a real client puts here. The
+        # ciphertext is 16 bytes like the plaintext, and ARC4 is the same
+        # construction the server's own sealer runs.
+        set_owf(arm, 'LmOwfPassword', ARC4.new(session_key).encrypt(b'\x00' * 16))
+        set_owf(arm, 'NtOwfPassword',
+                ARC4.new(session_key).encrypt(ntlm.compute_nthash(password)))
         return dce.request(request)
 
     def open_channel(account, password):
