@@ -510,8 +510,9 @@ void BackendTest::connectsWithASavedProfileThatHasNoPassword()
     // longer leaves the console with nothing to browse.
     QCOMPARE(connection.baseDn(), QStringLiteral("DC=corp,DC=example,DC=com"));
 
-    // And a write goes through on that anonymous session instead of failing on a
-    // credential the console does not hold.
+    // A session with no password is Anonymous Logon, and a 2000 DC refuses a
+    // write from one with insufficientAccessRights. The console reports that
+    // refusal rather than writing anonymously, which is what this used to do.
     DirectoryService directory(&connection);
     QSignalSpy errors(&directory, &DirectoryService::error);
     DirectoryObject user;
@@ -523,8 +524,20 @@ void BackendTest::connectsWithASavedProfileThatHasNoPassword()
 
     auto addFuture = directory.addObject(user);
     QTRY_VERIFY_WITH_TIMEOUT(addFuture.isFinished(), 5000);
-    QVERIFY(addFuture.result());
-    QCOMPARE(errors.count(), 0);
+    QVERIFY(!addFuture.result());
+    QVERIFY(errors.count() >= 1);
+
+    // Supplying the password the saved profile never kept is what lets the write
+    // through, on the same directory object.
+    connection.disconnect();
+    profile.password = QString::fromLatin1(kAdministratorPassword);
+    auto reconnectFuture = connection.connect(profile);
+    QTRY_VERIFY_WITH_TIMEOUT(reconnectFuture.isFinished(), 5000);
+    QVERIFY(reconnectFuture.result());
+
+    auto retryFuture = directory.addObject(user);
+    QTRY_VERIFY_WITH_TIMEOUT(retryFuture.isFinished(), 5000);
+    QVERIFY(retryFuture.result());
 }
 
 // A saved profile need not carry a base DN: on a real install dc.conf is not
@@ -583,11 +596,15 @@ void BackendTest::administratorDecidesThePasswordPolicy()
     server.setObjects(objects);
     QVERIFY(giveAdministratorAVerifier(server));
 
+    // The policy is the administrator's to set, and AD will not let an anonymous
+    // session create anything at all, so this binds as one.
     ConnectionService connection;
     ConnectionProfile profile;
     profile.server = QStringLiteral("127.0.0.1");
     profile.port = server.serverPort();
     profile.baseDn = QStringLiteral("DC=corp,DC=example,DC=com");
+    profile.bindDn = QString::fromLatin1(kAdministratorDn);
+    profile.password = QString::fromLatin1(kAdministratorPassword);
 
     auto connectFuture = connection.connect(profile);
     QTRY_VERIFY_WITH_TIMEOUT(connectFuture.isFinished(), 5000);

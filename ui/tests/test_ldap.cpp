@@ -114,6 +114,22 @@ void authenticate(QTcpSocket &client, Reader &reader, const QByteArray &dn, int 
 }
 
 const char kSampleUserDn[] = "CN=Alice Chen,CN=Users,DC=corp,DC=example,DC=com";
+const char kSampleAdministratorDn[] = "CN=Administrator,CN=Users,DC=corp,DC=example,DC=com";
+const char kSamplePlainUserDn[] = "CN=Bob Martinez,CN=Users,DC=corp,DC=example,DC=com";
+
+// AD's user-driven password change: delete the old value, then add the new one,
+// in one Modify. A lone replace is a reset, which needs the Reset Password right.
+QByteArray passwordChangeRequest(int id, const QByteArray &dn, const QByteArray &oldValue,
+                                 const QByteArray &newValue)
+{
+    const QByteArray deleteChange =
+        tlv(0x30, tlv(0x0a, QByteArray(1, 0x01))
+                      + tlv(0x30, tlv(0x04, "unicodePwd") + tlv(0x31, tlv(0x04, oldValue))));
+    const QByteArray addChange =
+        tlv(0x30, tlv(0x0a, QByteArray(1, 0x00))
+                      + tlv(0x30, tlv(0x04, "unicodePwd") + tlv(0x31, tlv(0x04, newValue))));
+    return ldapMessage(id, char(0x66), tlv(0x04, dn) + tlv(0x30, deleteChange + addChange));
+}
 
 // The Windows DC locator's query (MS-ADTS 6.3.1.4.1.1): a baseObject search on
 // the root DSE whose filter asserts DnsDomain and the NtVer capabilities it
@@ -261,6 +277,9 @@ private slots:
     void searchOnMissingBaseIsNoSuchObject();
     void anonymousSearchesOnlyTheRootDse();
     void anonymousReadsTheDirectoryByDefault();
+    void anonymousWritesAreRefused();
+    void aPasswordBoundPlainUserCannotWrite();
+    void anAccountMayChangeItsOwnPassword();
     void simpleBindRecordsTheConnectionIdentity();
     void whoAmIReportsTheBoundIdentity();
     void searchMissingRequiredFieldsIsProtocolError();
@@ -511,7 +530,7 @@ void LdapTest::acceptsPermissiveModifyControl()
     client.connectToHost(QHostAddress::LocalHost, server.serverPort());
     QVERIFY(client.waitForConnected(3000));
     Reader reader(&client);
-    authenticate(client, reader, kSampleUserDn);
+    authenticate(client, reader, QByteArray(kSampleAdministratorDn));
 
     const QByteArray controls =
         controlsField({control("1.2.840.113556.1.4.1413", QByteArray(), true)});
@@ -1027,6 +1046,135 @@ void LdapTest::anonymousReadsTheDirectoryByDefault()
     QVERIFY(!wire.contains("userPassword"));
     QVERIFY(!wire.contains("ntHash"));
     QVERIFY(!wire.contains("unicodePwd"));
+}
+
+// AD answers a write on a connection that never bound with 50: Anonymous Logon
+// holds no write access. Before this was checked, an unauthenticated client
+// could create accounts -- measured against a provisioned DC with ldapadd.
+void LdapTest::anonymousWritesAreRefused()
+{
+    LdapServer server;
+    server.setObjects(sampleObjects());
+    QVERIFY(server.listen(0));
+
+    QTcpSocket client;
+    client.connectToHost(QHostAddress::LocalHost, server.serverPort());
+    QVERIFY(client.waitForConnected(3000));
+    Reader reader(&client);
+
+    const QByteArray dn = "CN=Anon Made,CN=Users,DC=corp,DC=example,DC=com";
+    client.write(addRequest(2, dn,
+                            {{QByteArrayLiteral("objectClass"), {QByteArrayLiteral("user")}},
+                             {QByteArrayLiteral("cn"), {QByteArrayLiteral("Anon Made")}},
+                             {QByteArrayLiteral("sAMAccountName"),
+                              {QByteArrayLiteral("anonmade")}}}));
+    const QByteArray refusal = reader.next();
+    QVERIFY(!refusal.isEmpty());
+    QCOMPARE(operationTag(refusal), 0x69); // addResponse
+    QCOMPARE(resultCode(refusal), 50);     // insufficientAccessRights
+
+    // The refusal is a refusal: nothing was written. An administrator's search
+    // finds no such account.
+    authenticate(client, reader, QByteArray(kSampleAdministratorDn));
+    client.write(equalitySearch(3, "DC=corp,DC=example,DC=com", "sAMAccountName", "anonmade"));
+    int entries = 0;
+    while (true) {
+        const QByteArray message = reader.next();
+        if (message.isEmpty())
+            break;
+        if (operationTag(message) == 0x64)
+            ++entries;
+        if (operationTag(message) == 0x65)
+            break;
+    }
+    QCOMPARE(entries, 0);
+}
+
+// The PAC is not the only identity a write can arrive with: an LDAP tool binds
+// with a password, and then the account's own groups decide. A plain user is
+// refused 50 even on a connection that authenticated.
+void LdapTest::aPasswordBoundPlainUserCannotWrite()
+{
+    LdapServer server;
+    server.setObjects(sampleObjects());
+    QVERIFY(server.listen(0));
+
+    QTcpSocket client;
+    client.connectToHost(QHostAddress::LocalHost, server.serverPort());
+    QVERIFY(client.waitForConnected(3000));
+    Reader reader(&client);
+    authenticate(client, reader, QByteArray(kSamplePlainUserDn));
+
+    client.write(addRequest(2, "CN=Made By Bob,CN=Users,DC=corp,DC=example,DC=com",
+                            {{QByteArrayLiteral("objectClass"), {QByteArrayLiteral("user")}},
+                             {QByteArrayLiteral("cn"), {QByteArrayLiteral("Made By Bob")}},
+                             {QByteArrayLiteral("sAMAccountName"),
+                              {QByteArrayLiteral("madebybob")}}}));
+    const QByteArray refusal = reader.next();
+    QVERIFY(!refusal.isEmpty());
+    QCOMPARE(operationTag(refusal), 0x69);
+    QCOMPARE(resultCode(refusal), 50);
+
+    // A Domain Admin, bound by password rather than Kerberos, may do the same.
+    QTcpSocket admin;
+    admin.connectToHost(QHostAddress::LocalHost, server.serverPort());
+    QVERIFY(admin.waitForConnected(3000));
+    Reader adminReader(&admin);
+    authenticate(admin, adminReader, QByteArray(kSampleAdministratorDn));
+    admin.write(addRequest(3, "CN=Made By Admin,CN=Users,DC=corp,DC=example,DC=com",
+                           {{QByteArrayLiteral("objectClass"), {QByteArrayLiteral("user")}},
+                            {QByteArrayLiteral("cn"), {QByteArrayLiteral("Made By Admin")}},
+                            {QByteArrayLiteral("sAMAccountName"),
+                             {QByteArrayLiteral("madebyadmin")}}}));
+    const QByteArray accepted = adminReader.next();
+    QVERIFY(!accepted.isEmpty());
+    QCOMPARE(operationTag(accepted), 0x69);
+    QCOMPARE(resultCode(accepted), 0);
+}
+
+// AD grants SELF the delete+add of unicodePwd, so an account changes its own
+// password over LDAP without an administrator. That right is the pair and that
+// attribute: any other attribute on the same entry still needs admin rights.
+void LdapTest::anAccountMayChangeItsOwnPassword()
+{
+    LdapServer server;
+    server.setObjects(sampleObjects());
+    QVERIFY(server.listen(0));
+
+    // Give the account a password first, the way provisioning does.
+    LdapServer::ModifyChange setPassword;
+    setPassword.operation = 2;
+    setPassword.type = QStringLiteral("unicodePwd");
+    setPassword.values = QStringList{QStringLiteral("Old-Pass-1234!")};
+    setPassword.rawValue = QByteArray("Old-Pass-1234!");
+    QCOMPARE(server.applyModify(QString::fromLatin1(kSamplePlainUserDn), {setPassword}), 0);
+
+    QTcpSocket client;
+    client.connectToHost(QHostAddress::LocalHost, server.serverPort());
+    QVERIFY(client.waitForConnected(3000));
+    Reader reader(&client);
+    // The account now has a verifier, so the fixture's placeholder password is
+    // refused: bind with the one it was given.
+    client.write(bindRequest(1, kSamplePlainUserDn, QByteArray("Old-Pass-1234!")));
+    const QByteArray bindReply = reader.next();
+    QVERIFY(!bindReply.isEmpty());
+    QCOMPARE(operationTag(bindReply), 0x61);
+    QCOMPARE(resultCode(bindReply), 0);
+
+    client.write(passwordChangeRequest(2, kSamplePlainUserDn, "Old-Pass-1234!",
+                                       "New-Pass-1234!"));
+    const QByteArray changed = reader.next();
+    QVERIFY(!changed.isEmpty());
+    QCOMPARE(operationTag(changed), 0x67); // modifyResponse
+    QCOMPARE(resultCode(changed), 0);
+
+    // The same session, a non-password attribute on its own entry: refused.
+    client.write(modifyRequest(3, kSamplePlainUserDn, "description",
+                               {QByteArray("my own description")}));
+    const QByteArray refused = reader.next();
+    QVERIFY(!refused.isEmpty());
+    QCOMPARE(operationTag(refused), 0x67);
+    QCOMPARE(resultCode(refused), 50);
 }
 
 // A simple bind has to record the connection's identity, or gating reads on it

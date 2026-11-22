@@ -259,8 +259,10 @@ either dialect: a GPO is delivered but not edited over the SMB1 path.
 - **PKINIT** (needs an X.509/CMS path and a CA), **S4U2Self/S4U2Proxy**.
 - **Multi-hop/transitive trusts**, transited-realm encoding beyond one hop, SID
   filtering, selective authentication, trust-password rotation.
-- **PAC read authorization** (writes are authorized from the PAC; reads are not
-  yet), PAC credential/delegation/claims buffers.
+- **Read authorization from the session's identity** (writes now answer to it:
+  the PAC on a Kerberos session, the bound account's groups on a password bind,
+  and nothing for Anonymous Logon, with AD's SELF right on `unicodePwd`), PAC
+  credential/delegation/claims buffers, attribute-level ACLs.
 - GPO CSE processing (the shares are writable, but nothing interprets a
   policy's `GPT.INI`/`registry.pol` the way a client's CSE does), multi-DC
   replication (the

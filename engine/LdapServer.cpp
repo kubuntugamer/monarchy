@@ -2134,15 +2134,20 @@ bool LdapServer::processMessage(ClientState *st, const QByteArray &msg) {
         }
     }
 
-    // Writes over a Kerberos session are authorized from the ticket's PAC.
+    // Writes are authorized from the identity the connection carries: the
+    // PAC on a Kerberos session, the bound account's groups on a password
+    // bind, and nothing at all on a connection that never bound.
     const bool writeOp = opTag == 0x66 || opTag == 0x68 || opTag == 0x4a || opTag == 0x6c;
-    if (writeOp && !allowsWrite(st)) {
+    if (writeOp && !allowsWrite(st, opTag, opContent)) {
         const int responseTag = opTag == 0x66 ? 0x67
                                 : opTag == 0x68 ? 0x69
                                 : opTag == 0x4a ? 0x6b
                                                 : 0x6d;
         const QByteArray denied = makeLdapResult(msgId, responseTag, 50);
-        emit requestReceived(QStringLiteral("Write refused: the PAC has no administrative group"));
+        emit requestReceived(
+            QStringLiteral("Write refused: %1 holds no write access")
+                .arg(st->authenticatedDn.isEmpty() ? QStringLiteral("Anonymous Logon")
+                                                   : st->authenticatedDn));
         if (st->socket) {
             if (saslLayerActive(st))
                 st->socket->write(saslFrame(st, denied));
@@ -2644,13 +2649,96 @@ QByteArray LdapServer::handleGssapiBind(ClientState *st, int msgId,
     return makeBindResponse(msgId, 2);
 }
 
-bool LdapServer::allowsWrite(const ClientState *st) const
+bool LdapServer::allowsWrite(const ClientState *st, int opTag, const QByteArray &payload) const
 {
-    if (!st->gssHasIdentity)
+    if (st->gssHasIdentity) {
+        // 512 Domain Admins, 518 Schema Admins, 519 Enterprise Admins.
+        return st->gssIdentity.isMemberOf(512) || st->gssIdentity.isMemberOf(518)
+               || st->gssIdentity.isMemberOf(519);
+    }
+    // No bind, no identity: Anonymous Logon holds no write access.
+    if (st->authenticatedDn.isEmpty())
+        return false;
+    if (holdsAdministrativeRights(st->authenticatedDn))
         return true;
-    // 512 Domain Admins, 518 Schema Admins, 519 Enterprise Admins.
-    return st->gssIdentity.isMemberOf(512) || st->gssIdentity.isMemberOf(518)
-           || st->gssIdentity.isMemberOf(519);
+    return opTag == 0x66 && changesOwnPassword(st->authenticatedDn, payload);
+}
+
+bool LdapServer::holdsAdministrativeRights(const QString &dn) const
+{
+    // A group's members are DNs in the store AD writes and account names in the
+    // fixture the console ships, so both name the same account.
+    QString accountCn = dn.section(QLatin1Char(','), 0, 0);
+    if (accountCn.startsWith(QStringLiteral("CN="), Qt::CaseInsensitive))
+        accountCn = accountCn.mid(3);
+    for (const DirectoryObject &object : m_objects) {
+        if (object.id.compare(dn, Qt::CaseInsensitive) == 0) {
+            // The built-in Administrator is a Domain Admin in every domain AD
+            // creates, and holds full control on its own.
+            if (Pac::ridOf(object) == 500)
+                return true;
+        }
+        if (object.members.isEmpty())
+            continue;
+        bool lists = false;
+        for (const QString &member : object.members) {
+            if (member.compare(dn, Qt::CaseInsensitive) == 0
+                || (!member.contains(QLatin1Char('='))
+                    && member.compare(accountCn, Qt::CaseInsensitive) == 0)) {
+                lists = true;
+                break;
+            }
+        }
+        if (!lists)
+            continue;
+        // 512 Domain Admins, 516 Domain Controllers, 518 Schema Admins,
+        // 519 Enterprise Admins, 544 BUILTIN\Administrators.
+        const quint32 rid = Pac::ridOf(object);
+        if (rid == 512 || rid == 516 || rid == 518 || rid == 519 || rid == 544)
+            return true;
+    }
+    return false;
+}
+
+bool LdapServer::changesOwnPassword(const QString &dn, const QByteArray &payload) const
+{
+    int pos = 0;
+    const QString target = readString(payload, pos);
+    if (target.compare(dn, Qt::CaseInsensitive) != 0)
+        return false;
+    const int tag = readTag(payload, pos);
+    Q_UNUSED(tag)
+    const int len = readLength(payload, pos);
+    const int end = pos + len;
+    bool deletes = false;
+    bool adds = false;
+    while (pos < end) {
+        const int ctag = readTag(payload, pos);
+        Q_UNUSED(ctag)
+        const int clen = readLength(payload, pos);
+        const int cend = pos + clen;
+        const int operation = readInt(payload, pos);
+        const int mtag = readTag(payload, pos);
+        Q_UNUSED(mtag)
+        const int mlen = readLength(payload, pos);
+        const int mend = pos + mlen;
+        const QString type = readString(payload, pos);
+        // The self right covers the password attribute only; any other
+        // attribute in the same Modify needs administrative rights.
+        if (type.compare(QStringLiteral("unicodePwd"), Qt::CaseInsensitive) != 0)
+            return false;
+        if (operation == 1)
+            deletes = true;
+        else if (operation == 0)
+            adds = true;
+        else
+            return false;
+        pos = mend;
+        pos = cend;
+    }
+    // AD's user-driven change is the pair; a lone replace is a reset, which
+    // needs the Reset Password right this connection does not have.
+    return deletes && adds;
 }
 
 QByteArray LdapServer::gssWrap(ClientState *st, const QByteArray &data, bool conf)

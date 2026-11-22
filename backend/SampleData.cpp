@@ -100,7 +100,7 @@ QList<DirectoryObject> sampleObjects()
 {
     const QStringList domainUsers = {QStringLiteral("Domain Users")};
 
-    return {
+    QList<DirectoryObject> objects = {
         makeUser(QStringLiteral("Administrator"), QString(), QString(),
                  QStringLiteral("Built-in account for administering the domain"),
                  QStringLiteral("IT"), QStringLiteral("555-0100"),
@@ -151,4 +151,25 @@ QList<DirectoryObject> sampleObjects()
                      QStringLiteral("File server"),
                      QStringLiteral("Windows Server 2022"), false),
     };
+
+    // Every AD object carries an objectSid, and rights are decided from it: the
+    // account's own RID and the RID of each group that lists it. The fixture's
+    // domain SID is fixed so a test can name a RID it expects.
+    struct Known { const char *name; int rid; };
+    const Known known[] = {
+        {"Administrator", 500},   {"Guest", 501},           {"Alice Chen", 1105},
+        {"Bob Martinez", 1106},   {"Domain Admins", 512},   {"Domain Users", 513},
+        {"Domain Computers", 515}, {"Enterprise Admins", 519}, {"DC01", 1000},
+        {"WORKSTATION01", 1001},  {"WORKSTATION02", 1002},  {"FILE01", 1003},
+    };
+    for (DirectoryObject &object : objects) {
+        for (const Known &entry : known) {
+            if (object.name != QLatin1String(entry.name))
+                continue;
+            object.attributes.insert(
+                QStringLiteral("objectSid"),
+                QStringLiteral("S-1-5-21-1004336348-1177238915-682003330-%1").arg(entry.rid));
+        }
+    }
+    return objects;
 }

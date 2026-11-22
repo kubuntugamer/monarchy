@@ -350,11 +350,24 @@ private:
     // NetBIOS domain and DC host name published in the NTLM challenge.
     QString ntlmDomainName() const;
     QString ntlmServerName() const;
-    // Writes are authorized from the PAC when the session authenticated with
-    // Kerberos: only Domain Admins (512), Enterprise Admins (519) and Schema
-    // Admins (518) may modify the directory. Sessions that bound with simple or
-    // NTLM credentials keep the pre-ACL behaviour.
-    bool allowsWrite(const ClientState *st) const;
+    // Writes are authorized from whatever identity the connection carries.
+    // Kerberos reads the ticket's PAC: only Domain Admins (512), Enterprise
+    // Admins (519) and Schema Admins (518) may modify the directory. A simple or
+    // NTLM bind has no PAC, so the account's own group memberships decide, and
+    // the built-in Administrator (RID 500) always may. A connection that never
+    // bound is Anonymous Logon and may not write at all -- AD answers 50, and
+    // before this check existed an unauthenticated client could create
+    // accounts. The one exception is AD's SELF right on unicodePwd: an account
+    // may change its own password with a delete followed by an add, which is
+    // the form a Windows client sends, and nothing else on its own entry.
+    bool allowsWrite(const ClientState *st, int opTag, const QByteArray &payload) const;
+    // Whether `dn` is an account AD's default ACLs give write access to: the
+    // built-in Administrator, or a member of Domain Admins, Schema Admins,
+    // Enterprise Admins, BUILTIN\Administrators or Domain Controllers.
+    bool holdsAdministrativeRights(const QString &dn) const;
+    // Whether this Modify is a password change on the bound account's own
+    // entry. `dn` is the account the connection authenticated as.
+    bool changesOwnPassword(const QString &dn, const QByteArray &payload) const;
     QByteArray handleSearch(ClientState *st, int msgId, const QByteArray &payload,
                             const QList<Control> &controls);
     // Controls carried after the protocol op of one LDAPMessage.
