@@ -1940,6 +1940,14 @@ void NetlogonTest::dcLocatorNamesThisDc()
     QVERIFY(ex2Reply.contains(Ndr::utf16le(config.dnsDomain)));
     QVERIFY(ex2Reply.contains(Ndr::utf16le(config.siteName)));
     QCOMPARE(readLe32(ex2Reply, ex2Reply.size() - 4), quint32(0));
+    // server_type sits between the forest_name and dc_site_name referents, and
+    // is the same NBT_SERVER word the CLDAP blob carries: PDC, GC, LDAP, DS,
+    // KDC, closest site and writable — and no TIMESERV, since nothing here
+    // answers time. A client that reads WRITABLE clear treats the DC as
+    // read-only and will not change its machine password against it.
+    const int forestNameReferent = ex2Reply.indexOf(QByteArray::fromHex("04f40200"));
+    QVERIFY(forestNameReferent >= 0);
+    QCOMPARE(readLe32(ex2Reply, forestNameReferent + 4), quint32(0x1bdu));
 }
 
 #include "test_netlogon.moc"

@@ -44,12 +44,26 @@ constexpr quint16 kSecChanDomain = 3;
 constexpr quint16 kSecChanServer = 6;
 constexpr quint16 kSecChanDnsDomain = 11;
 
-// NBT_SERVER_* bits a DC reports to the DC locator (MS-NRPC 2.2.1.4.13).
-constexpr quint32 kNbtServerDs = 0x00000008u;
-constexpr quint32 kNbtServerKdc = 0x00000010u;
-constexpr quint32 kNbtServerTimeserv = 0x00000020u;
-constexpr quint32 kNbtServerWritable = 0x00000040u;
-constexpr quint32 kNbtServerGc = 0x00000200u;
+// NBT_SERVER_* bits a DC reports to the DC locator (MS-NRPC 2.2.1.4.13; the
+// DS_SERVER_* names are the same field under another name). The numbering is
+// the one the CLDAP answer in LdapServer.cpp publishes, which is checked byte
+// for byte against Samba's own ping — these were shifted by one bit and named
+// five of the seven bits this DC really has, so the Ex2 arm told a client it
+// was read-only while claiming a time service. TIMESERV is absent on purpose:
+// there is no NTP server here, so a client asking to be pointed at a time
+// source is told no rather than sent to one that cannot answer.
+constexpr quint32 kNbtServerPdc = 0x00000001u;
+constexpr quint32 kNbtServerGc = 0x00000004u;
+constexpr quint32 kNbtServerLdap = 0x00000008u;
+constexpr quint32 kNbtServerDs = 0x00000010u;
+constexpr quint32 kNbtServerKdc = 0x00000020u;
+constexpr quint32 kNbtServerClosest = 0x00000080u;
+constexpr quint32 kNbtServerWritable = 0x00000100u;
+
+// What this server is, as both locator answers state it. 0x1bd: the word the
+// CLDAP blob carries.
+constexpr quint32 kNbtServerType = kNbtServerPdc | kNbtServerGc | kNbtServerLdap
+    | kNbtServerDs | kNbtServerKdc | kNbtServerClosest | kNbtServerWritable;
 
 // NETLOGON_VALIDATION_* levels (MS-NRPC 2.2.1.5.2).
 constexpr quint16 kValidationSamInfo = 2;
@@ -1869,8 +1883,7 @@ QByteArray NetlogonServer::dsrGetDcNameEx2(const QByteArray &stub)
     fixed.append(domainGuid(m_config.domainSid));
     putLe32(fixed, 0x0002f403u); // domain_name
     putLe32(fixed, 0x0002f404u); // forest_name
-    putLe32(fixed, kNbtServerDs | kNbtServerKdc | kNbtServerTimeserv | kNbtServerWritable
-                       | kNbtServerGc);
+    putLe32(fixed, kNbtServerType);
     putLe32(fixed, 0x0002f405u); // dc_site_name
     putLe32(fixed, 0x0002f406u); // client_site_name
 

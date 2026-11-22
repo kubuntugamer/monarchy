@@ -128,7 +128,7 @@ Status is what the code does, not what the specs allow. **Absent** means no code
 | G30 | partial | SMB 2.0.2/2.1 with signing; no 3.x, so no encryption and no preauth integrity | `engine/Smb2.cpp` |
 | G31 | absent | EDNS DO bit is read; nothing signs, so no DNSSEC | `engine/DnsServer.cpp:741-747` |
 | G32 | absent | No aging or scavenging | — |
-| G33 | partial | The locator advertises `TIMESERV`; no time service and no signed NTP | `engine/Netlogon.cpp` |
+| G33 | partial | Both locator answers report the same `DS_SERVER` word and leave `TIMESERV` clear, because there is no time service and no signed NTP | `engine/Netlogon.cpp`, `engine/LdapServer.cpp` |
 | G34 | partial | Trust objects, secrets, inter-realm keys, direction, SID and the Netlogon trust-channel authentication exist; no forest trust info, no 30-day rollover, no RPC schannel, no SID filtering or selective authentication | `engine/Lsad.cpp`, `engine/Netlogon.cpp` |
 | G35 | absent | No AD LDS | — |
 | G36 | absent | No AD CS | — |
