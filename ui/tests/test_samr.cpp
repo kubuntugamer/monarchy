@@ -808,6 +808,57 @@ void SamrTest::samrDirectoryCalls()
     hours.append(QByteArray(21, char(0xff)));
     QVERIFY(allReply.contains(hours));
 
+    // Classes 1, 2 and 3 are the general, preferences and logon records a
+    // property sheet reads before it opens the aggregate: the three a caller
+    // gets from `rpcclient queryuser`, and the ones this endpoint used to drop
+    // on the floor with a tag of its own choosing. Samba's NDR decoder pulls
+    // all three, so each arm is pinned here by shape.
+    for (int level : {1, 2, 3}) {
+        QByteArray request = userHandle;
+        request.append(char(level));
+        request.append(QByteArray(2, '\0'));
+        const QByteArray reply = server.handleCall(Samr::OpQueryInformationUser2, request);
+        QCOMPARE(lastWord(reply), 0u);
+        QCOMPARE(quint8(reply.at(4)), quint8(level)); // the tag names the class
+        // Class 2 carries the user's comment and no name of any kind.
+        if (level != 2)
+            QVERIFY(utf16Text(reply).contains(QStringLiteral("alice")));
+    }
+
+    // Class 1: five counted strings around the primary group, which falls back
+    // to Domain Users for an account that names none.
+    QByteArray generalRequest = userHandle;
+    generalRequest.append(char(1));
+    generalRequest.append(QByteArray(2, '\0'));
+    const QByteArray generalReply =
+        server.handleCall(Samr::OpQueryInformationUser2, generalRequest);
+    QCOMPARE(generalReply.mid(8 + 16, 4), QByteArray::fromHex("01020000")); // group 513
+
+    // Class 2: the user's comment, then the string AD accepts and never stores
+    // — answered as the NULL pointer, so no characters follow it.
+    QByteArray preferencesRequest = userHandle;
+    preferencesRequest.append(char(2));
+    preferencesRequest.append(QByteArray(2, '\0'));
+    const QByteArray preferencesReply =
+        server.handleCall(Samr::OpQueryInformationUser2, preferencesRequest);
+    QCOMPARE(preferencesReply.mid(8 + 8 + 4, 4), QByteArray::fromHex("00000000"));
+
+    // Class 3: the logon record. Its fixed part is 120 bytes — nine counted
+    // strings, the RID and group, five NTTIMEs, the week's length and pointer,
+    // the two counters and the flags — with the week behind it.
+    QByteArray logonRequest = userHandle;
+    logonRequest.append(char(3));
+    logonRequest.append(QByteArray(2, '\0'));
+    const QByteArray logonReply = server.handleCall(Samr::OpQueryInformationUser2, logonRequest);
+    QVERIFY(logonReply.contains(QByteArray::fromHex("e9030000"))); // RID 1001
+    QVERIFY(logonReply.size() > 8 + 120 + 4);                       // arm, then buffers
+    QByteArray week;
+    week.append(QByteArray::fromHex("ec040000")); // 1260
+    week.append(QByteArray::fromHex("00000000")); // offset
+    week.append(QByteArray::fromHex("15000000")); // 21
+    week.append(QByteArray(21, char(0xff)));
+    QVERIFY(logonReply.contains(week));
+
     // A class this server does not implement is refused, not faked.
     QByteArray otherClass = userHandle;
     otherClass.append(char(23)); // SamrUserInternal4Information

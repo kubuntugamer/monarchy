@@ -1839,6 +1839,126 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
                 putLe32(fixed, kStatusSuccess);
                 return fixed;
             }
+            // Classes 1, 2 and 3 are the general, preferences and logon
+            // records: what a property sheet reads before it opens the
+            // aggregate, and what `rpcclient queryuser 1` asks for. Each arm is
+            // a structure of counted strings, so every character buffer is
+            // deferred behind the fixed part in field order; the numbering is
+            // Samba's samr.idl, which is the order clients on this wire use.
+            if (infoClass == 1 || infoClass == 2 || infoClass == 3) {
+                QString account = object.attributes.value(QStringLiteral("sAMAccountName"));
+                if (account.isEmpty())
+                    account = object.name;
+                QString fullName = object.attributes.value(QStringLiteral("displayName"));
+                if (fullName.isEmpty())
+                    fullName = object.name;
+                quint32 primaryGroup =
+                    object.attributes.value(QStringLiteral("primaryGroupID")).toUInt();
+                if (primaryGroup == 0)
+                    primaryGroup = 513; // Domain Users
+
+                putLe32(fixed, 0x0002ea00u); // union referent
+                fixed.append(char(infoClass));
+                fixed.append(char(0));
+                fixed.append(char(0));
+                fixed.append(char(0));
+
+                QByteArray arm;
+                QByteArray armDeferred;
+                quint32 referent = 0x0002ea10u;
+                if (infoClass == 1) {
+                    // samr_UserInfo1: the two names, the primary group, the
+                    // administrator's comment and the user's own.
+                    appendCountedString(arm, armDeferred, account, referent++);
+                    appendCountedString(arm, armDeferred, fullName, referent++);
+                    putLe32(arm, primaryGroup);
+                    appendCountedString(arm, armDeferred,
+                                        object.attributes.value(QStringLiteral("description")),
+                                        referent++);
+                    appendCountedString(arm, armDeferred,
+                                        object.attributes.value(QStringLiteral("comment")),
+                                        referent++);
+                } else if (infoClass == 2) {
+                    // samr_UserInfo2: the user's comment, a reserved string AD
+                    // accepts and never stores, and the two locale numbers.
+                    appendCountedString(arm, armDeferred,
+                                        object.attributes.value(QStringLiteral("comment")),
+                                        referent++);
+                    appendCountedString(arm, armDeferred, QString(), 0);
+                    putLe16(arm, quint16(
+                                     object.attributes.value(QStringLiteral("countryCode"))
+                                         .toUInt()));
+                    putLe16(arm, quint16(object.attributes.value(QStringLiteral("codePage"))
+                                             .toUInt()));
+                } else {
+                    // samr_UserInfo3: the whole logon record — the account's
+                    // identity, its home and profile paths, the five instants a
+                    // logon screen and a `net user` listing show, the week, and
+                    // the counters SamLogon keeps.
+                    const quint64 pwdLastSet =
+                        object.attributes.value(QStringLiteral("pwdLastSet")).toULongLong();
+                    const quint32 accountControl =
+                        object.attributes.value(QStringLiteral("userAccountControl")).toUInt();
+                    const LdapServer::PasswordPolicy policy =
+                        LdapServer::passwordPolicyFrom(domainObject());
+                    appendCountedString(arm, armDeferred, account, referent++);
+                    appendCountedString(arm, armDeferred, fullName, referent++);
+                    putLe32(arm, ridOf(object));
+                    putLe32(arm, primaryGroup);
+                    appendCountedString(arm, armDeferred,
+                                        object.attributes.value(QStringLiteral("homeDirectory")),
+                                        referent++);
+                    appendCountedString(arm, armDeferred,
+                                        object.attributes.value(QStringLiteral("homeDrive")),
+                                        referent++);
+                    appendCountedString(arm, armDeferred,
+                                        object.attributes.value(QStringLiteral("scriptPath")),
+                                        referent++);
+                    appendCountedString(arm, armDeferred,
+                                        object.attributes.value(QStringLiteral("profilePath")),
+                                        referent++);
+                    appendCountedString(arm, armDeferred,
+                                        object.attributes.value(QStringLiteral("userWorkstations")),
+                                        referent++);
+                    // lastLogon is per-DC NTTIME as stored; the password
+                    // instants are the domain policy's window around
+                    // pwdLastSet, the same three the aggregate reports.
+                    putLe64(arm, object.attributes.value(QStringLiteral("lastLogon")).toULongLong());
+                    putLe64(arm,
+                            object.attributes.value(QStringLiteral("lastLogoff")).toULongLong());
+                    putLe64(arm, pwdLastSet == 0 ? 0 : ntTimeFromUnix(pwdLastSet));
+                    putLe64(arm, ntTimeFromDelta(pwdLastSet, accountControl, policy.minAge));
+                    putLe64(arm, ntTimeFromDelta(pwdLastSet, accountControl, policy.maxAge));
+                    const QByteArray hours = logonHoursForWire(QByteArray::fromHex(
+                        object.attributes.value(QStringLiteral("logonHours")).toLatin1()));
+                    putLe16(arm, quint16(hours.size() * 8));
+                    arm.append(QByteArray(2, '\0'));
+                    putLe32(arm, referent++);
+                    putLe16(arm, quint16(
+                                     object.attributes.value(QStringLiteral("badPwdCount"))
+                                         .toUInt()));
+                    putLe16(arm, quint16(
+                                     object.attributes.value(QStringLiteral("logonCount"))
+                                         .toUInt()));
+                    putLe32(arm, accountControl);
+                    // The week is the last deferred buffer: maximum count 1260
+                    // from the IDL, offset zero, one octet per hour.
+                    putLe32(armDeferred, 1260);
+                    putLe32(armDeferred, 0);
+                    putLe32(armDeferred, quint32(hours.size()));
+                    armDeferred.append(hours);
+                    while (armDeferred.size() % 4 != 0)
+                        armDeferred.append('\0');
+                }
+
+                fixed.append(arm);
+                fixed.append(armDeferred);
+                putLe32(fixed, kStatusSuccess);
+                emit requestReceived(QStringLiteral("QueryInformationUser2(%1, class %2)")
+                                         .arg(user.dn)
+                                         .arg(infoClass));
+                return fixed;
+            }
             // Class 8 = SamrUserFullNameInformation: one inline
             // RPC_UNICODE_STRING whose characters are deferred behind the arm.
             if (infoClass == 8) {
