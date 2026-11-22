@@ -1845,7 +1845,7 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
             // a structure of counted strings, so every character buffer is
             // deferred behind the fixed part in field order; the numbering is
             // Samba's samr.idl, which is the order clients on this wire use.
-            if (infoClass == 1 || infoClass == 2 || infoClass == 3) {
+            if (infoClass == 1 || infoClass == 2 || infoClass == 3 || infoClass == 5) {
                 QString account = object.attributes.value(QStringLiteral("sAMAccountName"));
                 if (account.isEmpty())
                     account = object.name;
@@ -1890,6 +1890,66 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
                                          .toUInt()));
                     putLe16(arm, quint16(object.attributes.value(QStringLiteral("codePage"))
                                              .toUInt()));
+                } else if (infoClass == 5) {
+                    // samr_UserInfo5: the logon record's predecessor. The same
+                    // identity, home and workstations fields and the same week
+                    // and counters, but the password instants collapse to
+                    // last_password_change and one expiry, so the arm is laid
+                    // out in that order rather than class 3's.
+                    const quint32 accountControl =
+                        object.attributes.value(QStringLiteral("userAccountControl")).toUInt();
+                    appendCountedString(arm, armDeferred, account, referent++);
+                    appendCountedString(arm, armDeferred, fullName, referent++);
+                    putLe32(arm, ridOf(object));
+                    putLe32(arm, primaryGroup);
+                    appendCountedString(arm, armDeferred,
+                                        object.attributes.value(QStringLiteral("homeDirectory")),
+                                        referent++);
+                    appendCountedString(arm, armDeferred,
+                                        object.attributes.value(QStringLiteral("homeDrive")),
+                                        referent++);
+                    appendCountedString(arm, armDeferred,
+                                        object.attributes.value(QStringLiteral("scriptPath")),
+                                        referent++);
+                    appendCountedString(arm, armDeferred,
+                                        object.attributes.value(QStringLiteral("profilePath")),
+                                        referent++);
+                    appendCountedString(arm, armDeferred,
+                                        object.attributes.value(QStringLiteral("description")),
+                                        referent++);
+                    appendCountedString(arm, armDeferred,
+                                        object.attributes.value(QStringLiteral("userWorkstations")),
+                                        referent++);
+                    putLe64(arm, object.attributes.value(QStringLiteral("lastLogon")).toULongLong());
+                    putLe64(arm,
+                            object.attributes.value(QStringLiteral("lastLogoff")).toULongLong());
+                    const QByteArray hours = logonHoursForWire(QByteArray::fromHex(
+                        object.attributes.value(QStringLiteral("logonHours")).toLatin1()));
+                    putLe16(arm, quint16(hours.size() * 8));
+                    arm.append(QByteArray(2, '\0'));
+                    putLe32(arm, referent++);
+                    putLe16(arm, quint16(
+                                     object.attributes.value(QStringLiteral("badPwdCount"))
+                                         .toUInt()));
+                    putLe16(arm, quint16(
+                                     object.attributes.value(QStringLiteral("logonCount"))
+                                         .toUInt()));
+                    // No alignment gap before the instants: these legacy
+                    // records carry OLD_LARGE_INTEGER, two ULONGs, so they sit
+                    // on a four-byte boundary and a pad here desynchronises the
+                    // deferred buffers of every client that reads them.
+                    const quint64 pwdLastSet =
+                        object.attributes.value(QStringLiteral("pwdLastSet")).toULongLong();
+                    putLe64(arm, pwdLastSet == 0 ? 0 : ntTimeFromUnix(pwdLastSet));
+                    putLe64(arm,
+                            object.attributes.value(QStringLiteral("accountExpires")).toULongLong());
+                    putLe32(arm, accountControl);
+                    putLe32(armDeferred, 1260);
+                    putLe32(armDeferred, 0);
+                    putLe32(armDeferred, quint32(hours.size()));
+                    armDeferred.append(hours);
+                    while (armDeferred.size() % 4 != 0)
+                        armDeferred.append('\0');
                 } else {
                     // samr_UserInfo3: the whole logon record — the account's
                     // identity, its home and profile paths, the five instants a
@@ -1953,6 +2013,67 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
 
                 fixed.append(arm);
                 fixed.append(armDeferred);
+                putLe32(fixed, kStatusSuccess);
+                emit requestReceived(QStringLiteral("QueryInformationUser2(%1, class %2)")
+                                         .arg(user.dn)
+                                         .arg(infoClass));
+                return fixed;
+            }
+            // Classes 7, 9, 10, 11, 12, 13, 14, 17 and 20 are the single-field
+            // records a property sheet edits one at a time: the account name,
+            // the primary group, the home path, the logon script, the profile
+            // path, the administrator's comment, the workstations list, the
+            // expiry instant and the user parameters blob. Each arm is one
+            // counted string, two for the home path, or one ULONG or NTTIME, so
+            // they are answered from the attributes the general record reads.
+            if (infoClass == 7 || infoClass == 9 || infoClass == 10 || infoClass == 11
+                || infoClass == 12 || infoClass == 13 || infoClass == 14 || infoClass == 17
+                || infoClass == 20) {
+                const auto attribute = [&object](const char *name) {
+                    return object.attributes.value(QLatin1String(name));
+                };
+                putLe32(fixed, 0x0002eb00u); // union referent
+                fixed.append(char(infoClass));
+                fixed.append(char(0));
+                fixed.append(char(0));
+                fixed.append(char(0));
+                if (infoClass == 9) {
+                    quint32 primaryGroup =
+                        object.attributes.value(QStringLiteral("primaryGroupID")).toUInt();
+                    if (primaryGroup == 0)
+                        primaryGroup = 513; // Domain Users
+                    putLe32(fixed, primaryGroup);
+                } else if (infoClass == 17) {
+                    // accountExpires is already an NTTIME, and zero is the
+                    // value AD keeps for an account that never expires.
+                    putLe64(fixed,
+                            object.attributes.value(QStringLiteral("accountExpires"))
+                                .toULongLong());
+                } else {
+                    QByteArray arm;
+                    QByteArray armDeferred;
+                    quint32 referent = 0x0002eb10u;
+                    if (infoClass == 7) {
+                        QString account =
+                            object.attributes.value(QStringLiteral("sAMAccountName"));
+                        if (account.isEmpty())
+                            account = object.name;
+                        appendCountedString(arm, armDeferred, account, referent++);
+                    } else if (infoClass == 10) {
+                        appendCountedString(arm, armDeferred, attribute("homeDirectory"),
+                                            referent++);
+                        appendCountedString(arm, armDeferred, attribute("homeDrive"), referent++);
+                    } else {
+                        const char *name = infoClass == 11   ? "scriptPath"
+                                           : infoClass == 12 ? "profilePath"
+                                           : infoClass == 13 ? "description"
+                                           : infoClass == 14 ? "userWorkstations"
+                                                             : "userParameters";
+                        appendCountedString(arm, armDeferred, attribute(name), referent++);
+                    }
+                    fixed.append(arm);
+                    fixed.append(armDeferred);
+                }
                 putLe32(fixed, kStatusSuccess);
                 emit requestReceived(QStringLiteral("QueryInformationUser2(%1, class %2)")
                                          .arg(user.dn)

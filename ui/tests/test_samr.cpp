@@ -808,22 +808,72 @@ void SamrTest::samrDirectoryCalls()
     hours.append(QByteArray(21, char(0xff)));
     QVERIFY(allReply.contains(hours));
 
-    // Classes 1, 2 and 3 are the general, preferences and logon records a
-    // property sheet reads before it opens the aggregate: the three a caller
-    // gets from `rpcclient queryuser`, and the ones this endpoint used to drop
+    // The per-field records a property sheet reads before it opens the
+    // aggregate, and the ones `rpcclient queryuser` asks for by number: the
+    // general, preferences and logon records, the logon record's predecessor,
+    // and the single-field arms. This endpoint used to drop every one of them
     // on the floor with a tag of its own choosing. Samba's NDR decoder pulls
-    // all three, so each arm is pinned here by shape.
-    for (int level : {1, 2, 3}) {
+    // all of them, so each arm is pinned here by shape.
+    for (int level : {1, 2, 3, 5, 7, 9, 10, 11, 12, 13, 14, 17, 20}) {
         QByteArray request = userHandle;
         request.append(char(level));
         request.append(QByteArray(2, '\0'));
         const QByteArray reply = server.handleCall(Samr::OpQueryInformationUser2, request);
         QCOMPARE(lastWord(reply), 0u);
         QCOMPARE(quint8(reply.at(4)), quint8(level)); // the tag names the class
-        // Class 2 carries the user's comment and no name of any kind.
-        if (level != 2)
+        // Only the classes that carry a name of some kind report the account's.
+        if (level == 1 || level == 3 || level == 5 || level == 7)
             QVERIFY(utf16Text(reply).contains(QStringLiteral("alice")));
     }
+
+    // Class 5 is the logon record's predecessor: two names, the RID and group,
+    // six more strings, two instants, the week's length and pointer, the two
+    // counters, then the two password instants and the flags. Its 120-byte arm
+    // has no padding inside it, because those legacy records carry
+    // OLD_LARGE_INTEGER (two ULONGs, four-byte aligned) rather than a hyper;
+    // Samba's decoder rejects the reply if a pad is inserted there.
+    QByteArray predecessorRequest = userHandle;
+    predecessorRequest.append(char(5));
+    predecessorRequest.append(QByteArray(2, '\0'));
+    const QByteArray predecessorReply =
+        server.handleCall(Samr::OpQueryInformationUser2, predecessorRequest);
+    QVERIFY(predecessorReply.contains(QByteArray::fromHex("e9030000"))); // RID 1001
+    QVERIFY(predecessorReply.size() > 8 + 120 + 4); // arm, then the week
+    QByteArray predecessorWeek;
+    predecessorWeek.append(QByteArray::fromHex("ec040000")); // 1260
+    predecessorWeek.append(QByteArray::fromHex("00000000")); // offset
+    predecessorWeek.append(QByteArray::fromHex("15000000")); // 21
+    predecessorWeek.append(QByteArray(21, char(0xff)));
+    QVERIFY(predecessorReply.contains(predecessorWeek));
+
+    // Class 9 is the primary group on its own, with the same Domain Users
+    // fallback the general record applies.
+    QByteArray groupRequest = userHandle;
+    groupRequest.append(char(9));
+    groupRequest.append(QByteArray(2, '\0'));
+    const QByteArray groupReply = server.handleCall(Samr::OpQueryInformationUser2, groupRequest);
+    QCOMPARE(groupReply.size(), 16);
+    QCOMPARE(groupReply.mid(8, 4), QByteArray::fromHex("01020000")); // group 513
+
+    // Class 17 is accountExpires as a bare NTTIME, and zero is the value AD
+    // keeps for an account that never expires.
+    QByteArray expiryRequest = userHandle;
+    expiryRequest.append(char(17));
+    expiryRequest.append(QByteArray(2, '\0'));
+    const QByteArray expiryReply =
+        server.handleCall(Samr::OpQueryInformationUser2, expiryRequest);
+    QCOMPARE(expiryReply.size(), 20);
+    QCOMPARE(expiryReply.mid(8, 8), QByteArray(8, '\0'));
+
+    // Class 20 is userParameters, unset on this account, so it is answered as
+    // the NULL pointer: the lengths are zero and no characters follow.
+    QByteArray parametersRequest = userHandle;
+    parametersRequest.append(char(20));
+    parametersRequest.append(QByteArray(2, '\0'));
+    const QByteArray parametersReply =
+        server.handleCall(Samr::OpQueryInformationUser2, parametersRequest);
+    QCOMPARE(parametersReply.size(), 20);
+    QCOMPARE(parametersReply.mid(8, 8), QByteArray(8, '\0'));
 
     // Class 1: five counted strings around the primary group, which falls back
     // to Domain Users for an account that names none.
