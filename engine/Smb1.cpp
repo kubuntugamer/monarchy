@@ -651,13 +651,25 @@ QByteArray Session::treeConnect(const QByteArray &message)
     words.append(char(0));
     putLe16(words, 0);
     putLe16(words, 0x0001); // OptionalSupport: SMB_SUPPORT_SEARCH_BITS
+    // MS-CIFS 2.2.4.55.2: an NT client gets the seven-word form, which adds the
+    // two maximal access masks. Measured against a Windows 2000 DC: it answers
+    // 0x1ff for both, for IPC$ as well as for a disk share.
+    putLe32(words, 0x000001ffu); // MaximalShareAccessRights
+    putLe32(words, 0x000001ffu); // GuestMaximalShareAccessRights
 
     // Service: "IPC" for the pipe share, "A:" for a disk share.
     QByteArray data = isIpc ? QByteArray("IPC", 3) : QByteArray("A:", 2);
     data.append(char(0));
     data.append(char(0)); // pad so the Unicode name starts on an even offset
-    data.append(toUtf16Bytes(QStringLiteral("NTFS")));
-    data.append(QByteArray(2, '\0'));
+    // The native file system string is empty for IPC$: the Windows 2000 DC
+    // answers that way (seven-byte body). Naming a disk file system on a pipe
+    // share is not what a 2000 client expects to read there.
+    if (isIpc) {
+        data.append(QByteArray(2, '\0'));
+    } else {
+        data.append(toUtf16Bytes(QStringLiteral("NTFS")));
+        data.append(QByteArray(2, '\0'));
+    }
     // The TID is assigned here and has to be in the header the signature covers.
     return reply(message, kStatusSuccess, words, data, -1, tid);
 }
