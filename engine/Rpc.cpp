@@ -498,22 +498,22 @@ void RpcServer::handlePdu(Client *client, const QByteArray &pdu)
 
         // An authenticated session must carry a verifier on every call: the
         // signature covers the PDU with its own field excluded (MS-RPCE §2.2.3.4,
-        // with the NTLMSSP rules of MS-NLMP §3.4.5.2).
+        // with the NTLMSSP rules of MS-NLMP §3.4.5.2). Connect level (DCE
+        // RPC_C_AUTHN_LEVEL_CONNECT, 2) is the exception: the bind authenticated
+        // the connection and later PDUs carry nothing, which is what NTLM clients
+        // that complete at connect level send. Kerberos keeps its own rule below.
         if (client->security.active && !client->security.transportOnly) {
-            if (!verifier.present && client->security.kerberos) {
-                // A Kerberos context at connect level authenticates the bind
-                // only; above that every call carries a token.
-                if (client->security.level >= 2) {
-                    if (client->canWrite())
-                        client->write(faultPdu(callId, FaultProtoError));
-                    return;
-                }
-            } else if (!verifier.present) {
+            const bool perPduRequired =
+                client->security.kerberos ? client->security.level >= 2
+                                          : client->security.level > 2;
+            if (!verifier.present && perPduRequired) {
                 if (client->canWrite())
                     client->write(faultPdu(callId, FaultProtoError));
                 return;
             }
-            if (client->security.schannel) {
+            if (!verifier.present) {
+                // Connect level: nothing to verify and nothing to unpad.
+            } else if (client->security.schannel) {
                 if (!verifySchannelRequest(client, verifier, &stub)) {
                     emit requestReceived(
                         QStringLiteral("%1 refused: bad Netlogon signature").arg(m_interface.name));
@@ -1101,7 +1101,14 @@ bool RpcServer::verifyAuthenticate(Client *client, const QByteArray &ntlmsspToke
 
     client->security.keys = keys;
     client->security.user = authenticate.user;
-    client->security.level = qMax(client->security.level, level);
+    // The level the AUTH3 declares is the one the session runs at. The bind's
+    // sec_trailer carries the level the client asked for when it still had no
+    // context to use, and a client need not keep that: impacket asks for
+    // PKT_PRIVACY at the bind and then completes at connect level, because
+    // set_credentials() resets its level before the AUTHENTICATE is built.
+    // Keeping the higher level would demand a verifier on calls it sends
+    // unverified by design.
+    client->security.level = level;
     client->security.privacy = client->security.level >= 6;
     client->security.active = true;
     if (client->security.privacy) {
