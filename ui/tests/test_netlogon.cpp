@@ -248,7 +248,8 @@ void appendNetworkLogon(QByteArray &out, quint16 validationLevel, const QByteArr
 // 16-byte one-way functions of the password itself, in place, so this arm ends
 // where netr_NetworkInfo's challenge and response headers begin. The interactive
 // (1) and service (3) classes marshal it.
-void appendPasswordLogon(QByteArray &out, quint16 validationLevel, const QByteArray &ntOwf,
+void appendPasswordLogon(QByteArray &out, quint16 validationLevel, const QByteArray &ntHash,
+                         const QByteArray &sessionKey,
                          const QString &workstation = QStringLiteral("CLIENT1"))
 {
     while (out.size() % 4 != 0) out.append(char(0));
@@ -264,8 +265,11 @@ void appendPasswordLogon(QByteArray &out, quint16 validationLevel, const QByteAr
     appendLe16(out, workstationBytes); appendLe16(out, workstationBytes);
     appendLe32(out, 0x00020003u);
 
-    out.append(QByteArray(16, '\0')); // lmpassword: ignored, no LM hash is stored
-    out.append(ntOwf);
+    // Both halves travel RC4-ciphered under the channel's session key, as a
+    // real client sends them; the LM half is deciphered and then ignored
+    // because no LM hash is stored.
+    out.append(Ntlm::Sealer(sessionKey).apply(QByteArray(16, '\0')));
+    out.append(Ntlm::Sealer(sessionKey).apply(ntHash));
 
     appendDeferredString(out, QStringLiteral("CORP"));
     appendDeferredString(out, QStringLiteral("alice"));
@@ -357,6 +361,14 @@ ChannelFixture openChannel(NetlogonServer &server, const QByteArray &machineHash
     out.seed = expectedCredential(clientChallenge, out.sessionKey, flags);
     out.ok = true;
     return out;
+}
+
+// The status a SamLogon answer carries: the last word of the frame, because
+// validation_level, the netr_Validation union and the authoritative byte all
+// precede it. A bare status is not a frame a client can unmarshal.
+quint32 samLogonStatus(const QByteArray &reply)
+{
+    return reply.size() >= 4 ? readLe32(reply, reply.size() - 4) : 0u;
 }
 
 // A SamLogon the way the logon-hours case builds it: the caller's channel
@@ -699,9 +711,9 @@ void NetlogonTest::refusesALogonOutsideLogonHours()
 
     const QByteArray reply = server.handleCall(Netlogon::OpLogonSamLogon, request);
     // The credentials were right, so the answer is the hour restriction rather
-    // than a wrong-password status.
-    QCOMPARE(reply.size(), 4);
-    QCOMPARE(readLe32(reply, 0), quint32(0xc000006eu));
+    // than a wrong-password status, and it still arrives as the whole frame.
+    QVERIFY(reply.size() > 4);
+    QCOMPARE(samLogonStatus(reply), quint32(0xc000006eu));
     QVERIFY(!wroteBack);
 }
 
@@ -764,12 +776,12 @@ void NetlogonTest::countsRefusedPasswords()
             samLogonRequest(QStringLiteral("CLIENT"), credential, timestamp, ntResponse));
     };
 
-    QCOMPARE(readLe32(wrongPassword(), 0), quint32(0xc000006au)); // STATUS_WRONG_PASSWORD
+    QCOMPARE(samLogonStatus(wrongPassword()), quint32(0xc000006au)); // STATUS_WRONG_PASSWORD
     QCOMPARE(writes.size(), 1);
     QCOMPARE(writes.last().value(QStringLiteral("badPwdCount")), QStringLiteral("1"));
     QVERIFY(writes.last().value(QStringLiteral("badPasswordTime")).toLongLong() > 0);
 
-    QCOMPARE(readLe32(wrongPassword(), 0), quint32(0xc000006au));
+    QCOMPARE(samLogonStatus(wrongPassword()), quint32(0xc000006au));
     QCOMPARE(writes.last().value(QStringLiteral("badPwdCount")), QStringLiteral("2"));
 
     ChannelFixture channel = openChannel(server, machineHash);
@@ -860,17 +872,17 @@ void NetlogonTest::locksTheAccountAfterTheThreshold()
     };
     const QByteArray wrongHash = Ntlm::ntowfV1(QStringLiteral("Not!ThePassword9"));
 
-    QCOMPARE(readLe32(attempt(wrongHash), 0), quint32(0xc000006au));
+    QCOMPARE(samLogonStatus(attempt(wrongHash)), quint32(0xc000006au));
     // Below the threshold nothing is locked, so the account's own lockoutTime
     // is still what it was.
     QVERIFY(!stored.contains(QStringLiteral("lockoutTime")));
-    QCOMPARE(readLe32(attempt(wrongHash), 0), quint32(0xc000006au));
+    QCOMPARE(samLogonStatus(attempt(wrongHash)), quint32(0xc000006au));
     const quint64 lockedAt = stored.value(QStringLiteral("lockoutTime")).toULongLong();
     QVERIFY(lockedAt > 0);
 
     // The right password is refused while the lockout stands, and the attempt
     // does not count as another bad password.
-    QCOMPARE(readLe32(attempt(userHash), 0), quint32(0xc0000234u));
+    QCOMPARE(samLogonStatus(attempt(userHash)), quint32(0xc0000234u));
     QCOMPARE(stored.value(QStringLiteral("lockoutTime")).toULongLong(), lockedAt);
     QCOMPARE(stored.value(QStringLiteral("badPwdCount")), QStringLiteral("2"));
 
@@ -903,8 +915,8 @@ void NetlogonTest::refusesALogonFromAnotherWorkstation()
         Netlogon::OpLogonSamLogon,
         samLogonRequest(QStringLiteral("CLIENT"), credential, timestamp, ntResponse));
 
-    QCOMPARE(reply.size(), 4);
-    QCOMPARE(readLe32(reply, 0), quint32(0xc0000070u));
+    QVERIFY(reply.size() > 4);
+    QCOMPARE(samLogonStatus(reply), quint32(0xc0000070u));
     QVERIFY(!logon.wroteBack);
 }
 
@@ -959,8 +971,8 @@ void NetlogonTest::refusesAnExpiredPassword()
         Netlogon::OpLogonSamLogon,
         samLogonRequest(QStringLiteral("WS1"), credential, timestamp, ntResponse));
 
-    QCOMPARE(reply.size(), 4);
-    QCOMPARE(readLe32(reply, 0), quint32(0xc0000071u)); // STATUS_PASSWORD_EXPIRED
+    QVERIFY(reply.size() > 4);
+    QCOMPARE(samLogonStatus(reply), quint32(0xc0000071u)); // STATUS_PASSWORD_EXPIRED
     QVERIFY(!logon.wroteBack);
 }
 
@@ -982,8 +994,8 @@ void NetlogonTest::refusesAPasswordThatMustChange()
         Netlogon::OpLogonSamLogon,
         samLogonRequest(QStringLiteral("WS1"), credential, timestamp, ntResponse));
 
-    QCOMPARE(reply.size(), 4);
-    QCOMPARE(readLe32(reply, 0), quint32(0xc0000224u)); // STATUS_PASSWORD_MUST_CHANGE
+    QVERIFY(reply.size() > 4);
+    QCOMPARE(samLogonStatus(reply), quint32(0xc0000224u)); // STATUS_PASSWORD_MUST_CHANGE
     QVERIFY(!logon.wroteBack);
 }
 
@@ -1056,12 +1068,12 @@ void NetlogonTest::interactiveAndServiceLogonClasses()
     appendLe16(request, logonLevel); // LogonLevel: the class, not the validation
     appendLe16(request, logonLevel); // NETLOGON_LEVEL's NDR32 union discriminator
     appendLe32(request, 0x00021003u); // LogonInteractive/Service referent
-    appendPasswordLogon(request, 3, owf, QStringLiteral("WS1"));
+    appendPasswordLogon(request, 3, owf, logon.channel.sessionKey, QStringLiteral("WS1"));
 
     const QByteArray reply = logon.server.handleCall(Netlogon::OpLogonSamLogon, request);
     if (!correctPassword) {
-        QCOMPARE(reply.size(), 4);
-        QCOMPARE(readLe32(reply, 0), quint32(0xc000006au)); // STATUS_WRONG_PASSWORD
+        QVERIFY(reply.size() > 4);
+        QCOMPARE(samLogonStatus(reply), quint32(0xc000006au)); // STATUS_WRONG_PASSWORD
         // A refused password is a counted failure, but not a logon.
         QCOMPARE(logon.writtenAttributes.value(QStringLiteral("badPwdCount")), QStringLiteral("1"));
         QVERIFY(!logon.writtenAttributes.contains(QStringLiteral("logonCount")));
@@ -1805,7 +1817,7 @@ void NetlogonTest::networkSamLogonHonoursNtlmv1Policy()
 
     // Each attempt needs its own channel: a SamLogon spends the authenticator
     // it was sent with, whatever the answer turns out to be.
-    const auto attempt = [&](int lmCompatibilityLevel) -> quint32 {
+    const auto attempt = [&](int lmCompatibilityLevel) -> QByteArray {
         NetlogonServer server;
         Netlogon::Config config;
         config.netbios = QStringLiteral("CORP");
@@ -1880,15 +1892,17 @@ void NetlogonTest::networkSamLogonHonoursNtlmv1Policy()
         appendNetworkLogon(request, 3, v1Response, 0, QStringLiteral("CLIENT"),
                            QByteArray(24, '\0'), QByteArray::fromHex("0123456789abcdef"));
         const QByteArray reply = server.handleCall(Netlogon::OpLogonSamLogon, request);
-        return readLe32(reply, 0);
+        return reply;
     };
 
     // At the default the answer is refused before the password counts, which is
     // what this pipe did before the policy was reachable from dc.conf...
-    QCOMPARE(attempt(Ntlm::kDefaultLmCompatibilityLevel), quint32(0xc000006au));
-    QCOMPARE(attempt(3), quint32(0xc000006au));
+    QCOMPARE(samLogonStatus(attempt(Ntlm::kDefaultLmCompatibilityLevel)), quint32(0xc000006au));
+    QCOMPARE(samLogonStatus(attempt(3)), quint32(0xc000006au));
     // ...and at 2 the same 24 bytes log alice on.
-    QCOMPARE(attempt(2), quint32(0x0002f210u));
+    const QByteArray accepted = attempt(2);
+    QVERIFY(accepted.size() > 24);
+    QCOMPARE(samLogonStatus(accepted), quint32(0));
 }
 
 void NetlogonTest::dcLocatorNamesThisDc()
