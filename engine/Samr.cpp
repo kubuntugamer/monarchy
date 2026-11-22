@@ -3122,7 +3122,201 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
             return fixed;
         };
 
+        // A set that names several attributes reports the first failure and the
+        // rest of the record stands as it was, which is what AD does when one
+        // attribute in the write is refused.
+        auto apply = [&](const QList<QPair<QString, QString>> &writes) {
+            quint32 status = kStatusSuccess;
+            for (const auto &write : writes) {
+                QString error;
+                if (m_writes.set && m_writes.set(user.dn, write.first, write.second, &error))
+                    continue;
+                status = m_writes.set ? kStatusAccessDenied : kStatusNotSupported;
+                emit requestReceived(QStringLiteral("SetInformationUser(%1) %2=%3: %4")
+                                         .arg(user.dn, write.first, write.second,
+                                              m_writes.set ? error
+                                                           : QStringLiteral("no write backend")));
+                break;
+            }
+            putLe32(fixed, status);
+            return fixed;
+        };
+        // A counted string arrives as its (length, maximum, referent) tuple in
+        // the fixed part and its characters behind it, in field order, so a
+        // record of several strings is read in two passes: every tuple first,
+        // then every buffer the referents point at.
+        struct Counted {
+            quint16 length = 0;
+            quint32 referent = 0;
+        };
+        // A structure that does not parse is refused with a status rather than
+        // answered with an empty stub, which a client reads as transport loss.
+        const auto malformed = [&fixed]() {
+            putLe32(fixed, kStatusInvalidParameter);
+            return fixed;
+        };
+        const auto readCounted = [&reader](Counted *out) {
+            quint16 maximum = 0;
+            return reader.u16(&out->length) && reader.u16(&maximum)
+                   && reader.u32(&out->referent);
+        };
+        const auto readCountedText = [&reader](const Counted &ref, QString *out) {
+            out->clear();
+            if (ref.referent == 0)
+                return true;
+            // An empty string still carries its buffer's three counts, so it is
+            // read and dropped rather than skipped: skipping it would shift
+            // every buffer behind it.
+            quint32 count = 0;
+            quint32 offset = 0;
+            quint32 actual = 0;
+            if (!reader.u32(&count) || !reader.u32(&offset) || !reader.u32(&actual))
+                return false;
+            if (actual == 0)
+                return true;
+            QByteArray chars;
+            if (!reader.bytes(int(actual) * 2, &chars))
+                return false;
+            *out = QString::fromUtf16(reinterpret_cast<const char16_t *>(chars.constData()),
+                                      qsizetype(chars.size() / 2));
+            // Some clients count the terminator in the buffer (impacket does);
+            // it ends the string rather than being part of it, and AD stores
+            // what is left.
+            if (out->endsWith(QChar(u'\0')))
+                out->chop(1);
+            return true;
+        };
+
         switch (infoClass) {
+        // Classes 1, 2 and 3 are the general, preferences and logon records a
+        // property sheet writes back whole. The fields the DC owns — the RID,
+        // the instants the domain policy derives, the logon counters and the
+        // account flags — are read past and left alone: they are not the
+        // client's to set through this call, and a stale copy of them must not
+        // overwrite what the server keeps.
+        case 1: { // SamrUserGeneralInformation
+            Counted account;
+            Counted fullName;
+            quint32 primaryGroup = 0;
+            Counted description;
+            Counted comment;
+            QString accountText;
+            QString fullNameText;
+            QString descriptionText;
+            QString commentText;
+            if (!readCounted(&account) || !readCounted(&fullName)
+                || !reader.u32(&primaryGroup) || !readCounted(&description)
+                || !readCounted(&comment) || !readCountedText(account, &accountText)
+                || !readCountedText(fullName, &fullNameText)
+                || !readCountedText(description, &descriptionText)
+                || !readCountedText(comment, &commentText))
+                return malformed();
+            QList<QPair<QString, QString>> writes;
+            // The account name is what the handle was opened by; a record that
+            // carries none is not a rename and is skipped.
+            if (!accountText.isEmpty())
+                writes.append({QStringLiteral("sAMAccountName"), accountText});
+            writes.append({QStringLiteral("displayName"), fullNameText});
+            writes.append({QStringLiteral("primaryGroupID"), QString::number(primaryGroup)});
+            writes.append({QStringLiteral("description"), descriptionText});
+            writes.append({QStringLiteral("comment"), commentText});
+            return apply(writes);
+        }
+        case 2: { // SamrUserPreferencesInformation
+            Counted comment;
+            Counted reserved;
+            quint16 countryCode = 0;
+            quint16 codePage = 0;
+            QString commentText;
+            QString reservedText;
+            // The second string is the field AD accepts and never stores, so its
+            // characters are consumed to keep the stream in step and dropped.
+            if (!readCounted(&comment) || !readCounted(&reserved) || !reader.u16(&countryCode)
+                || !reader.u16(&codePage) || !readCountedText(comment, &commentText)
+                || !readCountedText(reserved, &reservedText))
+                return malformed();
+            return apply({{QStringLiteral("comment"), commentText},
+                          {QStringLiteral("countryCode"), QString::number(countryCode)},
+                          {QStringLiteral("codePage"), QString::number(codePage)}});
+        }
+        case 3: { // SamrUserLogonInformation
+            Counted account;
+            Counted fullName;
+            quint32 rid = 0;
+            quint32 primaryGroup = 0;
+            Counted homeDirectory;
+            Counted homeDrive;
+            Counted scriptPath;
+            Counted profilePath;
+            Counted workstations;
+            // The five instants sit between the workstations and the week, in
+            // a fixed eight-byte width each (MS-SAMR 2.2.7.5). samr_LogonHours
+            // follows as a pointer to the week: its units-per-week count and
+            // referent inline, the octets behind the strings.
+            quint64 instants[5] = {};
+            quint16 hoursLength = 0;
+            quint16 hoursPad = 0;
+            quint32 hoursReferent = 0;
+            quint16 badPasswordCount = 0;
+            quint16 logonCount = 0;
+            quint32 accountControl = 0;
+            bool complete = readCounted(&account) && readCounted(&fullName) && reader.u32(&rid)
+                            && reader.u32(&primaryGroup) && readCounted(&homeDirectory)
+                            && readCounted(&homeDrive) && readCounted(&scriptPath)
+                            && readCounted(&profilePath) && readCounted(&workstations);
+            for (quint64 &instant : instants)
+                complete = complete && reader.u64(&instant);
+            complete = complete && reader.u16(&hoursLength) && reader.u16(&hoursPad)
+                       && reader.u32(&hoursReferent) && reader.u16(&badPasswordCount)
+                       && reader.u16(&logonCount) && reader.u32(&accountControl);
+            if (!complete)
+                return malformed();
+            Q_UNUSED(instants)
+            Q_UNUSED(hoursPad)
+            Q_UNUSED(rid)
+            Q_UNUSED(logonCount)
+            Q_UNUSED(accountControl)
+            QString accountText;
+            QString fullNameText;
+            QString homeDirectoryText;
+            QString homeDriveText;
+            QString scriptPathText;
+            QString profilePathText;
+            QString workstationsText;
+            if (!readCountedText(account, &accountText) || !readCountedText(fullName, &fullNameText)
+                || !readCountedText(homeDirectory, &homeDirectoryText)
+                || !readCountedText(homeDrive, &homeDriveText)
+                || !readCountedText(scriptPath, &scriptPathText)
+                || !readCountedText(profilePath, &profilePathText)
+                || !readCountedText(workstations, &workstationsText))
+                return malformed();
+            QList<QPair<QString, QString>> writes;
+            if (!accountText.isEmpty())
+                writes.append({QStringLiteral("sAMAccountName"), accountText});
+            writes.append({QStringLiteral("displayName"), fullNameText});
+            writes.append({QStringLiteral("primaryGroupID"), QString::number(primaryGroup)});
+            writes.append({QStringLiteral("homeDirectory"), homeDirectoryText});
+            writes.append({QStringLiteral("homeDrive"), homeDriveText});
+            writes.append({QStringLiteral("scriptPath"), scriptPathText});
+            writes.append({QStringLiteral("profilePath"), profilePathText});
+            writes.append({QStringLiteral("userWorkstations"), workstationsText});
+            if (hoursReferent != 0) {
+                // units_per_week counts bits; the array itself is one octet per
+                // eight hours of the week.
+                quint32 count = 0;
+                quint32 offset = 0;
+                quint32 actual = 0;
+                QByteArray hours;
+                if (!reader.u32(&count) || !reader.u32(&offset) || !reader.u32(&actual)
+                    || !reader.bytes(int(actual), &hours))
+                    return malformed();
+                if (!hours.isEmpty())
+                    writes.append(
+                        {QStringLiteral("logonHours"), QString::fromLatin1(hours.toHex())});
+            }
+            Q_UNUSED(hoursLength)
+            return apply(writes);
+        }
         case 8:  // SamrUserFullNameInformation
         case 13: // SamrUserAdminCommentInformation
         case 20: { // SamrUserParametersInformation

@@ -234,6 +234,97 @@ QByteArray fullNameStub(const QByteArray &userHandle, const QString &name)
     return stub;
 }
 
+// One counted string of a class 1/2/3 record: its length and referent in the
+// fixed part, its characters behind it. A string that is not set still carries
+// its three counts, which is what keeps the buffers behind it in step.
+void appendCountedTuple(QByteArray &fixed, QByteArray &deferred, const QString &text,
+                        quint32 referent)
+{
+    const QByteArray utf16 = Ndr::utf16le(text);
+    fixed.append(char(utf16.size() & 0xff));
+    fixed.append(char((utf16.size() >> 8) & 0xff));
+    fixed.append(char(utf16.size() & 0xff));
+    fixed.append(char((utf16.size() >> 8) & 0xff));
+    appendLe32(fixed, referent);
+    appendLe32(deferred, quint32(text.size() + 1));
+    appendLe32(deferred, 0);
+    appendLe32(deferred, quint32(text.size()));
+    deferred.append(utf16);
+    while (deferred.size() % 4 != 0)
+        deferred.append('\0');
+}
+
+// SamrSetInformationUser2, class 1 (general record), as impacket marshals it.
+QByteArray generalRecordStub(const QByteArray &userHandle, const QString &name,
+                             const QString &fullName, quint32 primaryGroup,
+                             const QString &adminComment, const QString &comment)
+{
+    QByteArray stub = userHandle + QByteArray::fromHex("01000100");
+    QByteArray deferred;
+    appendCountedTuple(stub, deferred, name, 0x0000e310u);
+    appendCountedTuple(stub, deferred, fullName, 0x0000e320u);
+    appendLe32(stub, primaryGroup);
+    appendCountedTuple(stub, deferred, adminComment, 0x0000e330u);
+    appendCountedTuple(stub, deferred, comment, 0x0000e340u);
+    stub.append(deferred);
+    return stub;
+}
+
+// SamrSetInformationUser2, class 2 (preferences): the comment, the string AD
+// accepts and never stores, and the two locale numbers.
+QByteArray preferencesStub(const QByteArray &userHandle, const QString &comment,
+                           quint16 countryCode, quint16 codePage)
+{
+    QByteArray stub = userHandle + QByteArray::fromHex("02000200");
+    QByteArray deferred;
+    appendCountedTuple(stub, deferred, comment, 0x0000e410u);
+    appendCountedTuple(stub, deferred, QString(), 0x0000e420u);
+    stub.append(char(countryCode & 0xff));
+    stub.append(char((countryCode >> 8) & 0xff));
+    stub.append(char(codePage & 0xff));
+    stub.append(char((codePage >> 8) & 0xff));
+    stub.append(deferred);
+    return stub;
+}
+
+// SamrSetInformationUser2, class 3 (logon record): nine counted strings, the
+// RID and primary group, five instants, the week, the counters and the flags.
+QByteArray logonRecordStub(const QByteArray &userHandle, const QString &name,
+                           const QString &fullName, quint32 primaryGroup,
+                           const QString &homeDirectory, const QString &homeDrive,
+                           const QString &scriptPath, const QString &profilePath,
+                           const QString &workstations, const QByteArray &week)
+{
+    QByteArray stub = userHandle + QByteArray::fromHex("03000300");
+    QByteArray deferred;
+    appendCountedTuple(stub, deferred, name, 0x0000e510u);
+    appendCountedTuple(stub, deferred, fullName, 0x0000e520u);
+    appendLe32(stub, 1001); // RID, which the DC owns
+    appendLe32(stub, primaryGroup);
+    appendCountedTuple(stub, deferred, homeDirectory, 0x0000e530u);
+    appendCountedTuple(stub, deferred, homeDrive, 0x0000e540u);
+    appendCountedTuple(stub, deferred, scriptPath, 0x0000e550u);
+    appendCountedTuple(stub, deferred, profilePath, 0x0000e560u);
+    appendCountedTuple(stub, deferred, workstations, 0x0000e570u);
+    for (int i = 0; i < 5; ++i)
+        for (int b = 0; b < 8; ++b)
+            stub.append('\0'); // last logon, last logoff, and the three password instants
+    stub.append(char((week.size() * 8) & 0xff));
+    stub.append(char(((week.size() * 8) >> 8) & 0xff));
+    stub.append(QByteArray(2, '\0'));
+    appendLe32(stub, 0x0000e580u);
+    stub.append(QByteArray(4, '\0')); // bad-password and logon counters
+    appendLe32(stub, 0x200);        // userAccountControl, which the DC owns here
+    appendLe32(deferred, 1260);
+    appendLe32(deferred, 0);
+    appendLe32(deferred, quint32(week.size()));
+    deferred.append(week);
+    while (deferred.size() % 4 != 0)
+        deferred.append('\0');
+    stub.append(deferred);
+    return stub;
+}
+
 // A class 24/26 password set: 512 bytes of UTF-16 password followed by its
 // length, ciphered with the session key (class 24) or with MD5(confounder ||
 // session key) behind a 16-byte confounder (class 26).
@@ -1427,6 +1518,67 @@ void SamrTest::samrSetPasswordAndAccountControl()
              0u);
     QCOMPARE(store.at(0).attributes.value(QStringLiteral("displayName")),
              QStringLiteral("Gina Walker"));
+
+    // Classes 1, 2 and 3 are written back whole: each counted string's tuple is
+    // inline and its characters deferred, so the reader has to walk both passes
+    // to find them.
+    QCOMPARE(lastWord(server.handleCall(
+                 Samr::OpSetInformationUser2,
+                 generalRecordStub(userHandle, QStringLiteral("walker"),
+                                   QStringLiteral("Gina Walker"), 513,
+                                   QStringLiteral("in the office"),
+                                   QStringLiteral("night shift")))),
+             0u);
+    QCOMPARE(store.at(0).attributes.value(QStringLiteral("sAMAccountName")),
+             QStringLiteral("walker"));
+    QCOMPARE(store.at(0).attributes.value(QStringLiteral("displayName")),
+             QStringLiteral("Gina Walker"));
+    QCOMPARE(store.at(0).attributes.value(QStringLiteral("primaryGroupID")), QStringLiteral("513"));
+    QCOMPARE(store.at(0).attributes.value(QStringLiteral("description")),
+             QStringLiteral("in the office"));
+    QCOMPARE(store.at(0).attributes.value(QStringLiteral("comment")),
+             QStringLiteral("night shift"));
+
+    QCOMPARE(lastWord(server.handleCall(Samr::OpSetInformationUser2,
+                                        preferencesStub(userHandle,
+                                                        QStringLiteral("day shift"), 39, 850))),
+             0u);
+    QCOMPARE(store.at(0).attributes.value(QStringLiteral("comment")),
+             QStringLiteral("day shift"));
+    QCOMPARE(store.at(0).attributes.value(QStringLiteral("countryCode")), QStringLiteral("39"));
+    QCOMPARE(store.at(0).attributes.value(QStringLiteral("codePage")), QStringLiteral("850"));
+
+    const QByteArray week = QByteArray::fromHex("00000000000000000000ffffffffffffffffffffff");
+    QCOMPARE(lastWord(server.handleCall(
+                 Samr::OpSetInformationUser2,
+                 logonRecordStub(userHandle, QStringLiteral("walker"),
+                                 QStringLiteral("Gina W"), 513,
+                                 QStringLiteral("\\\\srv\\home\\walker"),
+                                 QStringLiteral("H:"), QStringLiteral("logon.bat"),
+                                 QStringLiteral("\\\\srv\\profiles\\walker"),
+                                 QStringLiteral("WKS01,WKS02"), week))),
+             0u);
+    QCOMPARE(store.at(0).attributes.value(QStringLiteral("homeDirectory")),
+             QStringLiteral("\\\\srv\\home\\walker"));
+    QCOMPARE(store.at(0).attributes.value(QStringLiteral("homeDrive")), QStringLiteral("H:"));
+    QCOMPARE(store.at(0).attributes.value(QStringLiteral("scriptPath")),
+             QStringLiteral("logon.bat"));
+    QCOMPARE(store.at(0).attributes.value(QStringLiteral("userWorkstations")),
+             QStringLiteral("WKS01,WKS02"));
+    QCOMPARE(store.at(0).attributes.value(QStringLiteral("logonHours")),
+             QString::fromLatin1(week.toHex()));
+    // The RID and the account flags are the DC's, so the record that carries them
+    // does not overwrite either.
+    QCOMPARE(store.at(0).attributes.value(QStringLiteral("userAccountControl")),
+             QStringLiteral("514"));
+
+    // A record cut short is refused rather than half-applied.
+    QByteArray shortLogon = logonRecordStub(userHandle, QStringLiteral("walker"),
+                                            QStringLiteral("Gina W"), 513, QString(),
+                                            QString(), QString(), QString(), QString(), week);
+    shortLogon.chop(24);
+    QCOMPARE(lastWord(server.handleCall(Samr::OpSetInformationUser2, shortLogon)),
+             0xc000000du); // STATUS_INVALID_PARAMETER
 
     // A password set: class 24 ciphers 516 bytes under the session key alone.
     const QByteArray sessionKey = QByteArray::fromHex("00112233445566778899aabbccddeeff");
