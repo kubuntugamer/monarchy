@@ -147,6 +147,34 @@ QByteArray sessionSetupMessage(const QByteArray &token)
     return smb(Smb1::CmdSessionSetupAndX, 0, 0, words, token);
 }
 
+// The pre-extended-security session setup: the LM and NT responses inline, the
+// account and domain as terminated strings after them, and no security blob.
+// Samba's client sends this form with `client use spnego = no`, and a Windows
+// 2000 machine's Netlogon path sends it too.
+QByteArray legacySetupMessage(const QString &user, const QString &domain)
+{
+    const QByteArray lm(24, '\0');
+    const QByteArray nt(48, 'n');
+    QByteArray names = utf16le(user);
+    names.append(QByteArray(2, '\0'));
+    names.append(utf16le(domain));
+    names.append(QByteArray(2, '\0'));
+    QByteArray words;
+    words.append(char(0xff));        // AndXCommand
+    words.append(char(0));
+    putLe16(words, 0);               // AndXOffset
+    putLe16(words, 4356);            // MaxBufferSize
+    putLe16(words, 50);              // MaxMpxCount
+    putLe16(words, 1);               // VcNumber
+    putLe32(words, 0);               // SessionKey
+    putLe16(words, quint16(lm.size())); // PasswordLength
+    putLe16(words, quint16(nt.size())); // UnicodePasswordLength
+    putLe32(words, 0);               // Reserved
+    putLe32(words, 0);               // Capabilities
+    QByteArray data = lm + nt + names;
+    return smb(Smb1::CmdSessionSetupAndX, 0, 0, words, data);
+}
+
 // A GSS-SPNEGO NegTokenInit the way a Windows 2000 member sends it when it
 // holds a TGT: mechTypes lists Kerberos first and NTLMSSP last, and the
 // mechToken is a Kerberos AP-REQ. This SMB1 endpoint speaks NTLMSSP only, so it
@@ -462,6 +490,7 @@ private slots:
     void acceptsTheKerberosTicketAWindows2000MemberOffers();
     void setsTheStateOfAnOpenPipe();
     void signsAndVerifiesASignedSession();
+    void signsAPreExtendedSecuritySessionTheWayTheClientKeysIt();
 
 private:
     QTemporaryDir m_root;
@@ -1131,6 +1160,49 @@ void Smb1Test::listsADirectoryOverFindFirst2()
 // `client signing` setting says, which is how this was measured: with no reply
 // signing, tree connect to SYSVOL and the Netlogon pipe both died on
 // `smb1_signing_good: BAD SIG`, and the DC answered a flag it did not honour.
+// The pre-extended form carries no negotiated flags, so the key the client
+// signs with has to be built the way its own client builds it: Samba's
+// smb1_signing_activate concatenates the user session key with the NTLM
+// response it sent. Signing with the 16-byte key alone was refused
+// `smb1_signing_good: BAD SIG: seq 1` on every reply while an unsigned session
+// over the same form worked, which is why this went unnoticed.
+void Smb1Test::signsAPreExtendedSecuritySessionTheWayTheClientKeysIt()
+{
+    const QByteArray baseKey = QByteArray::fromHex("00112233445566778899aabbccddeeff");
+    // legacySetupMessage sends a 48-byte NT response, so the MAC key is the
+    // base key followed by those bytes.
+    const QByteArray macKey = baseKey + QByteArray(48, 'n');
+    QHash<QString, QString> shares;
+    shares.insert(QStringLiteral("sysvol"), m_root.path());
+    Smb1::Session session(
+        QHash<QString, RpcServer *>(),
+        [&baseKey](const Rpc::AuthRequest &, Ntlm::SessionKeys *keys) {
+            *keys = Ntlm::SessionKeys();
+            keys->sessionBaseKey = baseKey;
+            return true;
+        },
+        QStringLiteral("MONARCHY"), QStringLiteral("DC1"),
+        QStringLiteral("monarchy.test"), shares);
+
+    session.feed(negotiateMessage());
+    QByteArray setup = legacySetupMessage(QStringLiteral("Administrator"),
+                                          QStringLiteral("MONARCHY"));
+    setup[10] = char(readLe16(setup, 10) | 0x0004);
+    const QByteArray reply = session.feed(setup);
+    QCOMPARE(statusOf(reply), quint32(0));
+    QVERIFY2(signatureMatches(reply, macKey, 1),
+             "the legacy session-setup reply is not keyed the way the client keys it");
+    QVERIFY2(!signatureMatches(reply, baseKey, 1),
+             "the reply was signed with the bare session base key");
+
+    // One sequence numbers both directions here too, so the client's seq 2 tree
+    // connect is answered by seq 3.
+    const QByteArray treeReply = session.feed(signedMessage(
+        treeConnectMessage(QStringLiteral("\\\\dc1\\SYSVOL")), macKey, 2));
+    QCOMPARE(statusOf(treeReply), quint32(0));
+    QVERIFY2(signatureMatches(treeReply, macKey, 3), "the reply to seq 2 is not seq 3");
+}
+
 void Smb1Test::signsAndVerifiesASignedSession()
 {
     const QByteArray key = QByteArray::fromHex("00112233445566778899aabbccddeeff");

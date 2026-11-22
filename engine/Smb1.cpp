@@ -445,8 +445,14 @@ QByteArray Session::sessionSetup(const QByteArray &message)
         request.user = oemString(namesAt, &namesAt);
         request.domain = oemString(namesAt, nullptr);
         // No NTLM flags are exchanged in this form, so there is no 128-bit or
-        // key-exchange negotiation: the client signs with the 16-byte
-        // UserSessionKey — MD4 of the NT hash — whatever response it computed.
+        // key-exchange negotiation: the client signs with the session base key
+        // MS-NLMP derives for the response it sent. That one value covers both
+        // versions — HMAC_MD5(ResponseKeyNT, NTProofStr) for NTLMv2 and
+        // MD4(NTOWFv1) for NTLMv1. Signing with MD4 of the NT one-way function
+        // instead (the NTLMv2 `userSessionKey`) is one hash too many: Samba's
+        // client logged on in this form and then refused the reply
+        // `smb1_signing_good: BAD SIG: seq 1`, while an unsigned session over it
+        // worked, which is what made this look like the client's problem.
         request.flags = 0;
 
         Ntlm::SessionKeys keys;
@@ -456,7 +462,13 @@ QByteArray Session::sessionSetup(const QByteArray &message)
         if (!request.user.isEmpty() && m_authenticator
             && m_authenticator(request, &keys)) {
             m_authenticated = true;
-            m_sessionKey = keys.userSessionKey;
+            // The MAC key is not the session key on its own: Samba's client
+            // forms it as the user session key followed by the NTLM response it
+            // sent (libcli/smb/smb_signing.c, smb1_signing_activate), and with
+            // the 16-byte key alone every reply to a signing client in this
+            // form was refused `smb1_signing_good: BAD SIG: seq 1`. Keyed this
+            // way the client's own expected MAC reproduces byte for byte.
+            m_sessionKey = keys.sessionBaseKey + request.ntResponse;
             m_user = request.domain.isEmpty()
                          ? request.user
                          : request.domain + QLatin1Char('\\') + request.user;

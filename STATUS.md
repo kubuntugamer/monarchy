@@ -197,9 +197,12 @@ naming-context split, non-zero exit on any failure) |`
   inline, account and domain as terminated strings, no security blob) is
   accepted too, with the responses verified against the challenge the negotiate
   reply advertised — eight zero bytes, since that reply carries none — and the
-  session key taken as `MD4(NTOWFv1)`; a client that signs in that form is still
-  answered with a signature it rejects (Samba reports `BAD SIG: seq 1`), so
-  signed sessions over it remain unusable while unsigned ones work. Live with
+  SMB1 MAC key built the way the client builds it: the session base key
+  followed by the NT response it sent, which is what Samba's
+  `smb1_signing_activate` concatenates. The client's own expected MAC then
+  reproduces byte for byte, and a signing client over this form lists SYSVOL
+  where it was previously refused `smb1_signing_good: BAD SIG: seq 1` — the key
+  alone, without the response bytes, is not the key. Live with
   `client signing = required`: `\\dc\SYSVOL` lists,
   and Samba's dcerpc-over-SMB1 transport — which signs every PDU whatever
   `client signing` says — carries SAMR (`enumdomusers`) and Netlogon
