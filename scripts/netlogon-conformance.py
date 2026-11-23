@@ -101,6 +101,7 @@ CHECKS = [
     'NetrLogonSamLogon answers a service logon (class 3)',
     'a wrong one-way function is refused with STATUS_WRONG_PASSWORD',
     'NetrLogonSamLogon honours lmCompatibilityLevel for NTLMv1',
+    'NetrLogonSamLogon reports pwdLastSet as NT time',
 ]
 
 
@@ -297,6 +298,45 @@ def logon_statistics(options):
     samr.hSamrCloseHandle(dce, server)
     dce.disconnect()
     return (bad == 0 and logons >= 1), (bad, logons)
+
+
+def nt_ticks(value):
+    """An NDR LARGE_INTEGER as one integer. Impacket hands back an object with
+    LowPart/HighPart on some releases and a plain int on others."""
+    if hasattr(value, 'fields'):
+        high = (int(value['HighPart']) & 0xFFFFFFFF) << 32
+        return high | (int(value['LowPart']) & 0xFFFFFFFF)
+    return int(value)
+
+
+def password_last_set(options):
+    """The account's pwdLastSet as SAMR reports it, in 100 ns ticks since 1601.
+    SAMR and netlogon expose the same directory value through two boundaries, so
+    the two have to agree on the unit."""
+    dce = samr_bind(options)
+    server = samr.hSamrConnect5(dce, '\\\\%s\x00' % options.host,
+                                MAXIMUM_ALLOWED, 1, 3)['ServerHandle']
+    domain_id = samr.hSamrLookupDomainInSamServer(dce, server, options.domain)['DomainId']
+    domain = samr.hSamrOpenDomain(dce, server, MAXIMUM_ALLOWED, domain_id)['DomainHandle']
+    names = samr.hSamrLookupNamesInDomain(dce, domain, (options.user,))
+    rid = names['RelativeIds']['Element'][0]
+    rid = int(rid['Data']) if hasattr(rid, 'fields') else int(rid)
+    user = samr.hSamrOpenUser(dce, domain, MAXIMUM_ALLOWED, rid)['UserHandle']
+    response = samr.hSamrQueryInformationUser2(dce, user, 21)  # SamrUserAllInformation
+    buffer = response['Buffer']
+    arm_name = samr.SAMPR_USER_INFO_BUFFER.union[21][0]
+    arm = buffer[arm_name] if arm_name in buffer.fields else None
+    if arm is None:
+        for value in buffer.fields.values():
+            if hasattr(value, 'fields') and 'PasswordLastSet' in value.fields:
+                arm = value
+                break
+    observed = nt_ticks(arm['PasswordLastSet'])
+    samr.hSamrCloseHandle(dce, user)
+    samr.hSamrCloseHandle(dce, domain)
+    samr.hSamrCloseHandle(dce, server)
+    dce.disconnect()
+    return observed
 
 
 def ntlmv2_response(nt_hash, user, domain, challenge):
@@ -601,6 +641,7 @@ def main():
             skip(CHECKS[14], 'no machine account to open a secure channel with')
             skip(CHECKS[15], 'no machine account to open a secure channel with')
             skip(CHECKS[16], 'no machine account to open a secure channel with')
+            skip(CHECKS[17], 'no secure channel to read a logon reply off')
         else:
             account, password, rid = machine
             check(CHECKS[4], True, '%s rid %d' % (account, rid))
@@ -647,6 +688,7 @@ def main():
             if not channel:
                 skip(CHECKS[6], 'no secure channel')
                 skip(CHECKS[16], 'no secure channel to try NTLMv1 over')
+                skip(CHECKS[17], 'no secure channel to read a logon reply off')
             else:
                 try:
                     response = samlogon(server_credential, session_key, options.user,
@@ -659,9 +701,32 @@ def main():
                           response['ErrorCode'] == STATUS_SUCCESS
                           and name == options.user,
                           (hex(response['ErrorCode']), name))
+
+                    # netr_SamBaseInfo.pwd_last_set is a 100 ns interval since
+                    # 1601, and the directory stores the attribute in Unix seconds
+                    # because that is what the password-age arithmetic compares.
+                    # A reply that sent the stored value untouched named
+                    # 1601-01-01T00:02:59, so the field is read back here and
+                    # matched against SAMR's view of the same attribute -- two
+                    # boundaries, one unit -- and against the epoch itself, so a
+                    # value left in seconds fails both ways. netr_SamBaseInfo is
+                    # inlined in this arm, so the field is the arm's own
+                    # PasswordLastSet, not a nested Base.PwdLastSet.
+                    try:
+                        observed = nt_ticks(validation_field(
+                            response['ValidationInformation']['ValidationSam2'],
+                            'PasswordLastSet'))
+                        expected = password_last_set(options)
+                        after_2000 = 125911584000000000
+                        check(CHECKS[17],
+                              observed == expected and observed > after_2000,
+                              'netlogon %d samr %d' % (observed, expected))
+                    except Exception as error:  # noqa: BLE001
+                        check(CHECKS[17], False, '%s: %s' % (type(error).__name__, error))
                 except Exception as error:  # noqa: BLE001
                     traceback.print_exc()
                     check(CHECKS[6], False, '%s: %s' % (type(error).__name__, error))
+                    skip(CHECKS[17], 'no logon reply to read pwdLastSet off')
 
                 # The good logon cleared the counter the refusal raised, and
                 # raised the logon count, on the account itself.
