@@ -36,6 +36,7 @@ constexpr quint8 kEncApRepPartTag = 0x7B;
 // KDC error codes (RFC 4120 §7.5.9).
 constexpr int kErrCPrincipalUnknown = 6;
 constexpr int kErrSPrincipalUnknown = 7;
+constexpr int kErrWrongRealm = 68;
 constexpr int kErrBadOption = 13;
 constexpr int kErrEtypeNoSupp = 14;
 constexpr int kErrPadTypeNoSupp = 16;
@@ -632,8 +633,18 @@ QByteArray Kdc::krbError(int code, const QString &realm, const QString &cname,
 QByteArray Kdc::handleAsReq(const KdcRequest &request)
 {
     const QString realm = Krb5::canonicalRealm(m_config.realm);
-    if (request.realm.compare(realm, Qt::CaseInsensitive) != 0)
+    if (request.realm.compare(realm, Qt::CaseInsensitive) != 0) {
+        // The short form of this realm's own name is not an alias for it. A
+        // Windows 2000 DC answers such a request KDC_ERR_WRONG_REALM (68) —
+        // measured against one, where the client then retries with the FQDN —
+        // and C_PRINCIPAL_UNKNOWN (6) says something else: that the account
+        // does not exist. Neither creates a ticket, but only one of them tells
+        // the client to try the name it already knows.
+        if (!m_config.netbios.isEmpty()
+            && request.realm.compare(m_config.netbios, Qt::CaseInsensitive) == 0)
+            return krbError(kErrWrongRealm, realm, request.cname);
         return krbError(kErrCPrincipalUnknown, realm, request.cname);
+    }
 
     Krb5::Principal client;
     if (!Krb5::findPrincipal(directory(),
