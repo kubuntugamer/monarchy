@@ -538,16 +538,21 @@ bool verify(const QByteArray &pac, const Keys &keys)
 QByteArray authorizationData(const QByteArray &pac)
 {
     // AuthorizationData ::= SEQUENCE OF AuthorizationDataElement, with
-    // AD-IF-RELEVANT wrapping AD-WIN2K-PAC.
-    QByteArray pacElement;
-    pacElement.append(Asn1::integer(0x02, kWin2kPac));
-    pacElement.append(Asn1::octets(0x04, pac));
-    const QByteArray innerAuthorizationData = Asn1::sequenceOf({Asn1::sequence(pacElement)});
-
-    QByteArray ifRelevant;
-    ifRelevant.append(Asn1::integer(0x02, kIfRelevant));
-    ifRelevant.append(Asn1::octets(0x04, innerAuthorizationData));
-    return Asn1::sequenceOf({Asn1::sequence(ifRelevant)});
+    // AD-IF-RELEVANT wrapping AD-WIN2K-PAC. RFC 4120 §5.2.6 tags both fields of
+    // an element — ad-type [0] Int32, ad-data [1] OCTET STRING. Writing them
+    // untagged, as this did, is accepted by MIT's client but refused by a
+    // strict decoder: pyasn1 rejects the whole ticket with "tags 0:0:2 not in
+    // asn1Spec Int32 [0]", which is how this was found. Windows reads its own
+    // tickets strictly too, so the tags belong here however tolerant one client
+    // happens to be.
+    auto element = [](int type, const QByteArray &data) {
+        QByteArray fields;
+        fields.append(Asn1::tlv(0xA0, Asn1::integer(0x02, type)));
+        fields.append(Asn1::tlv(0xA1, Asn1::octets(0x04, data)));
+        return Asn1::sequence(fields);
+    };
+    const QByteArray innerAuthorizationData = Asn1::sequenceOf({element(kWin2kPac, pac)});
+    return Asn1::sequenceOf({element(kIfRelevant, innerAuthorizationData)});
 }
 
 QByteArray extract(const QByteArray &authorizationData)
@@ -557,23 +562,41 @@ QByteArray extract(const QByteArray &authorizationData)
     Asn1::Element outer;
     if (!Asn1::parse(authorizationData, &outer) || outer.tag != 0x30)
         return {};
+    // An element's fields are context-tagged, but a ticket issued while this
+    // server wrote them untagged is still valid until it expires, so both
+    // shapes are read on the way in.
+    auto field = [](const Asn1::Element &node, quint8 tagged, quint8 plain,
+                    Asn1::Element *out) {
+        if (node.tag == tagged)
+            return Asn1::parse(node.value, out) && out->tag == plain;
+        if (node.tag != plain)
+            return false;
+        *out = node;
+        return true;
+    };
     for (const Asn1::Element &outerElement : outer.children) {
         if (outerElement.tag != 0x30 || outerElement.children.size() < 2)
             continue;
-        if (int(Asn1::toInteger(outerElement.children.at(0))) != kIfRelevant)
+        Asn1::Element type;
+        Asn1::Element data;
+        if (!field(outerElement.children.at(0), 0xA0, 0x02, &type)
+            || !field(outerElement.children.at(1), 0xA1, 0x04, &data))
             continue;
-        if (outerElement.children.at(1).tag != 0x04)
+        if (int(Asn1::toInteger(type)) != kIfRelevant)
             continue;
         Asn1::Element inner;
-        if (!Asn1::parse(outerElement.children.at(1).value, &inner) || inner.tag != 0x30)
+        if (!Asn1::parse(data.value, &inner) || inner.tag != 0x30)
             continue;
         for (const Asn1::Element &pacElement : inner.children) {
             if (pacElement.tag != 0x30 || pacElement.children.size() < 2)
                 continue;
-            if (int(Asn1::toInteger(pacElement.children.at(0))) != kWin2kPac)
+            Asn1::Element pacType;
+            Asn1::Element pacData;
+            if (!field(pacElement.children.at(0), 0xA0, 0x02, &pacType)
+                || !field(pacElement.children.at(1), 0xA1, 0x04, &pacData))
                 continue;
-            if (pacElement.children.at(1).tag == 0x04)
-                return pacElement.children.at(1).value;
+            if (int(Asn1::toInteger(pacType)) == kWin2kPac)
+                return pacData.value;
         }
     }
     return {};
