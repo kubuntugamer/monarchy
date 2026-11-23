@@ -583,7 +583,18 @@ QByteArray Session::sessionSetup(const QByteArray &message)
             // the connection right after the IPC$ tree connect, which is where
             // the domain join dies with "the specified network name is no
             // longer available".
-            m_sessionKey = context.key.left(16);
+            //
+            // The whole key, not its first 16 bytes: SMB2's session key is the
+            // SSPI form, which GSS_KRB5_INQ_SSPI_SESSION_KEY truncates to 16, and
+            // that is what Smb2.cpp uses. SMB1 has no such truncation — Samba's
+            // smb1_signing_set_key() takes the GSS key at its full length, as
+            // smbd's own SMB1 signing does — so an AES-256 ticket signed every
+            // message with 32 bytes here and 16 there. Measured: a Kerberos
+            // SMB1 session was refused NT_STATUS_ACCESS_DENIED with "smb1_signing_good:
+            // BAD SIG: seq 1" under the default aes256 session key, and worked
+            // once GSS_TKT/SKEY_TGS were forced to rc4-hmac, whose session key is
+            // 16 bytes and so hid the truncation.
+            m_sessionKey = context.key;
             replyToken = Gss::spnegoResponse(0, QString(), context.replyToken);
             status = kStatusSuccess;
             if (m_notifier)

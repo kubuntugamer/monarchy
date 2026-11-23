@@ -900,15 +900,20 @@ void Smb1Test::answersARawNtlmTokenWithoutSpnego()
 void Smb1Test::acceptsTheKerberosTicketAWindows2000MemberOffers()
 {
     const QByteArray acceptorReply = QByteArray::fromHex("6b05020300000001");
+    // An AES-256 context key: 32 bytes, which is what a session key is unless
+    // the client forced RC4. SMB1 signs with all of it.
+    const QByteArray contextKey = QByteArray::fromHex(
+        "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
     Smb1::Session session(QHash<QString, RpcServer *>(),
                           [](const Rpc::AuthRequest &, Ntlm::SessionKeys *) { return false; },
                           QStringLiteral("MONARCHY"), QStringLiteral("DC1"),
                           QStringLiteral("monarchy.test"));
-    session.setKerberosAcceptor([&acceptorReply](const QByteArray &apReq,
-                                                 Rpc::KerberosContext *context, QString *) {
+    session.setKerberosAcceptor([&](const QByteArray &apReq,
+                                    Rpc::KerberosContext *context, QString *) {
         if (apReq != QByteArray::fromHex("aabbcc"))
             return false;
         context->user = QStringLiteral("NEURALNODE0$@MONARCHY.TEST");
+        context->key = contextKey;
         context->replyToken = acceptorReply;
         return true;
     });
@@ -924,9 +929,16 @@ void Smb1Test::acceptsTheKerberosTicketAWindows2000MemberOffers()
     QVERIFY(blob.contains(acceptorReply));        // the AP-REP the acceptor built
 
     // The ticket named the principal, so the session opens the pipe share the
-    // Netlogon channel rides on.
-    QCOMPARE(statusOf(session.feed(treeConnectMessage(QStringLiteral("\\\\dc1\\IPC$")))),
-             quint32(0));
+    // Netlogon channel rides on. That request is signed, and the reply is signed
+    // with the whole context key: a client keys its MAC with all 32 bytes, so a
+    // server that used the first 16 answered ACCESS_DENIED to this very message
+    // ("smb1_signing_good: BAD SIG: seq 1") whenever the ticket was AES-256.
+    const QByteArray signedRequest = signedMessage(
+        treeConnectMessage(QStringLiteral("\\\\dc1\\IPC$")), contextKey, 1);
+    const QByteArray treeReply = session.feed(signedRequest);
+    QCOMPARE(statusOf(treeReply), quint32(0));
+    QVERIFY(signatureMatches(treeReply, contextKey, 2));
+    QVERIFY(!signatureMatches(treeReply, contextKey.left(16), 2));
 }
 
 // Windows 2000 sets a named pipe's handle state on the handle it has already
