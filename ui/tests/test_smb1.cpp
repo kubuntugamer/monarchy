@@ -487,6 +487,7 @@ private slots:
     void refusesWrites();
     void answersARawNtlmTokenWithoutSpnego();
     void acceptsPreExtendedSecuritySessionSetup();
+    void namesItselfAfterTheSecurityBlob();
     void acceptsTheKerberosTicketAWindows2000MemberOffers();
     void setsTheStateOfAnOpenPipe();
     void signsAndVerifiesASignedSession();
@@ -892,6 +893,53 @@ void Smb1Test::answersARawNtlmTokenWithoutSpnego()
     QVERIFY(readLe16(kerberosBlob, 33 + 6) > 0);
     QCOMPARE(kerberosBlob.at(43), char(0xa1)); // NegTokenResp
     QVERIFY(kerberosBlob.contains(QByteArray::fromHex("2b06010401823702020a")));
+}
+
+// MS-CIFS 2.2.4.6.3 lists NativeOS and NativeLanMan after the security blob,
+// and a client that parses the answer by that definition reads both from the
+// bytes the blob does not cover. Sending the bare blob put a client into the
+// strings' first byte: impacket's SMB1 client stopped with "Can't find NUL
+// terminator in field 'NativeLanMan'" and answered itself LOGON_FAILURE without
+// ever sending a Type 3, which looks exactly like a DC that refused the
+// password. The strings follow the blob, in the request's own encoding.
+void Smb1Test::namesItselfAfterTheSecurityBlob()
+{
+    QByteArray type1("NTLMSSP", 7);
+    type1.append(char(0));
+    putLe32(type1, 1);            // NEGOTIATE
+    putLe32(type1, 0x00008201u);  // UNICODE | NTLM
+
+    // The non-Unicode request: FLAGS2 keeps long names and drops the Unicode
+    // bit, which is what impacket's SMB1 session setup carries.
+    QScopedPointer<Smb1::Session> ascii(plainSession());
+    QVERIFY(ascii);
+    ascii->feed(negotiateMessage());
+    QByteArray request = sessionSetupMessage(type1);
+    request.replace(10, 2, QByteArray::fromHex("0100"));
+    const QByteArray reply = ascii->feed(request);
+    QCOMPARE(statusOf(reply), Smb1::kStatusMoreProcessingRequired);
+    const QByteArray payload = payloadOf(reply);
+    // WordCount 4: AndX, Action, SecurityBlobLength. ByteCount starts at 41 and
+    // the blob at 43.
+    QCOMPARE(quint8(payload.at(32)), quint8(4));
+    const int blobLength = readLe16(payload, 39);
+    QVERIFY(blobLength > 0);
+    QVERIFY2(payload.mid(43 + blobLength).endsWith(QByteArray("Monarchy\0Monarchy\0", 18)),
+             qPrintable(QString::fromLatin1(payload.mid(43 + blobLength).toHex())));
+
+    // Every Windows client asks in UTF-16, so the same fields go back that way.
+    QScopedPointer<Smb1::Session> wide(plainSession());
+    QVERIFY(wide);
+    wide->feed(negotiateMessage());
+    const QByteArray wideReply = wide->feed(sessionSetupMessage(type1));
+    QCOMPARE(statusOf(wideReply), Smb1::kStatusMoreProcessingRequired);
+    const QByteArray widePayload = payloadOf(wideReply);
+    QByteArray expected = utf16le(QStringLiteral("Monarchy"));
+    expected.append(QByteArray(2, '\0'));
+    expected.append(utf16le(QStringLiteral("Monarchy")));
+    expected.append(QByteArray(2, '\0'));
+    QVERIFY2(widePayload.endsWith(expected),
+             qPrintable(QString::fromLatin1(widePayload.right(48).toHex())));
 }
 
 // The other half of that choice: when the session can accept Kerberos, it does,

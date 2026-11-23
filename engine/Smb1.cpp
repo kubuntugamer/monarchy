@@ -563,7 +563,7 @@ QByteArray Session::sessionSetup(const QByteArray &message)
                                .arg(request.ntResponse.size())
                                .arg(request.flags, 8, 16, QLatin1Char('0')));
         }
-    } else if (m_kerberosAcceptor && Gss::carriesKerberos(token)) {
+    } else if (m_kerberosAcceptor && !Gss::kerberosToken(token).isEmpty()) {
         // SPNEGO lets the acceptor choose any mechanism the initiator listed, and
         // a Windows 2000 member offers Kerberos first on its machine channel. It
         // holds a ticket for this server, so the AP-REQ is accepted and answered
@@ -607,10 +607,11 @@ QByteArray Session::sessionSetup(const QByteArray &message)
                                .arg(apReq.isEmpty() ? QStringLiteral("no AP-REQ token") : error));
         }
     } else if (spnegoWrapped && Gss::carriesKerberos(token)) {
-        // No Kerberos acceptor is installed, so the offer cannot be honoured.
-        // SPNEGO lets the acceptor pick any listed mechanism, and a Windows 2000
-        // member lists NTLMSSP last: select it and let the exchange go on rather
-        // than dropping the session with LOGON_FAILURE.
+        // An offer that names Kerberos but carries no AP-REQ: either no acceptor
+        // is installed or the client holds no ticket for this server. SPNEGO
+        // lets the acceptor pick any listed mechanism, and a Windows 2000 member
+        // lists NTLMSSP last: select it and let the exchange go on rather than
+        // dropping the session with LOGON_FAILURE.
         replyToken = Gss::spnegoResponse(1, kNtlmMech, QByteArray());
         status = kStatusMoreProcessingRequired;
     } else {
@@ -629,14 +630,35 @@ QByteArray Session::sessionSetup(const QByteArray &message)
     putLe16(words, action);   // Action
     putLe16(words, quint16(replyToken.size())); // SecurityBlobLength
 
-    // CAP_EXTENDED_SECURITY was negotiated in the negotiate reply, and in that
-    // mode the response carries the security blob and nothing else: Windows 2000
-    // reads the trailing Native OS / LAN Manager strings of the legacy form as a
-    // malformed reply and drops the session (LOGON_FAILURE then logoff) instead
-    // of sending its Type 3 message. Samba omits them for the same reason.
+    // CAP_EXTENDED_SECURITY was negotiated in the negotiate reply, so the
+    // security blob is the answer. MS-CIFS 2.2.4.6.3 still puts NativeOS and
+    // NativeLanMan after it — both NUL-terminated, and UTF-16 when the request
+    // was Unicode — and a client that parses the response by that definition
+    // reads the blob's trailing bytes as the first string and fails to find its
+    // terminator: impacket's SMB1 client sent a non-Unicode session setup, took
+    // our bare blob for a NativeOS/NativeLanMan pair and stopped at
+    // LOGON_FAILURE without ever sending its Type 3 message. The legacy form's
+    // trailing strings are the ones a Windows 2000 member reads as malformed;
+    // these are the extended form's own fields.
     QByteArray data = replyToken;
     if (data.size() % 2 == 0)
         data.append(char(0));
+    const auto nativeString = [&header](const QString &text) {
+        QByteArray out;
+        if (header.unicode) {
+            for (const QChar c : text) {
+                out.append(char(c.unicode() & 0xff));
+                out.append(char((c.unicode() >> 8) & 0xff));
+            }
+            out.append(QByteArray(2, '\0'));
+        } else {
+            out = text.toLatin1();
+            out.append(char(0));
+        }
+        return out;
+    };
+    data.append(nativeString(QStringLiteral("Monarchy"))); // NativeOS
+    data.append(nativeString(QStringLiteral("Monarchy"))); // NativeLanMan
 
     if (m_notifier)
         m_notifier(QStringLiteral("SMB1 session setup type %1").arg(type));

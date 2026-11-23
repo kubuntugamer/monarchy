@@ -895,15 +895,27 @@ QByteArray Smb2Server::sessionSetup(Connection *connection, const QByteArray &bo
     }
 
     QByteArray replyToken;
-    // A session setup carries one of three things: a SPNEGO offer that is
-    // Kerberos (an AP-REQ inside the mechToken), an NTLMSSP NEGOTIATE, or an
-    // NTLMSSP AUTHENTICATE. Kerberos is tried first because its token is a
-    // SPNEGO wrapper rather than a bare NTLMSSP message.
-    if (m_kerberosAcceptor && Gss::carriesKerberos(token)) {
+    // A session setup carries one of four things: a SPNEGO offer that is
+    // Kerberos (an AP-REQ inside the mechToken), an NTLMSSP NEGOTIATE, an
+    // NTLMSSP AUTHENTICATE, or a SPNEGO offer that names mechanisms and carries
+    // no token yet. Kerberos is tried first because its token is a SPNEGO
+    // wrapper rather than a bare NTLMSSP message.
+    //
+    // A client that lists Kerberos without holding a ticket for this server
+    // sends the mechTypes and nothing else, and that offer has to be answered
+    // by *choosing* one of the mechanisms it listed: a reject tells the client
+    // this DC cannot authenticate it at all. impacket offers Kerberos alone
+    // when it has no ticket, so a reject left it at LOGON_FAILURE while its
+    // next message — a perfectly good NTLMSSP AUTHENTICATE — was accepted and
+    // thrown away with the session. SMB1 selects NTLMSSP for the same offer; the
+    // SMB2 path was the one that refused.
+    const QByteArray apReq = Gss::carriesKerberos(token) ? Gss::kerberosToken(token) : QByteArray();
+    const bool offer = apReq.isEmpty() && Gss::carriesKerberos(token)
+                       && Ntlm::embeddedToken(token).isEmpty();
+    if (m_kerberosAcceptor && !apReq.isEmpty()) {
         Rpc::KerberosContext context;
         QString error;
-        const QByteArray apReq = Gss::kerberosToken(token);
-        if (!apReq.isEmpty() && m_kerberosAcceptor(apReq, &context, &error)) {
+        if (m_kerberosAcceptor(apReq, &context, &error)) {
             connection->sessionId = ++connection->nextSession;
             connection->authenticated = true;
             connection->user = context.user;
@@ -930,6 +942,12 @@ QByteArray Smb2Server::sessionSetup(Connection *connection, const QByteArray &bo
             replyToken = Gss::spnegoResponse(2, kKrb5Mech, QByteArray()); // reject
             *status = Smb2::StatusLogonFailure;
         }
+    } else if (offer) {
+        // Select NTLMSSP and ask for its NEGOTIATE: accept-incomplete with the
+        // mechanism named and no token, which is what a Windows DC answers an
+        // offer it cannot finish in one round.
+        replyToken = Gss::spnegoResponse(1, kNtlmMech, QByteArray());
+        *status = Smb2::StatusMoreProcessingRequired;
     } else if (const int type = Ntlm::messageType(Ntlm::embeddedToken(token)); type == 1) {
         connection->sessionId = ++connection->nextSession;
         connection->challenge = QByteArray(8, '\0');

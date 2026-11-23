@@ -10,6 +10,7 @@
 #include "Epm.h"
 #include "Ntlm.h"
 #include "Smb2.h"
+#include "Gss.h"
 #include "Smb3Crypto.h"
 
 namespace {
@@ -132,6 +133,30 @@ QByteArray ntlmNegotiate()
     token.append(char(0));
     putLe32(token, 1);          // NEGOTIATE_MESSAGE
     putLe32(token, 0x00000201); // flags: unicode, NTLM, session security
+    return token;
+}
+
+// A SPNEGO offer that names Kerberos and carries no token, the way a client
+// with no ticket for this server starts: mechTypes only. impacket's SMB2 client
+// offers Kerberos alone in that state.
+QByteArray spnegoMechOffer()
+{
+    const QByteArray krb5 = QByteArray::fromHex("06092a864886f712010202");
+    QByteArray mechList(1, char(0x30));
+    mechList.append(char(krb5.size()));
+    mechList.append(krb5);
+    QByteArray mechTypes(1, char(0xa0));
+    mechTypes.append(char(mechList.size()));
+    mechTypes.append(mechList);
+    QByteArray init(1, char(0x30));
+    init.append(char(mechTypes.size()));
+    init.append(mechTypes);
+    QByteArray token(1, char(0x60));
+    token.append(char(init.size() + 10));
+    token.append(QByteArray::fromHex("06062b0601050502")); // SPNEGO OID
+    token.append(char(0xa0));
+    token.append(char(init.size()));
+    token.append(init);
     return token;
 }
 
@@ -337,7 +362,37 @@ private slots:
     void sealsWithAesCcmAsTheStandardDoes();
     void sealsAThreeOneOneSession();
     void acceptsASessionOverTheNetbiosSessionService();
+    void selectsNtlmsspWhenTheOfferCarriesNoToken();
 };
+
+// A client that lists Kerberos and sends nothing yet has not failed to
+// authenticate: it is asking the server to pick a mechanism. Answering with a
+// reject ended that client's logon before it sent the NTLMSSP message it was
+// perfectly able to send, so the answer is accept-incomplete naming NTLMSSP and
+// the exchange carries on from there.
+void Smb2Test::selectsNtlmsspWhenTheOfferCarriesNoToken()
+{
+    Smb2Server server;
+    server.setAuthenticator([](const Rpc::AuthRequest &, Ntlm::SessionKeys *keys) {
+        keys->sessionBaseKey = QByteArray(16, 'k');
+        return true;
+    });
+
+    QByteArray reply = server.feed(nbt(sessionSetup(1, spnegoMechOffer())));
+    QCOMPARE(statusOf(reply), quint32(Smb2::StatusMoreProcessingRequired));
+    const QByteArray answer = bodyOf(reply);
+    const QByteArray token = answer.mid(8, readLe16(answer, 6));
+    QCOMPARE(token, Gss::spnegoResponse(1, QStringLiteral("1.3.6.1.4.1.311.2.2.10"),
+                                       QByteArray()));
+
+    // The client takes the hint and the logon finishes in the usual two rounds.
+    reply = server.feed(nbt(sessionSetup(2, ntlmNegotiate())));
+    QCOMPARE(statusOf(reply), quint32(Smb2::StatusMoreProcessingRequired));
+    reply = server.feed(nbt(sessionSetup(3, ntlmAuthenticate(
+        QStringLiteral("CYBERDYNE"), QStringLiteral("alice"),
+        QByteArray(16, 'r') + QByteArray(40, 'b')))));
+    QCOMPARE(statusOf(reply), quint32(Smb2::StatusSuccess));
+}
 
 // Windows 2000 does not use TCP 445: it opens a NetBIOS session to the server
 // name on 139, and only then speaks SMB1 on that socket. The session request has
