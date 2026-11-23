@@ -4,6 +4,7 @@
 #include "DnsServer.h"
 
 #include <QDate>
+#include <QDebug>
 #include <QFile>
 #include <QHostAddress>
 #include <QJsonArray>
@@ -2144,6 +2145,17 @@ QByteArray DnsServer::handlePacket(const QByteArray &packet, const QHostAddress 
             const int verdict = verifyTsig(packet, &requestMac, &tsigError, &other,
                                            &signRefusal, &tsigKey, &clientTime, &clientFudge);
             if (verdict != 0) {
+                // The zone never sees this one: the message did not prove where it
+                // came from. The reply says so in its TSIG error, which is the
+                // only place a client learns which end failed, so the same fact
+                // is named here — an unverified update and an unauthored zone are
+                // both NOTAUTH on the wire.
+                qInfo().noquote()
+                    << QStringLiteral("DNS update refused: %1 from key %2 (TSIG error %3)")
+                           .arg(gssAttempt ? QStringLiteral("gss-tsig did not verify")
+                                           : QStringLiteral("TSIG did not verify"),
+                                tsigKey.isEmpty() ? QStringLiteral("<none>") : tsigKey)
+                           .arg(tsigError);
                 QByteArray refusal = buildResponse(packet, {}, verdict, {}, udp);
                 // A refusal to something that carried a TSIG is answered with a
                 // TSIG too: that is how the client learns which end failed.
@@ -3190,12 +3202,31 @@ int DnsServer::handleQuery(const Message &message, QList<Record> &answers) {
 }
 
 int DnsServer::handleUpdate(const Message &message) {
+    // A refusal is a statement about this server — it does not host that zone,
+    // or the packet was not one it could read — and it is the only thing the
+    // client is told. Naming it in the log is what separates "the client asked
+    // for a zone we do not serve" from "the client's update was answered no":
+    // both look like NOTAUTH on the wire. A dynamic update that is refused is
+    // rare enough that every one of them is worth a line, so this is not behind
+    // a trace variable. NXRRSET and the other prerequisite answers are protocol
+    // dialogue, not refusals, and stay silent.
+    const QString askedZone = message.questions.size() == 1
+                                  ? message.questions.first().name.toLower()
+                                  : QString();
+    const auto refuse = [&askedZone](int rcode, const QString &why) {
+        qInfo().noquote() << QStringLiteral("DNS update for %1 refused: %2")
+                                 .arg(askedZone.isEmpty() ? QStringLiteral("<no zone section>")
+                                                          : askedZone,
+                                      why);
+        return rcode;
+    };
     if (!m_updatesEnabled)
-        return Refused;
+        return refuse(Refused, QStringLiteral("updates are disabled"));
     if (m_zone.isEmpty())
-        return NotAuth;
+        return refuse(NotAuth, QStringLiteral("no zone is loaded"));
     if (message.questions.size() != 1)
-        return FormErr;
+        return refuse(FormErr, QStringLiteral("%1 zone-section questions")
+                                        .arg(message.questions.size()));
 
     // The zone section names the zone the update writes into, and this server is
     // authoritative for two: the AD zone and the /24 reverse zone derived from
@@ -3209,19 +3240,27 @@ int DnsServer::handleUpdate(const Message &message) {
         || (!m_reverseZone.isEmpty()
             && zoneSection.name.compare(m_reverseZone, Qt::CaseInsensitive) == 0);
     if (!authored)
-        return NotAuth;
+        return refuse(NotAuth,
+                      QStringLiteral("it is not one of the zones this DC authors (%1%2)")
+                          .arg(m_zone, m_reverseZone.isEmpty()
+                                           ? QString()
+                                           : QStringLiteral(", ") + m_reverseZone));
     if (zoneSection.qclass != ClassIn)
-        return NotAuth;
+        return refuse(NotAuth, QStringLiteral("zone-section class %1 is not IN")
+                                        .arg(zoneSection.qclass));
     if (zoneSection.type != TypeSoa)
-        return FormErr;
+        return refuse(FormErr, QStringLiteral("zone-section type %1 is not SOA")
+                                        .arg(zoneSection.type));
 
     for (const Record &prerequisite : message.prerequisites) {
         if (!inZone(prerequisite.name))
-            return NotZone;
+            return refuse(NotZone, QStringLiteral("prerequisite %1 is outside every zone")
+                                        .arg(prerequisite.name));
     }
     for (const Record &update : message.updates) {
         if (!inZone(update.name))
-            return NotZone;
+            return refuse(NotZone,
+                          QStringLiteral("update %1 is outside every zone").arg(update.name));
     }
 
     // --- Prerequisite section (RFC 2136 §2.4) -----------------------------
