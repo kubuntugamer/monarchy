@@ -3516,8 +3516,14 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
             const bool ok = m_writes.setNtHash && m_writes.setNtHash(user.dn, ntHash, &error);
             if (ok && passwordExpired != 0)
                 m_writes.set(user.dn, QStringLiteral("pwdLastSet"), QStringLiteral("0"), &error);
+            // A refused hash is the same policy refusal the plaintext classes
+            // report — history, length, the account being gone — so it carries
+            // the same word. Answering ACCESS_DENIED here named the caller's
+            // rights instead, and told a client with the rights two different
+            // things about one refusal depending on how it encoded the password.
             putLe32(fixed, ok ? kStatusSuccess
-                              : (m_writes.setNtHash ? kStatusAccessDenied : kStatusNotSupported));
+                              : (m_writes.setNtHash ? kStatusPasswordRestriction
+                                                    : kStatusNotSupported));
             emit requestReceived(QStringLiteral("SetInformationUser(%1) NT hash: %2")
                                      .arg(user.dn,
                                           ok ? QStringLiteral("ok") : error));
@@ -3600,7 +3606,8 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
                 if (ntHash.size() != 16) {
                     status = kStatusInvalidParameter;
                 } else if (!m_writes.setNtHash || !m_writes.setNtHash(user.dn, ntHash, &error)) {
-                    status = m_writes.setNtHash ? kStatusAccessDenied : kStatusNotSupported;
+                    status = m_writes.setNtHash ? kStatusPasswordRestriction
+                                                : kStatusNotSupported;
                 }
                 emit requestReceived(QStringLiteral("SetInformationUser(%1) NT hash: %2")
                                          .arg(user.dn,

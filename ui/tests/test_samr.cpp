@@ -1698,8 +1698,14 @@ void SamrTest::samrSetsCredentialFromHash()
         }
         return false;
     };
-    backend.setNtHash = [&store, &receivedHash](const QString &dn, const QByteArray &hash,
-                                                QString *) {
+    bool refuseHash = false;
+    backend.setNtHash = [&store, &receivedHash, &refuseHash](const QString &dn,
+                                                             const QByteArray &hash,
+                                                             QString *) {
+        // The store's own policy: a hash it has seen before is refused, the way
+        // the password history refuses it on the live DC.
+        if (refuseHash)
+            return false;
         for (DirectoryObject &object : store) {
             if (object.id.compare(dn, Qt::CaseInsensitive) != 0)
                 continue;
@@ -1750,6 +1756,16 @@ void SamrTest::samrSetsCredentialFromHash()
                                         sessionKey)),
              0u);
     QCOMPARE(store.at(0).attributes.value(QStringLiteral("pwdLastSet")), QStringLiteral("0"));
+
+    // A hash the store refuses is a policy refusal, not a verdict on the
+    // caller's rights: a client that sends the password as a hash has to read
+    // the same word a client that sends it ciphered reads, or an operator is
+    // told "access denied" about a password the policy rejected.
+    refuseHash = true;
+    QCOMPARE(lastWord(server.handleCall(Samr::OpSetInformationUser,
+                                        internal1Stub(userHandle, ntHash, sessionKey),
+                                        sessionKey)),
+             0xc000006cu); // STATUS_PASSWORD_RESTRICTION
 }
 
 // SamrSetInformationUser2 class 21 is the call ADUC's "new user" dialog makes:
