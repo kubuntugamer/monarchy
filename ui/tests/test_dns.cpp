@@ -3351,6 +3351,33 @@ void DnsTest::negotiatesGssTsigAndSignsUpdates()
                                    updateSignature.timeSigned, updateSignature.fudge, 0, {});
     QCOMPARE(updateSignature.mac, gssMic(updateDigest, 1, contextKey, true));
 
+    // A client registering its address writes twice in one context: the A record
+    // in the forward zone, then the PTR in the reverse zone. The reverse zone is
+    // derived from the DC's address, and the second update continues the
+    // context's sequence rather than starting a new one — an update the zone
+    // section does not name is refused NOTAUTH even with a valid MIC, so the
+    // reverse zone has to be one this server authors for the PTR to land.
+    QVERIFY(server.repairReverseZone(QStringLiteral("dc1.corp.example.com"),
+                                     QStringLiteral("192.168.5.20")));
+    QCOMPARE(server.reverseZone(), QStringLiteral("5.168.192.in-addr.arpa"));
+    UpdateRecord ptr;
+    ptr.name = QStringLiteral("50.5.168.192.in-addr.arpa");
+    ptr.type = DnsServer::TypePtr;
+    ptr.rclass = 1;
+    ptr.ttl = 1200;
+    ptr.rdata = nameBytes(QStringLiteral("client50.corp.example.com"));
+    const QByteArray ptrUpdate =
+        updatePacket(0x8a05, QStringLiteral("5.168.192.in-addr.arpa"), {}, {ptr});
+    const QByteArray ptrMic = gssMic(
+        ptrUpdate + tsigVariables(keyName, QStringLiteral("gss-tsig"), now, 300, 0, {}), 1,
+        contextKey, false);
+    Reply ptrAccepted;
+    QVERIFY(parseReply(exchange(server.serverPort(),
+                                appendGssTsig(ptrUpdate, keyName, ptrMic, now)),
+                       &ptrAccepted));
+    QCOMPARE(ptrAccepted.rcode, 0);
+    QCOMPARE(server.records(ptr.name, DnsServer::TypePtr).size(), 1);
+
     // The same bytes again are a replay: the MIC verifies but carries the
     // sequence number the first message used, so nothing is written twice.
     Reply replayed;
