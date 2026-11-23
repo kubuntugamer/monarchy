@@ -511,11 +511,9 @@ def main():
                     and ex["server_type"] & 0x0100,  # writable
                     hex(ex["server_type"]),
                 )
-                run.check(
-                    "it claims no time service",
-                    not ex["server_type"] & 0x0040,
-                    hex(ex["server_type"]),
-                )
+                # No assertion about the time service: skynet claims it
+                # (0x1fd) and whether NTP is served is a property of the DC, not
+                # a rule the locator answer has to obey.
 
             # NtVer in the reply's blob is a statement about what the blob
             # carries, not the question repeated. A Windows 2000 DC varies the
@@ -641,18 +639,16 @@ def main():
         else:
             run.check("a ping for another domain is answered", result == 0,
                       "resultCode %s" % result)
-            try:
-                foreign_domain = decode_netlogon_ex(
-                    attribute_value(foreign_attrs, "Netlogon"))["dns_domain"]
-            except Exception as error:  # noqa: BLE001
-                run.check("the answer names this DC's own domain, not the one asked",
-                          False, str(error))
-            else:
-                run.check(
-                    "the answer names this DC's own domain, not the one asked",
-                    foreign_domain.lower() == args.domain.lower(),
-                    foreign_domain,
-                )
+            # AD evaluates the domain assertion against its own root DSE, so a
+            # filter that names another domain matches nothing: success with no
+            # entry at all (22 bytes measured). An entry here would either name
+            # this DC's domain for a foreign question or refuse it, and neither
+            # is what the DC does.
+            run.check(
+                "the foreign-domain answer carries no entry",
+                foreign_attrs is None,
+                "an entry came back: %r" % (sorted(foreign_attrs or {}),),
+            )
 
     # 4. A UDP search that is not a locator ping is refused, not ignored:
     #    unwillingToPerform with the diagnostic a Windows 2000 DC sends

@@ -1511,11 +1511,8 @@ void LdapTest::locatorPingForAnotherDomainIsAnswered()
 
     const QByteArray reply = udpQuery(server.cldapPort(), locatorPing("other.example.com"));
     QVERIFY(!reply.isEmpty());
-    QCOMPARE(operationTag(reply), 0x64); // the entry comes first, then the result
-    // A refused ping has no entry at all, so an entry naming this DC's domain is
-    // the success a Windows 2000 DC answers with.
-    // The answer names this DC's domain, not the one the ping asked for.
-    QVERIFY(reply.contains(QByteArray("\x04" "corp" "\x07" "example" "\x03" "com\x00", 18)));
+    QCOMPARE(operationTag(reply), 0x65);
+    QCOMPARE(resultCode(reply), 0);
 }
 
 // RFC 4511 dropped LDAP over UDP; only the locator ping survives on it. Any

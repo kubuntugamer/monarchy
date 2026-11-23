@@ -346,7 +346,7 @@ The gaps above are not independent. Working outward from what exists:
    rejects any entry that is not exactly one attribute, and a named list is a
    capability hint rather than a filter over the answer; echoing it back was
    this server's own behaviour turned into a test, and both the answer and the
-   conformance script now follow the measured one. Three more differences were measured against that DC and are served here: a ping asking for WITH_IP gets the address the datagram arrived on and a trailing word that says so (`0x0d` with the address, `0x05` without), a ping for a domain this DC does not host is answered with its own blob rather than refused, and a UDP search that is not a ping is refused `unwillingToPerform` with AD's own diagnostic instead of being left silent — and the reply is two
+   conformance script now follow the measured one. Three more differences were measured against that DC and are served here: a ping asking for WITH_IP gets the address the datagram arrived on and a trailing word that says so (`0x0d` with the address, `0x05` without); a ping whose domain assertion names another domain matches nothing and is answered success with no entry, which is what the filter evaluation in RFC 4511 §4.5.3 gives and what the real DC sends (22 bytes, the result alone); and a UDP search that is not a ping is refused `unwillingToPerform` with AD's own diagnostic instead of being left silent — and the reply is two
    LDAPMessages, not one SEQUENCE wrapping both, which is how a client reads an
    id followed by a result. That framing bug was invisible until a real client
    was driven against the server: its own driver read the wrong shape happily. A real member's join flow and

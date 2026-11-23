@@ -643,14 +643,16 @@ QByteArray LdapServer::cldapResponse(const QByteArray &request,
     const QList<const Asn1::Element *> scopeFields = Asn1::children(*search, 0x0a);
     if (!scopeFields.isEmpty() && Asn1::toInteger(*scopeFields.first()) != 0) return {};
 
-    // Collect the filter's assertions. A ping names a domain, but the named
-    // domain is not a filter over the answer: a Windows 2000 DC answers a ping
-    // for any domain with its own blob and leaves the client to compare
-    // DnsDomain for itself (measured — a foreign-domain ping there returns
-    // success, not noSuchObject). Refusing it made a client that had already
-    // picked this DC see it as absent.
+    // Collect the filter's assertions. The named attributes are a capability
+    // hint, not a filter over the answer, but a named domain is a filter over the
+    // entry: a Windows 2000 DC evaluates it against its own root DSE, so a ping
+    // for another domain is answered success with no entry at all (measured: 22
+    // bytes, the result message alone). Answering with this DC's blob instead
+    // would tell a client for that other domain that this server hosts it, and
+    // refusing it noSuchObject was a third answer neither DC gives.
     QStringList assertions;
     QList<QByteArray> assertionValues;
+    int domainIndex = -1;
     QList<const Asn1::Element *> pending;
     for (const Asn1::Element &child : search->children) {
         // The filter is the context-tagged field of the search request; its
@@ -678,6 +680,7 @@ QByteArray LdapServer::cldapResponse(const QByteArray &request,
     for (int i = 0; i < assertions.size(); ++i) {
         const QString &assertion = assertions.at(i);
         if (assertion.compare(QStringLiteral("DnsDomain"), Qt::CaseInsensitive) == 0) {
+            domainIndex = i + 1;
             asksAboutDomain = true;
         } else if (assertion.compare(QStringLiteral("NtVer"), Qt::CaseInsensitive) == 0) {
             asksAboutDomain = true;
@@ -685,6 +688,31 @@ QByteArray LdapServer::cldapResponse(const QByteArray &request,
             userIndex = i + 1;
         }
     }
+    const int msgId = int(Asn1::toInteger(*idField));
+
+    // The domain assertion decides whether the entry matches, and a base search
+    // whose filter does not match is success with no entry (RFC 4511 §4.5.3).
+    // The trailing root dot is not part of the name: a Windows locator sends the
+    // FQDN with it while the SRV record it followed has no dot.
+    const auto canonicalDomain = [](QString name) {
+        while (name.endsWith(QLatin1Char('.'))) name.chop(1);
+        return name;
+    };
+    if (domainIndex > 0 && domainIndex < assertions.size()
+        && canonicalDomain(assertions.at(domainIndex))
+                   .compare(canonicalDomain(m_identity.dnsDomain), Qt::CaseInsensitive) != 0) {
+        QByteArray inner;
+        writeInt(inner, 0x0a, 0); // success: the filter matched nothing
+        writeString(inner, 0x04, QString());
+        writeString(inner, 0x04, QString());
+        QByteArray out;
+        writeInt(out, 0x02, msgId);
+        writeTLV(out, 0x65, inner);
+        QByteArray seq;
+        writeTLV(seq, 0x30, out);
+        return seq;
+    }
+
     // NtVer carries a four-byte capabilities mask in the filter's value, and one
     // bit of it is a demand rather than a hint: NETLOGON_NT_VERSION_5EX_WITH_IP
     // (0x08) asks for this DC's address in the blob. A Windows 2000 DC answers it
@@ -702,7 +730,6 @@ QByteArray LdapServer::cldapResponse(const QByteArray &request,
         break;
     }
 
-    const int msgId = int(Asn1::toInteger(*idField));
     if (!asksAboutDomain) {
         // A UDP search that is not a locator ping is refused, not ignored. A
         // Windows 2000 DC answers unwillingToPerform with this diagnostic,
