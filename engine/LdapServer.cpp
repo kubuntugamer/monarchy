@@ -3673,6 +3673,29 @@ QByteArray LdapServer::makeSearchEntry(int msgId, const DirectoryObject &o,
             values = {QDateTime::currentDateTimeUtc().toString(Qt::ISODate)};
         if (key == QLatin1String("cn") && it.value().isEmpty())
             values = {o.name};
+        // pwdLastSet is held as Unix seconds, the unit the password-age
+        // arithmetic compares, but AD defines the attribute as 100 ns intervals
+        // since 1601 and every client renders it as one. SAMR already converts
+        // on the way out (Samr.cpp); LDAP did not, so a directory read reported a
+        // password last set at 1601-01-01T00:02:59 — the seconds count read as
+        // ticks — while the same value showed correctly through SAMR.
+        if (key == QLatin1String("pwdlastset")) {
+            QStringList converted;
+            for (const QString &value : values) {
+                bool ok = false;
+                const qint64 seconds = value.toLongLong(&ok);
+                if (!ok) {
+                    converted.append(value);
+                    continue;
+                }
+                converted.append(seconds > 0
+                                     ? QString::number(quint64(seconds
+                                                              + Q_INT64_C(11644473600))
+                                                       * 10000000ull)
+                                     : QStringLiteral("0"));
+            }
+            values = converted;
+        }
         if (key == QLatin1String("objectsid")) {
             const QByteArray sid = Ndr::sidFromString(it.value());
             if (!sid.isEmpty()) {

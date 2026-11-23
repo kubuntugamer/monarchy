@@ -269,6 +269,7 @@ private slots:
     void refusesUnknownCriticalControl();
     void acceptsPermissiveModifyControl();
     void objectSidIsBinaryOnTheWire();
+    void pwdLastSetIsNtTimeOnTheWire();
     void derivesTheCategoryAndAccountTypeClientsFilterOn();
     void understandsTheBitwiseFiltersAducSends();
     void storesAQuotedUtf16MachinePassword();
@@ -575,6 +576,44 @@ void LdapTest::objectSidIsBinaryOnTheWire()
     QCOMPARE(values.size(), 1);
     QCOMPARE(values.first(), Ndr::sidFromString(sidText));
     QVERIFY(values.first().startsWith(QByteArray("\x01\x05", 2)));
+}
+
+// pwdLastSet is one of the attributes AD defines as a 100 ns interval since
+// 1601. The store holds it as Unix seconds because that is what the password-age
+// arithmetic compares, and SAMR converts on the way out; LDAP used to send the
+// seconds count itself, which reads back as 1601-01-01T00:02:59, so every client
+// that shows "password last set" showed the epoch instead of the date.
+void LdapTest::pwdLastSetIsNtTimeOnTheWire()
+{
+    const QString seconds = QStringLiteral("1795293849");
+    DirectoryObject user;
+    user.id = QString::fromLatin1(kSampleUserDn);
+    user.name = QStringLiteral("Alice Chen");
+    user.kind = ObjectKind::User;
+    user.attributes.insert(QStringLiteral("objectClass"), QStringLiteral("user"));
+    user.attributes.insert(QStringLiteral("sAMAccountName"), QStringLiteral("alice"));
+    user.attributes.insert(QStringLiteral("pwdLastSet"), seconds);
+
+    LdapServer server;
+    server.setObjects({user});
+    QVERIFY(server.listen(0));
+
+    QTcpSocket client;
+    client.connectToHost(QHostAddress::LocalHost, server.serverPort());
+    QVERIFY(client.waitForConnected(3000));
+    Reader reader(&client);
+    authenticate(client, reader, kSampleUserDn);
+
+    client.write(searchRequest(2, kSampleUserDn));
+    const QByteArray message = reader.next();
+    QVERIFY(!message.isEmpty());
+    QCOMPARE(operationTag(message), 0x64); // searchResEntry
+
+    const QList<QByteArray> values = entryAttribute(message, QByteArray("pwdLastSet"));
+    QCOMPARE(values.size(), 1);
+    // 1795293849 s since 1970 is 134397674490000000 ticks since 1601, the form a
+    // client parses; the raw seconds would be 1795293849.
+    QCOMPARE(values.first(), QByteArray("134397674490000000"));
 }
 
 // AD computes a handful of attributes instead of storing them, and its own
