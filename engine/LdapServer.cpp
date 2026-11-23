@@ -632,6 +632,21 @@ void LdapServer::onCldapDatagram() {
     }
 }
 
+QUuid LdapServer::domainGuid() const
+{
+    for (const DirectoryObject &object : m_objects) {
+        if (object.kind != ObjectKind::Domain)
+            continue;
+        // A store that carries the attribute decides, and one that predates it
+        // falls back to the same derivation the replication wire and the
+        // objectGuid read use, so every reader names the domain the same way.
+        const QUuid stored(
+            object.attributes.value(QStringLiteral("objectGUID")).trimmed());
+        return stored.isNull() ? objectGuidFor(object.id) : stored;
+    }
+    return QUuid();
+}
+
 QByteArray LdapServer::cldapResponse(const QByteArray &request,
                                     const QHostAddress &localAddress) const {
     // The only query a DC answers over UDP is the locator's ping: a baseObject
@@ -762,25 +777,21 @@ QByteArray LdapServer::cldapResponse(const QByteArray &request,
     const QString netbiosHost = host.section(QLatin1Char('.'), 0, 0).toUpper();
 
     // The domain's GUID, in the mixed-endian layout a GUID wears on the wire.
-    QByteArray domainGuid;
-    for (const DirectoryObject &object : m_objects) {
-        if (object.kind != ObjectKind::Domain) continue;
-        const QUuid stored(object.attributes.value(QStringLiteral("objectGUID")));
-        const QUuid guid = stored.isNull() ? objectGuidFor(object.id) : stored;
-        if (guid.isNull()) continue;
-        const quint32 d1 = guid.data1;
-        const quint16 d2 = guid.data2;
-        const quint16 d3 = guid.data3;
-        domainGuid.append(char(d1 & 0xff));
-        domainGuid.append(char((d1 >> 8) & 0xff));
-        domainGuid.append(char((d1 >> 16) & 0xff));
-        domainGuid.append(char((d1 >> 24) & 0xff));
-        domainGuid.append(char(d2 & 0xff));
-        domainGuid.append(char((d2 >> 8) & 0xff));
-        domainGuid.append(char(d3 & 0xff));
-        domainGuid.append(char((d3 >> 8) & 0xff));
-        for (int i = 0; i < 8; ++i) domainGuid.append(char(guid.data4[i]));
-        break;
+    QByteArray domainGuidBlob;
+    const QUuid domainGuid = this->domainGuid();
+    if (!domainGuid.isNull()) {
+        const quint32 d1 = domainGuid.data1;
+        const quint16 d2 = domainGuid.data2;
+        const quint16 d3 = domainGuid.data3;
+        domainGuidBlob.append(char(d1 & 0xff));
+        domainGuidBlob.append(char((d1 >> 8) & 0xff));
+        domainGuidBlob.append(char((d1 >> 16) & 0xff));
+        domainGuidBlob.append(char((d1 >> 24) & 0xff));
+        domainGuidBlob.append(char(d2 & 0xff));
+        domainGuidBlob.append(char((d2 >> 8) & 0xff));
+        domainGuidBlob.append(char(d3 & 0xff));
+        domainGuidBlob.append(char((d3 >> 8) & 0xff));
+        for (int i = 0; i < 8; ++i) domainGuidBlob.append(char(domainGuid.data4[i]));
     }
 
     // A locator ping names the attributes it wants, and the answer carries the
@@ -831,7 +842,7 @@ QByteArray LdapServer::cldapResponse(const QByteArray &request,
                                    | 0x00000080 // closest site
                                    | 0x00000100; // writable
         for (int i = 0; i < 4; ++i) blob.append(char((serverType >> (8 * i)) & 0xff));
-        blob.append(domainGuid.leftJustified(16, '\0', true));
+        blob.append(domainGuidBlob.leftJustified(16, '\0', true));
         // NBT strings: one length-prefixed label at a time, then a NUL. An empty
         // string is that NUL alone, which is why the guard is on the whole name
         // rather than on each label.
@@ -3773,6 +3784,22 @@ QByteArray LdapServer::makeSearchEntry(int msgId, const DirectoryObject &o,
     if (!emitted.contains(QStringLiteral("distinguishedname")) && !o.id.isEmpty()
         && wanted(QStringLiteral("distinguishedName")))
         addAttr(QStringLiteral("distinguishedName"), {o.id});
+    // Every object in AD carries an objectGUID, and a store built here may not.
+    // The value it has to report is the one the rest of the server names the
+    // object by -- the DSNAME on the replication wire, the domain GUID the
+    // locator states, and the zone's domains._msdcs owner -- because a client
+    // that reads one of those and then asks the directory gets to notice when
+    // they disagree. Derived from the object's own identity, so it is stable
+    // across restarts without a schema migration.
+    if (!emitted.contains(QStringLiteral("objectguid")) && !o.id.isEmpty()
+        && wanted(QStringLiteral("objectGUID"))) {
+        const QByteArray derived =
+            guidBytes(objectGuidFor(o.id).toString(QUuid::WithoutBraces));
+        if (!derived.isEmpty()) {
+            addRawAttr(QStringLiteral("objectGUID"), derived);
+            emitted.append(QStringLiteral("objectguid"));
+        }
+    }
 
     QByteArray entry;
     writeString(entry, 0x04, o.id); // objectName

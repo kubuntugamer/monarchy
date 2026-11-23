@@ -1483,10 +1483,12 @@ bool DcService::start(const QString &dcDir)
     // while the master is also restarting.
     applyDnsMaster(m_dnsServer, dcConfig);
     m_dnsServer->refreshSecondaryZones();
-    // The GUID a member asks for under domains._msdcs comes off the domain SID,
-    // so the zone and the DC's own answers name the same domain.
-    const QString domainGuid =
-        DnsServer::domainGuidFor(dcConfig.value(QStringLiteral("domainSid"), QString()).toString());
+    // The GUID a member asks for under domains._msdcs is the domain NC's
+    // objectGUID, which is what the locator answer states: taken from the store
+    // so the zone and the answer cannot name two different domains.
+    const QString domainGuid = m_ldapServer
+                                   ? m_ldapServer->domainGuid().toString(QUuid::WithoutBraces)
+                                   : QString();
     if (!m_dnsServer->loadZone(m_zonePath)) {
         m_dnsServer->loadAdZone(dnsDomain, dcHost, dcIp, boundLdapPort, boundGcPort, siteName,
                                 boundKpasswdPort, boundKdcPort, domainGuid);

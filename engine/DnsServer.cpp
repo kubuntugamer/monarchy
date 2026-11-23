@@ -956,24 +956,6 @@ QString ptrOwnerFor(const QString &ip)
 
 } // namespace
 
-QString DnsServer::domainGuidFor(const QString &domainSid)
-{
-    if (domainSid.isEmpty())
-        return QString();
-    const QByteArray digest = QCryptographicHash::hash(domainSid.toUpper().toUtf8(),
-                                                       QCryptographicHash::Md5);
-    if (digest.size() != 16)
-        return QString();
-    // AD writes the first three fields of a GUID little-endian and the last
-    // eight bytes as they are, so the text a member asks for is the digest with
-    // the first four bytes reversed and the next two pairs swapped.
-    const QString hex = QString::fromLatin1(digest.toHex());
-    return QStringLiteral("%1-%2-%3-%4-%5")
-        .arg(hex.mid(6, 2) + hex.mid(4, 2) + hex.mid(2, 2) + hex.mid(0, 2),
-             hex.mid(10, 2) + hex.mid(8, 2), hex.mid(14, 2) + hex.mid(12, 2), hex.mid(16, 4),
-             hex.mid(20, 12));
-}
-
 void DnsServer::loadAdZone(const QString &zone, const QString &host, const QString &ip,
                            quint16 ldapPort, quint16 gcPort, const QString &site,
                            quint16 kpasswdPort, quint16 kdcPort, const QString &domainGuid) {
@@ -1029,6 +1011,26 @@ bool DnsServer::repairAdZoneLocators(const QString &host, quint16 ldapPort, quin
     const QString hostName = host.toLower();
     const QString siteName = site.isEmpty() ? QStringLiteral("Default-First-Site-Name") : site;
     bool changed = false;
+    // A zone written by an older build keys the domain-GUID locators on
+    // md5(SID), and a member that resolved that name keeps asking for it. Add
+    // the current owner, then drop the stale ones: leaving both would let the
+    // zone send a client to a GUID the locator answer then contradicts.
+    if (!domainGuid.isEmpty()) {
+        const QString suffix = QStringLiteral(".domains._msdcs.") + m_zone;
+        const QString current = domainGuid.toLower();
+        for (auto it = m_records.begin(); it != m_records.end();) {
+            const QString owner = it.key();
+            const QString label = owner.section(QLatin1Char('.'), 2, 2);
+            const bool keyedOnGuid = owner.startsWith(QStringLiteral("_ldap._tcp."))
+                                     || owner.startsWith(QStringLiteral("_gc._tcp."));
+            if (keyedOnGuid && owner.endsWith(suffix) && label != current) {
+                it = m_records.erase(it);
+                changed = true;
+                continue;
+            }
+            ++it;
+        }
+    }
     for (const AdSrvSpec &spec :
          adSrvSpecs(m_zone, siteName, ldapPort, gcPort, kpasswdPort, kdcPort, domainGuid)) {
         const QList<Record> existing = records(spec.owner, TypeSrv);

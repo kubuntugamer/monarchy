@@ -290,6 +290,8 @@ private slots:
     void answersTheDcLocatorPingOverUdp();
     void locatorPingForAnotherDomainIsAnswered();
     void udpSearchThatIsNotALocatorPingIsRefused();
+    void servesTheObjectGuidItDerives();
+    void publishesTheStoredDomainGuid();
 };
 
 // The password policy is the domain object's: minPwdLength, pwdHistoryLength and
@@ -577,6 +579,74 @@ void LdapTest::objectSidIsBinaryOnTheWire()
     QCOMPARE(values.size(), 1);
     QCOMPARE(values.first(), Ndr::sidFromString(sidText));
     QVERIFY(values.first().startsWith(QByteArray("\x01\x05", 2)));
+}
+
+// AD gives every object an objectGUID, and clients key on it: the replication
+// wire names an object by GUID, and a join reads the domain's own GUID back to
+// match it against what the locator answered. A store built here does not have to
+// carry the attribute, so the server states the value it names the object by
+// everywhere else -- derived from the DN when absent -- in the 16 bytes AD sends,
+// not as text.
+void LdapTest::servesTheObjectGuidItDerives()
+{
+    DirectoryObject user;
+    user.id = QString::fromLatin1(kSampleUserDn);
+    user.name = QStringLiteral("Alice Chen");
+    user.kind = ObjectKind::User;
+    user.attributes.insert(QStringLiteral("objectClass"), QStringLiteral("user"));
+    user.attributes.insert(QStringLiteral("sAMAccountName"), QStringLiteral("alice"));
+    QVERIFY(user.attributes.value(QStringLiteral("objectGUID")).isEmpty());
+
+    LdapServer server;
+    server.setObjects({user});
+    QVERIFY(server.listen(0));
+
+    QTcpSocket client;
+    client.connectToHost(QHostAddress::LocalHost, server.serverPort());
+    QVERIFY(client.waitForConnected(3000));
+    Reader reader(&client);
+    authenticate(client, reader, kSampleUserDn);
+
+    client.write(searchRequest(2, kSampleUserDn));
+    const QByteArray message = reader.next();
+    QVERIFY(!message.isEmpty());
+    QCOMPARE(operationTag(message), 0x64); // searchResEntry
+
+    const QList<QByteArray> values = entryAttribute(message, QByteArray("objectGUID"));
+    QCOMPARE(values.size(), 1);
+    QCOMPARE(values.first(), wireGuid(objectGuidFor(user.id)));
+}
+
+// A store that does carry the attribute decides, and the locator answer states
+// that same value: the zone publishes it under domains._msdcs, so all three have
+// to name one domain.
+void LdapTest::publishesTheStoredDomainGuid()
+{
+    DirectoryObject domain;
+    domain.id = QStringLiteral("DC=corp,DC=example,DC=com");
+    domain.name = QStringLiteral("CORP");
+    domain.kind = ObjectKind::Domain;
+    domain.attributes.insert(QStringLiteral("objectClass"),
+                             QStringLiteral("top;domain;domainDNS"));
+    const QUuid stored = QUuid::fromString(
+        QStringLiteral("{0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0}"));
+    QVERIFY(!stored.isNull());
+    domain.attributes.insert(QStringLiteral("objectGUID"),
+                             stored.toString(QUuid::WithoutBraces));
+
+    LdapServer server;
+    server.setObjects({domain});
+    LdapServer::Identity identity;
+    identity.realm = QStringLiteral("CORP.EXAMPLE.COM");
+    identity.netbios = QStringLiteral("CORP");
+    identity.dnsDomain = QStringLiteral("corp.example.com");
+    identity.dcHost = QStringLiteral("dc1.corp.example.com");
+    identity.siteName = QStringLiteral("Default-First-Site-Name");
+    server.setIdentity(identity);
+
+    QCOMPARE(server.domainGuid(), stored);
+    QVERIFY(server.cldapResponse(windows2000LocatorPing("corp.example.com."))
+                .contains(wireGuid(stored)));
 }
 
 // pwdLastSet is one of the attributes AD defines as a 100 ns interval since
@@ -1529,8 +1599,11 @@ void LdapTest::answersTheDcLocatorPingOverUdp()
     QVERIFY(!reply.contains("DnsDomain"));
     QVERIFY(!reply.contains("LdapService"));
     // The domain GUID the client is told is the one the directory publishes for
-    // the same object, so a join can match them up.
-    QVERIFY(reply.contains(wireGuid(objectGuidFor(QStringLiteral("DC=corp,DC=example,DC=com")))));
+    // the same object, so a join can match them up -- and it is the single value
+    // this server decides, the same one the DNS zone keys domains._msdcs on, so
+    // the locator and the zone cannot send a client two different domains.
+    QCOMPARE(server.domainGuid(), objectGuidFor(QStringLiteral("DC=corp,DC=example,DC=com")));
+    QVERIFY(reply.contains(wireGuid(server.domainGuid())));
 
     // Samba's ping asks for one attribute, so the entry carries one: its client
     // rejects any answer whose entry is not exactly one attribute called

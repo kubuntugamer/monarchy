@@ -7,6 +7,7 @@
 #include "Krb5.h"
 #include "LdapServer.h"
 #include "Ntlm.h"
+#include "ObjectGuid.h"
 
 #include <QCryptographicHash>
 #include <QDateTime>
@@ -907,7 +908,7 @@ ProvisionResult provisionDomain(const ProvisionConfig &config)
         DnsServer dns;
         dns.loadAdZone(b.dnsDomain, result.dcHost, dcIp, ldapPort, gcPort,
                        QStringLiteral("Default-First-Site-Name"), kpasswdPort, kdcPort,
-                       DnsServer::domainGuidFor(b.sid));
+                       objectGuidFor(result.baseDn).toString(QUuid::WithoutBraces));
         QString zoneError;
         if (!dns.saveZone(result.zonePath, &zoneError)) {
             result.error = zoneError;

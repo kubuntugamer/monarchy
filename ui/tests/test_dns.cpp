@@ -16,6 +16,7 @@
 #include "DnsServer.h"
 #include "Gss.h"
 #include "Krb5.h"
+#include "ObjectGuid.h"
 
 namespace {
 
@@ -536,6 +537,7 @@ class DnsTest : public QObject
 private slots:
     void publishesAdServiceRecords();
     void publishesTheDomainGuidLocator();
+    void repairsTheDomainGuidLocator();
     void repairsAdZoneLocators();
     void withdrawsLocatorsForUnboundServices();
     void followsConfiguredAddressOnDiskZone();
@@ -640,13 +642,15 @@ void DnsTest::publishesTheDomainGuidLocator()
 {
     // A member confirms the controller it found by asking for the locators under
     // the domain's own GUID, and a client answered NXDOMAIN there stops trusting
-    // DNS discovery. The GUID is the one Netlogon hands out: the MD5 of the
-    // domain SID with the first three fields written little-endian.
+    // DNS discovery. The GUID is the domain NC's objectGUID -- the same value a
+    // locator answer states as DomainGuid -- not a function of the domain SID: a
+    // client that learns it from the zone and then reads a different one in the
+    // answer has been told two domains.
     const QString zone = QStringLiteral("cyberdyne.lan");
     const QString host = QStringLiteral("minerva.cyberdyne.lan");
-    const QString guid =
-        DnsServer::domainGuidFor(QStringLiteral("S-1-5-21-5926014-2702479734-3490867515"));
-    QCOMPARE(guid, QStringLiteral("385867b2-0f2e-4ea5-d5a1-91dfbd86d1cc"));
+    const QString guid = objectGuidFor(QStringLiteral("DC=cyberdyne,DC=lan"))
+                             .toString(QUuid::WithoutBraces);
+    QCOMPARE(guid, QStringLiteral("1d61bba3-e319-3527-73ac-1e6c90146bd6"));
 
     DnsServer server;
     server.loadAdZone(zone, host, QStringLiteral("10.0.0.10"), 389, 3268,
@@ -677,6 +681,48 @@ void DnsTest::publishesTheDomainGuidLocator()
     plain.loadAdZone(zone, host, QStringLiteral("10.0.0.10"), 389, 3268,
                      QStringLiteral("Default-First-Site-Name"), 464, 88);
     QVERIFY(plain.records(expectations.first().owner, DnsServer::TypeSrv).isEmpty());
+}
+
+void DnsTest::repairsTheDomainGuidLocator()
+{
+    // A zone an older build wrote keys these names on md5(SID). Once the domain
+    // GUID is the object's, that owner is stale: leaving it beside the current
+    // one lets a client resolve a GUID the locator answer then contradicts.
+    const QString zone = QStringLiteral("cyberdyne.lan");
+    const QString host = QStringLiteral("minerva.cyberdyne.lan");
+    const QString site = QStringLiteral("Default-First-Site-Name");
+    const QString current = objectGuidFor(QStringLiteral("DC=cyberdyne,DC=lan"))
+                                .toString(QUuid::WithoutBraces);
+    const QString stale = QStringLiteral("385867b2-0f2e-4ea5-d5a1-91dfbd86d1cc");
+    QVERIFY(current != stale);
+
+    DnsServer server;
+    server.loadAdZone(zone, host, QStringLiteral("10.0.0.10"), 389, 3268, site, 464, 88, stale);
+    const QList<QString> owners = {
+        QStringLiteral("_ldap._tcp.") + stale + QStringLiteral(".domains._msdcs.") + zone,
+        QStringLiteral("_gc._tcp.") + stale + QStringLiteral(".domains._msdcs.") + zone,
+    };
+    for (const QString &owner : owners)
+        QCOMPARE(server.records(owner, DnsServer::TypeSrv).size(), 1);
+
+    QVERIFY(server.repairAdZoneLocators(host, 389, 3268, site, 464, 88, current));
+
+    for (const QString &owner : owners) {
+        QVERIFY2(server.records(owner, DnsServer::TypeSrv).isEmpty(),
+                 qPrintable(QStringLiteral("the stale GUID owner %1 survived").arg(owner)));
+        const QString fresh = owner.contains(QStringLiteral("_gc."))
+                                  ? QStringLiteral("_gc._tcp.") + current
+                                        + QStringLiteral(".domains._msdcs.") + zone
+                                  : QStringLiteral("_ldap._tcp.") + current
+                                        + QStringLiteral(".domains._msdcs.") + zone;
+        QCOMPARE(server.records(fresh, DnsServer::TypeSrv).size(), 1);
+    }
+
+    // The owner of a name that is not GUID-keyed is left alone by the sweep.
+    QCOMPARE(server.records(QStringLiteral("_ldap._tcp.dc._msdcs.") + zone,
+                            DnsServer::TypeSrv)
+                 .size(),
+             1);
 }
 
 void DnsTest::repairsAdZoneLocators()

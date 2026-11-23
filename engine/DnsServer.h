@@ -84,17 +84,13 @@ public:
     void setZone(const QString &zone);
     QString zone() const;
 
-    // The domain's GUID in the textual form AD publishes it under
-    // `domains._msdcs`: derived from the domain SID, so it is the GUID the
-    // DC's own answers carry and a restart does not change it. A member asks
-    // for the locators under this name to confirm that the DC it found serves
-    // this domain.
-    static QString domainGuidFor(const QString &domainSid);
-
     // Loads an empty zone: SOA, NS, the apex A record and the complete set of
     // domain-controller SRV records for `host`/`ip`. `site` is the AD site the
     // DC belongs to, which decides the _sites._msdcs record names, and
-    // `domainGuid` adds the names AD keys on the domain GUID.
+    // `domainGuid` adds the names AD keys on the domain GUID. That GUID is the
+    // domain NC's objectGUID -- the same value a locator answer states -- never
+    // a function of the domain SID, or a client that follows the zone and then
+    // reads the answer is told two different domains.
     void loadAdZone(const QString &zone, const QString &host, const QString &ip,
                     quint16 ldapPort, quint16 gcPort, const QString &site,
                     quint16 kpasswdPort = 464, quint16 kdcPort = 88,

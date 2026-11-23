@@ -13,6 +13,7 @@
 #include <QList>
 #include <QMap>
 #include <QString>
+#include <QUuid>
 
 #include <functional>
 
@@ -77,6 +78,11 @@ public:
     // asking for WITH_IP is answered with.
     QByteArray cldapResponse(const QByteArray &request,
                              const QHostAddress &localAddress = QHostAddress()) const;
+    // The domain's GUID -- the domain NC's objectGUID, which is what AD publishes
+    // under `domains._msdcs` and states in a locator answer's DomainGuid. Null
+    // when the store holds no domain object. This is the one place it is decided,
+    // so the zone the DC serves and the answer a member gets cannot disagree.
+    QUuid domainGuid() const;
 
     // TLS for StartTLS (RFC 4511 §4.14.1). The listener accepts plaintext and
     // upgrades a connection in place when the client sends the StartTLS extended
