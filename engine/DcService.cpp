@@ -13,6 +13,7 @@
 #include "Lsad.h"
 #include "Netlogon.h"
 #include "Srvsvc.h"
+#include "Browser.h"
 #include "Rpc.h"
 #include "Ntlm.h"
 #include "Pac.h"
@@ -980,6 +981,14 @@ bool DcService::start(const QString &dcDir)
                                .arg(m_srvsvcServer->serverPort()));
     }
 
+    // The browser endpoint (\piperowser) a 2000 member's logon enumerates
+    // through. It has no TCP listener: the pipe is the only transport Windows
+    // uses for it, and the pipe is what the logon opens.
+    m_browserServer = new BrowserServer(this);
+    m_browserServer->setAuthenticator(authenticator);
+    connect(m_browserServer, &BrowserServer::requestReceived, this,
+            [this](const QString &operation) { emit statusMessage(operation); });
+
     // Pull replication: when dc.conf names a partner, this DC takes changes from
     // it on its own schedule instead of waiting for an administrator to ask. The
     // cursor lives in the agent, so each pull asks only for what is new, and a
@@ -1221,6 +1230,16 @@ bool DcService::start(const QString &dcDir)
         srvsvcPipe.pipe = QStringLiteral("srvsvc");
         entries.append(srvsvcPipe);
 
+        // The browser service is reachable only on its pipe, as on Windows: a
+        // client asks for it by name, never for a port.
+        const Rpc::Interface browser = Browser::interface();
+        Epm::Entry browserPipe;
+        browserPipe.uuid = browser.uuid;
+        browserPipe.major = browser.major;
+        browserPipe.minor = browser.minor;
+        browserPipe.pipe = QStringLiteral("browser");
+        entries.append(browserPipe);
+
         // DRSUAPI, where a replication partner asks which port to pull
         // changes on. Advertised as TCP only: there is no drsuapi pipe.
         if (m_drsServer->isListening()) {
@@ -1297,6 +1316,9 @@ bool DcService::start(const QString &dcDir)
     m_smbServer->addPipe(QStringLiteral("epmapper"), m_epmServer->rpc());
     m_smbServer->addPipe(QStringLiteral("netlogon"), m_netlogonServer->rpc());
     m_smbServer->addPipe(QStringLiteral("srvsvc"), m_srvsvcServer->rpc());
+    // A Windows 2000 member's logon enumerates the domain through this pipe,
+    // and an open that fails stops the logon before any Netlogon call.
+    m_smbServer->addPipe(QStringLiteral("browser"), m_browserServer->rpc());
 
     // The domain's SYSVOL tree and the NETLOGON scripts it contains, served as
     // the disk shares a member reads its GPOs and logon scripts from. The

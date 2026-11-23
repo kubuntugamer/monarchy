@@ -86,6 +86,7 @@ add_library(monarchy-ui-core STATIC
     ../engine/Epm.cpp
     ../engine/Srvsvc.h
     ../engine/Srvsvc.cpp
+    ../engine/Browser.cpp
     ../engine/Smb1.h
     ../engine/Smb1.cpp
     ../engine/Smb2.h
@@ -407,6 +408,21 @@ if(BUILD_TESTING)
 
     add_test(NAME monarchy-srvsvc-tests COMMAND monarchy-srvsvc-tests)
     set_tests_properties(monarchy-srvsvc-tests PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+    )
+
+    # The browser endpoint a 2000 member's logon enumerates through.
+    add_executable(monarchy-browser-tests
+        tests/test_browser.cpp
+    )
+
+    target_link_libraries(monarchy-browser-tests PRIVATE
+        monarchy-ui-core
+        Qt6::Test
+    )
+
+    add_test(NAME monarchy-browser-tests COMMAND monarchy-browser-tests)
+    set_tests_properties(monarchy-browser-tests PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
     )
 

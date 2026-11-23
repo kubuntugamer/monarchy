@@ -18,6 +18,7 @@ class SamrServer;
 class LsadServer;
 class NetlogonServer;
 class SrvsvcServer;
+class BrowserServer;
 class DrsServer;
 class EpmServer;
 class Smb2Server;
@@ -110,6 +111,7 @@ private:
     LsadServer *m_lsadServer = nullptr;
     NetlogonServer *m_netlogonServer = nullptr;
     SrvsvcServer *m_srvsvcServer = nullptr;
+    BrowserServer *m_browserServer = nullptr;
     DrsServer *m_drsServer = nullptr;
     EpmServer *m_epmServer = nullptr;
     Smb2Server *m_smbServer = nullptr;
