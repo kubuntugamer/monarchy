@@ -1439,21 +1439,20 @@ void LdapTest::answersTheDcLocatorPingOverUdp()
     QCOMPARE(operationTag(win2000), 0x64); // searchResEntry
     QVERIFY(win2000.contains("Netlogon"));
 
-    // What the client reads to decide this DC hosts the domain.
-    QVERIFY(reply.contains("DnsDomain"));
-    QVERIFY(reply.contains("corp.example.com"));
-    QVERIFY(reply.contains("DnsForestName"));
-    QVERIFY(reply.contains("DcSiteName"));
-    QVERIFY(reply.contains("NetbiosDomainName"));
-    QVERIFY(reply.contains("CORP"));
-    QVERIFY(reply.contains("HostName"));
-    QVERIFY(reply.contains("dc1.corp.example.com"));
-    QVERIFY(reply.contains("NtVer"));
-    QVERIFY(reply.contains(QByteArray("\x06\x00\x00\x00", 4)));
-    QVERIFY(reply.contains("LdapService"));
+    // What the client reads to decide this DC hosts the domain is inside the
+    // blob; the entry itself carries one attribute, however many the ping named.
+    // A Windows 2000 DC answers that way, and Samba's locator rejects any entry
+    // that is not exactly one attribute called netlogon (omitted from this
+    // reply, which the ping below asks for by name), so echoing the named list
+    // is neither what AD does nor what a client can read.
+    QVERIFY(reply.contains(QByteArray("\x04" "corp" "\x07" "example" "\x03" "com\x00", 18)));
+    QVERIFY(reply.contains(QByteArray("\x04" "CORP\x00", 6)));
+    QVERIFY(reply.contains(
+        QByteArray("\x03" "dc1" "\x04" "corp" "\x07" "example" "\x03" "com\x00", 22)));
+    QVERIFY(!reply.contains("DnsDomain"));
+    QVERIFY(!reply.contains("LdapService"));
     // The domain GUID the client is told is the one the directory publishes for
     // the same object, so a join can match them up.
-    QVERIFY(reply.contains("DomainGuid"));
     QVERIFY(reply.contains(wireGuid(objectGuidFor(QStringLiteral("DC=corp,DC=example,DC=com")))));
 
     // Samba's ping asks for one attribute, so the entry carries one: its client

@@ -518,8 +518,12 @@ def main():
                 for name in sorted(attrs):
                     print("    %s = %r" % (name, attrs[name]))
 
-    # 2. The DsGetDcName-shaped ping asks for the domain by name, and names the
-    #    attributes it wants. The entry has to carry those and nothing else.
+    # 2. The DsGetDcName-shaped ping asks for the domain by name and lists the
+    #    attributes it would like. A Windows 2000 DC answers with the netlogon
+    #    blob alone whatever that list says — measured against one — so the
+    #    entry is not allowed to echo the names back: a client reads the blob it
+    #    came for, and Samba's locator rejects an entry with more than one
+    #    attribute outright.
     windows_attributes = [
         "Netlogon",
         "DnsDomain",
@@ -553,18 +557,21 @@ def main():
         else:
             run.check("the named-domain reply parses", True)
             run.check("the named-domain reply is success", result == 0, str(result))
-            for name in windows_attributes:
-                run.check("the answer names %s when asked" % name, name in named, "missing")
             run.check(
-                "the answer carries no attribute that was not asked for",
-                {name.lower() for name in named} <= {name.lower() for name in windows_attributes},
-                repr(sorted(named)),
+                "the entry carries the netlogon blob and nothing else",
+                [name.lower() for name in named] == ["netlogon"],
+                "attributes %r" % (sorted(named),),
             )
-            run.check(
-                "DnsDomain is the domain this DC hosts",
-                (named.get("DnsDomain") or [b""])[0].decode().lower() == args.domain.lower(),
-                (named.get("DnsDomain") or [b""])[0].decode(),
-            )
+            try:
+                named_ex = decode_netlogon_ex((named.get("Netlogon") or [b""])[0])
+            except Exception as error:  # noqa: BLE001 - the blob is what a client reads
+                run.check("the blob names the domain this DC hosts", False, str(error))
+            else:
+                run.check(
+                    "the blob names the domain this DC hosts",
+                    named_ex["dns_domain"].lower() == args.domain.lower(),
+                    named_ex["dns_domain"],
+                )
 
     # 3. A ping for a domain this DC does not host must be refused, not answered
     #    as though it did: the client would then trust a server that cannot

@@ -736,30 +736,14 @@ QByteArray LdapServer::cldapResponse(const QByteArray &request) const {
         break;
     }
 
-    // The search names the attributes it wants back, and the entry carries those
-    // and no others: an absent list means every attribute, a list means the ones
-    // named. This is load-bearing rather than tidy. Samba's locator client
-    // refuses any answer whose entry is not exactly one attribute called
-    // netlogon (`num_attributes != 1` in libads/netlogon_ping.c), so a DC that
-    // answers every ping with its whole attribute set cannot be found by
-    // `net ads lookup` however good its Netlogon blob is.
-    QList<QByteArray> requested;
-    bool allAttributes = true;
-    if (const Asn1::Element *attributeList = Asn1::child(*search, 0x30)) {
-        for (const Asn1::Element &item : attributeList->children) requested.append(item.value);
-        // An empty list is not "no attributes": RFC 4511 4.5.1.8 makes it mean
-        // all user attributes, the same as no list at all.
-        allAttributes = requested.isEmpty();
-    }
-    auto wants = [&requested, allAttributes](const char *name) {
-        if (allAttributes) return true;
-        for (const QByteArray &asked : requested) {
-            if (asked == "*") return true;
-            if (asked.compare(name, Qt::CaseInsensitive) == 0) return true;
-        }
-        return false;
-    };
-
+    // A locator ping names the attributes it wants, and the answer carries the
+    // netlogon blob alone whatever it named: that is how a Windows DC replies,
+    // measured against a Windows 2000 DC, and it is what the client-side checks
+    // assume. Samba's locator refuses any entry that is not exactly one
+    // attribute called netlogon (`num_attributes != 1` in
+    // libads/netlogon_ping.c). The named list is a capability hint — a client
+    // asks for the set it knows and reads what comes back — not a filter over
+    // the answer's attributes.
     auto attribute = [](const QString &type, const QByteArray &value) {
         QByteArray set;
         writeTLV(set, 0x04, value);
@@ -772,35 +756,7 @@ QByteArray LdapServer::cldapResponse(const QByteArray &request) const {
     };
 
     QByteArray attributes;
-    if (wants("DnsDomain"))
-        attributes.append(attribute(QStringLiteral("DnsDomain"), m_identity.dnsDomain.toUtf8()));
-    // One namespace here: the domain is its own forest root.
-    if (wants("DnsForestName"))
-        attributes.append(
-            attribute(QStringLiteral("DnsForestName"), m_identity.dnsDomain.toUtf8()));
-    if (wants("DcSiteName"))
-        attributes.append(attribute(QStringLiteral("DcSiteName"), site.toUtf8()));
-    if (wants("NetbiosDomainName"))
-        attributes.append(attribute(QStringLiteral("NetbiosDomainName"), m_identity.netbios.toUtf8()));
-    if (wants("NetbiosComputerName"))
-        attributes.append(
-            attribute(QStringLiteral("NetbiosComputerName"), netbiosHost.toUtf8()));
-    // DnsHostName is the name a client puts in its DC list; HostName is what a
-    // Windows DC also publishes, so both are here.
-    if (wants("DnsHostName"))
-        attributes.append(attribute(QStringLiteral("DnsHostName"), host.toUtf8()));
-    if (wants("HostName"))
-        attributes.append(attribute(QStringLiteral("HostName"), host.toUtf8()));
-    // NT_VERSION_5 | NT_VERSION_5EX: the capabilities mask a Windows DC
-    // publishes, and the value the locator's own filter asks for.
-    if (wants("NtVer"))
-        attributes.append(attribute(QStringLiteral("NtVer"), QByteArray("\x06\x00\x00\x00", 4)));
-    if (!domainGuid.isEmpty() && wants("DomainGuid"))
-        attributes.append(attribute(QStringLiteral("DomainGuid"), domainGuid));
-    if (wants("LdapService"))
-        attributes.append(attribute(QStringLiteral("LdapService"), QByteArray("LDAP")));
-
-    if (wants("NetLogon")) {
+    {
         // The locator's second answer, the binary blob `net ads lookup` and
         // Windows both parse: NETLOGON_SAM_LOGON_RESPONSE_EX as Samba's
         // librpc/idl/nbt.idl defines it, pushed with NDR_NOALIGN. Two things

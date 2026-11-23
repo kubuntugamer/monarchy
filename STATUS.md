@@ -340,11 +340,15 @@ The gaps above are not independent. Working outward from what exists:
    claimed, forest and domain names, both site names, `NT 5` and the two
    `0xffff` tokens. The blob is mask-independent (nt_version `5` inside it says
    there is no address field, so no mask can make one appear), the entry carries
-   exactly the attributes the ping named — Samba asks one and rejects any answer
-   that is not one — and the reply is two LDAPMessages, not one SEQUENCE
-   wrapping both, which is how a client reads an id followed by a result. That
-   framing bug was invisible until a real client was driven against the server:
-   its own driver read the wrong shape happily. A real member's join flow and
+   the `Netlogon` attribute and nothing else whatever attributes the ping named
+   — a Windows 2000 DC answers that way (measured against one), Samba's locator
+   rejects any entry that is not exactly one attribute, and a named list is a
+   capability hint rather than a filter over the answer; echoing it back was
+   this server's own behaviour turned into a test, and both the answer and the
+   conformance script now follow the measured one — and the reply is two
+   LDAPMessages, not one SEQUENCE wrapping both, which is how a client reads an
+   id followed by a result. That framing bug was invisible until a real client
+   was driven against the server: its own driver read the wrong shape happily. A real member's join flow and
    RPC-layer schannel are done (§6); what remains here is trust creation over
    the channel.
 7. ~~DRSR~~ — `DsBind`/`DsGetNCChanges`/`DsReplicaSync` plus `DsCrackNames`
