@@ -735,6 +735,49 @@ ProvisionResult provisionDomain(const ProvisionConfig &config)
                                    QStringLiteral("Password Settings Container"));
     }
 
+    {
+        // The BUILTIN domain: the well-known local groups whose SIDs appear in
+        // ACLs on every machine. AD keeps them in this container, and stores
+        // them here rather than synthesising them so a membership SAMR adds to
+        // one has somewhere to live.
+        const QString builtinDn = QStringLiteral("CN=Builtin,%1").arg(b.baseDn);
+        DirectoryObject &builtin =
+            b.add(builtinDn, QStringLiteral("Builtin"), QStringLiteral("Builtin-Domain"),
+                  ObjectKind::Container, QStringLiteral("Console Root"));
+        b.objectClass(builtin, {QStringLiteral("top"), QStringLiteral("builtinDomain")});
+        static const struct { const char *name; quint32 rid; } kAliases[] = {
+            {"Administrators", 544},
+            {"Users", 545},
+            {"Guests", 546},
+            {"Power Users", 547},
+            {"Account Operators", 548},
+            {"Server Operators", 549},
+            {"Print Operators", 550},
+            {"Backup Operators", 551},
+            {"Replicator", 552},
+            {"Remote Desktop Users", 555},
+            {"Network Configuration Operators", 556},
+            {"Performance Monitor Users", 558},
+            {"Performance Log Users", 559},
+            {"IIS_IUSRS", 568},
+            {"Event Log Readers", 573},
+            {"Certificate Service DCOM Access", 574},
+        };
+        for (const auto &alias : kAliases) {
+            const QString name = QString::fromLatin1(alias.name);
+            DirectoryObject &object = b.add(QStringLiteral("CN=%1,%2").arg(name, builtinDn), name,
+                                            QStringLiteral("Security Group"), ObjectKind::Group,
+                                            QStringLiteral("Builtin"));
+            b.objectClass(object, {QStringLiteral("top"), QStringLiteral("group")});
+            object.attributes.insert(QStringLiteral("cn"), name);
+            object.attributes.insert(QStringLiteral("sAMAccountName"), name);
+            object.attributes.insert(QStringLiteral("objectSid"),
+                                     QStringLiteral("S-1-5-32-%1").arg(alias.rid));
+            // A domain-local security group, which is what SAMR calls an alias.
+            object.attributes.insert(QStringLiteral("groupType"), QStringLiteral("-2147483644"));
+        }
+    }
+
     // --- Group Policy -----------------------------------------------------
     // The two policies every domain is created with, linked from the domain
     // and the Domain Controllers OU by the gPLink values set above.

@@ -164,7 +164,7 @@ const QList<BuiltinAlias> &builtinAliasTable()
 // The aliases in the shape the enumeration and the lookups already take, so the
 // BUILTIN domain needs no second code path through them. groupType carries
 // GROUP_TYPE_RESOURCE_GROUP, which is what makes them aliases and not groups.
-QList<DirectoryObject> builtinAliasObjects()
+QList<DirectoryObject> builtinAliasObjects(const QList<DirectoryObject> &stored)
 {
     QList<DirectoryObject> result;
     for (const BuiltinAlias &entry : builtinAliasTable()) {
@@ -176,6 +176,26 @@ QList<DirectoryObject> builtinAliasObjects()
         object.attributes.insert(QStringLiteral("objectSid"), object.id);
         object.attributes.insert(QStringLiteral("sAMAccountName"), object.name);
         object.attributes.insert(QStringLiteral("groupType"), QStringLiteral("4"));
+        // The memberships this directory keeps for the alias, when it keeps them:
+        // the stored object under CN=Builtin is what a write lands on, and what
+        // it holds is added to the memberships AD seeds. The SID stays the
+        // well-known one, because that is the name every ACL on the machine uses.
+        for (const DirectoryObject &candidate : stored) {
+            if (!candidate.id.contains(QStringLiteral(",CN=Builtin,"), Qt::CaseInsensitive))
+                continue;
+            const bool sameSid =
+                candidate.attributes.value(QStringLiteral("objectSid"))
+                    .compare(object.id, Qt::CaseInsensitive) == 0;
+            const bool sameName =
+                candidate.attributes.value(QStringLiteral("sAMAccountName"))
+                    .compare(object.name, Qt::CaseInsensitive) == 0;
+            if (!sameSid && !sameName)
+                continue;
+            object.members = candidate.members;
+            object.attributes.insert(QStringLiteral("description"),
+                                     candidate.attributes.value(QStringLiteral("description")));
+            break;
+        }
         result.append(object);
     }
     return result;
@@ -190,8 +210,27 @@ bool isBuiltinAlias(const QString &dn)
 // groups, plus the two runtime identities Windows puts in Users. A group is
 // listed only when the directory holds it, so a directory without Domain Admins
 // reports an empty Administrators rather than a member nobody has.
+// The SIDs of the given member DNs, for memberships this directory stores.
+QList<QByteArray> memberSids(const QStringList &members, const QList<DirectoryObject> &objects)
+{
+    QList<QByteArray> sids;
+    for (const QString &member : members) {
+        for (const DirectoryObject &candidate : objects) {
+            if (candidate.id.compare(member, Qt::CaseInsensitive) != 0)
+                continue;
+            const QByteArray sid = Ndr::sidFromString(
+                candidate.attributes.value(QStringLiteral("objectSid")));
+            if (!sid.isEmpty())
+                sids.append(sid);
+            break;
+        }
+    }
+    return sids;
+}
+
 QList<QByteArray> builtinMemberSids(quint32 rid, const QString &domainSid,
-                                    const QList<DirectoryObject> &objects)
+                                    const QList<DirectoryObject> &objects,
+                                    const QStringList &storedMembers = {})
 {
     QList<QByteArray> sids;
     QList<quint32> seeded;
@@ -219,8 +258,16 @@ QList<QByteArray> builtinMemberSids(quint32 rid, const QString &domainSid,
                 sids.append(sid);
         }
     }
+    // A membership written since is reported alongside the seed ones, once: the
+    // seeded groups are members through the table and would otherwise appear
+    // twice to a client that added one of them explicitly.
+    for (const QByteArray &sid : memberSids(storedMembers, objects)) {
+        if (!sids.contains(sid))
+            sids.append(sid);
+    }
     return sids;
 }
+
 
 // RPC_SID as MS-RPCE carries it: the sub-authority count is a conformant array
 // length, so it comes before the fixed header, then the header and the
@@ -840,6 +887,53 @@ QList<DirectoryObject> SamrServer::groups() const
         result.append(object);
     }
     return result;
+}
+
+// The object under CN=Builtin that holds this alias's memberships, created when
+// the tree was provisioned before those objects existed. Its SID as stored is not
+// what identifies it to a client: the alias keeps the well-known SID either way.
+QString SamrServer::ensureBuiltinAlias(const QString &sidText, QString *error)
+{
+    const quint32 rid = sidText.section(QLatin1Char('-'), -1).toUInt();
+    QString name;
+    for (const BuiltinAlias &entry : builtinAliasTable()) {
+        if (entry.rid == rid) {
+            name = QString::fromLatin1(entry.name);
+            break;
+        }
+    }
+    if (name.isEmpty()) {
+        if (error)
+            *error = QStringLiteral("no BUILTIN alias carries %1").arg(sidText);
+        return {};
+    }
+    const QString dn = QStringLiteral("CN=%1,CN=Builtin,%2").arg(name, m_config.baseDn);
+    for (const DirectoryObject &candidate : directory()) {
+        if (candidate.id.compare(dn, Qt::CaseInsensitive) == 0)
+            return candidate.id;
+    }
+    if (!m_writes.create) {
+        if (error)
+            *error = QStringLiteral("no write backend");
+        return {};
+    }
+    DirectoryObject alias;
+    alias.id = dn;
+    alias.name = name;
+    alias.type = QStringLiteral("Group");
+    alias.kind = ObjectKind::Group;
+    alias.container = QStringLiteral("Builtin");
+    alias.attributes.insert(QStringLiteral("distinguishedName"), dn);
+    alias.attributes.insert(QStringLiteral("cn"), name);
+    alias.attributes.insert(QStringLiteral("sAMAccountName"), name);
+    alias.attributes.insert(QStringLiteral("objectSid"), sidText);
+    // A domain-local security group, which is what SAMR calls an alias.
+    alias.attributes.insert(QStringLiteral("groupType"), QStringLiteral("-2147483644"));
+    alias.attributes.insert(QStringLiteral("objectClass"),
+                            QStringLiteral("top;group"));
+    if (!m_writes.create(&alias, error))
+        return {};
+    return dn;
 }
 
 QList<DirectoryObject> SamrServer::aliases() const
@@ -1581,7 +1675,7 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
         }
 
         const QList<DirectoryObject> all =
-            domain.dn == kBuiltinDomainSid ? builtinAliasObjects() : aliases();
+            domain.dn == kBuiltinDomainSid ? builtinAliasObjects(directory()) : aliases();
         QList<DirectoryObject> page;
         for (int i = int(context); i < all.size(); ++i)
             page.append(all.at(i));
@@ -1606,7 +1700,7 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
             return fixed;
         }
         const QList<DirectoryObject> pool =
-            domain.dn == kBuiltinDomainSid ? builtinAliasObjects() : aliases();
+            domain.dn == kBuiltinDomainSid ? builtinAliasObjects(directory()) : aliases();
         for (const DirectoryObject &alias : pool) {
             if (ridOf(alias) != rid)
                 continue;
@@ -1635,9 +1729,14 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
             putLe32(fixed, kStatusInvalidHandle);
             return fixed;
         }
-        if (isBuiltinAlias(alias.dn)) {
+        // A BUILTIN alias is a stored object under CN=Builtin, so the write below
+        // lands on it like any other alias; the target is resolved once the
+        // member's DN is known. A server with no write backend has nothing to
+        // store it in, and says so before it judges the member.
+        const bool builtinAlias = isBuiltinAlias(alias.dn);
+        if (builtinAlias && !m_writes.create) {
             putLe32(fixed, kStatusNotSupported);
-            emit requestReceived(QStringLiteral("%1 BUILTIN alias member: not stored")
+            emit requestReceived(QStringLiteral("%1 BUILTIN alias member: no store")
                                      .arg(adding ? QStringLiteral("Add") : QStringLiteral("Remove")));
             return fixed;
         }
@@ -1670,9 +1769,17 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
             return fixed;
         }
         QString error;
-        const bool ok = adding ? (m_writes.addMember && m_writes.addMember(alias.dn, memberDn, &error))
+        const QString target = builtinAlias ? ensureBuiltinAlias(alias.dn, &error) : alias.dn;
+        if (target.isEmpty()) {
+            putLe32(fixed, kStatusNotSupported);
+            emit requestReceived(QStringLiteral("%1 BUILTIN alias member refused: %2")
+                                     .arg(adding ? QStringLiteral("Add") : QStringLiteral("Remove"),
+                                          error));
+            return fixed;
+        }
+        const bool ok = adding ? (m_writes.addMember && m_writes.addMember(target, memberDn, &error))
                                : (m_writes.removeMember
-                                  && m_writes.removeMember(alias.dn, memberDn, &error));
+                                  && m_writes.removeMember(target, memberDn, &error));
         putLe32(fixed, ok ? kStatusSuccess
                           : (adding ? kStatusMemberInAlias : kStatusMemberNotInAlias));
         emit requestReceived(QStringLiteral("%1AliasMember(%2) %3")
@@ -1696,7 +1803,14 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
         }
         QList<QByteArray> sids;
         if (isBuiltinAlias(alias.dn)) {
-            sids = builtinMemberSids(alias.rid, m_config.domainSid, directory());
+            QStringList stored;
+            for (const DirectoryObject &candidate : builtinAliasObjects(directory())) {
+                if (candidate.id.compare(alias.dn, Qt::CaseInsensitive) == 0) {
+                    stored = candidate.members;
+                    break;
+                }
+            }
+            sids = builtinMemberSids(alias.rid, m_config.domainSid, directory(), stored);
         } else {
             QStringList members;
             for (const DirectoryObject &object : aliases()) {
@@ -2288,7 +2402,7 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
         // BUILTIN holds only its aliases, so its own name and RID tables are the
         // alias table rather than the account NC.
         const QList<DirectoryObject> all =
-            domain.dn == kBuiltinDomainSid ? builtinAliasObjects() : directory();
+            domain.dn == kBuiltinDomainSid ? builtinAliasObjects(directory()) : directory();
         QList<quint32> rids;
         QList<quint32> types;
         int mapped = 0;
@@ -2375,7 +2489,7 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
         }
 
         const QList<DirectoryObject> all =
-            domain.dn == kBuiltinDomainSid ? builtinAliasObjects() : directory();
+            domain.dn == kBuiltinDomainSid ? builtinAliasObjects(directory()) : directory();
         QStringList names;
         QList<quint32> types;
         QList<bool> resolved;
@@ -2894,7 +3008,7 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
             return fixed;
         }
         const QList<DirectoryObject> pool =
-            isBuiltinAlias(alias.dn) ? builtinAliasObjects() : aliases();
+            isBuiltinAlias(alias.dn) ? builtinAliasObjects(directory()) : aliases();
         DirectoryObject found;
         bool foundObject = false;
         for (const DirectoryObject &object : pool) {
@@ -2938,7 +3052,7 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
             putUnicode(name, 0x0002e710u);
             putLe32(fixed, quint32(isBuiltinAlias(alias.dn)
                                        ? builtinMemberSids(alias.rid, m_config.domainSid,
-                                                          directory())
+                                                          directory(), found.members)
                                              .size()
                                        : found.members.size()));
             putUnicode(comment, 0x0002e720u);
@@ -2988,9 +3102,13 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
             putLe32(fixed, kStatusInvalidHandle);
             return fixed;
         }
-        if (isBuiltinAlias(alias.dn)) {
+        const bool builtinAlias = isBuiltinAlias(alias.dn);
+        if (builtinAlias && !m_writes.set) {
+            // No store to write a BUILTIN alias's description into: the refusal
+            // comes before the arguments are read, as it did when every BUILTIN
+            // write was refused.
             putLe32(fixed, kStatusNotSupported);
-            emit requestReceived(QStringLiteral("SetInformationAlias(%1): BUILTIN is read-only")
+            emit requestReceived(QStringLiteral("SetInformationAlias(%1): no store")
                                      .arg(alias.dn));
             return fixed;
         }
@@ -3022,8 +3140,9 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
                                       qsizetype(chars.size() / 2));
         }
         QString error;
-        const bool ok = m_writes.set
-                        && m_writes.set(alias.dn, QStringLiteral("description"), text, &error);
+        const QString target = builtinAlias ? ensureBuiltinAlias(alias.dn, &error) : alias.dn;
+        const bool ok = !target.isEmpty() && m_writes.set
+                        && m_writes.set(target, QStringLiteral("description"), text, &error);
         putLe32(fixed, ok ? kStatusSuccess
                           : (m_writes.set ? kStatusAccessDenied : kStatusNotSupported));
         emit requestReceived(QStringLiteral("SetInformationAlias(%1) description: %2")

@@ -166,6 +166,8 @@ private:
     QList<DirectoryObject> users() const;
     QList<DirectoryObject> groups() const;
     QList<DirectoryObject> aliases() const;
+    // The stored <alias>, created if this tree predates the objects.
+    QString ensureBuiltinAlias(const QString &sidText, QString *error);
     QByteArray newHandle(Handle::Kind kind, const QString &dn, quint32 rid);
     bool lookupHandle(const QByteArray &handle, Handle::Kind kind, Handle *out) const;
 

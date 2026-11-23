@@ -554,6 +554,7 @@ private slots:
     void samrServesTheDomainPasswordPolicy();
     void samrServesTheBuiltinDomain();
     void samrWritesAccountsAndGroups();
+    void samrWritesBuiltinAliasMembers();
     void samrSetPasswordAndAccountControl();
     void desPrimitivesAndHashEncoding();
     void samrSetsCredentialFromHash();
@@ -2129,6 +2130,120 @@ void SamrTest::rpcBindAnswersEveryContext()
              quint16(2)); // result: provider rejection
     QCOMPARE(quint16(quint8(reply.at(first + 26))),
              quint16(2)); // reason: transfer syntaxes not supported
+}
+
+
+// A BUILTIN alias is a stored object, so a membership SAMR adds to one is
+// written where LDAP serves it: the well-known SIDs stay the identity a client
+// sees, and the memberships AD seeds are reported beside the added ones.
+void SamrTest::samrWritesBuiltinAliasMembers()
+{
+    QList<DirectoryObject> store;
+    DirectoryObject user;
+    user.id = QStringLiteral("CN=gina,CN=Users,DC=corp,DC=example,DC=com");
+    user.name = QStringLiteral("gina");
+    user.type = QStringLiteral("User");
+    user.kind = ObjectKind::User;
+    user.attributes.insert(QStringLiteral("objectSid"), QStringLiteral("S-1-5-21-1-2-3-1001"));
+    store.append(user);
+
+    SamrServer server;
+    Samr::Config config;
+    config.realm = QStringLiteral("CORP.EXAMPLE.COM");
+    config.netbios = QStringLiteral("CORP");
+    config.domainSid = QStringLiteral("S-1-5-21-1-2-3");
+    config.baseDn = QStringLiteral("DC=corp,DC=example,DC=com");
+    server.setConfig(config);
+    server.setObjectProvider([&store]() { return store; });
+
+    Samr::WriteBackend backend;
+    backend.create = [&store](DirectoryObject *object, QString *) {
+        store.append(*object);
+        return true;
+    };
+    backend.addMember = [&store](const QString &groupDn, const QString &memberDn, QString *) {
+        for (DirectoryObject &object : store) {
+            if (object.id.compare(groupDn, Qt::CaseInsensitive) == 0) {
+                if (!object.members.contains(memberDn, Qt::CaseInsensitive))
+                    object.members.append(memberDn);
+                return true;
+            }
+        }
+        return false;
+    };
+    backend.removeMember = [&store](const QString &groupDn, const QString &memberDn, QString *) {
+        for (DirectoryObject &object : store) {
+            if (object.id.compare(groupDn, Qt::CaseInsensitive) == 0) {
+                object.members.removeAll(memberDn);
+                return true;
+            }
+        }
+        return false;
+    };
+    backend.set = [&store](const QString &dn, const QString &attribute, const QString &value,
+                           QString *) {
+        for (DirectoryObject &object : store) {
+            if (object.id.compare(dn, Qt::CaseInsensitive) == 0) {
+                object.attributes.insert(attribute, value);
+                return true;
+            }
+        }
+        return false;
+    };
+    backend.remove = [&store](const QString &dn, QString *) {
+        for (int i = 0; i < store.size(); ++i) {
+            if (store.at(i).id.compare(dn, Qt::CaseInsensitive) == 0) {
+                store.removeAt(i);
+                return true;
+            }
+        }
+        return false;
+    };
+    server.setWriteBackend(backend);
+
+    const QByteArray serverHandle = server.handleCall(Samr::OpConnect, kConnect).left(20);
+    // The BUILTIN domain, S-1-5-32, opened by its own SID.
+    QByteArray openBuiltin = serverHandle;
+    openBuiltin.append(QByteArray::fromHex("000000020000000001000000"
+                                           "010100000000000520000000"));
+    const QByteArray builtinReply = server.handleCall(Samr::OpOpenDomain, openBuiltin);
+    QCOMPARE(lastWord(builtinReply), 0u);
+    const QByteArray builtinHandle = builtinReply.left(20);
+
+    const QByteArray memberSid = Ndr::sidFromString(QStringLiteral("S-1-5-21-1-2-3-1001"));
+    const QByteArray aliasReply = server.handleCall(Samr::OpOpenAlias,
+                                                   openUserStub(builtinHandle, 546));
+    QCOMPARE(lastWord(aliasReply), 0u);
+    const QByteArray aliasHandle = aliasReply.left(20);
+    QCOMPARE(lastWord(server.handleCall(Samr::OpAddMemberToAlias,
+                                        aliasMemberStub(aliasHandle, memberSid))),
+             0u);
+
+    // The membership is in the store, on the alias object LDAP serves.
+    QStringList storedMembers;
+    bool stored = false;
+    for (const DirectoryObject &object : store) {
+        if (object.id.compare(QStringLiteral("CN=Guests,CN=Builtin,DC=corp,DC=example,DC=com"),
+                              Qt::CaseInsensitive) == 0) {
+            stored = true;
+            storedMembers = object.members;
+        }
+    }
+    QVERIFY(stored);
+    QCOMPARE(storedMembers,
+             QStringList{QStringLiteral("CN=gina,CN=Users,DC=corp,DC=example,DC=com")});
+    QCOMPARE(lastWord(server.handleCall(Samr::OpQueryInformationAlias,
+                                       queryAliasStub(aliasHandle, 1))),
+             0u);
+    const QByteArray members = server.handleCall(Samr::OpGetMembersInAlias, aliasHandle);
+    QCOMPARE(lastWord(members), 0u);
+    QCOMPARE(readLe32At(members, 0), 1u);
+    QVERIFY(members.contains(memberSid));
+
+    QCOMPARE(lastWord(server.handleCall(Samr::OpRemoveMemberFromAlias,
+                                        aliasMemberStub(aliasHandle, memberSid))),
+             0u);
+    QCOMPARE(readLe32At(server.handleCall(Samr::OpGetMembersInAlias, aliasHandle), 0), 0u);
 }
 
 #include "test_samr.moc"
