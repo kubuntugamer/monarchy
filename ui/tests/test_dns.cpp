@@ -551,6 +551,7 @@ private slots:
     void dropsItsOwnListenerFromAConfiguredList();
     void separatesAHostFilesForwardingFacts();
     void appliesDynamicUpdates();
+    void acceptsReverseZoneUpdates();
     void enforcesUpdatePolicy();
     void refusesZoneTransfers();
     void transfersTheZoneToASignedPeer();
@@ -1528,6 +1529,58 @@ void DnsTest::appliesDynamicUpdates()
 
     // The zone apex keeps its SOA whatever the update did.
     QCOMPARE(server.records(QStringLiteral("monarchy.example.com"), DnsServer::TypeSoa).size(), 1);
+}
+
+void DnsTest::acceptsReverseZoneUpdates()
+{
+    DnsServer server;
+    QVERIFY(server.listen(0));
+    const QString zone = QStringLiteral("monarchy.example.com");
+    server.loadAdZone(zone, QStringLiteral("dc1.monarchy.example.com"),
+                      QStringLiteral("192.168.5.20"), 1389, 3268,
+                      QStringLiteral("Default-First-Site-Name"));
+    QVERIFY(server.repairReverseZone(QStringLiteral("dc1.monarchy.example.com"),
+                                     QStringLiteral("192.168.5.20")));
+    const QString reverse = server.reverseZone();
+    QCOMPARE(reverse, QStringLiteral("5.168.192.in-addr.arpa"));
+    const quint32 before = soaSerial(server.records(reverse, DnsServer::TypeSoa).first().rdata);
+
+    // A member registers its own address: the A record goes into the forward
+    // zone and the PTR into the reverse zone, which is the zone this DC derives
+    // from its own address. A Windows 2000 client sends the second one, and it
+    // was answered NOTAUTH because the zone section was compared with the
+    // forward zone alone.
+    UpdateRecord ptr;
+    ptr.name = QStringLiteral("21.5.168.192.in-addr.arpa");
+    ptr.type = DnsServer::TypePtr;
+    ptr.rclass = 1;
+    ptr.ttl = 1200;
+    ptr.rdata = nameBytes(QStringLiteral("workstation5.monarchy.example.com"));
+    Reply addReply;
+    QVERIFY(parseReply(
+        exchange(server.serverPort(), updatePacket(0x6a01, reverse, {}, {ptr})), &addReply));
+    QCOMPARE(addReply.rcode, 0);
+    QCOMPARE(server.records(ptr.name, DnsServer::TypePtr).size(), 1);
+    QCOMPARE(server.records(ptr.name, DnsServer::TypePtr).first().rdata, ptr.rdata);
+    const quint32 after = soaSerial(server.records(reverse, DnsServer::TypeSoa).first().rdata);
+    QVERIFY2(after > before, "the reverse zone's own serial moves so its secondaries pull");
+
+    // A name below the reverse zone is not the zone, so naming it in the zone
+    // section is still not authority: only an apex this server authors is.
+    Reply below;
+    QVERIFY(parseReply(exchange(server.serverPort(),
+                                updatePacket(0x6a02, QStringLiteral("10.5.168.192.in-addr.arpa"),
+                                             {}, {ptr})),
+                       &below));
+    QCOMPARE(below.rcode, 9); // NOTAUTH
+
+    // A zone this server does not author stays refused, copy or not.
+    Reply foreign;
+    QVERIFY(parseReply(exchange(server.serverPort(),
+                                updatePacket(0x6a03, QStringLiteral("elsewhere.example.net"), {},
+                                             {ptr})),
+                       &foreign));
+    QCOMPARE(foreign.rcode, 9); // NOTAUTH
 }
 
 void DnsTest::enforcesUpdatePolicy()

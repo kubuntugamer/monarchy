@@ -158,15 +158,6 @@ bool isNameBearing(quint16 type) {
 // into its uncompressed form.
 QByteArray normalizeRdata(const QByteArray &packet, int rdataStart, quint16 type,
                           const QByteArray &raw) {
-    // A zero-length RDATA is a value in its own right in RFC 2136: a prerequisite
-    // of class NONE means "this RRset does not exist" and of class ANY "this name
-    // is not in use", and both carry no RDATA at all. Running it through the name
-    // decoder anyway turned the empty value into a root label, so the prerequisite
-    // read as the value-dependent form, the two did not match, and the answer was
-    // FORMERR — which is what a Windows 2000 client's own registration got on
-    // every boot, from a packet that is correct.
-    if (raw.isEmpty())
-        return raw;
     if (!isNameBearing(type))
         return raw;
 
@@ -3199,8 +3190,18 @@ int DnsServer::handleUpdate(const Message &message) {
     if (message.questions.size() != 1)
         return FormErr;
 
+    // The zone section names the zone the update writes into, and this server is
+    // authoritative for two: the AD zone and the /24 reverse zone derived from
+    // the DC's own address. A PTR registration names the reverse zone, so
+    // comparing against the forward zone alone answered NOTAUTH to a client
+    // registering the address it had just been given. The name must be the apex
+    // of one of those zones rather than a name below it, and a zone this server
+    // does not author (including one it only holds a copy of) is still refused.
     const Message::Question zoneSection = message.questions.first();
-    if (zoneSection.name.compare(m_zone, Qt::CaseInsensitive) != 0)
+    const bool authored = zoneSection.name.compare(m_zone, Qt::CaseInsensitive) == 0
+        || (!m_reverseZone.isEmpty()
+            && zoneSection.name.compare(m_reverseZone, Qt::CaseInsensitive) == 0);
+    if (!authored)
         return NotAuth;
     if (zoneSection.qclass != ClassIn)
         return NotAuth;
