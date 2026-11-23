@@ -87,6 +87,7 @@ add_library(monarchy-ui-core STATIC
     ../engine/Srvsvc.h
     ../engine/Srvsvc.cpp
     ../engine/Browser.cpp
+    ../engine/PasswordSettings.cpp
     ../engine/Smb1.h
     ../engine/Smb1.cpp
     ../engine/Smb2.h
@@ -423,6 +424,21 @@ if(BUILD_TESTING)
 
     add_test(NAME monarchy-browser-tests COMMAND monarchy-browser-tests)
     set_tests_properties(monarchy-browser-tests PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+    )
+
+    # The policy that governs an account, fine-grained policies included.
+    add_executable(monarchy-passwordsettings-tests
+        tests/test_passwordsettings.cpp
+    )
+
+    target_link_libraries(monarchy-passwordsettings-tests PRIVATE
+        monarchy-ui-core
+        Qt6::Test
+    )
+
+    add_test(NAME monarchy-passwordsettings-tests COMMAND monarchy-passwordsettings-tests)
+    set_tests_properties(monarchy-passwordsettings-tests PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
     )
 

@@ -9,6 +9,7 @@
 #include "Kdc.h"
 #include "LogonHours.h"
 #include "PasswordAge.h"
+#include "PasswordSettings.h"
 #include "Ntlm.h"
 #include "Ndr.h"
 
@@ -1294,7 +1295,30 @@ LdapServer::PasswordPolicy LdapServer::passwordPolicy() const
 // always the domain policy.
 bool LdapServer::passwordMeetsPolicy(const QString &password, QString *reason) const
 {
-    const PasswordPolicy policy = this->passwordPolicy();
+    return passwordMeetsPolicy(password, passwordPolicy(), reason);
+}
+
+LdapServer::PasswordPolicy LdapServer::passwordPolicyFor(const DirectoryObject &account) const
+{
+    return PasswordSettings::policyFor(account, m_objects);
+}
+
+LdapServer::PasswordPolicy LdapServer::policyForDn(const QString &dn) const
+{
+    for (const DirectoryObject &object : m_objects) {
+        if (object.id.compare(dn, Qt::CaseInsensitive) == 0)
+            return passwordPolicyFor(object);
+    }
+    // Not stored yet: a policy that names this DN directly applies to it, which
+    // is what makes an account created under a policy born governed by it.
+    DirectoryObject pending;
+    pending.id = dn;
+    return PasswordSettings::policyFor(pending, m_objects);
+}
+
+bool LdapServer::passwordMeetsPolicy(const QString &password, const PasswordPolicy &policy,
+                                    QString *reason) const
+{
     if (password.size() < policy.minLength || password.size() > 256) {
         if (reason)
             *reason = QStringLiteral("password must be at least %1 characters")
@@ -1845,13 +1869,13 @@ int LdapServer::applyModify(const QString &dn, const QList<ModifyChange> &change
             }
             const QString password = decodePasswordValue(change.rawValue, change.values.value(0));
             QString reason;
-            if (!passwordMeetsPolicy(password, &reason) || passwordWasUsed(object, password, &reason)) {
+            if (!passwordMeetsPolicy(password, policyForDn(dn), &reason) || passwordWasUsed(object, password, &reason)) {
                 emit requestReceived(QStringLiteral("Password rejected: %1").arg(reason));
                 return 19; // constraintViolation
             }
             storePasswordVerifier(object, password,
                                   m_kdc ? m_kdc->realm().realm : QString(),
-                                  passwordPolicy().historyLength);
+                                  policyForDn(dn).historyLength);
             continue;
         }
         if (type == QLatin1String("member")) {
@@ -3305,13 +3329,13 @@ QByteArray LdapServer::handleAdd(int msgId, const QByteArray &payload) {
             // Never store the plaintext: keep a salted verifier instead.
             const QString password = decodePasswordValue(rawValue, val);
             QString reason;
-            if (!passwordMeetsPolicy(password, &reason)) {
+            if (!passwordMeetsPolicy(password, policyForDn(dn), &reason)) {
                 emit requestReceived(QStringLiteral("Password rejected: %1").arg(reason));
                 return makeLdapResult(msgId, 0x69, 19); // constraintViolation
             }
             storePasswordVerifier(obj, password,
                                   m_kdc ? m_kdc->realm().realm : QString(),
-                                  passwordPolicy().historyLength);
+                                  policyForDn(dn).historyLength);
             continue;
         }
         obj.attributes.insert(type, val);
@@ -3684,6 +3708,14 @@ QByteArray LdapServer::makeSearchEntry(int msgId, const DirectoryObject &o,
             continue;
         addAttr(derived.first, {derived.second});
         emitted.append(key);
+    }
+    // msDS-ResultantPSO: the policy that actually governs this account, which AD
+    // computes rather than stores and its own tooling reads to explain why an
+    // account is held to a policy other than the domain's.
+    if (o.kind == ObjectKind::User && wanted(QStringLiteral("msDS-ResultantPSO"))
+        && !emitted.contains(QStringLiteral("msds-resultantpso"))) {
+        if (const DirectoryObject *pso = PasswordSettings::resultant(o, m_objects))
+            addAttr(QStringLiteral("msDS-ResultantPSO"), {pso->id});
     }
     if (!emitted.contains(QStringLiteral("cn")) && !o.name.isEmpty()
         && wanted(QStringLiteral("cn")))

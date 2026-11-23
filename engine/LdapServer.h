@@ -203,6 +203,14 @@ public:
     static PasswordPolicy passwordPolicyFrom(const DirectoryObject &domain);
     PasswordPolicy passwordPolicy() const;
 
+    // The policy that governs one account: the domain's, overridden by the
+    // fine-grained policy that applies to it through msDS-PSOAppliesTo.
+    PasswordPolicy passwordPolicyFor(const DirectoryObject &account) const;
+    // The same, for a write path that holds a name rather than an object. A DN
+    // the store does not yet hold (an entry being added) is resolved by name, so
+    // a policy that names it directly still applies.
+    PasswordPolicy policyForDn(const QString &dn) const;
+
     // pwdProperties bits this server acts on. MS-SAMR 2.2.3.5 defines the rest
     // (anonymous-change and clear-change rules, reversible encryption, locking
     // out the built-in Administrator), and they are reported but not enforced.
@@ -348,6 +356,10 @@ private:
     // Whether a password passes the domain policy, and whether it is one of the
     // account's remembered passwords. `reason` says which rule refused it.
     bool passwordMeetsPolicy(const QString &password, QString *reason) const;
+    // The same judgement against a policy the caller resolved, which is how
+    // an account governed by a fine-grained policy is checked against it.
+    bool passwordMeetsPolicy(const QString &password, const PasswordPolicy &policy,
+                            QString *reason) const;
     bool passwordWasUsed(const DirectoryObject &object, const QString &password,
                          QString *reason) const;
     // NetBIOS domain and DC host name published in the NTLM challenge.

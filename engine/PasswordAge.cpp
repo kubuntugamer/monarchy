@@ -6,6 +6,7 @@
 #include <limits>
 
 #include "LdapServer.h"
+#include "PasswordSettings.h"
 
 namespace {
 
@@ -61,12 +62,8 @@ PasswordAge::State PasswordAge::stateFor(const DirectoryObject &account,
         account.attributes.value(QStringLiteral("pwdLastSet")).toLongLong();
     const quint32 userAccountControl =
         account.attributes.value(QStringLiteral("userAccountControl")).toUInt();
-    qint64 maxPasswordAge = 0;
-    for (const DirectoryObject &object : directory) {
-        if (object.kind != ObjectKind::Domain)
-            continue;
-        maxPasswordAge = LdapServer::passwordPolicyFrom(object).maxAge;
-        break;
-    }
+    // The age that governs this account: a fine-grained policy applying to it
+    // replaces the domain's, and the domain's governs everything else.
+    const qint64 maxPasswordAge = PasswordSettings::policyFor(account, directory).maxAge;
     return state(pwdLastSet, userAccountControl, maxPasswordAge, now);
 }

@@ -721,6 +721,20 @@ ProvisionResult provisionDomain(const ProvisionConfig &config)
         infrastructure.attributes.insert(QStringLiteral("fSMORoleOwner"), ntdsSettingsDn);
     }
 
+    {
+        // Fine-grained password policies live in a container the domain is
+        // created with, before an administrator writes the first policy into it.
+        const QString settingsDn =
+            QStringLiteral("CN=Password Settings Container,CN=System,%1").arg(b.baseDn);
+        DirectoryObject &settings =
+            b.add(settingsDn, QStringLiteral("Password Settings Container"),
+                  QStringLiteral("Container"), ObjectKind::Container,
+                  QStringLiteral("Console Root"));
+        b.objectClass(settings, {QStringLiteral("top"), QStringLiteral("container")});
+        settings.attributes.insert(QStringLiteral("cn"),
+                                   QStringLiteral("Password Settings Container"));
+    }
+
     // --- Group Policy -----------------------------------------------------
     // The two policies every domain is created with, linked from the domain
     // and the Domain Controllers OU by the gPLink values set above.

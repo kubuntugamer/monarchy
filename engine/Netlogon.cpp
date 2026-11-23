@@ -14,6 +14,7 @@
 #include "Krb5.h"
 #include "LogonHours.h"
 #include "PasswordAge.h"
+#include "PasswordSettings.h"
 #include "WorkstationRestriction.h"
 #include "Ndr.h"
 #include "Ntlm.h"
@@ -1447,22 +1448,14 @@ QByteArray NetlogonServer::samLogon(const QByteArray &stub, bool withAuthenticat
     // The domain's lockout policy sits on the domain object, in AD's own
     // encoding: a negative 100-nanosecond interval for each duration, and a
     // threshold of zero for "count the refusal, never lock the account".
-    quint32 lockoutThreshold = 0;
-    quint64 lockoutDuration = 0;
-    quint64 observationWindow = 0;
-    for (const DirectoryObject &object : directory()) {
-        if (object.kind != ObjectKind::Domain)
-            continue;
-        lockoutThreshold =
-            object.attributes.value(QStringLiteral("lockoutThreshold")).toUInt();
-        const qint64 duration =
-            object.attributes.value(QStringLiteral("lockoutDuration")).toLongLong();
-        const qint64 window =
-            object.attributes.value(QStringLiteral("lockoutObservationWindow")).toLongLong();
-        lockoutDuration = quint64(duration < 0 ? -duration : duration);
-        observationWindow = quint64(window < 0 ? -window : window);
-        break;
-    }
+    // The lockout policy that governs this account, which a fine-grained policy
+    // may narrow for it alone.
+    const PasswordSettings::Lockout lockout = PasswordSettings::lockoutFor(account, directory());
+    const quint32 lockoutThreshold = lockout.threshold;
+    const quint64 lockoutDuration =
+        quint64(lockout.duration < 0 ? -lockout.duration : lockout.duration);
+    const quint64 observationWindow =
+        quint64(lockout.window < 0 ? -lockout.window : lockout.window);
     const quint64 now = ntTimeNow();
     const quint64 lockedAt = account.attributes.value(QStringLiteral("lockoutTime")).toULongLong();
     // A lockout lasts lockoutDuration; zero means until an administrator clears
