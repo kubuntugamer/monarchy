@@ -147,6 +147,35 @@ def decode_messages(data):
     return messages
 
 
+def structure(data):
+    """A datagram's elements as (tag, contents), with lengths re-encoded.
+
+    A length is not part of what a datagram says. A Windows 2000 DC writes every
+    length in long form (`30 84 00 00 00 91 …`), so comparing bytes against a
+    rebuild with minimal lengths reports a framing difference that is not one.
+    Walking the tree keeps the check about messages and nothing else.
+    """
+
+    def walk(blob):
+        reader = Reader(blob)
+        out = []
+        while not reader.eof():
+            tag, value = reader.element()
+            out.append((tag, walk(value) if tag & 0x20 else value))
+        return out
+
+    return walk(data)
+
+
+def result_of(data):
+    """The resultCode of the last result message in an answer."""
+    for _, ops in reversed(decode_messages(data)):
+        for op, inner in ops:
+            if op == 0x65:
+                return decode_result(inner)
+    return None
+
+
 def decode_result(inner):
     reader = Reader(inner)
     results = []
@@ -181,6 +210,18 @@ def decode_entry(inner):
             collected.append(value)
         out[attr_type.decode("latin-1")] = collected
     return name, out
+
+
+def attribute_value(attrs, name):
+    """The first value of an attribute, looked up without regard to case.
+
+    A Windows 2000 DC answers the locator with `netlogon` in lower case, so a
+    case-sensitive lookup reads no value at all and calls a good blob empty.
+    """
+    for key, values in attrs.items():
+        if key.lower() == name.lower() and values:
+            return values[0]
+    return b""
 
 
 def search_result(data):
@@ -396,22 +437,21 @@ def main():
             )
             run.check(
                 "the datagram is exactly its messages and nothing else",
-                rebuilt == reply,
+                structure(reply) == structure(rebuilt),
                 "%d bytes rebuilt, %d on the wire" % (len(rebuilt), len(reply)),
             )
 
-            # The attribute list is honoured, and this one is strict for a
-            # reason: Samba's locator client refuses any answer whose entry is
-            # not exactly one attribute called netlogon (`num_attributes != 1`
-            # in libads/netlogon_ping.c), so the blob below is only reachable if
-            # the entry carries nothing else.
+            # One attribute, whatever the ping named, in any case: Samba's
+            # locator refuses an answer whose entry is not exactly one attribute
+            # called netlogon (`num_attributes != 1` in libads/netlogon_ping.c),
+            # and a Windows 2000 DC spells it `netlogon`.
             run.check(
-                "the entry carries exactly the one attribute the ping asked for",
+                "the entry carries the netlogon attribute and nothing else",
                 [name.lower() for name in attrs] == ["netlogon"],
                 "attributes %r" % (sorted(attrs),),
             )
 
-            blob = (attrs.get("Netlogon") or [b""])[0]
+            blob = attribute_value(attrs, "Netlogon")
             try:
                 ex = decode_netlogon_ex(blob)
             except Exception as error:  # noqa: BLE001 - an unparseable blob is a failure
@@ -477,15 +517,13 @@ def main():
                     hex(ex["server_type"]),
                 )
 
-            # NtVer in an answer is the DC's own capability mask, not the
-            # question repeated. Ask with a mask the DC does not advertise: a
-            # reply that changes with the question tells a client it supports
-            # whatever it happened to ask for, which is worse than saying
-            # nothing because it is a claim about fields the client will parse.
-            # Same message id as the vector, so the echo cannot account for a
-            # difference: whatever the mask asked, the answer has to be the same
-            # bytes. Comparing lengths alone would pass on a different id, which
-            # echoes one byte wider, and would miss a field that changed size.
+            # NtVer in the reply's blob is a statement about what the blob
+            # carries, not the question repeated. A Windows 2000 DC varies the
+            # blob with the mask — WITH_IP appends the address field and sets the
+            # bit in the word, the closest-site bit is asked for and not claimed
+            # — so the rule is that the declared word agrees with the fields
+            # actually present. Same message id as the vector, so an echoed id
+            # cannot account for a difference in length.
             other = search(
                 0x0000FB3D,
                 "",
@@ -494,25 +532,33 @@ def main():
                 ["Netlogon"],
             )
             _, other_reply = ask(host, port, other)
-            other_nt_version = None
+            other_ex = None
             if other_reply:
                 try:
                     _, other_attrs, _ = search_result(other_reply)
-                    other_nt_version = decode_netlogon_ex(
-                        (other_attrs.get("Netlogon") or [b""])[0]
-                    )["nt_version"]
+                    other_ex = decode_netlogon_ex(attribute_value(other_attrs, "Netlogon"))
                 except Exception:  # noqa: BLE001 - a malformed reply fails the check below
-                    other_nt_version = None
+                    other_ex = None
+            other_nt_version = other_ex["nt_version"] if other_ex else None
             run.check(
-                "the answer is the same bytes whatever mask was asked",
-                other_reply is not None and other_reply == reply,
-                "asked \\x1f: %r bytes, asked \\x06: %d bytes"
-                % (len(other_reply) if other_reply else None, len(reply)),
+                "the blob declares an address field exactly when it carries one",
+                other_ex is not None
+                and (("sockaddr" in other_ex) == bool(other_ex["nt_version"] & 0x00000008))
+                and (not parsed
+                     or (("sockaddr" in ex) == bool(ex["nt_version"] & 0x00000008))),
+                "asked \\x1f\\x00\\x00\\x00: %s"
+                % (("declares %s with an address" % hex(other_nt_version))
+                   if other_ex and "sockaddr" in other_ex
+                   else ("declares %s without one" % hex(other_nt_version)
+                         if other_ex else "no blob")),
             )
             run.check(
-                "the blob's server_type and nt_version do not follow the mask asked",
-                other_nt_version is not None and other_nt_version == (ex["nt_version"] if parsed else None),
-                "asked \\x1f\\x00\\x00\\x00, blob declares %r" % other_nt_version,
+                "server_type is the DC's own claim whatever mask was asked",
+                other_ex is not None and parsed
+                and other_ex["server_type"] == ex["server_type"],
+                "asked \\x1f: %s, asked \\x06: %s"
+                % (hex(other_ex["server_type"]) if other_ex else None,
+                   hex(ex["server_type"]) if parsed else None),
             )
             if verbose:
                 for name in sorted(attrs):
@@ -563,7 +609,7 @@ def main():
                 "attributes %r" % (sorted(named),),
             )
             try:
-                named_ex = decode_netlogon_ex((named.get("Netlogon") or [b""])[0])
+                named_ex = decode_netlogon_ex(attribute_value(named, "Netlogon"))
             except Exception as error:  # noqa: BLE001 - the blob is what a client reads
                 run.check("the blob names the domain this DC hosts", False, str(error))
             else:
@@ -573,9 +619,10 @@ def main():
                     named_ex["dns_domain"],
                 )
 
-    # 3. A ping for a domain this DC does not host must be refused, not answered
-    #    as though it did: the client would then trust a server that cannot
-    #    authenticate its machines.
+    # 3. A ping for a domain this DC does not host is answered, not refused: a
+    #    Windows 2000 DC replies with its own blob and leaves the client to
+    #    compare DnsDomain (measured — resultCode 0, no filtering). What must not
+    #    happen is an answer that claims to be the other domain.
     foreign = search(
         0x0042,
         "",
@@ -588,24 +635,35 @@ def main():
         run.check("a ping for another domain is answered noSuchObject", False, "no reply")
     else:
         try:
-            _, _, result = search_result(reply)
+            _, foreign_attrs, result = search_result(reply)
         except Exception as error:  # noqa: BLE001
-            run.check("a ping for another domain is answered noSuchObject", False, str(error))
+            run.check("a ping for another domain is answered", False, str(error))
         else:
-            run.check(
-                "a ping for another domain is answered noSuchObject",
-                result == 32,
-                "resultCode %s" % result,
-            )
+            run.check("a ping for another domain is answered", result == 0,
+                      "resultCode %s" % result)
+            try:
+                foreign_domain = decode_netlogon_ex(
+                    attribute_value(foreign_attrs, "Netlogon"))["dns_domain"]
+            except Exception as error:  # noqa: BLE001
+                run.check("the answer names this DC's own domain, not the one asked",
+                          False, str(error))
+            else:
+                run.check(
+                    "the answer names this DC's own domain, not the one asked",
+                    foreign_domain.lower() == args.domain.lower(),
+                    foreign_domain,
+                )
 
-    # 4. Anything that is not a locator ping stays unanswered: RFC 4511 dropped
-    #    LDAP over UDP, and answering a subtree search would claim it.
+    # 4. A UDP search that is not a locator ping is refused, not ignored:
+    #    unwillingToPerform with the diagnostic a Windows 2000 DC sends
+    #    (measured), because silence is indistinguishable from a dead DC to
+    #    anything holding a timeout.
     subtree = search(0x0007, "dc=example,dc=org", 2, and_filter(equality("objectClass", "top")), ["*"])
     _, reply = ask(host, port, subtree, timeout=1.0)
     run.check(
-        "a subtree search over UDP is not answered",
-        reply is None,
-        "the engine answered a search that is not a locator ping",
+        "a subtree search over UDP is refused as not allowed over UDP",
+        reply is not None and result_of(reply) == 53,
+        "%s" % ("no answer" if reply is None else "resultCode %r" % result_of(reply)),
     )
 
     print("\n%d checks, %d failing" % (run.passed + run.failed, run.failed))
