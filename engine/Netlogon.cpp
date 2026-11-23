@@ -105,6 +105,16 @@ quint64 ntTimeAttribute(const DirectoryObject &object, const QString &name)
     return ok ? value : 0;
 }
 
+// Some of the NT-time attributes AD reports are stored as Unix seconds, because
+// that is the unit the password-age arithmetic compares; SAMR converts at its
+// own boundary. The wire field is 100 ns ticks since 1601, so convert on read
+// here and leave the stored value alone.
+quint64 ntTimeFromUnixAttribute(const DirectoryObject &object, const QString &name)
+{
+    const quint64 seconds = ntTimeAttribute(object, name);
+    return seconds == 0 ? 0 : seconds * 10000000ull + kNtTimeEpoch * 10000000ull;
+}
+
 quint32 ridOf(const DirectoryObject &object)
 {
     const QStringList parts =
@@ -1633,7 +1643,8 @@ QByteArray NetlogonServer::samLogon(const QByteArray &stub, bool withAuthenticat
     // This logon cleared the failure counter, so the account it leaves behind
     // has none, whatever the copy read before the write.
     answer.badPasswordCount = 0;
-    answer.lastPasswordChange = ntTimeAttribute(account, QStringLiteral("pwdLastSet"));
+    answer.lastPasswordChange =
+        ntTimeFromUnixAttribute(account, QStringLiteral("pwdLastSet"));
     answer.forcePasswordChange = kNeverNtTime;
     answer.lastSuccessfulLogon = ntTimeAttribute(account, QStringLiteral("lastLogon"));
     answer.logonServer = m_config.dcName;

@@ -47,6 +47,14 @@ quint32 readLe32(const QByteArray &data, int offset)
            | (quint32(quint8(data.at(offset + 3))) << 24);
 }
 
+quint64 readLe64(const QByteArray &data, int offset)
+{
+    quint64 value = 0;
+    for (int i = 7; i >= 0; --i)
+        value = (value << 8) | quint64(quint8(data.at(offset + i)));
+    return value;
+}
+
 void appendStringArray(QByteArray &out, const QString &text, bool align = true)
 {
     const QByteArray chars = Ndr::utf16le(text) + QByteArray(2, '\0');
@@ -490,6 +498,7 @@ private slots:
     void locksTheAccountAfterTheThreshold();
     void refusesALogonFromAnotherWorkstation();
     void allowsALogonFromAListedWorkstation();
+    void samLogonReportsPwdLastSetInNtTime();
     void networkSamLogonHonoursNtlmv1Policy();
     void refusesAnExpiredPassword();
     void refusesAPasswordThatMustChange();
@@ -948,6 +957,39 @@ void NetlogonTest::allowsALogonFromAListedWorkstation()
     QCOMPARE(readLe32(reply, int(reply.size()) - 4), quint32(0));
     QVERIFY(reply.contains(Ndr::utf16le(QStringLiteral("alice"))));
     QVERIFY(logon.wroteBack);
+}
+
+// pwdLastSet is stored as Unix seconds because the password-age arithmetic
+// compares it in that unit, but netr_SamBaseInfo.pwd_last_set is a 100 ns
+// interval since 1601. Sending the stored value untouched made the reply name
+// 1601-01-01T00:02:59, which is the date clients showed for "password last set".
+void NetlogonTest::samLogonReportsPwdLastSetInNtTime()
+{
+    WorkstationLogon logon;
+    const qint64 seconds = QDateTime::currentSecsSinceEpoch() - 3600;
+    prepareWorkstationLogon(&logon, QString(),
+                            {{QStringLiteral("pwdLastSet"), QString::number(seconds)}});
+    QVERIFY(logon.channel.ok);
+
+    const quint32 timestamp = 62;
+    const QByteArray credential = nextCredential(logon.channel.seed, timestamp,
+                                                 logon.channel.sessionKey, logon.channel.flags, false);
+    const QByteArray ntResponse = ntlmV2Response(
+        logon.userHash, QStringLiteral("alice"), QStringLiteral("CORP"),
+        QByteArray::fromHex("0102030405060708"));
+    const QByteArray reply = logon.server.handleCall(
+        Netlogon::OpLogonSamLogon,
+        samLogonRequest(QStringLiteral("WS1"), credential, timestamp, ntResponse));
+
+    QVERIFY2(reply.size() > 56, qPrintable(QStringLiteral("SamLogon returned %1 bytes")
+                                              .arg(reply.size())));
+    // netr_SamBaseInfo starts at 24 in this reply, and pwd_last_set is its fourth
+    // field: logon_time, logoff_time, kickoff_time, pwd_last_set.
+    constexpr int kPwdLastSetOffset = 24 + 3 * 8;
+    const quint64 expected = quint64(seconds) * 10000000ull + 116444736000000000ull;
+    QCOMPARE(readLe64(reply, kPwdLastSetOffset), expected);
+    // The stored seconds themselves must not reach the wire.
+    QVERIFY(readLe64(reply, kPwdLastSetOffset) != quint64(seconds));
 }
 
 // A password older than the domain's maxPwdAge is proved but not accepted: the
