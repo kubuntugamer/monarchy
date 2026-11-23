@@ -17,6 +17,7 @@ class TestBrowser : public QObject
 
 private slots:
     void interfaceIsTheBrowserUuid();
+    void queryOtherDomainsAnswersAnEmptyList();
     void netServerEnumIsRefusedByStatus();
 };
 
@@ -27,6 +28,27 @@ void TestBrowser::interfaceIsTheBrowserUuid()
     QCOMPARE(browser.major, quint16(0));
     QCOMPARE(browser.minor, quint16(0));
     QCOMPARE(browser.name, QStringLiteral("browser"));
+}
+
+void TestBrowser::queryOtherDomainsAnswersAnEmptyList()
+{
+    BrowserServer server;
+    const QByteArray reply = server.handleCall(Browser::OpQueryOtherDomains, QByteArray());
+    // The empty SERVER_ENUM at level 100 MS-BRWS 3.1.4.1 asks for, with the
+    // [out] TotalEntries that follows it: two present pointers for the enum, the
+    // container's own present pointer, the count's, then the empty container and
+    // NERR_Success. Pinned byte for byte because a reply that omits the out
+    // parameters is the packet tshark called malformed.
+    const QByteArray expected = QByteArray::fromHex(
+        "00000200"  // InfoStruct present
+        "64000000"  // Level 100
+        "04000200"  // Level100 present
+        "08000200"  // TotalEntries present
+        "00000000"  // EntriesRead
+        "00000000"  // Buffer NULL
+        "00000000"  // TotalEntries
+        "00000000"); // NERR_Success
+    QCOMPARE(reply.toHex(), expected.toHex());
 }
 
 void TestBrowser::netServerEnumIsRefusedByStatus()

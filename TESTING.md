@@ -88,7 +88,7 @@ when you want the narrow loop first.
 | `Netlogon.cpp` | `monarchy-netlogon-tests` `monarchy-logonhours-tests` `monarchy-workstation-tests` | `netlogon-conformance.py` |
 | `Schannel.cpp`, the auth type it registers in `Rpc.cpp` | `monarchy-netlogon-tests` (`sealsThePipeWithTheChannelKey`) | **Samba** `net ads join` — impacket has no Netlogon security provider, so the independent client for this is the one that seals with it. The suite's bind verifier is the 17-byte one Samba sends, and every sealed byte is checked against Samba's own layout: header, sequence, HMAC, confounder, the CFB8 IV `seq‖seq`, and the AES key `sessionKey ^ 0xf0` |
 | `Epm.cpp` | `monarchy-epm-tests` | `epm-conformance.py` — a tower naming a dead port, or the wrong address, is the failure this catches |
-| `Browser.cpp` | `monarchy-browser-tests` | a Windows 2000 member enumerating over `\pipe\browser` — the suite pins the interface and the refusal, only the client shows the pipe opens |
+| `Browser.cpp` | `monarchy-browser-tests` | a Windows 2000 member enumerating over `\pipe\browser` — the suite pins the interface, the empty other-domains answer and the refusal, only the client shows the pipe opens |
 | `Srvsvc.cpp` | `monarchy-srvsvc-tests` | `rpcclient -c netshareenum` and `smbclient -L` — the suite pins the stub against Samba's encoder, but only a client shows the endpoint is reachable on `\pipe\srvsvc` |
 | `DcService.cpp` (which address a listener binds) | `monarchy-dcservice-tests` `monarchy-epm-tests` | `epm-conformance.py --host <lan>` — a loopback bind passes every probe made on this host |
 | `DnsServer.cpp` | `monarchy-dns-tests` | `scripts/check-dc-health.sh` — the locators *and* the two negative answers |

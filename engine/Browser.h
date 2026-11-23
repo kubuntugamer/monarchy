@@ -30,10 +30,21 @@ namespace Browser {
 // MS-BRWS 3.1.1: 6bffd098-a112-3610-9833-012892020162 v0.0.
 Rpc::Interface interface();
 
-// The opnum a member's NetServerEnum rides on. The answer is a status, not a
-// container; see the note above.
+// I_BrowserrServerEnum (opnum 0): a browser enumerating the servers in a domain.
+// Refused by status; see the note above.
 constexpr quint16 OpNetServerEnum = 0;
 
+// I_BrowserrQueryOtherDomains (opnum 2): the PDC-emulator query a master browser
+// makes for the domains this DC knows besides its own. MS-BRWS 3.1.4.1 requires
+// an answer here — a SERVER_ENUM at level 100 holding one entry per name in
+// OtherDomains — and a forest of one domain has no other domains, so the answer
+// is an empty list and NERR_Success. Refusing it was the wrong shape as well as
+// the wrong answer: the call's [in,out] SERVER_ENUM and [out] TotalEntries are
+// marshalled back whatever the status, and a bare status word is a packet the
+// dissector cannot read.
+constexpr quint16 OpQueryOtherDomains = 2;
+
+constexpr quint32 kErrorSuccess = 0u;            // NERR_Success
 constexpr quint32 kErrorNotSupported = 0x00000032u; // ERROR_NOT_SUPPORTED
 
 } // namespace Browser
