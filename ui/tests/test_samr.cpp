@@ -764,6 +764,10 @@ void SamrTest::samrDirectoryCalls()
                                      QStringLiteral("1234605616436508552"));
     objects.last().attributes.insert(QStringLiteral("logonCount"), QStringLiteral("7"));
     objects.last().attributes.insert(QStringLiteral("badPwdCount"), QStringLiteral("3"));
+    // A machine account, whose SID_NAME_USE is not a user's.
+    addUser(QStringLiteral("WS01$"), QStringLiteral("WS01$"), QStringLiteral("S-1-5-21-1-2-3-2001"));
+    objects.last().type = QStringLiteral("Computer");
+    objects.last().kind = ObjectKind::Computer;
 
     // The domain NC object, which carries the lockout policy.
     DirectoryObject domainObject;
@@ -1048,6 +1052,25 @@ void SamrTest::samrDirectoryCalls()
     QCOMPARE(lastWord(server.handleCall(Samr::OpLookupIdsInDomain,
                                         lookupIdsStub(domainHandle, {1001, 4242}))),
              0x00000107u); // STATUS_SOME_NOT_MAPPED
+
+    // A machine account carries SidTypeComputer (9) in both directions. It used
+    // to be answered 8, SidTypeUnknown: the one value that says nothing about a
+    // name the lookup had just mapped, and a different answer for the same
+    // account than LsaLookupNames gives over LSAD.
+    const QByteArray machineNames = server.handleCall(
+        Samr::OpLookupNamesInDomain, lookupNamesStub(domainHandle, {QStringLiteral("WS01$")}));
+    QCOMPARE(lastWord(machineNames), 0u);
+    pos = 0;
+    QVERIFY(readIdArray(machineNames, &pos, &rids));
+    QVERIFY(readIdArray(machineNames, &pos, &types));
+    QCOMPARE(rids, (QList<quint32>{2001}));
+    QCOMPARE(types, (QList<quint32>{9})); // SidTypeComputer
+    const QByteArray machineIds =
+        server.handleCall(Samr::OpLookupIdsInDomain, lookupIdsStub(domainHandle, {2001}));
+    QCOMPARE(lastWord(machineIds), 0u);
+    const int typeReferent = machineIds.indexOf(QByteArray::fromHex("30e10200"));
+    QVERIFY(typeReferent >= 0);
+    QCOMPARE(machineIds.mid(typeReferent + 8, 4), QByteArray::fromHex("09000000"));
 
     // CloseHandle releases the context.
     QByteArray closeRequest = userHandle;

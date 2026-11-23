@@ -110,7 +110,7 @@ quint32 nameTypeFor(const DirectoryObject &object)
     if (object.kind == ObjectKind::Group)
         return isAlias(object) ? 4 : 2; // SidTypeAlias : SidTypeGroup
     if (object.kind == ObjectKind::Computer)
-        return 8; // SidTypeComputer
+        return 9; // SidTypeComputer — 8 is SidTypeUnknown, which no mapped name is
     return 1;     // SidTypeUser
 }
 
