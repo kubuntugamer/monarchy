@@ -136,6 +136,9 @@ private:
         quint32 encTimestampKvno = 0;
         bool hasApReq = false;
         QByteArray apReq;
+        // RFC 4120 §5.4.2: the tickets the client already holds for the target,
+        // sent so the KDC can answer in their key instead of the service's.
+        QList<QByteArray> additionalTickets;
     };
 
     struct OpenedTicket {

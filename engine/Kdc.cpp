@@ -36,6 +36,7 @@ constexpr quint8 kEncApRepPartTag = 0x7B;
 // KDC error codes (RFC 4120 §7.5.9).
 constexpr int kErrCPrincipalUnknown = 6;
 constexpr int kErrSPrincipalUnknown = 7;
+constexpr int kErrBadOption = 13;
 constexpr int kErrEtypeNoSupp = 14;
 constexpr int kErrPadTypeNoSupp = 16;
 constexpr int kErrClientRevoked = 18;
@@ -52,6 +53,11 @@ constexpr int kErrGeneric = 60;
 // value of a flag is therefore its bit from the top of a 32-bit word, which is
 // what MIT's TKT_FLG_* names encode: 0x40000000 is *forwardable*, and marking a
 // ticket "initial" with that constant marked every TGT forwardable instead.
+// RFC 4120 5.4.1: enc-tkt-in-skey asks for the ticket in the key of the
+// additional ticket rather than in the service's own long-term key.
+// KDCOptions numbers its bits from the most significant end, so "bit 28" is
+// 0x08 in a 32-bit word, which is the value Windows sends and MS-KILE names.
+constexpr quint32 kEncTktInSkey = 0x00000008;
 constexpr quint32 kFlagForwardable = 0x40000000;
 constexpr quint32 kFlagProxiable = 0x10000000;
 constexpr quint32 kFlagRenewable = 0x00800000;
@@ -521,6 +527,19 @@ bool Kdc::parseRequest(const QByteArray &der, quint8 expectedTag, KdcRequest *ou
     out->options = decodeBits(Asn1::child(body, 0xA0));
     out->till = decodeTime(Asn1::child(body, 0xA5));
 
+    // RFC 4120 §5.4.2: additional-tickets [11] is a SEQUENCE OF Ticket, sent by
+    // a client that wants its answer in a key it already shares with the target
+    // instead of one sealed to the target's long-term key.
+    if (const Asn1::Element *ticketsTag = Asn1::child(body, 0xAB)) {
+        Asn1::Element tickets;
+        if (Asn1::parse(ticketsTag->value, &tickets) && tickets.tag == 0x30) {
+            for (const Asn1::Element &entry : tickets.children) {
+                if (entry.tag == 0x61)
+                    out->additionalTickets.append(Asn1::tlv(0x61, entry.value));
+            }
+        }
+    }
+
     if (const Asn1::Element *etypesTag = Asn1::child(body, 0xA8)) {
         Asn1::Element etypes;
         if (Asn1::parse(etypesTag->value, &etypes) && etypes.tag == 0x30) {
@@ -896,6 +915,45 @@ QByteArray Kdc::issueTgsRep(const KdcRequest &request, const OpenedTicket &tgt,
     if (!request.etypes.isEmpty() && !request.etypes.contains(sessionEtype))
         return krbError(kErrEtypeNoSupp, realm, tgt.client);
 
+    // RFC 4120 §3.3.3: with enc-tkt-in-skey set, the ticket comes back sealed in
+    // the session key of the target's own TGT, which the client supplies as an
+    // additional ticket, not in the target's long-term key. A Windows 2000
+    // member's LSA asks this way for tickets it authenticates with, and a DC
+    // that answers with the service key instead hands it a ticket nothing on
+    // the client can open — the logon then stops locally, before any Netlogon
+    // call, which is the shape of the failure measured against this DC. When no
+    // usable additional ticket is supplied there is nothing to seal with, and
+    // saying so (KDC_ERR_BADOPTION) is the only honest answer: issuing a
+    // service-key ticket is exactly the answer being avoided.
+    QByteArray ticketKey = service.keyFor(serviceEtype);
+    int ticketEtype = serviceEtype;
+    int ticketKvno = int(service.kvno);
+    if (request.options & kEncTktInSkey) {
+        Krb5::Principal localKrbtgt;
+        const bool haveLocalKrbtgt = Krb5::findPrincipal(
+            directory(), QStringLiteral("krbtgt/%1").arg(realm), realm, &localKrbtgt);
+        bool sealedInHeld = false;
+        for (const QByteArray &candidate : request.additionalTickets) {
+            OpenedTicket held;
+            QString reason;
+            if (!haveLocalKrbtgt || !openTicket(candidate, localKrbtgt, &held, &reason)
+                || held.sessionKey.size() != Krb5::keySize(held.sessionEtype))
+                continue;
+            ticketKey = held.sessionKey;
+            ticketEtype = held.sessionEtype;
+            // The key is the target's session key, not a long-term one; a kvno
+            // would name a key the client never derives, so the field is left
+            // out (encryptedData omits it at zero).
+            ticketKvno = 0;
+            sealedInHeld = true;
+            break;
+        }
+        if (!sealedInHeld) {
+            trace(QStringLiteral("TGS-REQ enc-tkt-in-skey without a usable ticket"));
+            return krbError(kErrBadOption, realm, tgt.client);
+        }
+    }
+
     const qint64 now = QDateTime::currentSecsSinceEpoch();
     qint64 endtime = qMin(tgt.endtime, now + kTicketLifetime);
     if (request.till > 0)
@@ -927,7 +985,7 @@ QByteArray Kdc::issueTgsRep(const KdcRequest &request, const OpenedTicket &tgt,
     // realm; a local client's realm is ours.
     const QString crealm = tgt.crealm.isEmpty() ? realm : tgt.crealm;
     const QByteArray ticketCipher =
-        Krb5::encrypt(serviceEtype, 2, service.keyFor(serviceEtype),
+        Krb5::encrypt(ticketEtype, 2, ticketKey,
                       encTicketPart(flags, sessionKey, sessionEtype, crealm, tgt.client, now,
                                     endtime, authorizationData));
     // RFC 4120 §7.5.1: a TGS reply is sealed under the request's subkey with
@@ -946,7 +1004,7 @@ QByteArray Kdc::issueTgsRep(const KdcRequest &request, const OpenedTicket &tgt,
     content.append(explicitInteger(1, 13));
     content.append(kerberosString(3, crealm));
     content.append(taggedPrincipal(4, tgt.client));
-    content.append(contextTag(5, ticket(realm, request.sname, serviceEtype, int(service.kvno),
+    content.append(contextTag(5, ticket(realm, request.sname, ticketEtype, ticketKvno,
                                         ticketCipher)));
     content.append(contextTag(6, encryptedData(replyEtype, 0, encPart)));
     return Asn1::tlv(kTgsRepTag, Asn1::sequence(content));
