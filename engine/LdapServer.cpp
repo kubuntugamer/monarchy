@@ -35,6 +35,11 @@
 #include <algorithm>
 #include <functional>
 
+// Largest LDAP message this server will assemble. Framing has to be bounded:
+// a claimed length is reserved in the read buffer before any of it arrives, so
+// an unbounded one lets a single client decide the server's memory use.
+constexpr quint64 kMaxLdapMessage = 16 * 1024 * 1024;
+
 // The listener hands each accepted descriptor straight to the server instead of
 // letting QTcpServer wrap it in a QTcpSocket: a connection has to start as a
 // QSslSocket so StartTLS can upgrade the very same socket in place, and Qt does
@@ -2098,21 +2103,38 @@ void LdapServer::pump(ClientState *st, QSslSocket *sock) {
         if (st->buffer.size() < 2) break;
         if ((unsigned char)st->buffer[0] != 0x30) { st->buffer.clear(); break; }
         int pos = 1;
-        int lenBytes = 0, length = 0;
+        int lenBytes = 0;
+        quint64 length = 0;
         unsigned char b = (unsigned char)st->buffer[pos++];
         lenBytes = 1;
         if (b >= 0x80) {
-            int n = b & 0x7f;
+            const int n = b & 0x7f;
+            // Indefinite length (0x80) is not valid LDAP framing, and a width
+            // wider than four bytes cannot describe a message this server will
+            // accept. Both used to be passed through to the arithmetic below,
+            // where a length that did not fit an int made `total` negative: the
+            // completeness check then passed on every pass, the same bytes were
+            // never consumed, and the pump loop spun forever.
+            if (n == 0 || n > 4) {
+                st->buffer.clear();
+                sock->disconnectFromHost();
+                return;
+            }
             if (st->buffer.size() < 1 + n) break;
             for (int i = 0; i < n; i++) length = (length << 8) | (unsigned char)st->buffer[pos++];
             lenBytes = 1 + n;
         } else {
             length = b;
         }
-        int total = 1 + lenBytes + length;
-        if (st->buffer.size() < total) break;
-        QByteArray msg = st->buffer.left(total);
-        st->buffer.remove(0, total);
+        if (length > kMaxLdapMessage) {
+            st->buffer.clear();
+            sock->disconnectFromHost();
+            return;
+        }
+        const quint64 total = quint64(1 + lenBytes) + length;
+        if (quint64(st->buffer.size()) < total) break;
+        QByteArray msg = st->buffer.left(qsizetype(total));
+        st->buffer.remove(0, qsizetype(total));
         // An UnbindRequest disconnects synchronously, which frees `st` from
         // onDisconnected(); nothing may read it after that. processMessage()
         // reports the close so the loop stops on a state that still exists.

@@ -286,6 +286,7 @@ private slots:
     void searchMissingRequiredFieldsIsProtocolError();
     void searchOversizeIntegerIsProtocolError();
     void messageIdWithTheTopBitSetIsEchoed();
+    void unusableLengthIsRefusedNotSpunOn();
     void answersTheDcLocatorPingOverUdp();
     void locatorPingForAnotherDomainIsAnswered();
     void udpSearchThatIsNotALocatorPingIsRefused();
@@ -1417,6 +1418,43 @@ void LdapTest::messageIdWithTheTopBitSetIsEchoed()
     QVERIFY(!reply.isEmpty());
     QCOMPARE(messageId(reply), id);
     QCOMPARE(operationTag(reply), 0x65); // searchResDone, not a refusal
+}
+
+// A long-form length that does not fit the arithmetic used to measure the
+// message made `total` negative, so the completeness check passed on every
+// pass: the same bytes were never consumed and the pump loop spun on them,
+// holding one core and stalling every other service on that event loop. The
+// frame has to be refused instead.
+void LdapTest::unusableLengthIsRefusedNotSpunOn()
+{
+    LdapServer server;
+    QVERIFY(server.listen(0));
+
+    // 0x84 says four length octets follow; 0x80000000 does not fit an int.
+    QTcpSocket client;
+    client.connectToHost(QHostAddress::LocalHost, server.serverPort());
+    QVERIFY(client.waitForConnected(3000));
+    client.write(QByteArray("\x30\x84\x80\x00\x00\x00", 6));
+    // QTRY_* instead of waitForDisconnected: the server shares this thread, so
+    // the close it queues is only delivered while the event loop is pumped.
+    QTRY_COMPARE(client.state(), QAbstractSocket::UnconnectedState);
+
+    // Indefinite length (0x80) is not valid LDAP framing either.
+    QTcpSocket indefinite;
+    indefinite.connectToHost(QHostAddress::LocalHost, server.serverPort());
+    QVERIFY(indefinite.waitForConnected(3000));
+    indefinite.write(QByteArray("\x30\x80\x00\x00", 4));
+    QTRY_COMPARE(indefinite.state(), QAbstractSocket::UnconnectedState);
+
+    // And the server still answers on a fresh connection.
+    QTcpSocket after;
+    after.connectToHost(QHostAddress::LocalHost, server.serverPort());
+    QVERIFY(after.waitForConnected(3000));
+    Reader reader(&after);
+    after.write(bindRequest(9, QByteArray(), QByteArray()));
+    const QByteArray reply = reader.next();
+    QVERIFY(!reply.isEmpty());
+    QCOMPARE(resultCode(reply), 0);
 }
 
 // DsGetDcName follows a DC's SRV record and then pings UDP/389 to satisfy
