@@ -601,21 +601,30 @@ def main():
         else:
             run.check("the named-domain reply parses", True)
             run.check("the named-domain reply is success", result == 0, str(result))
-            run.check(
-                "the entry carries the netlogon blob and nothing else",
-                [name.lower() for name in named] == ["netlogon"],
-                "attributes %r" % (sorted(named),),
-            )
-            try:
-                named_ex = decode_netlogon_ex(attribute_value(named, "Netlogon"))
-            except Exception as error:  # noqa: BLE001 - the blob is what a client reads
-                run.check("the blob names the domain this DC hosts", False, str(error))
+            if named is None:
+                # --domain may name a domain this DC does not host, and AD
+                # answers that with success and no entry at all (see check 3),
+                # so there is nothing here to read. Reading it anyway is what
+                # turned this run into a TypeError instead of a result.
+                why = "%r is not the domain this DC hosts: success with no entry" % (args.domain,)
+                run.skip("the entry carries the netlogon blob and nothing else", why)
+                run.skip("the blob names the domain this DC hosts", why)
             else:
                 run.check(
-                    "the blob names the domain this DC hosts",
-                    named_ex["dns_domain"].lower() == args.domain.lower(),
-                    named_ex["dns_domain"],
+                    "the entry carries the netlogon blob and nothing else",
+                    [name.lower() for name in named] == ["netlogon"],
+                    "attributes %r" % (sorted(named),),
                 )
+                try:
+                    named_ex = decode_netlogon_ex(attribute_value(named, "Netlogon"))
+                except Exception as error:  # noqa: BLE001 - the blob is what a client reads
+                    run.check("the blob names the domain this DC hosts", False, str(error))
+                else:
+                    run.check(
+                        "the blob names the domain this DC hosts",
+                        named_ex["dns_domain"].lower() == args.domain.lower(),
+                        named_ex["dns_domain"],
+                    )
 
     # 3. A ping for a domain this DC does not host is answered, not refused: a
     #    Windows 2000 DC replies with its own blob and leaves the client to
