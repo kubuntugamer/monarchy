@@ -48,7 +48,7 @@ CHECKS = [
     'SamrEnumerateDomainsInSamServer lists BUILTIN',
     'SamrOpenDomain / SamrEnumerateAliasesInDomain (BUILTIN)',
     'SamrLookupNamesInDomain (BUILTIN)',
-    'BUILTIN aliases are read-only',
+    'BUILTIN aliases hold a membership a client adds',
     'SamrCreateUser2InDomain',
     'SamrCreateUser2InDomain makes a machine a computer',
     'SamrOpenUser / SamrQueryInformationUser2',
@@ -85,7 +85,7 @@ CHECKS = [
     DOMAINS_BUILTIN,
     BUILTIN_ALIASES,
     BUILTIN_NAMES,
-    BUILTIN_READONLY,
+    BUILTIN_WRITABLE,
     CREATE_USER,
     MACHINE_USER,
     OPEN_USER,
@@ -304,8 +304,10 @@ def main():
         except Exception as error:  # noqa: BLE001
             check(BUILTIN_NAMES, False, '%s: %s' % (type(error).__name__, error))
 
-        # The membership AD seeds at domain creation, and nothing writable: a
-        # BUILTIN write has nowhere to persist here, so it is refused.
+        # The membership AD seeds at domain creation, then one this client adds
+        # and takes away again: a BUILTIN alias is a stored object, so the write
+        # lands and reads back instead of being accepted and lost. Deleting the
+        # alias itself is still refused, as AD refuses it.
         try:
             builtin_alias = samr.hSamrOpenAlias(dce, builtin, MAXIMUM_ALLOWED, 544)['AliasHandle']
             general = samr.hSamrQueryInformationAlias(dce, builtin_alias, 1)['Buffer']['General']
@@ -316,20 +318,24 @@ def main():
             seeded = general['MemberCount'] == 1 and members == [domain_admins]
             admin_sid = dtypes.RPC_SID()
             admin_sid.fromCanonical('%s-500' % domain_id.formatCanonical())
-            refusals = 0
-            for call in (samr.hSamrAddMemberToAlias, samr.hSamrRemoveMemberFromAlias):
-                try:
-                    call(dce, builtin_alias, admin_sid)
-                except Exception as error:  # noqa: BLE001
-                    refusals += '0xc00000bb' in str(error).lower()
+            samr.hSamrAddMemberToAlias(dce, builtin_alias, admin_sid)
+            after = samr.hSamrQueryInformationAlias(dce, builtin_alias, 1)['Buffer']['General']
+            listed = [entry['Data']['SidPointer'].formatCanonical()
+                      for entry in samr.hSamrGetMembersInAlias(
+                          dce, builtin_alias)['Members']['Sids']]
+            added = after['MemberCount'] == 2 and admin_sid.formatCanonical() in listed
+            samr.hSamrRemoveMemberFromAlias(dce, builtin_alias, admin_sid)
+            back = samr.hSamrQueryInformationAlias(dce, builtin_alias, 1)['Buffer']['General']
+            removed = back['MemberCount'] == 1
             try:
                 samr.hSamrDeleteAlias(dce, builtin_alias)
+                deletion_refused = False
             except Exception as error:  # noqa: BLE001
-                refusals += '0xc00000bb' in str(error).lower()
-            check(BUILTIN_READONLY, seeded and refusals == 3,
-                  (general['MemberCount'], members, refusals))
+                deletion_refused = '0xc00000bb' in str(error).lower()
+            check(BUILTIN_WRITABLE, seeded and added and removed and deletion_refused,
+                  (seeded, added, removed, deletion_refused))
         except Exception as error:  # noqa: BLE001
-            check(BUILTIN_READONLY, False, '%s: %s' % (type(error).__name__, error))
+            check(BUILTIN_WRITABLE, False, '%s: %s' % (type(error).__name__, error))
 
     # A unique name keeps a repeated run from colliding with the previous one.
     name = 'conf-user-%s' % uuid.uuid4().hex[:8]
