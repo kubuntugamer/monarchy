@@ -770,6 +770,18 @@ QByteArray LdapServer::cldapResponse(const QByteArray &request,
         return seq;
     }
 
+    // MONARCHY_CLDAP_TRACE=1 names the domain the ping asked about, the way the
+    // RPC and KDC traces do. Which of its names a client uses decides whether
+    // its ping is answered, and the answer decides whether the client goes on
+    // to log on or falls back to its own cache.
+    if (!qEnvironmentVariableIsEmpty("MONARCHY_CLDAP_TRACE")) {
+        const int at = assertions.indexOf(QStringLiteral("DnsDomain"));
+        const QString asked = at >= 0 && at + 1 < assertions.size()
+                                  ? assertions.at(at + 1)
+                                  : QStringLiteral("(no DnsDomain)");
+        qWarning("CLDAP ping domain=%s", qPrintable(asked));
+    }
+
     const QString site = m_identity.siteName.isEmpty()
                              ? QStringLiteral("Default-First-Site-Name")
                              : m_identity.siteName;
