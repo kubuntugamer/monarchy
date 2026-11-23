@@ -73,7 +73,10 @@ public:
     // One datagram in, one reply out. Empty when the datagram is not a locator
     // ping: the ping is the only LDAP query AD answers over UDP, and answering
     // anything else here would claim a transport it does not implement.
-    QByteArray cldapResponse(const QByteArray &request) const;
+    // The local address is the one the datagram arrived on, which is what a ping
+    // asking for WITH_IP is answered with.
+    QByteArray cldapResponse(const QByteArray &request,
+                             const QHostAddress &localAddress = QHostAddress()) const;
 
     // TLS for StartTLS (RFC 4511 §4.14.1). The listener accepts plaintext and
     // upgrades a connection in place when the client sends the StartTLS extended

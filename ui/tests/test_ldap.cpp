@@ -134,12 +134,12 @@ QByteArray passwordChangeRequest(int id, const QByteArray &dn, const QByteArray 
 // The Windows DC locator's query (MS-ADTS 6.3.1.4.1.1): a baseObject search on
 // the root DSE whose filter asserts DnsDomain and the NtVer capabilities it
 // speaks. This is the only LDAP query sent over UDP.
-QByteArray locatorPing(const QByteArray &domain, int id = 7)
+QByteArray locatorPing(const QByteArray &domain, int id = 7,
+                       const QByteArray &mask = QByteArray("\x06\x00\x00\x00", 4))
 {
     QByteArray filter = tlv(char(0xa0),
                             tlv(char(0xa3), tlv(0x04, "DnsDomain") + tlv(0x04, domain))
-                                + tlv(char(0xa3), tlv(0x04, "NtVer")
-                                                      + tlv(0x04, QByteArray("\x06\x00\x00\x00", 4))));
+                                + tlv(char(0xa3), tlv(0x04, "NtVer") + tlv(0x04, mask)));
     QByteArray inner = tlv(0x04, QByteArray());        // base: the root DSE
     inner += tlv(char(0x0a), QByteArray(1, char(0)));   // scope: baseObject
     inner += tlv(char(0x0a), QByteArray(1, char(0)));   // derefAliases: never
@@ -286,8 +286,8 @@ private slots:
     void searchOversizeIntegerIsProtocolError();
     void messageIdWithTheTopBitSetIsEchoed();
     void answersTheDcLocatorPingOverUdp();
-    void locatorPingForAnotherDomainIsNoSuchObject();
-    void udpIsSilentForAnythingButTheLocatorPing();
+    void locatorPingForAnotherDomainIsAnswered();
+    void udpSearchThatIsNotALocatorPingIsRefused();
 };
 
 // The password policy is the domain object's: minPwdLength, pwdHistoryLength and
@@ -1464,6 +1464,20 @@ void LdapTest::answersTheDcLocatorPingOverUdp()
     QVERIFY2(!strict.contains("DnsDomain"),
              "the answer carried an attribute the ping did not ask for");
 
+    // A ping that asks for WITH_IP gets the address the datagram arrived on, and
+    // the word that ends the blob says so; one that does not ask gets neither.
+    // Measured against a Windows 2000 DC: 0x06 in, a blob whose word is 5 and no
+    // address; 0x1f in, a word of 0x0d and sixteen bytes of sockaddr.
+    const QByteArray withIp = server.cldapResponse(
+        locatorPing(QByteArray("corp.example.com"), 9,
+                    QByteArray("\x1f\x00\x00\x00", 4)),
+        QHostAddress(QStringLiteral("192.168.1.101")));
+    QVERIFY2(!withIp.isEmpty(), "a WITH_IP ping went unanswered");
+    QVERIFY(withIp.contains(QByteArray("\x0d\x00\x00\x00\xff\xff\xff\xff", 8)));
+    // sockaddr: sixteen bytes of address, AF_INET, no port, then the IPv4 address
+    // the datagram arrived on.
+    QVERIFY(withIp.contains(QByteArray("\x10\x02\x00\x00\x00\xc0\xa8\x01\x65", 9)));
+
     // NETLOGON_SAM_LOGON_RESPONSE_EX, as Samba's nbt.idl defines it with
     // NDR_NOALIGN. The command word, then the capability word with no 2008+ bits
     // (the domain records no functional level), and the two legacy tokens at the
@@ -1481,7 +1495,11 @@ void LdapTest::answersTheDcLocatorPingOverUdp()
 
 // The ping names the domain it is looking for. Answering a different name
 // would claim this DC hosts somebody else's namespace.
-void LdapTest::locatorPingForAnotherDomainIsNoSuchObject()
+// A ping naming a domain this DC does not host is still answered, with this
+// DC's own names: a Windows 2000 DC does no filtering of its own and leaves the
+// client to compare DnsDomain (measured — resultCode 0, not noSuchObject).
+// Refusing it made a client that had already picked this DC see it as absent.
+void LdapTest::locatorPingForAnotherDomainIsAnswered()
 {
     LdapServer server;
     LdapServer::Identity identity;
@@ -1493,14 +1511,18 @@ void LdapTest::locatorPingForAnotherDomainIsNoSuchObject()
 
     const QByteArray reply = udpQuery(server.cldapPort(), locatorPing("other.example.com"));
     QVERIFY(!reply.isEmpty());
-    QCOMPARE(operationTag(reply), 0x65); // searchResDone only
-    QCOMPARE(resultCode(reply), 32);     // noSuchObject
+    QCOMPARE(operationTag(reply), 0x64); // the entry comes first, then the result
+    // A refused ping has no entry at all, so an entry naming this DC's domain is
+    // the success a Windows 2000 DC answers with.
+    // The answer names this DC's domain, not the one the ping asked for.
+    QVERIFY(reply.contains(QByteArray("\x04" "corp" "\x07" "example" "\x03" "com\x00", 18)));
 }
 
-// RFC 4511 dropped LDAP over UDP; only the locator ping survives on it. A
-// search that is not a ping must not be answered, because a reply would tell a
-// client that a transport it does not implement works.
-void LdapTest::udpIsSilentForAnythingButTheLocatorPing()
+// RFC 4511 dropped LDAP over UDP; only the locator ping survives on it. Any
+// other search is refused with unwillingToPerform and a diagnostic, which is
+// what a Windows 2000 DC answers (measured) — silence would be
+// indistinguishable from a dead DC to a client holding a timeout.
+void LdapTest::udpSearchThatIsNotALocatorPingIsRefused()
 {
     LdapServer server;
     LdapServer::Identity identity;
@@ -1517,7 +1539,10 @@ void LdapTest::udpIsSilentForAnythingButTheLocatorPing()
     inner += tlv(char(0x87), QByteArray("objectClass")); // plain present filter
     inner += tlv(char(0x30), QByteArray());
     const QByteArray reply = udpQuery(server.cldapPort(), ldapMessage(1, char(0x63), inner), 700);
-    QVERIFY2(reply.isEmpty(), "a non-locator search was answered over UDP");
+    QVERIFY2(!reply.isEmpty(), "a non-locator search was not answered at all");
+    QCOMPARE(operationTag(reply), 0x65); // searchResDone
+    QCOMPARE(resultCode(reply), 53);     // unwillingToPerform
+    QVERIFY(reply.contains("Operation not allowed through UDP"));
 }
 
 QTEST_MAIN(LdapTest)

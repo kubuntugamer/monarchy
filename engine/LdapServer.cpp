@@ -15,6 +15,7 @@
 #include <QSaveFile>
 
 #include <QtNetwork/QTcpSocket>
+#include <QtNetwork/QNetworkDatagram>
 #include <QtNetwork/QUdpSocket>
 #include <QtNetwork/QHostAddress>
 #include <QtNetwork/QSslCipher>
@@ -613,19 +614,20 @@ quint16 LdapServer::cldapPort() const { return m_cldap ? m_cldap->localPort() : 
 
 void LdapServer::onCldapDatagram() {
     while (m_cldap && m_cldap->hasPendingDatagrams()) {
-        QByteArray datagram;
-        datagram.resize(int(m_cldap->pendingDatagramSize()));
-        QHostAddress peer;
-        quint16 peerPort = 0;
-        const qint64 read = m_cldap->readDatagram(datagram.data(), datagram.size(), &peer, &peerPort);
-        if (read < 0) continue;
-        datagram.truncate(int(read));
-        const QByteArray reply = cldapResponse(datagram);
-        if (!reply.isEmpty()) m_cldap->writeDatagram(reply, peer, peerPort);
+        // receiveDatagram rather than readDatagram: a ping that asks for WITH_IP
+        // is answered with the address it arrived on, and on a host with more
+        // than one interface only the destination says which one a client can
+        // reach.
+        const QNetworkDatagram received = m_cldap->receiveDatagram();
+        if (!received.isValid()) continue;
+        const QByteArray reply = cldapResponse(received.data(), received.destinationAddress());
+        if (!reply.isEmpty())
+            m_cldap->writeDatagram(reply, received.senderAddress(), received.senderPort());
     }
 }
 
-QByteArray LdapServer::cldapResponse(const QByteArray &request) const {
+QByteArray LdapServer::cldapResponse(const QByteArray &request,
+                                    const QHostAddress &localAddress) const {
     // The only query a DC answers over UDP is the locator's ping: a baseObject
     // search on the root DSE whose filter asserts DnsDomain (MS-ADTS 6.3.1.4.1).
     // It is how a client satisfies itself that the machine its SRV record points
@@ -641,10 +643,14 @@ QByteArray LdapServer::cldapResponse(const QByteArray &request) const {
     const QList<const Asn1::Element *> scopeFields = Asn1::children(*search, 0x0a);
     if (!scopeFields.isEmpty() && Asn1::toInteger(*scopeFields.first()) != 0) return {};
 
-    // Collect the filter's assertions. A ping names a domain; one that names a
-    // different domain is answered with noSuchObject, the way a DC that hosts
-    // only its own namespace would.
+    // Collect the filter's assertions. A ping names a domain, but the named
+    // domain is not a filter over the answer: a Windows 2000 DC answers a ping
+    // for any domain with its own blob and leaves the client to compare
+    // DnsDomain for itself (measured — a foreign-domain ping there returns
+    // success, not noSuchObject). Refusing it made a client that had already
+    // picked this DC see it as absent.
     QStringList assertions;
+    QList<QByteArray> assertionValues;
     QList<const Asn1::Element *> pending;
     for (const Asn1::Element &child : search->children) {
         // The filter is the context-tagged field of the search request; its
@@ -655,6 +661,7 @@ QByteArray LdapServer::cldapResponse(const QByteArray &request) const {
         const Asn1::Element *element = pending.takeFirst();
         if (element->children.isEmpty()) {
             assertions.append(QString::fromUtf8(element->value));
+            assertionValues.append(element->value);
             continue;
         }
         for (const Asn1::Element &child : element->children) pending.append(&child);
@@ -666,13 +673,11 @@ QByteArray LdapServer::cldapResponse(const QByteArray &request) const {
     // stays unanswered. A ping that names no domain is asking "are you a DC?",
     // so it is answered — refusing it looked exactly like a DC being absent,
     // which is the failure this reply exists to prevent.
-    int domainIndex = -1;
     int userIndex = -1;
     bool asksAboutDomain = false;
     for (int i = 0; i < assertions.size(); ++i) {
         const QString &assertion = assertions.at(i);
         if (assertion.compare(QStringLiteral("DnsDomain"), Qt::CaseInsensitive) == 0) {
-            domainIndex = i + 1;
             asksAboutDomain = true;
         } else if (assertion.compare(QStringLiteral("NtVer"), Qt::CaseInsensitive) == 0) {
             asksAboutDomain = true;
@@ -680,26 +685,35 @@ QByteArray LdapServer::cldapResponse(const QByteArray &request) const {
             userIndex = i + 1;
         }
     }
-    if (!asksAboutDomain) return {};
+    // NtVer carries a four-byte capabilities mask in the filter's value, and one
+    // bit of it is a demand rather than a hint: NETLOGON_NT_VERSION_5EX_WITH_IP
+    // (0x08) asks for this DC's address in the blob. A Windows 2000 DC answers it
+    // by appending the sockaddr field and setting the bit in the trailing word —
+    // measured: 0x06 in, 0x05 out; 0x1f in, 0x0d out with sixteen bytes of
+    // address — so the word has to follow the mask for that one bit and not for
+    // the others.
+    quint32 requestedNtVer = 0;
+    for (int i = 0; i + 1 < assertionValues.size(); ++i) {
+        if (assertions.at(i).compare(QStringLiteral("NtVer"), Qt::CaseInsensitive) != 0)
+            continue;
+        const QByteArray &mask = assertionValues.at(i + 1);
+        for (int b = 0; b < mask.size() && b < 4; ++b)
+            requestedNtVer |= quint32(quint8(mask.at(b))) << (8 * b);
+        break;
+    }
 
     const int msgId = int(Asn1::toInteger(*idField));
-    // A Windows locator ping names the domain as an FQDN with its root dot
-    // (`corp.example.com.`); the SRV record it followed does not. They name the
-    // same domain, and treating the dot as a different name made every Windows
-    // 2000 logon answer noSuchObject, after which the client reports the domain
-    // unavailable without ever opening the Netlogon pipe.
-    const auto canonicalDomain = [](QString name) {
-        while (name.endsWith(QLatin1Char('.'))) name.chop(1);
-        return name;
-    };
-    if (domainIndex > 0 && domainIndex < assertions.size()
-        && canonicalDomain(assertions.at(domainIndex))
-                   .compare(canonicalDomain(m_identity.dnsDomain), Qt::CaseInsensitive)
-               != 0) {
+    if (!asksAboutDomain) {
+        // A UDP search that is not a locator ping is refused, not ignored. A
+        // Windows 2000 DC answers unwillingToPerform with this diagnostic,
+        // measured byte for byte, and the difference matters: silence is
+        // indistinguishable from a dead DC to anything holding a timeout.
         QByteArray inner;
-        writeInt(inner, 0x0a, 32); // noSuchObject
+        writeInt(inner, 0x0a, 53); // unwillingToPerform
         writeString(inner, 0x04, QString());
-        writeString(inner, 0x04, QString());
+        writeString(inner, 0x04,
+                    QStringLiteral("00002040: LdapErr: DSID-0C0905C8, comment: "
+                                   "Operation not allowed through UDP, data 0, v893"));
         QByteArray out;
         writeInt(out, 0x02, msgId);
         writeTLV(out, 0x65, inner);
@@ -812,14 +826,31 @@ QByteArray LdapServer::cldapResponse(const QByteArray &request) const {
         // One site: every client computes into it, so the client's site is this
         // DC's site and the CLOSEST bit above says so.
         blob.append(labelList(site)); // client_site
-        // NT_VERSION_1 | NT_VERSION_5EX, which is what selects the EX layout in
-        // a client's parser — the same choice Samba's own CLDAP server makes.
-        // The IP address and closest-site fields are absent with these bits, so
-        // the blob stays the same whatever mask the client asked with.
-        blob.append(char(0x05));
-        blob.append(char(0x00));
-        blob.append(char(0x00));
-        blob.append(char(0x00));
+        // NT_VERSION_1 | NT_VERSION_5EX selects the EX layout in a client's
+        // parser — the same choice Samba's own CLDAP server makes — and the word
+        // describes the blob it ends, not the question: when the ping asked for
+        // WITH_IP the address is appended and its bit set, and when it did not,
+        // neither is there. The closest-site bit is never claimed: one site holds
+        // every client, and claiming it would promise a field this blob does not
+        // carry.
+        quint32 ntVersion = 0x00000005; // NT_VERSION_1 | NT_VERSION_5EX
+        if (requestedNtVer & 0x00000008u) { // NETLOGON_NT_VERSION_5EX_WITH_IP
+            ntVersion |= 0x00000008u;
+            // The address the datagram arrived on, which is the one a client can
+            // reach on a host with more than one.
+            quint32 address = 0;
+            if (localAddress.protocol() == QAbstractSocket::IPv4Protocol)
+                address = localAddress.toIPv4Address();
+            blob.append(char(0x10)); // length of the address structure
+            blob.append(char(0x02)); // AF_INET, little endian
+            blob.append(char(0x00));
+            blob.append(char(0x00)); // port
+            blob.append(char(0x00));
+            for (int shift = 24; shift >= 0; shift -= 8)
+                blob.append(char((address >> shift) & 0xff));
+            blob.append(QByteArray(8, '\0')); // the rest of sockaddr_storage
+        }
+        for (int i = 0; i < 4; ++i) blob.append(char((ntVersion >> (8 * i)) & 0xff));
         blob.append(char(0xff));
         blob.append(char(0xff)); // lmnt_token
         blob.append(char(0xff));
