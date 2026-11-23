@@ -158,7 +158,12 @@ bool isNameBearing(quint16 type) {
 // into its uncompressed form.
 QByteArray normalizeRdata(const QByteArray &packet, int rdataStart, quint16 type,
                           const QByteArray &raw) {
-    if (!isNameBearing(type))
+    // Nothing to rewrite: an update's "RRset does not exist" and its delete
+    // forms carry a zero-length rdata, and decoding a name from the bytes that
+    // follow would make the record look like it had one. Windows sends exactly
+    // that shape, so a name read past the record turned a valid update into
+    // FORMERR.
+    if (raw.isEmpty() || !isNameBearing(type))
         return raw;
 
     QByteArray out;

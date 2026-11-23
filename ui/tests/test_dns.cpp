@@ -551,6 +551,7 @@ private slots:
     void dropsItsOwnListenerFromAConfiguredList();
     void separatesAHostFilesForwardingFacts();
     void appliesDynamicUpdates();
+    void acceptsEmptyRdataInUpdateSections();
     void acceptsReverseZoneUpdates();
     void enforcesUpdatePolicy();
     void refusesZoneTransfers();
@@ -1581,6 +1582,65 @@ void DnsTest::acceptsReverseZoneUpdates()
                                              {ptr})),
                        &foreign));
     QCOMPARE(foreign.rcode, 9); // NOTAUTH
+}
+
+void DnsTest::acceptsEmptyRdataInUpdateSections()
+{
+    DnsServer server;
+    QVERIFY(server.listen(0));
+    const QString zone = QStringLiteral("monarchy.example.com");
+    server.loadAdZone(zone, QStringLiteral("monarchydc1.monarchy.example.com"),
+                      QStringLiteral("10.0.0.10"), 1389, 3268,
+                      QStringLiteral("Default-First-Site-Name"));
+    const QString host = QStringLiteral("workstation1.monarchy.example.com");
+
+    // What Windows 2000 sends to register its own A record: "no CNAME here"
+    // (class NONE, no rdata) then "the A RRset is exactly this address"
+    // (class IN, value dependent). Empty rdata is part of the encoding, so the
+    // pair has to be judged on what it says rather than answered FormErr.
+    UpdateRecord noCname;
+    noCname.name = host;
+    noCname.type = DnsServer::TypeCname;
+    noCname.rclass = 254;
+
+    UpdateRecord aValue;
+    aValue.name = host;
+    aValue.type = DnsServer::TypeA;
+    aValue.rclass = 1;
+    aValue.rdata = QByteArray::fromHex("0a000005");
+
+    Reply absent;
+    QVERIFY(parseReply(exchange(server.serverPort(), updatePacket(0x6101, zone, {noCname, aValue}, {})),
+                       &absent));
+    QCOMPARE(absent.rcode, 8); // NXRRSET: the address is not there yet (RFC 2136 §3.2.4)
+
+    server.addRecord(host, DnsServer::TypeA, 300, QByteArray::fromHex("0a000005"));
+    Reply present;
+    QVERIFY(parseReply(exchange(server.serverPort(), updatePacket(0x6102, zone, {noCname, aValue}, {})),
+                       &present));
+    QCOMPARE(present.rcode, 0);
+
+    // A whole-RRset delete (class ANY, no rdata) followed by an add: the empty
+    // record has to stay empty instead of taking the name that follows it.
+    UpdateRecord dropCname;
+    dropCname.name = QStringLiteral("alias.monarchy.example.com");
+    dropCname.type = DnsServer::TypeCname;
+    dropCname.rclass = 255;
+    server.addRecord(dropCname.name, DnsServer::TypeCname, 300, nameBytes(host));
+
+    UpdateRecord addCname;
+    addCname.name = dropCname.name;
+    addCname.type = DnsServer::TypeCname;
+    addCname.rclass = 1;
+    addCname.ttl = 300;
+    addCname.rdata = nameBytes(host);
+
+    Reply replace;
+    QVERIFY(parseReply(exchange(server.serverPort(),
+                                updatePacket(0x6103, zone, {}, {dropCname, addCname})),
+                       &replace));
+    QCOMPARE(replace.rcode, 0);
+    QCOMPARE(server.records(dropCname.name, DnsServer::TypeCname).size(), 1);
 }
 
 void DnsTest::enforcesUpdatePolicy()
