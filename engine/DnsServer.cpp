@@ -158,6 +158,15 @@ bool isNameBearing(quint16 type) {
 // into its uncompressed form.
 QByteArray normalizeRdata(const QByteArray &packet, int rdataStart, quint16 type,
                           const QByteArray &raw) {
+    // A zero-length RDATA is a value in its own right in RFC 2136: a prerequisite
+    // of class NONE means "this RRset does not exist" and of class ANY "this name
+    // is not in use", and both carry no RDATA at all. Running it through the name
+    // decoder anyway turned the empty value into a root label, so the prerequisite
+    // read as the value-dependent form, the two did not match, and the answer was
+    // FORMERR — which is what a Windows 2000 client's own registration got on
+    // every boot, from a packet that is correct.
+    if (raw.isEmpty())
+        return raw;
     if (!isNameBearing(type))
         return raw;
 
