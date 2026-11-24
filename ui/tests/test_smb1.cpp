@@ -909,6 +909,7 @@ void Smb1Test::answersARawNtlmTokenWithoutSpnego()
     QCOMPARE(statusOf(acceptReply), quint32(0));
     QCOMPARE(readLe16(payloadOf(acceptReply), 33 + 6), quint16(0));
 
+
     // A wrapped token still gets its SPNEGO answer, so the wrapper is not
     // dropped for clients that do speak it.
     QScopedPointer<Smb1::Session> wrapped(plainSession());
@@ -1293,17 +1294,21 @@ void Smb1Test::signsAPreExtendedSecuritySessionTheWayTheClientKeysIt()
     setup[10] = char(readLe16(setup, 10) | 0x0004);
     const QByteArray reply = session.feed(setup);
     QCOMPARE(statusOf(reply), quint32(0));
-    QVERIFY2(signatureMatches(reply, macKey, 1),
-             "the legacy session-setup reply is not keyed the way the client keys it");
-    QVERIFY2(!signatureMatches(reply, baseKey, 1),
-             "the reply was signed with the bare session base key");
+    // The answer that hands the session its key carries no signature: Samba's
+    // server builds its session-setup answer before it turns signing on, and a
+    // Windows 2000 member hung up on ours when the field held a MAC where it
+    // reads a sequence number.
+    QCOMPARE(readLe16(payloadOf(reply), 10) & 0x0004, quint16(0));
+    QCOMPARE(payloadOf(reply).mid(14, 8), QByteArray(8, '\0'));
 
-    // One sequence numbers both directions here too, so the client's seq 2 tree
-    // connect is answered by seq 3.
+    // One sequence numbers both directions, and the client's first signed
+    // message is its tree connect: seq 1, answered by seq 2.
     const QByteArray treeReply = session.feed(signedMessage(
-        treeConnectMessage(QStringLiteral("\\\\dc1\\SYSVOL")), macKey, 2));
+        treeConnectMessage(QStringLiteral("\\\\dc1\\SYSVOL")), macKey, 1));
     QCOMPARE(statusOf(treeReply), quint32(0));
-    QVERIFY2(signatureMatches(treeReply, macKey, 3), "the reply to seq 2 is not seq 3");
+    QVERIFY2(signatureMatches(treeReply, macKey, 2), "the reply to seq 1 is not seq 2");
+    QVERIFY2(!signatureMatches(treeReply, baseKey, 2),
+             "the reply was signed with the bare session base key");
 }
 
 void Smb1Test::signsAndVerifiesASignedSession()
@@ -1334,26 +1339,27 @@ void Smb1Test::signsAndVerifiesASignedSession()
              Smb1::kStatusMoreProcessingRequired);
 
     // A client that means to sign says so on the session-setup request, before it
-    // has a key to sign with, and the accepted reply is then sequence number 1.
+    // has a key to sign with. The accepted reply establishes the key, so it
+    // carries no signature of its own.
     QByteArray type3Setup = sessionSetupMessage(
         authenticateToken(QStringLiteral("alice"), QStringLiteral("MONARCHY")));
     type3Setup[10] = char(readLe16(type3Setup, 10) | 0x0004);
     const QByteArray acceptReply = session.feed(type3Setup);
     QCOMPARE(statusOf(acceptReply), quint32(0));
-    QVERIFY2(signatureMatches(acceptReply, key, 1), "the first signed reply is not seq 1");
+    QCOMPARE(readLe16(payloadOf(acceptReply), 10) & 0x0004, quint16(0));
+    QCOMPARE(payloadOf(acceptReply).mid(14, 8), QByteArray(8, '\0'));
 
-    // One sequence numbers both directions, so the client's seq 2 request is
-    // answered by seq 3. Samba's client verified exactly this: it logged
-    // "seq 1: got good", signed its tree connect as 2, and expected 3 back.
+    // One sequence numbers both directions, and the client's first signed
+    // message is its tree connect: seq 1, answered by seq 2.
     const QByteArray treeReply = session.feed(signedMessage(
-        treeConnectMessage(QStringLiteral("\\\\dc1\\SYSVOL")), key, 2));
+        treeConnectMessage(QStringLiteral("\\\\dc1\\SYSVOL")), key, 1));
     QCOMPARE(statusOf(treeReply), quint32(0));
-    QVERIFY2(signatureMatches(treeReply, key, 3), "the reply to seq 2 is not seq 3");
+    QVERIFY2(signatureMatches(treeReply, key, 2), "the reply to seq 1 is not seq 2");
 
     // A signature that does not cover the message is refused before dispatch, so
     // a signed request cannot be altered in flight and still be executed.
     QByteArray forged = signedMessage(
-        treeConnectMessage(QStringLiteral("\\\\dc1\\SYSVOL")), key, 4);
+        treeConnectMessage(QStringLiteral("\\\\dc1\\SYSVOL")), key, 3);
     forged[24] = char(0x77); // a TID the signature above never covered
     QCOMPARE(statusOf(session.feed(forged)), Smb1::kStatusAccessDenied);
 
@@ -1362,7 +1368,7 @@ void Smb1Test::signsAndVerifiesASignedSession()
     const QByteArray afterForgery =
         session.feed(treeConnectMessage(QStringLiteral("\\\\dc1\\SYSVOL")));
     QCOMPARE(statusOf(afterForgery), quint32(0));
-    QVERIFY(signatureMatches(afterForgery, key, 5));
+    QVERIFY(signatureMatches(afterForgery, key, 4));
 
     // A session that never signalled intent — Windows 2000 with no signing
     // policy — is served too, and its replies claim no signature.

@@ -135,8 +135,14 @@ private:
     // uid and tid override the echoed ones; session setup assigns the UID and
     // tree connect the TID, and both have to be in the header before a signed
     // reply is hashed or the client rejects the signature it is given.
+    // `sign` exists for the reply that gives the session its key: the client
+    // has not armed signing for that session yet, and a signature there is a
+    // MAC in a field the client reads as a sequence number. Samba's server
+    // builds its session-setup answer before it turns signing on, which is
+    // what a Windows 2000 client is written against.
     QByteArray reply(const QByteArray &request, quint32 status, const QByteArray &words,
-                     const QByteArray &data, int uid = -1, int tid = -1) const;
+                     const QByteArray &data, int uid = -1, int tid = -1,
+                     bool sign = true) const;
     QString stringAt(const QByteArray &data, int at) const;
     // Splits `data` on DCE/RPC frag_length and feeds each PDU to the channel.
     void feedPipe(OpenFile *file, const QByteArray &data);

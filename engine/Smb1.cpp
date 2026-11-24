@@ -205,7 +205,7 @@ QString Session::stringAt(const QByteArray &data, int at) const
 }
 
 QByteArray Session::reply(const QByteArray &request, quint32 status, const QByteArray &words,
-                          const QByteArray &data, int uid, int tid) const
+                          const QByteArray &data, int uid, int tid, bool sign) const
 {
     QByteArray out;
     out.append("\377SMB", 4);
@@ -219,7 +219,7 @@ QByteArray Session::reply(const QByteArray &request, quint32 status, const QByte
     // not sign its own requests must not be answered with a signature it will
     // not check.
     const bool signedReply =
-        !m_sessionKey.isEmpty() && m_authenticated && m_signingActive;
+        sign && !m_sessionKey.isEmpty() && m_authenticated && m_signingActive;
     putLe16(out, quint16((readLe16(request, 10) & ~0x0004) | (signedReply ? 0x0004 : 0)));
     putLe16(out, 0);  // PID high
     out.append(QByteArray(8, '\0')); // signature, filled in below
@@ -507,7 +507,7 @@ QByteArray Session::sessionSetup(const QByteArray &message)
                            .arg(request.lmResponse.size())
                            .arg(request.ntResponse.size()));
         }
-        return reply(message, legacyStatus, words, data, m_uid ? m_uid : -1);
+        return reply(message, legacyStatus, words, data, m_uid ? m_uid : -1, -1, false);
     }
 
     const int type = Ntlm::messageType(Ntlm::embeddedToken(token));
@@ -679,7 +679,13 @@ QByteArray Session::sessionSetup(const QByteArray &message)
     if (m_notifier)
         m_notifier(QStringLiteral("SMB1 session setup type %1").arg(type));
     // The UID is assigned here and has to be in the header the signature covers.
-    return reply(message, status, words, data, m_uid ? m_uid : -1);
+    // The signature itself is not on this reply: it is the message that gives
+    // the session its key, and Samba's server answers it before it turns
+    // signing on for the session. Measured: a Windows 2000 member's session
+    // setup was answered signed and the guest hung up without a tree connect,
+    // where the same exchange answered unsigned is what every other client here
+    // accepts.
+    return reply(message, status, words, data, m_uid ? m_uid : -1, -1, false);
 }
 
 QByteArray Session::treeConnect(const QByteArray &message)
