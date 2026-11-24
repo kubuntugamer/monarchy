@@ -111,6 +111,9 @@ public:
     // `net ads join` kinits with its credentials first — is refused, and falls
     // back to nothing, since a client that chose krb5 does not retry with NTLM.
     void setKerberosAcceptor(Rpc::KerberosAcceptor acceptor);
+    // The domain's LmCompatibilityLevel, so a refused SMB1 logon can say whether
+    // the level or the credential refused it.
+    void setLmCompatibilityLevel(int level) { m_lmCompatibilityLevel = level; }
     void setDomainNames(const QString &domain, const QString &serverName,
                         const QString &dnsDomain = QString());
 
@@ -181,6 +184,7 @@ private:
     QHash<QString, Share> m_shares;
     Rpc::Authenticator m_authenticator;
     Rpc::KerberosAcceptor m_kerberosAcceptor;
+    int m_lmCompatibilityLevel = Ntlm::kDefaultLmCompatibilityLevel;
     std::function<bool(const QString &)> m_writePolicy;
     QString m_domain;
     QString m_serverName;

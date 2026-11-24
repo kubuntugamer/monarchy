@@ -154,19 +154,34 @@ namespace Smb1 {
 
 Session::Session(QHash<QString, RpcServer *> pipes, Rpc::Authenticator authenticator,
                  QString domain, QString serverName, QString dnsDomain,
-                 QHash<QString, QString> shares)
+                 QHash<QString, QString> shares, int lmCompatibilityLevel)
     : m_pipes(std::move(pipes))
     , m_shares(std::move(shares))
     , m_authenticator(std::move(authenticator))
     , m_domain(std::move(domain))
     , m_serverName(std::move(serverName))
     , m_dnsDomain(std::move(dnsDomain))
+    , m_lmCompatibilityLevel(lmCompatibilityLevel)
 {
 }
 
 bool Session::isSmb1(const QByteArray &message)
 {
     return message.size() >= 35 && message.left(4) == QByteArray("\377SMB", 4);
+}
+
+QString Session::refusalReason(const Rpc::AuthRequest &request) const
+{
+    // NTLMv2 is never refused by the level, so a refusal of one is about the
+    // credential. A v1 answer is refused by the level only when it reaches 5,
+    // and below that the level cannot be why the logon failed.
+    if (!Ntlm::isNtlmv1Response(request.ntResponse))
+        return QStringLiteral("ntlmv2 answer, which the level never refuses");
+    if (!Ntlm::acceptsNtlmv1(m_lmCompatibilityLevel))
+        return QStringLiteral("policy: lmCompatibilityLevel %1 refuses an NTLMv1 answer")
+            .arg(m_lmCompatibilityLevel);
+    return QStringLiteral("credential: lmCompatibilityLevel %1 accepts an NTLMv1 answer")
+        .arg(m_lmCompatibilityLevel);
 }
 
 QString Session::stringAt(const QByteArray &data, int at) const
@@ -557,11 +572,12 @@ QByteArray Session::sessionSetup(const QByteArray &message)
                                        : QByteArray();
             status = kStatusLogonFailure;
             if (m_notifier)
-                m_notifier(QStringLiteral("SMB1 logon refused %1 (nt %2 bytes, flags 0x%3)")
+                m_notifier(QStringLiteral("SMB1 logon refused %1 (nt %2 bytes, flags 0x%3, %4)")
                                .arg(request.user.isEmpty() ? QStringLiteral("?")
                                                            : request.user)
                                .arg(request.ntResponse.size())
-                               .arg(request.flags, 8, 16, QLatin1Char('0')));
+                               .arg(request.flags, 8, 16, QLatin1Char('0'))
+                               .arg(refusalReason(request)));
         }
     } else if (m_kerberosAcceptor && !Gss::kerberosToken(token).isEmpty()) {
         // SPNEGO lets the acceptor choose any mechanism the initiator listed, and

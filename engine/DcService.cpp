@@ -1296,6 +1296,9 @@ bool DcService::start(const QString &dcDir)
     // authenticator.
     m_smbServer = new Smb2Server(this);
     m_smbServer->setAuthenticator(authenticator);
+    // A refused SMB1 logon names the rule that refused it, so the level the
+    // domain is running at is on the line rather than inferred from it.
+    m_smbServer->setLmCompatibilityLevel(lmCompatibilityLevel);
     // Kerberos session setup is plain GSS-API, not DCE/RPC: the AP-REP is sealed
     // under the service ticket's session key instead of the initiator's subkey,
     // so this is the acceptor the LDAP SASL bind uses, not the RPC one.

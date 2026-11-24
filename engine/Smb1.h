@@ -63,9 +63,15 @@ public:
     // pipe map and the disk shares are separate namespaces on one session: a
     // 2000 client opens \\dc\SYSVOL and \\dc\pipe\samr over the same
     // connection, exactly as it does on Windows.
+    // The policy level is carried so a refusal can say which rule refused: an
+    // answer the domain's LmCompatibilityLevel does not allow and an answer that
+    // does not match the stored hash produce the same LOGON_FAILURE on the wire,
+    // and a log line that cannot tell them apart sends an administrator to the
+    // wrong place.
     Session(QHash<QString, RpcServer *> pipes, Rpc::Authenticator authenticator,
             QString domain, QString serverName, QString dnsDomain,
-            QHash<QString, QString> shares = QHash<QString, QString>());
+            QHash<QString, QString> shares = QHash<QString, QString>(),
+            int lmCompatibilityLevel = Ntlm::kDefaultLmCompatibilityLevel);
 
     // A 2000 member authenticates to the pipe share with Kerberos: it holds a
     // ticket for the server and offers an AP-REQ in SPNEGO, and only falls back
@@ -118,6 +124,10 @@ private:
     QByteArray find(const QByteArray &message, quint16 subcommand,
                     const QByteArray &parameters, const QString &shareRoot);
     QByteArray unsupportedReply(const QByteArray &message);
+    // Which rule refused a logon: the domain's LmCompatibilityLevel refusing an
+    // NTLMv1 answer is a configuration fact, while the same status from a level
+    // that accepts that shape is a credential or account fact.
+    QString refusalReason(const Rpc::AuthRequest &request) const;
     // MS-CIFS 3.2.4.1: the signature field carries a sequence number per
     // direction, so a request is checked against the number expected next.
     bool signatureValid(const QByteArray &message, quint32 sequence) const;
@@ -134,6 +144,7 @@ private:
     QHash<QString, RpcServer *> m_pipes;
     QHash<QString, QString> m_shares;
     Rpc::Authenticator m_authenticator;
+    int m_lmCompatibilityLevel = Ntlm::kDefaultLmCompatibilityLevel;
     Rpc::KerberosAcceptor m_kerberosAcceptor;
     QString m_domain;
     QString m_serverName;

@@ -487,6 +487,7 @@ private slots:
     void refusesWrites();
     void answersARawNtlmTokenWithoutSpnego();
     void acceptsPreExtendedSecuritySessionSetup();
+    void refusalNamesTheRule();
     void namesItselfAfterTheSecurityBlob();
     void acceptsTheKerberosTicketAWindows2000MemberOffers();
     void setsTheStateOfAnOpenPipe();
@@ -834,6 +835,48 @@ void Smb1Test::acceptsPreExtendedSecuritySessionSetup()
     anonymous->feed(negotiateMessage());
     QCOMPARE(statusOf(anonymous->feed(smb(Smb1::CmdSessionSetupAndX, 0, 0, empty, QByteArray()))),
              Smb1::kStatusLogonFailure);
+}
+
+// A refused logon says which rule refused it. On the wire a policy refusal and a
+// wrong password are the same LOGON_FAILURE, and a line carrying only the answer's
+// length and flags is evidence of neither — a driver reading one reported a
+// credential problem as a policy refusal, and the round trip it cost is the reason
+// the level is on the line.
+void Smb1Test::refusalNamesTheRule()
+{
+    QByteArray type1("NTLMSSP", 7);
+    type1.append(char(0));
+    putLe32(type1, 1);            // NEGOTIATE
+    putLe32(type1, 0x00008201u);  // UNICODE | NTLM
+
+    quint32 status = 0;
+    const auto refusal = [&type1, &status](int level) -> QString {
+        QStringList lines;
+        QScopedPointer<Smb1::Session> session(new Smb1::Session(
+            QHash<QString, RpcServer *>(),
+            [](const Rpc::AuthRequest &, Ntlm::SessionKeys *) { return false; },
+            QStringLiteral("MONARCHY"), QStringLiteral("DC1"),
+            QStringLiteral("monarchy.test"), QHash<QString, QString>(), level));
+        session->setNotifier([&lines](const QString &line) { lines.append(line); });
+        session->feed(negotiateMessage());
+        session->feed(sessionSetupMessage(type1));
+        // authenticateToken's NT response is 24 bytes, the v1 shape a client
+        // whose own policy is 0-2 sends.
+        status = statusOf(session->feed(sessionSetupMessage(
+            authenticateToken(QStringLiteral("alice"), QStringLiteral("MONARCHY")))));
+        return lines.join(QLatin1Char('\n'));
+    };
+
+    const QString atFive = refusal(5);
+    QCOMPARE(status, Smb1::kStatusLogonFailure);
+    QVERIFY2(atFive.contains(QStringLiteral("policy: lmCompatibilityLevel 5 refuses an NTLMv1")),
+             qPrintable(atFive));
+    // Below 5 the level accepts that answer, so the same status is about the
+    // credential and the line has to say so rather than leave it ambiguous.
+    const QString atThree = refusal(3);
+    QCOMPARE(status, Smb1::kStatusLogonFailure);
+    QVERIFY2(atThree.contains(QStringLiteral("credential: lmCompatibilityLevel 3 accepts an NTLMv1")),
+             qPrintable(atThree));
 }
 
 // Windows 2000 sends the session-setup token as raw NTLMSSP with no GSS
