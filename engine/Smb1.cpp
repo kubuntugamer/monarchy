@@ -204,8 +204,20 @@ QString Session::stringAt(const QByteArray &data, int at) const
     return QString::fromLatin1(bytes);
 }
 
+Session::SessionState *Session::sessionState(quint16 uid)
+{
+    const auto at = m_sessions.find(uid);
+    return at == m_sessions.end() ? nullptr : &at.value();
+}
+
+const Session::SessionState *Session::sessionState(quint16 uid) const
+{
+    const auto at = m_sessions.constFind(uid);
+    return at == m_sessions.constEnd() ? nullptr : &at.value();
+}
+
 QByteArray Session::reply(const QByteArray &request, quint32 status, const QByteArray &words,
-                          const QByteArray &data, int uid, int tid, bool sign) const
+                          const QByteArray &data, int uid, int tid, bool sign)
 {
     QByteArray out;
     out.append("\377SMB", 4);
@@ -218,8 +230,12 @@ QByteArray Session::reply(const QByteArray &request, quint32 status, const QByte
     // session key exists there is nothing to sign with, and a client that did
     // not sign its own requests must not be answered with a signature it will
     // not check.
-    const bool signedReply =
-        sign && !m_sessionKey.isEmpty() && m_authenticated && m_signingActive;
+    // The key, the identity and the counter belong to the session the request
+    // names, not to the connection: a Windows 2000 member signs its machine
+    // channel and its user session with two different keys over one socket.
+    SessionState *session = sessionState(readLe16(request, 28));
+    const bool signedReply = sign && m_signingActive && session
+                             && session->authenticated && !session->key.isEmpty();
     putLe16(out, quint16((readLe16(request, 10) & ~0x0004) | (signedReply ? 0x0004 : 0)));
     putLe16(out, 0);  // PID high
     out.append(QByteArray(8, '\0')); // signature, filled in below
@@ -240,10 +256,10 @@ QByteArray Session::reply(const QByteArray &request, quint32 status, const QByte
     // signature the client is about to verify.
     if (signedReply) {
         QByteArray sequence;
-        putLe32(sequence, m_signingSeq++);
+        putLe32(sequence, session->signingSeq++);
         sequence.append(QByteArray(4, '\0'));
         out.replace(14, 8, sequence);
-        QByteArray macInput = m_sessionKey;
+        QByteArray macInput = session->key;
         macInput.append(out);
         const QByteArray digest = QCryptographicHash::hash(macInput, QCryptographicHash::Md5);
         out.replace(14, 8, digest.left(8));
@@ -259,9 +275,10 @@ QByteArray Session::unsupportedReply(const QByteArray &message)
     return reply(message, kStatusNotSupported, QByteArray(2, '\0'), QByteArray());
 }
 
-bool Session::signatureValid(const QByteArray &message, quint32 sequence) const
+bool Session::signatureValid(const QByteArray &message, quint32 sequence,
+                             const QByteArray &key) const
 {
-    if (m_sessionKey.isEmpty() || !(readLe16(message, 10) & 0x0004))
+    if (key.isEmpty() || !(readLe16(message, 10) & 0x0004))
         return true;
     // The client's own counter is not trusted; the number this side expects is
     // put in the field and the MAC is recomputed, so a replayed or reordered
@@ -271,7 +288,7 @@ bool Session::signatureValid(const QByteArray &message, quint32 sequence) const
     putLe32(expected, sequence);
     expected.append(QByteArray(4, '\0'));
     zeroed.replace(14, 8, expected);
-    QByteArray macInput = m_sessionKey;
+    QByteArray macInput = key;
     macInput.append(zeroed);
     const QByteArray digest = QCryptographicHash::hash(macInput, QCryptographicHash::Md5);
     return digest.left(8) == message.mid(14, 8);
@@ -292,14 +309,19 @@ QByteArray Session::feed(const QByteArray &message)
     // they carried, so the flag promised integrity the endpoint did not give.
     if (header.flags2 & 0x0004)
         m_signingActive = true;
-    if (!m_sessionKey.isEmpty() && (header.flags2 & 0x0004)) {
-        if (!signatureValid(message, m_signingSeq)) {
+    // Only a request a session can be checked against is verified. A session
+    // setup that names no session — every one that opens a new one — carries no
+    // signature and has no key yet, so demanding one refused the very request
+    // Windows 2000 opens its user session with after the machine's channel.
+    SessionState *requestSession = sessionState(header.uid);
+    if (requestSession && !requestSession->key.isEmpty() && (header.flags2 & 0x0004)) {
+        if (!signatureValid(message, requestSession->signingSeq, requestSession->key)) {
             if (m_notifier)
                 m_notifier(QStringLiteral("SMB1 cmd %1 refused: bad signature")
                                .arg(header.command));
             return reply(message, kStatusAccessDenied, QByteArray(), QByteArray());
         }
-        ++m_signingSeq;
+        ++requestSession->signingSeq;
     }
 
     switch (header.command) {
@@ -397,6 +419,18 @@ QByteArray Session::negotiate(const QByteArray &message)
 QByteArray Session::sessionSetup(const QByteArray &message)
 {
     const Header header = parseHeader(message);
+    // A request that names a session this connection does not have opens a new
+    // one and is given a UID of its own. Two sessions on one connection is not
+    // an edge case: it is every Windows member's logon, where the machine's
+    // Kerberos channel and the user's NTLM session share a socket.
+    quint16 sessionUid = header.uid;
+    if (!sessionState(sessionUid)) {
+        do {
+            sessionUid = quint16(QRandomGenerator::system()->generate() | 1);
+        } while (sessionState(sessionUid));
+        m_sessions.insert(sessionUid, SessionState());
+    }
+    SessionState &session = *sessionState(sessionUid);
     //    Extended security: AndX (4), MaxBuffer (2), MaxMpx (2), Vc (2),
     // SessionKey (4), SecurityBlobLength (2), Reserved (4), Capabilities (4).
     const quint16 blobLength = readLe16(header.words, 14);
@@ -472,24 +506,22 @@ QByteArray Session::sessionSetup(const QByteArray &message)
 
         Ntlm::SessionKeys keys;
         quint32 legacyStatus = kStatusLogonFailure;
-        if (!m_uid)
-            m_uid = quint16(QRandomGenerator::system()->generate() | 1);
         if (!request.user.isEmpty() && m_authenticator
             && m_authenticator(request, &keys)) {
-            m_authenticated = true;
+            session.authenticated = true;
             // The MAC key is not the session key on its own: Samba's client
             // forms it as the user session key followed by the NTLM response it
             // sent (libcli/smb/smb_signing.c, smb1_signing_activate), and with
             // the 16-byte key alone every reply to a signing client in this
             // form was refused `smb1_signing_good: BAD SIG: seq 1`. Keyed this
             // way the client's own expected MAC reproduces byte for byte.
-            m_sessionKey = keys.sessionBaseKey + request.ntResponse;
-            m_user = request.domain.isEmpty()
-                         ? request.user
-                         : request.domain + QLatin1Char('\\') + request.user;
+            session.key = keys.sessionBaseKey + request.ntResponse;
+            session.user = request.domain.isEmpty()
+                               ? request.user
+                               : request.domain + QLatin1Char('\\') + request.user;
             legacyStatus = kStatusSuccess;
             if (m_notifier)
-                m_notifier(QStringLiteral("SMB1 logon %1").arg(m_user));
+                m_notifier(QStringLiteral("SMB1 logon %1").arg(session.user));
         }
         QByteArray words;
         words.append(char(0xff)); // AndXCommand: none
@@ -507,7 +539,7 @@ QByteArray Session::sessionSetup(const QByteArray &message)
                            .arg(request.lmResponse.size())
                            .arg(request.ntResponse.size()));
         }
-        return reply(message, legacyStatus, words, data, m_uid ? m_uid : -1, -1, false);
+        return reply(message, legacyStatus, words, data, sessionUid, -1, false);
     }
 
     const int type = Ntlm::messageType(Ntlm::embeddedToken(token));
@@ -521,12 +553,10 @@ QByteArray Session::sessionSetup(const QByteArray &message)
     quint16 action = 0;
 
     if (type == 1) {
-        if (!m_uid)
-            m_uid = quint16(QRandomGenerator::system()->generate() | 1);
-        m_challenge = QByteArray(8, '\0');
+        session.challenge = QByteArray(8, '\0');
         for (int i = 0; i < 8; ++i)
-            m_challenge[i] = char(QRandomGenerator::system()->generate() & 0xff);
-        const QByteArray challenge = Ntlm::challengeToken(m_challenge, m_domain,
+            session.challenge[i] = char(QRandomGenerator::system()->generate() & 0xff);
+        const QByteArray challenge = Ntlm::challengeToken(session.challenge, m_domain,
                                                           m_serverName, m_dnsDomain);
         replyToken = spnegoWrapped ? Gss::spnegoResponse(1, kNtlmMech, challenge) : challenge;
         status = kStatusMoreProcessingRequired;
@@ -536,7 +566,8 @@ QByteArray Session::sessionSetup(const QByteArray &message)
         // that aborts the whole logon (LOGON_FAILURE, logoff) before the machine
         // account is ever authenticated, so it is answered as the anonymous
         // session it is. The session stays unauthenticated for the disk shares.
-        m_user.clear();
+        session.user.clear();
+        session.authenticated = false;
         replyToken = spnegoWrapped ? Gss::spnegoResponse(0, kNtlmMech, QByteArray())
                                    : QByteArray();
         status = kStatusSuccess;
@@ -544,29 +575,29 @@ QByteArray Session::sessionSetup(const QByteArray &message)
             m_notifier(QStringLiteral("SMB1 null session"));
     } else if (type == 3) {
         Rpc::AuthRequest request;
-        request.challenge = m_challenge;
+        request.challenge = session.challenge;
         QByteArray encryptedSessionKey;
         Ntlm::SessionKeys keys;
         if (parseAuthenticate(token, &request, &encryptedSessionKey) && m_authenticator
             && m_authenticator(request, &keys)) {
-            m_authenticated = true;
+            session.authenticated = true;
             // SMB1 signs with the NTLM session key (MS-CIFS 3.2.4.1), which is
             // the exported key when the client negotiated key exchange.
             constexpr quint32 kKeyExchange = 0x40000000u;
             if ((request.flags & kKeyExchange) && !encryptedSessionKey.isEmpty()) {
                 Ntlm::Sealer rc4(keys.sessionBaseKey);
-                m_sessionKey = rc4.apply(encryptedSessionKey);
+                session.key = rc4.apply(encryptedSessionKey);
             } else {
-                m_sessionKey = keys.sessionBaseKey;
+                session.key = keys.sessionBaseKey;
             }
-            m_user = request.domain.isEmpty()
-                         ? request.user
-                         : request.domain + QLatin1Char('\\') + request.user;
+            session.user = request.domain.isEmpty()
+                               ? request.user
+                               : request.domain + QLatin1Char('\\') + request.user;
             replyToken = spnegoWrapped ? Gss::spnegoResponse(0, kNtlmMech, QByteArray())
                                        : QByteArray();
             action = 0;
             if (m_notifier)
-                m_notifier(QStringLiteral("SMB1 logon %1").arg(m_user));
+                m_notifier(QStringLiteral("SMB1 logon %1").arg(session.user));
         } else {
             replyToken = spnegoWrapped ? Gss::spnegoResponse(2, kNtlmMech, QByteArray())
                                        : QByteArray();
@@ -588,10 +619,8 @@ QByteArray Session::sessionSetup(const QByteArray &message)
         QString error;
         const QByteArray apReq = Gss::kerberosToken(token);
         if (!apReq.isEmpty() && m_kerberosAcceptor(apReq, &context, &error)) {
-            if (!m_uid)
-                m_uid = quint16(QRandomGenerator::system()->generate() | 1);
-            m_authenticated = true;
-            m_user = context.user;
+            session.authenticated = true;
+            session.user = context.user;
             // The session key of a Kerberos session is the GSS context key, and
             // SMB1 signs with it exactly as it signs with NTLM's session key:
             // MD5(key || message). Windows 2000 signs a Kerberos session from
@@ -610,11 +639,11 @@ QByteArray Session::sessionSetup(const QByteArray &message)
             // BAD SIG: seq 1" under the default aes256 session key, and worked
             // once GSS_TKT/SKEY_TGS were forced to rc4-hmac, whose session key is
             // 16 bytes and so hid the truncation.
-            m_sessionKey = context.key;
+            session.key = context.key;
             replyToken = Gss::spnegoResponse(0, QString(), context.replyToken);
             status = kStatusSuccess;
             if (m_notifier)
-                m_notifier(QStringLiteral("SMB1 logon %1 (kerberos)").arg(m_user));
+                m_notifier(QStringLiteral("SMB1 logon %1 (kerberos)").arg(session.user));
         } else {
             replyToken = Gss::spnegoResponse(2, kKrb5Mech, QByteArray());
             status = kStatusLogonFailure;
@@ -691,7 +720,7 @@ QByteArray Session::sessionSetup(const QByteArray &message)
     // setup was answered signed and the guest hung up without a tree connect,
     // where the same exchange answered unsigned is what every other client here
     // accepts.
-    return reply(message, status, words, data, m_uid ? m_uid : -1, -1, false);
+    return reply(message, status, words, data, sessionUid, -1, false);
 }
 
 QByteArray Session::treeConnect(const QByteArray &message)
@@ -713,7 +742,8 @@ QByteArray Session::treeConnect(const QByteArray &message)
     }
     // A disk share, unlike IPC$, is only for an authenticated session: the
     // domain's policy files are not anonymous-readable on Windows either.
-    if (!isIpc && !m_authenticated) {
+    const SessionState *session = sessionState(header.uid);
+    if (!isIpc && !(session && session->authenticated)) {
         if (m_notifier)
             m_notifier(QStringLiteral("SMB1 tree connect %1 refused (anonymous)").arg(share));
         return reply(message, kStatusAccessDenied, QByteArray(), QByteArray());
@@ -721,6 +751,7 @@ QByteArray Session::treeConnect(const QByteArray &message)
 
     const quint16 tid = ++m_nextTree;
     m_trees.insert(tid, share);
+    m_treeSession.insert(tid, header.uid);
     if (m_notifier)
         m_notifier(QStringLiteral("SMB1 tree connect %1").arg(share));
 
@@ -756,21 +787,38 @@ QByteArray Session::treeConnect(const QByteArray &message)
 
 QByteArray Session::treeDisconnect(const QByteArray &message)
 {
-    m_trees.remove(parseHeader(message).tid);
+    const quint16 tid = parseHeader(message).tid;
+    m_trees.remove(tid);
+    m_treeSession.remove(tid);
     return reply(message, kStatusSuccess, QByteArray(), QByteArray());
 }
 
 QByteArray Session::logoff(const QByteArray &message)
 {
-    m_authenticated = false;
-    m_user.clear();
-    m_uid = 0;
-    for (auto &file : m_files) {
-        delete file.channel;
+    const Header header = parseHeader(message);
+    // The answer is built while the session still exists, because a signing
+    // session verifies it; only then is the session and everything it opened
+    // dropped. The other session on this connection keeps its trees and keys.
+    const QByteArray answer = reply(message, kStatusSuccess, QByteArray(), QByteArray());
+    QList<quint16> owned;
+    for (auto it = m_treeSession.cbegin(); it != m_treeSession.cend(); ++it) {
+        if (it.value() == header.uid)
+            owned.append(it.key());
     }
-    m_files.clear();
-    m_trees.clear();
-    return reply(message, kStatusSuccess, QByteArray(), QByteArray());
+    for (const quint16 tid : owned) {
+        m_trees.remove(tid);
+        m_treeSession.remove(tid);
+        for (auto it = m_files.begin(); it != m_files.end();) {
+            if (it.value().tid == tid) {
+                delete it.value().channel;
+                it = m_files.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    m_sessions.remove(header.uid);
+    return answer;
 }
 
 QByteArray Session::echo(const QByteArray &message)
@@ -817,8 +865,9 @@ QByteArray Session::ntCreate(const QByteArray &message)
     // function chose never reached the client.
     const QString shareName = m_trees.value(header.tid);
     const QString shareRoot = m_shares.value(shareName.toLower());
+    const SessionState *session = sessionState(header.uid);
     if (!shareRoot.isEmpty()) {
-        if (!m_authenticated)
+        if (!(session && session->authenticated))
             return reply(message, kStatusAccessDenied, QByteArray(), QByteArray());
         // Every disk share here is read-only, so an access that could change it
         // is refused before the name is resolved: a client creating a new name
@@ -900,10 +949,11 @@ QByteArray Session::ntCreate(const QByteArray &message)
     const quint16 fid = ++m_nextFid;
     OpenFile file;
     file.name = name;
+    file.tid = header.tid;
     file.channel = endpoint->newChannel(QStringLiteral("smb1:%1").arg(name));
-    if (m_authenticated && file.channel) {
-        file.channel->setTransportIdentity(m_user);
-        file.channel->setTransportSessionKey(m_sessionKey);
+    if (session && session->authenticated && file.channel) {
+        file.channel->setTransportIdentity(session->user);
+        file.channel->setTransportSessionKey(session->key);
     }
     m_files.insert(fid, file);
     if (m_notifier)
@@ -1104,7 +1154,7 @@ QByteArray Session::transact(const QByteArray &message)
 }
 
 QByteArray Session::transactionReply(const QByteArray &message, const QByteArray &out,
-                                     bool inData) const
+                                     bool inData)
 {
     const quint16 size = quint16(out.size());
     QByteArray words;
@@ -1153,7 +1203,8 @@ QByteArray Session::trans2(const QByteArray &message)
     const QString shareRoot = m_shares.value(shareName.toLower());
     if (shareRoot.isEmpty())
         return reply(message, kStatusBadNetworkName, QByteArray(), QByteArray());
-    if (!m_authenticated)
+    const SessionState *session = sessionState(header.uid);
+    if (!(session && session->authenticated))
         return reply(message, kStatusAccessDenied, QByteArray(), QByteArray());
 
     if (subcommand == 0x0001 || subcommand == 0x0002 || subcommand == 0x0004)
@@ -1281,7 +1332,8 @@ QByteArray Session::queryDisk(const QByteArray &message)
     const QString shareName = m_trees.value(header.tid);
     if (m_shares.value(shareName.toLower()).isEmpty())
         return reply(message, kStatusBadNetworkName, QByteArray(), QByteArray());
-    if (!m_authenticated)
+    const SessionState *session = sessionState(header.uid);
+    if (!(session && session->authenticated))
         return reply(message, kStatusAccessDenied, QByteArray(), QByteArray());
 
     constexpr quint32 kBlockSize = 4096;

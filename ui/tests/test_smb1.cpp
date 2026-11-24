@@ -40,6 +40,11 @@ quint32 readLe32(const QByteArray &data, int at)
     return quint32(readLe16(data, at)) | (quint32(readLe16(data, at + 2)) << 16);
 }
 
+// Every message after a session setup names the UID the server gave out, the
+// way a client does — a request that names none belongs to a different session,
+// which is the point of the per-session state.
+quint16 g_uid = 0;
+
 QByteArray frame(const QByteArray &message)
 {
     QByteArray out(4, '\0');
@@ -214,7 +219,7 @@ QByteArray treeConnectMessage(const QString &path)
     QByteArray data = utf16le(path);
     data.append(QByteArray(2, '\0'));
     data.append("A:\0", 3);
-    return smb(Smb1::CmdTreeConnectAndX, 0xffff, 0x1234, words, data);
+    return smb(Smb1::CmdTreeConnectAndX, 0xffff, g_uid, words, data);
 }
 
 QByteArray ntCreateMessage(quint16 tid, const QString &name)
@@ -227,7 +232,7 @@ QByteArray ntCreateMessage(quint16 tid, const QString &name)
     QByteArray data(1, '\0');        // the name starts on an even offset
     data.append(nameBytes);
     data.append(QByteArray(2, '\0'));
-    return smb(Smb1::CmdNtCreateAndX, tid, 0x1234, words, data);
+    return smb(Smb1::CmdNtCreateAndX, tid, g_uid, words, data);
 }
 
 // A Windows client includes the UTF-16 terminator in NameLength, so the name
@@ -241,7 +246,7 @@ QByteArray terminatedNtCreateMessage(quint16 tid, const QString &name)
     words[6] = char((nameBytes.size() >> 8) & 0xff);
     QByteArray data(1, '\0');
     data.append(nameBytes);
-    return smb(Smb1::CmdNtCreateAndX, tid, 0x1234, words, data);
+    return smb(Smb1::CmdNtCreateAndX, tid, g_uid, words, data);
 }
 
 // TRANS2 QUERY_FILE_INFORMATION: parameters are the FID and the information
@@ -261,7 +266,7 @@ QByteArray queryFileMessage(quint16 tid, quint16 fid, quint16 level)
     putLe16(words, 0x0007); // QUERY_FILE_INFORMATION
     QByteArray data(1, '\0');
     data.append(parameters);
-    return smb(Smb1::CmdTrans2, tid, 0x1234, words, data);
+    return smb(Smb1::CmdTrans2, tid, g_uid, words, data);
 }
 
 QString decodeUtf16(const QByteArray &bytes)
@@ -298,7 +303,7 @@ QByteArray findFirstMessage(quint16 tid, const QString &pattern, quint16 level,
     putLe16(words, 0x0001); // FIND_FIRST2
     QByteArray data(1, '\0');
     data.append(parameters);
-    return smb(Smb1::CmdTrans2, tid, 0x1234, words, data);
+    return smb(Smb1::CmdTrans2, tid, g_uid, words, data);
 }
 
 // TRANS2 FIND_NEXT2: the search the client is continuing, how many more it will
@@ -323,7 +328,7 @@ QByteArray findNextMessage(quint16 tid, quint16 searchId, quint16 maxEntries, qu
     putLe16(words, 0x0002); // FIND_NEXT2
     QByteArray data(1, '\0');
     data.append(parameters);
-    return smb(Smb1::CmdTrans2, tid, 0x1234, words, data);
+    return smb(Smb1::CmdTrans2, tid, g_uid, words, data);
 }
 
 // TRANS2 FIND_CLOSE2: the search the client is done with. Windows echoes the id
@@ -343,7 +348,7 @@ QByteArray findCloseMessage(quint16 tid, quint16 searchId)
     putLe16(words, 0x0004); // FIND_CLOSE2
     QByteArray data(1, '\0');
     data.append(parameters);
-    return smb(Smb1::CmdTrans2, tid, 0x1234, words, data);
+    return smb(Smb1::CmdTrans2, tid, g_uid, words, data);
 }
 
 // SMB_COM_TRANSACTION to a pipe the client has already opened, addressed the
@@ -383,7 +388,7 @@ QByteArray pipeTransactMessage(quint16 tid, quint16 fid, quint16 subcommand,
     data.append(QByteArray(2, '\0')); // the empty pipe name's terminator
     data.append(QByteArray(2, '\0')); // Pad2, so the payload starts at 84
     data.append(payload);
-    return smb(Smb1::CmdTrans, tid, 0x1234, words, data);
+    return smb(Smb1::CmdTrans, tid, g_uid, words, data);
 }
 
 QByteArray readMessage(quint16 tid, quint16 fid, quint32 offset, quint16 count)
@@ -398,7 +403,7 @@ QByteArray readMessage(quint16 tid, quint16 fid, quint32 offset, quint16 count)
     words[9] = char((offset >> 24) & 0xff);
     words[10] = char(count & 0xff);
     words[11] = char((count >> 8) & 0xff);
-    return smb(Smb1::CmdReadAndX, tid, 0x1234, words, QByteArray());
+    return smb(Smb1::CmdReadAndX, tid, g_uid, words, QByteArray());
 }
 
 QByteArray writeMessage(quint16 tid, quint16 fid, const QByteArray &payload)
@@ -414,7 +419,7 @@ QByteArray writeMessage(quint16 tid, quint16 fid, const QByteArray &payload)
     words[23] = char((dataOffset >> 8) & 0xff);
     QByteArray data(1, '\0');
     data.append(payload);
-    return smb(Smb1::CmdWriteAndX, tid, 0x1234, words, data);
+    return smb(Smb1::CmdWriteAndX, tid, g_uid, words, data);
 }
 
 // Replies are NetBIOS-framed; the SMB message starts after the four-byte header.
@@ -432,6 +437,24 @@ quint32 statusOf(const QByteArray &framed)
 quint16 tidOf(const QByteArray &framed)
 {
     return readLe16(payloadOf(framed), 24);
+}
+
+// Names a session explicitly, for the tests that keep two of them open at once.
+QByteArray withUid(QByteArray message, quint16 uid)
+{
+    message[28] = char(uid & 0xff);
+    message[29] = char((uid >> 8) & 0xff);
+    return message;
+}
+
+void rememberUid(const QByteArray &framed)
+{
+    g_uid = readLe16(payloadOf(framed), 28);
+}
+
+void forgetUid()
+{
+    g_uid = 0;
 }
 
 // Signs one message the way a client does: FLAGS2 says it is signed, the
@@ -493,6 +516,7 @@ private slots:
     void setsTheStateOfAnOpenPipe();
     void signsAndVerifiesASignedSession();
     void signsAPreExtendedSecuritySessionTheWayTheClientKeysIt();
+    void servesTwoSessionsOnOneConnection();
 
 private:
     QTemporaryDir m_root;
@@ -563,6 +587,7 @@ Smb1::Session *Smb1Test::authenticatedSession()
         delete session;
         return nullptr;
     }
+    rememberUid(reply);
     return session;
 }
 
@@ -717,8 +742,9 @@ void Smb1Test::acceptsTheNullSessionAWindows2000LogonStartsWith()
     putLe32(nullSession, 0x00008201u); // flags
     nullSession.append(char(0));       // the empty LM response
 
-    QCOMPARE(statusOf(session.feed(sessionSetupMessage(nullSession))),
-             Smb1::kStatusSuccess);
+    const QByteArray anonymousReply = session.feed(sessionSetupMessage(nullSession));
+    QCOMPARE(statusOf(anonymousReply), Smb1::kStatusSuccess);
+    rememberUid(anonymousReply);
     // An anonymous session is not the machine account: the domain's files stay
     // closed to it, exactly as they are to any other unknown caller.
     QCOMPARE(statusOf(session.feed(treeConnectMessage(QStringLiteral("\\\\dc1\\SYSVOL")))),
@@ -814,6 +840,7 @@ void Smb1Test::acceptsPreExtendedSecuritySessionSetup()
     const QByteArray reply =
         session->feed(smb(Smb1::CmdSessionSetupAndX, 0, 0, words, data));
     QCOMPARE(statusOf(reply), quint32(0));
+    rememberUid(reply);
     const QByteArray payload = payloadOf(reply);
     // AndX plus Action, and no security-blob word: this answer has to look
     // like the request's own dialect, or the client parses the words after it
@@ -1024,6 +1051,7 @@ void Smb1Test::acceptsTheKerberosTicketAWindows2000MemberOffers()
     QCOMPARE(Gss::kerberosToken(spnegoKerberosToken()), QByteArray::fromHex("aabbcc"));
 
     const QByteArray reply = session.feed(sessionSetupMessage(spnegoKerberosToken()));
+    rememberUid(reply);
     QCOMPARE(statusOf(reply), quint32(0));
     const QByteArray blob = payloadOf(reply);
     QCOMPARE(blob.at(43), char(0xa1));            // NegTokenResp
@@ -1157,9 +1185,10 @@ void Smb1Test::listsADirectoryOverFindFirst2()
     putLe32(type1, 1);
     putLe32(type1, 0x00008201u);
     session.feed(sessionSetupMessage(type1));
-    QCOMPARE(statusOf(session.feed(sessionSetupMessage(
-                 authenticateToken(QStringLiteral("alice"), QStringLiteral("MONARCHY"))))),
-             quint32(0));
+    const QByteArray loginReply = session.feed(sessionSetupMessage(
+        authenticateToken(QStringLiteral("alice"), QStringLiteral("MONARCHY"))));
+    QCOMPARE(statusOf(loginReply), quint32(0));
+    rememberUid(loginReply);
     const QByteArray treeReply =
         session.feed(treeConnectMessage(QStringLiteral("\\\\dc1\\SYSVOL")));
     QCOMPARE(statusOf(treeReply), quint32(0));
@@ -1304,6 +1333,7 @@ void Smb1Test::signsAPreExtendedSecuritySessionTheWayTheClientKeysIt()
     setup[10] = char(readLe16(setup, 10) | 0x0004);
     const QByteArray reply = session.feed(setup);
     QCOMPARE(statusOf(reply), quint32(0));
+    rememberUid(reply);
     // The answer that hands the session its key carries no signature: Samba's
     // server builds its session-setup answer before it turns signing on, and a
     // Windows 2000 member hung up on ours when the field held a MAC where it
@@ -1356,6 +1386,7 @@ void Smb1Test::signsAndVerifiesASignedSession()
     type3Setup[10] = char(readLe16(type3Setup, 10) | 0x0004);
     const QByteArray acceptReply = session.feed(type3Setup);
     QCOMPARE(statusOf(acceptReply), quint32(0));
+    rememberUid(acceptReply);
     QCOMPARE(readLe16(payloadOf(acceptReply), 10) & 0x0004, quint16(0));
     QCOMPARE(payloadOf(acceptReply).mid(14, 8), QByteArray(8, '\0'));
 
@@ -1393,13 +1424,74 @@ void Smb1Test::signsAndVerifiesASignedSession()
         QStringLiteral("monarchy.test"), shares);
     plain.feed(negotiateMessage());
     plain.feed(sessionSetupMessage(type1));
-    QCOMPARE(statusOf(plain.feed(sessionSetupMessage(
-                 authenticateToken(QStringLiteral("alice"), QStringLiteral("MONARCHY"))))),
-             quint32(0));
+    const QByteArray plainAccept = plain.feed(sessionSetupMessage(
+        authenticateToken(QStringLiteral("alice"), QStringLiteral("MONARCHY"))));
+    QCOMPARE(statusOf(plainAccept), quint32(0));
+    rememberUid(plainAccept);
     const QByteArray plainReply =
         plain.feed(treeConnectMessage(QStringLiteral("\\\\dc1\\SYSVOL")));
     QCOMPARE(statusOf(plainReply), quint32(0));
     QCOMPARE(readLe16(payloadOf(plainReply), 10) & 0x0004, quint16(0));
+}
+
+// A Windows 2000 member's logon always has two sessions on one socket: the
+// machine's Kerberos channel and then the user's. One set of members keyed by
+// the connection handed the user's session the machine's UID and refused the
+// request that opened it as a bad signature, because the key on the connection
+// belonged to the other session. Each session now has its own UID, key and
+// counter, and a logoff closes only what it opened.
+void Smb1Test::servesTwoSessionsOnOneConnection()
+{
+    QScopedPointer<Smb1::Session> session(plainSession());
+    QVERIFY(session);
+    session->feed(negotiateMessage());
+
+    QByteArray type1("NTLMSSP", 7);
+    type1.append(char(0));
+    putLe32(type1, 1);              // NEGOTIATE
+    putLe32(type1, 0x00008201u);    // UNICODE | NTLM
+
+    // The machine's channel, opened by the account a computer keeps.
+    const QByteArray machineChallenge = session->feed(sessionSetupMessage(type1));
+    QCOMPARE(statusOf(machineChallenge), Smb1::kStatusMoreProcessingRequired);
+    const quint16 machineUid = readLe16(payloadOf(machineChallenge), 28);
+    QVERIFY(machineUid != 0);
+    const QByteArray machineAccept = session->feed(withUid(sessionSetupMessage(
+        authenticateToken(QStringLiteral("neuralbode0$"), QStringLiteral("MONARCHY"))),
+        machineUid));
+    QCOMPARE(statusOf(machineAccept), quint32(0));
+    QCOMPARE(readLe16(payloadOf(machineAccept), 28), machineUid);
+
+    // The user's session names no UID, so it is a new one: it gets a UID of its
+    // own, and its own session setup is not refused for lacking a signature it
+    // could not have. Before the per-session state this request was answered
+    // ACCESS_DENIED and the logon stopped there.
+    const QByteArray userChallenge = session->feed(sessionSetupMessage(type1));
+    QCOMPARE(statusOf(userChallenge), Smb1::kStatusMoreProcessingRequired);
+    const quint16 userUid = readLe16(payloadOf(userChallenge), 28);
+    QVERIFY(userUid != 0);
+    QVERIFY2(userUid != machineUid, "the second session was handed the first session's UID");
+    const QByteArray userAccept = session->feed(withUid(sessionSetupMessage(
+        authenticateToken(QStringLiteral("alice"), QStringLiteral("MONARCHY"))), userUid));
+    QCOMPARE(statusOf(userAccept), quint32(0));
+    QCOMPARE(readLe16(payloadOf(userAccept), 28), userUid);
+
+    // Both are live on the same connection, and each opens its own tree.
+    const QByteArray machineTree = session->feed(withUid(
+        treeConnectMessage(QStringLiteral("\\\\dc1\\SYSVOL")), machineUid));
+    QCOMPARE(statusOf(machineTree), quint32(0));
+    const QByteArray userTree = session->feed(withUid(
+        treeConnectMessage(QStringLiteral("\\\\dc1\\SYSVOL")), userUid));
+    QCOMPARE(statusOf(userTree), quint32(0));
+    QVERIFY(readLe16(payloadOf(machineTree), 24) != readLe16(payloadOf(userTree), 24));
+
+    // The user logs off; the machine's channel keeps its tree and stays usable.
+    QCOMPARE(statusOf(session->feed(withUid(smb(Smb1::CmdLogoffAndX, 0, userUid,
+                                                QByteArray(), QByteArray()), userUid))),
+             quint32(0));
+    const QByteArray afterLogoff = session->feed(withUid(
+        treeConnectMessage(QStringLiteral("\\\\dc1\\SYSVOL")), machineUid));
+    QCOMPARE(statusOf(afterLogoff), quint32(0));
 }
 
 QTEST_GUILESS_MAIN(Smb1Test)

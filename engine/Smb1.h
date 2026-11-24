@@ -97,6 +97,7 @@ private:
         Kind kind = Kind::Pipe;
         QString name;
         QString path;   // resolved absolute path, for a disk object
+        quint16 tid = 0;
         qint64 size = 0;
         RpcServer::Channel *channel = nullptr;
         QByteArray pending;
@@ -117,7 +118,7 @@ private:
     // The SMB_COM_TRANSACTION response block, shared by every subcommand that
     // answers with parameters and no data.
     QByteArray transactionReply(const QByteArray &message, const QByteArray &out,
-                               bool inData) const;
+                               bool inData);
     QByteArray trans2(const QByteArray &message);
     // FIND_FIRST2 / FIND_NEXT2 / FIND_CLOSE2, the TRANS2 half a directory
     // listing needs. MS-CIFS 2.2.6.3.
@@ -130,7 +131,8 @@ private:
     QString refusalReason(const Rpc::AuthRequest &request) const;
     // MS-CIFS 3.2.4.1: the signature field carries a sequence number per
     // direction, so a request is checked against the number expected next.
-    bool signatureValid(const QByteArray &message, quint32 sequence) const;
+    bool signatureValid(const QByteArray &message, quint32 sequence,
+                        const QByteArray &key) const;
 
     // uid and tid override the echoed ones; session setup assigns the UID and
     // tree connect the TID, and both have to be in the header before a signed
@@ -142,7 +144,7 @@ private:
     // what a Windows 2000 client is written against.
     QByteArray reply(const QByteArray &request, quint32 status, const QByteArray &words,
                      const QByteArray &data, int uid = -1, int tid = -1,
-                     bool sign = true) const;
+                     bool sign = true);
     QString stringAt(const QByteArray &data, int at) const;
     // Splits `data` on DCE/RPC frag_length and feeds each PDU to the channel.
     void feedPipe(OpenFile *file, const QByteArray &data);
@@ -156,23 +158,33 @@ private:
     QString m_serverName;
     QString m_dnsDomain;
 
-    QByteArray m_challenge;
-    QByteArray m_sessionKey;
+    // One connection carries more than one session, and a Windows 2000 member's
+    // logon always does: a Kerberos channel for the machine's computer account,
+    // then a second session for the user over the same TCP connection. Each has
+    // its own key, identity and signing counter, and each needs its own UID —
+    // one set of members handed the user's session the machine's UID and then
+    // refused the request that opened it as a bad signature, because the key on
+    // the connection belonged to the other session.
+    struct SessionState {
+        bool authenticated = false;
+        QString user;
+        QByteArray challenge;
+        QByteArray key;
+        // One counter for both directions: MS-CIFS numbers each signed message
+        // in one sequence, so the reply to a request carries the number after
+        // it. Measured against Samba's client, which signed its tree connect as
+        // seq 1 and expected our reply as seq 2.
+        quint32 signingSeq = 1;
+    };
+    SessionState *sessionState(quint16 uid);
+    const SessionState *sessionState(quint16 uid) const;
+    QHash<quint16, SessionState> m_sessions;
     mutable quint32 m_sendSeq = 1;
-    // One counter for both directions: MS-CIFS numbers each signed message on
-    // the connection in one sequence, so the reply to a request carries the
-    // number after it. Measured against Samba's client, which verified our
-    // session-setup reply as seq 1, signed its tree connect as seq 2 and then
-    // expected our reply as seq 3.
-    mutable quint32 m_signingSeq = 1;
     // Set when a request arrives saying it is signed. A client announces
     // that before it has a key to sign with, so the flag is intent: replies
     // are signed only for a session that asked for it.
     mutable bool m_signingActive = false;
-    bool m_authenticated = false;
-    QString m_user;
     bool m_unicode = false;
-    quint16 m_uid = 0;
 
     // A directory search an SMB1 client is walking. The matches are resolved on
     // FIND_FIRST2 and kept, so FIND_NEXT2 returns the same set even if the
@@ -188,6 +200,9 @@ private:
     quint16 m_nextTree = 0x100;
     quint16 m_nextFid = 0x4000;
     QHash<quint16, QString> m_trees;
+    // Which session connected each tree, so a logoff closes that session's
+    // handles and leaves the other session on the connection alone.
+    QHash<quint16, quint16> m_treeSession;
     QHash<quint16, OpenFile> m_files;
 
     std::function<void(const QString &)> m_notifier;
