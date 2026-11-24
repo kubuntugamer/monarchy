@@ -104,13 +104,19 @@ with MS-SAMR, MS-LSAD, MS-DRSR, MS-NRPC or RFC 4511.
 
 ## 3. Proving a running DC
 
+A throwaway lives under `build-throwaway/`, not `/tmp`: on a host where `/tmp`
+is tmpfs the tree sits in RAM, so a power loss or a shutdown takes the provisioned
+DATABASE and its logs with it, and the run that was being measured has to be
+built again from nothing. `build-*/` is ignored by git, so the tree also stays
+out of the working copy.
+
 ```sh
 # throwaway domain on the unprivileged ports
 build/ui/monarchy-provision --realm T.EXAMPLE --domain T --adminpass '…' \
-    --targetdir /tmp/dc --dev-ports
-build/ui/monarchy-dcd --dcdir /tmp/dc &
+    --targetdir build-throwaway/dc --dev-ports
+build/ui/monarchy-dcd --dcdir build-throwaway/dc &
 
-scripts/check-dc-health.sh /tmp/dc     # every declared port + every SRV locator
+scripts/check-dc-health.sh build-throwaway/dc   # every declared port + every SRV locator
 scripts/drs-conformance.py      --host 127.0.0.1 --port 1038 --basedn … --user Administrator --password …
 scripts/lsad-conformance.py     --host 127.0.0.1 --port 1036 --domain-sid … --skip-samba …
 scripts/samr-conformance.py     --host 127.0.0.1 --port 1035 --user Administrator --password …
@@ -130,9 +136,9 @@ reachable are different things and the check only sees the interpreter it runs
 under:
 
 ```sh
-python3 -m venv /tmp/monarchy-impacket
-/tmp/monarchy-impacket/bin/pip install impacket
-source /tmp/monarchy-impacket/bin/activate    # ci.sh probes `python3` on PATH
+python3 -m venv build-throwaway/monarchy-impacket
+build-throwaway/monarchy-impacket/bin/pip install impacket
+source build-throwaway/monarchy-impacket/bin/activate    # ci.sh probes `python3` on PATH
 scripts/ci.sh --conformance
 ```
 
