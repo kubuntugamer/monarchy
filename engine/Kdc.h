@@ -166,6 +166,8 @@ private:
                     OpenedTicket *out, QString *error) const;
     // Strongest encryption type a principal has a key for.
     int preferredEtype(const Krb5::Principal &principal) const;
+    // The krbtgt key type that signs a PAC for a ticket of `ticketEtype`.
+    int kdcEtypeFor(const Krb5::Principal &krbtgt, int ticketEtype) const;
     // The fields of an AP-REQ authenticator, once its integrity is checked and
     // its timestamp accepted.
     struct AuthenticatorFields {

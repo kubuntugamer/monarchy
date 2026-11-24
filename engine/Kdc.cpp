@@ -588,6 +588,19 @@ int Kdc::preferredEtype(const Krb5::Principal &principal) const
     return 0;
 }
 
+// A PAC's KDC signature is made with the krbtgt key of the ticket's own
+// encryption type: an RC4 ticket carries an hmac-md5 signature, an AES-256 one
+// an hmac-sha1-96 signature, and a verifier reads the type off the buffer. AD
+// keeps a krbtgt key per type, so only a directory that is missing one falls
+// back to the strongest key.
+int Kdc::kdcEtypeFor(const Krb5::Principal &krbtgt, int ticketEtype) const
+{
+    if (ticketEtype != 0
+        && krbtgt.keyFor(ticketEtype).size() == Krb5::keySize(ticketEtype))
+        return ticketEtype;
+    return preferredEtype(krbtgt);
+}
+
 QByteArray Kdc::preauthRequired(const KdcRequest &request, const QString &salt,
                                 const QList<int> &etypes) const
 {
@@ -746,7 +759,10 @@ QByteArray Kdc::issueAsRep(const KdcRequest &request, const Krb5::Principal &cli
     const QString realm = Krb5::canonicalRealm(m_config.realm);
     // The krbtgt account always supplies the KDC signature of the PAC; the
     // ticket itself is sealed with the requested service's key when the AS-REQ
-    // named one, and with krbtgt's when it asked for a TGT.
+    // named one, and with krbtgt's when it asked for a TGT. Either key has to be
+    // one of the encryption types the client named, including krbtgt's: a
+    // Windows 2000 client offers RC4-HMAC and nothing else, and a TGT sealed
+    // under an AES-256 krbtgt key is a ticket it has no name for.
     Krb5::Principal krbtgt;
     if (!Krb5::findPrincipal(directory(), QStringLiteral("krbtgt/%1").arg(realm), realm,
                              &krbtgt))
@@ -756,15 +772,11 @@ QByteArray Kdc::issueAsRep(const KdcRequest &request, const Krb5::Principal &cli
     const Krb5::Principal ticketPrincipal = forService ? service : krbtgt;
     const QString sname = forService ? serviceName
                                      : QStringLiteral("krbtgt/%1").arg(realm);
-    // Same rule as the TGS path: a ticket the client has to open must use one
-    // of the encryption types it offered. A TGT is sealed for krbtgt, which no
-    // client can open, so the strongest krbtgt key stays correct there.
-    const int ticketEtype = forService ? ticketPrincipal.chooseEtype(request.etypes)
-                                       : preferredEtype(ticketPrincipal);
+    const int ticketEtype = ticketPrincipal.chooseEtype(request.etypes);
     if (ticketEtype == 0)
         return krbError(forService ? kErrEtypeNoSupp : kErrSPrincipalUnknown, realm,
                         request.cname);
-    const int kdcEtype = preferredEtype(krbtgt);
+    const int kdcEtype = kdcEtypeFor(krbtgt, ticketEtype);
     if (kdcEtype == 0)
         return krbError(kErrSPrincipalUnknown, realm, request.cname);
 
@@ -981,7 +993,7 @@ QByteArray Kdc::issueTgsRep(const KdcRequest &request, const OpenedTicket &tgt,
     if (!tgtPac.isEmpty()
         && Krb5::findPrincipal(directory(), QStringLiteral("krbtgt/%1").arg(realm), realm,
                                &krbtgt)) {
-        const int kdcEtype = preferredEtype(krbtgt);
+        const int kdcEtype = kdcEtypeFor(krbtgt, serviceEtype);
         Pac::Keys pacKeys;
         pacKeys.serviceKey = service.keyFor(serviceEtype);
         pacKeys.serviceEtype = serviceEtype;

@@ -215,6 +215,57 @@ QByteArray asReq(const QString &realm, const QString &user,
     return Asn1::tlv(0x6A, Asn1::sequence(request));
 }
 
+// PA-ENC-TIMESTAMP sealed with RC4-HMAC, which is the only mechanism that
+// matters for a client that offers RC4 as its session key.
+QByteArray paEncTimestamp(const QByteArray &rc4Key)
+{
+    QByteArray timestamp;
+    timestamp.append(
+        Asn1::tlv(0xA0, Asn1::generalizedTime(0x18, QDateTime::currentSecsSinceEpoch())));
+    QByteArray encryptedData;
+    encryptedData.append(Asn1::tlv(0xA0, Asn1::integer(0x02, Krb5::kRc4Hmac)));
+    encryptedData.append(
+        Asn1::tlv(0xA2, Asn1::octets(0x04, Krb5::encrypt(Krb5::kRc4Hmac, 1, rc4Key,
+                                                         Asn1::sequence(timestamp)))));
+    QByteArray paData;
+    paData.append(Asn1::tlv(0xA1, Asn1::integer(0x02, 2))); // PA-ENC-TIMESTAMP
+    paData.append(Asn1::tlv(0xA2, Asn1::octets(0x04, Asn1::sequence(encryptedData))));
+    return Asn1::sequence(paData);
+}
+
+// The etype on the AS-REP's ticket. Returns 0 when the reply is not an AS-REP.
+int asRepTicketEtype(const QByteArray &reply)
+{
+    Asn1::Element outer;
+    if (!Asn1::parse(reply, &outer) || outer.tag != 0x6B)
+        return 0;
+    Asn1::Element sequence;
+    if (!Asn1::parse(outer.value, &sequence) || sequence.tag != 0x30)
+        return 0;
+    const Asn1::Element *ticketTag = Asn1::child(sequence, 0xA5);
+    if (!ticketTag)
+        return 0;
+    Asn1::Element ticket;
+    if (!Asn1::parse(ticketTag->value, &ticket) || ticket.tag != 0x61)
+        return 0;
+    const Asn1::Element *ticketFields = Asn1::child(ticket, 0x30);
+    if (!ticketFields)
+        return 0;
+    const Asn1::Element *encPartTag = Asn1::child(*ticketFields, 0xA3);
+    if (!encPartTag)
+        return 0;
+    Asn1::Element encPart;
+    if (!Asn1::parse(encPartTag->value, &encPart) || encPart.tag != 0x30)
+        return 0;
+    const Asn1::Element *etypeTag = Asn1::child(encPart, 0xA0);
+    if (!etypeTag)
+        return 0;
+    Asn1::Element etype;
+    if (!Asn1::parse(etypeTag->value, &etype) || etype.tag != 0x02)
+        return 0;
+    return int(Asn1::toInteger(etype));
+}
+
 // One request/reply over the KDC's TCP transport (length-prefixed).
 QByteArray kdcExchange(quint16 port, const QByteArray &request)
 {
@@ -931,6 +982,7 @@ private slots:
     void knownStringToKey();
     void asReqRequiresPreauth();
     void preauthUsesTheEtypeItWasSealedWith();
+    void tgtUsesAnEtypeTheClientOffered();
     void unknownAccountIsRejected();
     void aesEtypesRoundTrip();
     void aesStringToKeyVectors();
@@ -1053,6 +1105,32 @@ void KerberosTest::preauthUsesTheEtypeItWasSealedWith()
     Asn1::Element outer;
     QVERIFY(Asn1::parse(reply, &outer));
     QCOMPARE(int(outer.tag), 0x6B);
+}
+
+// A Windows 2000 client offers RC4-HMAC and no AES. The TGT it gets back has to
+// be sealed with a krbtgt key of a type the client named: the ticket etype is
+// part of the ticket the client stores and forwards, and AD never hands out a
+// ticket under an etype that was not offered. The PAC inside is signed with the
+// matching krbtgt key, so the checksum type follows the ticket's etype too.
+void KerberosTest::tgtUsesAnEtypeTheClientOffered()
+{
+    Fixture fixture;
+    QVERIFY(fixture.start());
+
+    const QByteArray rc4Key = Ntlm::ntowfV1(QStringLiteral("Str0ng-Pass!"));
+    const QByteArray preauth = paEncTimestamp(rc4Key);
+    const auto request = [&](const QList<int> &etypes) {
+        return kdcExchange(fixture.service->port,
+                           asReq(QStringLiteral("CORP.EXAMPLE.COM"),
+                                 QStringLiteral("Administrator"), etypes, preauth));
+    };
+
+    // RC4 only: the ticket must be RC4-HMAC, even though the directory holds a
+    // stronger krbtgt key.
+    QCOMPARE(asRepTicketEtype(request({Krb5::kRc4Hmac})), int(Krb5::kRc4Hmac));
+    // A client that offers AES still gets the strongest key it named.
+    QCOMPARE(asRepTicketEtype(request({Krb5::kRc4Hmac, Krb5::kAes256})),
+             int(Krb5::kAes256));
 }
 
 void KerberosTest::unknownAccountIsRejected()
