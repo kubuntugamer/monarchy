@@ -51,6 +51,7 @@ CHECKS = [
     'BUILTIN aliases hold a membership a client adds',
     'SamrCreateUser2InDomain',
     'SamrCreateUser2InDomain makes a machine a computer',
+    'Joining over an existing account: refused as USER_EXISTS, then reopened',
     'SamrOpenUser / SamrQueryInformationUser2',
     'SamrLookupNamesInDomain',
     'SamrLookupIdsInDomain',
@@ -88,6 +89,7 @@ CHECKS = [
     BUILTIN_WRITABLE,
     CREATE_USER,
     MACHINE_USER,
+    REJOIN,
     OPEN_USER,
     LOOKUP_NAMES,
     LOOKUP_IDS,
@@ -163,6 +165,24 @@ def password_policy(min_length, history, properties, max_age, min_age):
     set_delta(buffer['Password']['MaxPasswordAge'], max_age)
     set_delta(buffer['Password']['MinPasswordAge'], min_age)
     return buffer
+
+
+def set_machine_password(dce, user, password):
+    """Class 18 the way a join sets a machine's password. impacket's
+    hSamrSetNTInternal1 does the same thing but takes the session key from an
+    SMB connection, so this binding's own key is used instead."""
+    from impacket import crypto, ntlm
+
+    request = samr.SamrSetInformationUser()
+    request['UserHandle'] = user
+    request['UserInformationClass'] = samr.USER_INFORMATION_CLASS.UserInternal1Information
+    request['Buffer']['tag'] = samr.USER_INFORMATION_CLASS.UserInternal1Information
+    request['Buffer']['Internal1']['EncryptedNtOwfPassword'] = \
+        crypto.SamEncryptNTLMHash(ntlm.NTOWFv1(password), dce.get_session_key())
+    request['Buffer']['Internal1']['EncryptedLmOwfPassword'] = b''
+    request['Buffer']['Internal1']['NtPasswordPresent'] = 1
+    request['Buffer']['Internal1']['LmPasswordPresent'] = 0
+    dce.request(request)
 
 
 def connect(options):
@@ -385,6 +405,39 @@ def main():
               machine_info['UserAccountControl'] == 0x1000
               and machine_info['PrimaryGroupId'] == 515,
               (machine_info['UserAccountControl'], machine_info['PrimaryGroupId']))
+
+        # Joining again, over an account that is already there. MS-ADOD's SAMR
+        # join sequence has the client open the existing account and set its
+        # password when the create fails, so the create has to refuse the name
+        # with STATUS_USER_EXISTS (MS-SAMR 2.2.1.15) rather than succeed or
+        # return a code no client handles — and the path the client then takes
+        # has to work, or a re-join is refused with nothing to fall back on.
+        step = 'create refused'
+        try:
+            samr.hSamrCreateUser2InDomain(
+                dce, domain, machine_name, samr.USER_WORKSTATION_TRUST_ACCOUNT,
+                MAXIMUM_ALLOWED)
+            check(REJOIN, False, 'a second create of %s was accepted' % machine_name)
+        except Exception as error:  # noqa: BLE001
+            refused = getattr(error, 'error_code', None)
+            if refused != 0xc0000063:
+                check(REJOIN, False, 'create refused with 0x%08x' % (refused or 0))
+            else:
+                try:
+                    step = 'lookup'
+                    existing = list_field(samr.hSamrLookupNamesInDomain(
+                        dce, domain, (machine_name,))['RelativeIds']) or []
+                    existing_rid = existing[0]['Data']
+                    step = 'open'
+                    reopened = samr.hSamrOpenUser(
+                        dce, domain, MAXIMUM_ALLOWED, existing_rid)['UserHandle']
+                    step = 'set machine password'
+                    set_machine_password(dce, reopened, 'Rejoin-Pass-%s!' % uuid.uuid4().hex[:8])
+                    check(REJOIN, True, (existing_rid, 'reopened, password set'))
+                except Exception as error:  # noqa: BLE001
+                    check(REJOIN, False, '%s: %s: %s'
+                          % (step, type(error).__name__, error))
+
         samr.hSamrDeleteUser(dce, machine)
         machine = None
     except Exception as error:  # noqa: BLE001
