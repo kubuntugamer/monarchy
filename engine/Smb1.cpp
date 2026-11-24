@@ -657,7 +657,13 @@ QByteArray Session::sessionSetup(const QByteArray &message)
     // trailing strings are the ones a Windows 2000 member reads as malformed;
     // these are the extended form's own fields.
     QByteArray data = replyToken;
-    if (data.size() % 2 == 0)
+    // Pad only when the blob ends mid-character. Padding an even-length blob
+    // put NativeOS one byte off, so the client read UTF-16 from an odd offset:
+    // every unit came out byte-swapped and the terminator it was looking for
+    // arrived as part of a character. Measured on our own answer to a raw
+    // NTLMSSP session setup, where the empty blob got a leading 0x00 and the
+    // strings after it decoded as U+4D00 rather than "Monarchy".
+    if (data.size() % 2 != 0)
         data.append(char(0));
     const auto nativeString = [&header](const QString &text) {
         QByteArray out;

@@ -909,6 +909,16 @@ void Smb1Test::answersARawNtlmTokenWithoutSpnego()
     QCOMPARE(statusOf(acceptReply), quint32(0));
     QCOMPARE(readLe16(payloadOf(acceptReply), 33 + 6), quint16(0));
 
+    // With no blob the byte area starts at NativeOS. A pad byte there — which
+    // this reply carried while the pad was added to an even-length blob — puts
+    // the client half a character into a UTF-16 string, where it reads U+4D00
+    // instead of "Monarchy" and never finds a terminator.
+    const QByteArray acceptData = payloadOf(acceptReply).mid(43);
+    QCOMPARE(quint16(acceptData.size()), readLe16(payloadOf(acceptReply), 41));
+    QVERIFY2(acceptData.startsWith(utf16le(QStringLiteral("Monarchy"))),
+             qPrintable(acceptData.left(16).toHex()));
+    QVERIFY2(acceptData.endsWith(QByteArray(2, '\0')), qPrintable(acceptData.toHex()));
+
 
     // A wrapped token still gets its SPNEGO answer, so the wrapper is not
     // dropped for clients that do speak it.
