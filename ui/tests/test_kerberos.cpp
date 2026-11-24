@@ -1843,10 +1843,40 @@ void KerberosTest::pacResignsAcrossSignatureSizes()
     QVERIFY(Pac::verify(resigned, rc4));
     QVERIFY(!Pac::verify(resigned, aes));
 
+    // A PAC_SIGNATURE_DATA buffer is a 4-byte checksum type and the signature,
+    // nothing else. A verifier that walks the buffer table reads cbBufferSize,
+    // so four stray bytes make the buffer the wrong size even though the bytes
+    // after it line up. Build a guard here rather than trusting verify(), which
+    // zeroes cbBufferSize - 4 and would accept its own extra bytes.
+    const auto bufferSize = [](const QByteArray &pac, quint32 wanted) -> int {
+        const quint32 count = quint32(quint8(pac.at(0))) | (quint32(quint8(pac.at(1))) << 8)
+                              | (quint32(quint8(pac.at(2))) << 16)
+                              | (quint32(quint8(pac.at(3))) << 24);
+        for (quint32 i = 0; i < count; ++i) {
+            const int entry = 8 + int(i) * 16;
+            const quint32 type = quint32(quint8(pac.at(entry)))
+                                 | (quint32(quint8(pac.at(entry + 1))) << 8)
+                                 | (quint32(quint8(pac.at(entry + 2))) << 16)
+                                 | (quint32(quint8(pac.at(entry + 3))) << 24);
+            if (type != wanted)
+                continue;
+            return int(quint8(pac.at(entry + 4))) | (int(quint8(pac.at(entry + 5))) << 8)
+                   | (int(quint8(pac.at(entry + 6))) << 16)
+                   | (int(quint8(pac.at(entry + 7))) << 24);
+        }
+        return -1;
+    };
+    QCOMPARE(bufferSize(pac, 6), 4 + 12); // AES: 12-byte signature
+    QCOMPARE(bufferSize(pac, 7), 4 + 12);
+    QCOMPARE(bufferSize(resigned, 6), 4 + 16); // RC4-HMAC: 16-byte signature
+    QCOMPARE(bufferSize(resigned, 7), 4 + 12); // KDC key still AES
+
     // Re-signing back to AES must work from the wider form too.
     const QByteArray back = Pac::resign(resigned, aes);
     QVERIFY(!back.isEmpty());
     QVERIFY(Pac::verify(back, aes));
+    QCOMPARE(bufferSize(back, 6), 4 + 12);
+    QCOMPARE(bufferSize(back, 7), 4 + 12);
 }
 
 QTEST_GUILESS_MAIN(KerberosTest)

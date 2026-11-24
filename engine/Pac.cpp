@@ -206,12 +206,17 @@ QByteArray resizeSignatures(const QByteArray &pac, int serverLength, int kdcLeng
         if (size < 0 || offset < 0 || offset + size > pac.size())
             return {};
         QByteArray payload = pac.mid(offset, size);
+        // PAC_SIGNATURE_DATA is exactly a 4-byte checksum type followed by the
+        // signature, so the buffer has to be 4 + the signature length and no
+        // more. putLe32 appends, which makes this a setLe32 on a buffer that
+        // was already sized: appending would leave four zero bytes inside the
+        // signed region and a cbBufferSize no strict verifier accepts.
         if (type == kServerChecksumType) {
             payload = QByteArray(4 + serverLength, '\0');
-            putLe32(payload, serverChecksum);
+            setLe32(payload, 0, serverChecksum);
         } else if (type == kKdcChecksumType) {
             payload = QByteArray(4 + kdcLength, '\0');
-            putLe32(payload, kdcChecksum);
+            setLe32(payload, 0, kdcChecksum);
         }
         buffers.append({type, payload});
     }
