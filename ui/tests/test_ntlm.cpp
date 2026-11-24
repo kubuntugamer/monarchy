@@ -472,10 +472,13 @@ void NtlmTest::verifiesNtlmv1UnderPolicy()
     // A v2 response is not mistaken for a v1 one.
     QVERIFY(!Ntlm::isNtlmv1Response(QByteArray(44, 'x')));
 
-    // AD's policy: LmCompatibilityLevel 0-2 accept NTLMv1, 3-5 do not.
+    // AD's policy: a domain controller refuses LM at 4 and LM and NTLM at 5, so
+    // every level below 5 still accepts a v1 answer — including the default 3,
+    // which is what a Windows 2000 machine whose own policy is 0-2 relies on.
     QVERIFY(Ntlm::acceptsNtlmv1(0));
     QVERIFY(Ntlm::acceptsNtlmv1(2));
-    QVERIFY(!Ntlm::acceptsNtlmv1(3));
+    QVERIFY(Ntlm::acceptsNtlmv1(Ntlm::kDefaultLmCompatibilityLevel));
+    QVERIFY(Ntlm::acceptsNtlmv1(4));
     QVERIFY(!Ntlm::acceptsNtlmv1(5));
 
     // The session base key of a v1 logon is MD4(NTOWFv1), not a proof string's
@@ -486,11 +489,14 @@ void NtlmTest::verifiesNtlmv1UnderPolicy()
                                  &keys));
     QCOMPARE(keys.sessionBaseKey.toHex(), QByteArray("d87262b0cde4b1cb7499becccdf10784"));
     QVERIFY(!keys.serverSigningKey.isEmpty());
-    // The same response under the default policy is refused, before the keys
-    // are touched.
+    // The same response verifies under the default policy too, and is refused
+    // only once the policy reaches 5.
+    QVERIFY(Ntlm::verifyResponse(ntHash, QStringLiteral("alice"), QStringLiteral("CORP"),
+                                 challenge, response, QByteArray(), Ntlm::kNegotiate128,
+                                 Ntlm::kDefaultLmCompatibilityLevel, &keys));
     QVERIFY(!Ntlm::verifyResponse(ntHash, QStringLiteral("alice"), QStringLiteral("CORP"),
-                                  challenge, response, QByteArray(), Ntlm::kNegotiate128,
-                                  Ntlm::kDefaultLmCompatibilityLevel, &keys));
+                                  challenge, response, QByteArray(), Ntlm::kNegotiate128, 5,
+                                  &keys));
 
     // An NTLM2 session response: the same 24 bytes, computed over
     // MD5(challenge || client challenge), with that challenge in the LM

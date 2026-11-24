@@ -23,7 +23,7 @@ STATUS_NO_TRUST_SAM_ACCOUNT, so that path is checked with a name nothing serves.
 
 The domain's NTLM policy is checked as well: a network logon answered with
 NTLMv1 -- impacket computes that answer itself -- is refused at the default
-`lmCompatibilityLevel` and accepted against a DC configured at 2.
+`lmCompatibilityLevel` and accepted against the default level 3 as well as 2.
 
 A wrong password has to be refused with STATUS_WRONG_PASSWORD *and* counted:
 the account's badPwdCount goes up, the good logon clears it, and SAMR reports
@@ -40,9 +40,9 @@ Options:
   --user USER        Account to bind SAMR as and to validate. Default: Administrator
   --password PASS    Its password. Default: P@ssw0rd123!
   --domain DOMAIN    NetBIOS domain name. Default: MONARCHY
-  --lm-compat LEVEL  The domain's lmCompatibilityLevel: 0-2 mean a network logon
-                     may answer with NTLMv1, 3-5 (AD's default) mean it is
-                     refused. Default: 3
+  --lm-compat LEVEL  The domain's lmCompatibilityLevel: 0-4 accept a network logon
+                     answered with NTLMv1, 5 (refuse LM and NTLM) refuses it.
+                     Default: 3, the documented DC default
   --list             Only list the checks that would run.
 
 Exit status is 0 when every check passes or is skipped with a reason, 1 when a
@@ -863,8 +863,9 @@ def main():
                     pass
 
             # NTLMv1 under the domain's policy. A client that predates NTLMv2
-            # answers a challenge with three DES blocks and no blob, and the DC
-            # accepts that only when dc.conf lowers lmCompatibilityLevel to 2.
+            # answers a challenge with three DES blocks and no blob; a domain
+            # controller accepts that at every lmCompatibilityLevel below 5 and
+            # refuses it only at 5, where the setting says so.
             # impacket computes the answer, so neither half of this check comes
             # from this repository. The logon is for an account of its own: the
             # lockout check above deliberately leaves `account` locked, and a
@@ -890,7 +891,7 @@ def main():
                     refused = getattr(error, 'error_code', None)
                 outcome = ('accepted' if refused is None
                            else 'refused 0x%08x' % refused)
-                if options.lm_compat <= 2:
+                if options.lm_compat <= 4:
                     check(CHECKS[16], refused is None,
                           '%s at level %d' % (outcome, options.lm_compat))
                 else:

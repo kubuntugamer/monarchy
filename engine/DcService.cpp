@@ -402,8 +402,9 @@ bool DcService::start(const QString &dcDir)
     });
     const QSettings dcConfig(resolvedDcDir + QStringLiteral("/dc.conf"), QSettings::IniFormat);
     // AD's LmCompatibilityLevel decides whether an NTLMv1 challenge response is
-    // answered at all: 0-2 accept it, 3-5 require NTLMv2. The default is 3,
-    // which is what this DC answered before the setting existed.
+    // answered at all: 0-4 accept it — the levels below 4 only decide what a
+    // client sends — and 5 refuses LM and NTLM. The default is 3, a domain
+    // controller's documented default, which accepts it.
     const int lmCompatibilityLevel =
         dcConfig.value(QStringLiteral("lmCompatibilityLevel"),
                        Ntlm::kDefaultLmCompatibilityLevel).toInt();

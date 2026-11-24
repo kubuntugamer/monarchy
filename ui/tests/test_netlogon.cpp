@@ -1996,14 +1996,17 @@ void NetlogonTest::networkSamLogonHonoursNtlmv1Policy()
         return reply;
     };
 
-    // At the default the answer is refused before the password counts, which is
-    // what this pipe did before the policy was reachable from dc.conf...
-    QCOMPARE(samLogonStatus(attempt(Ntlm::kDefaultLmCompatibilityLevel)), quint32(0xc000006au));
-    QCOMPARE(samLogonStatus(attempt(3)), quint32(0xc000006au));
-    // ...and at 2 the same 24 bytes log alice on.
-    const QByteArray accepted = attempt(2);
-    QVERIFY(accepted.size() > 24);
-    QCOMPARE(samLogonStatus(accepted), quint32(0));
+    // A domain controller accepts the v1 answer at every level below 5 — the
+    // default 3 included, which is what a machine whose own policy is 0-2 sends
+    // to — so the same 24 bytes log alice on there and at 2 and 4.
+    for (const int level : {Ntlm::kDefaultLmCompatibilityLevel, 2, 4}) {
+        const QByteArray accepted = attempt(level);
+        QVERIFY(accepted.size() > 24);
+        QCOMPARE(samLogonStatus(accepted), quint32(0));
+    }
+    // Only 5 takes NTLM away from the server, and the answer is then refused
+    // before the password counts.
+    QCOMPARE(samLogonStatus(attempt(5)), quint32(0xc000006au));
 }
 
 void NetlogonTest::dcLocatorNamesThisDc()

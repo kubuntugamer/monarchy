@@ -766,12 +766,12 @@ a provisioned DC, `smbclient -m NT1` lists SYSVOL, fetches a policy's `GPT.INI`
 and a NETLOGON logon script byte for byte, and an anonymous session is refused
 with logon failure.
 
-NTLMv1 and NTLM2-session answers are accepted only when `dc.conf` sets
-`lmCompatibilityLevel` to 2 or lower (AD's scale: 0–2 accept it, 3–5 require
-NTLMv2). A client that predates NTLMv2 answers a challenge with one of those, so
-a domain whose members include a machine that has not been raised to "Send
-NTLMv2 response only" needs that line; without it the session setup is refused
-`LOGON_FAILURE`, which is what this DC did before the setting existed. The
+NTLMv1 and NTLM2-session answers are accepted, as they are by a Windows domain
+controller, at every `lmCompatibilityLevel` below 5 — the default 3 included,
+where the setting only decides what a client sends and the server still takes LM,
+NTLM and NTLMv2. A client that predates NTLMv2 answers a challenge with one of
+those, so a machine that has not been raised to "Send NTLMv2 response only" logs
+on without any `dc.conf` line; set `lmCompatibilityLevel=5` to refuse it. The
 session key such a session signs with is an HMAC keyed by MD4(NTOWFv1) —
 measured from Samba's client rather than assumed — and an LM response on its own
 is always refused, because this store keeps no LM hash to check one against. The

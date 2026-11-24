@@ -158,8 +158,8 @@ public:
     Kdc *kdc() const { return m_kdc; }
 
     // AD's LmCompatibilityLevel, which decides whether an NTLMv1 challenge
-    // response is answered at all: 0-2 accept it, 3-5 require NTLMv2. The
-    // default refuses it, as this store did before the policy existed.
+    // response is answered at all: 0-4 accept it, 5 refuses it. The default, 3,
+    // is a domain controller's documented default and accepts it.
     void setLmCompatibilityLevel(int level) { m_lmCompatibilityLevel = level; }
 
     // AD's RestrictAnonymous, which decides what a session that never bound may

@@ -171,12 +171,15 @@ inline bool sessionKeys(const QByteArray &ntHash, const QString &user, const QSt
 bool v1SessionKeys(const QByteArray &ntHash, quint32 negotiateFlags, SessionKeys *out);
 
 // AD's LmCompatibilityLevel decides whether an NTLMv1 answer is accepted at all.
-// The documented table has a domain controller refuse LM at 4 and LM and NTLM
-// at 5, so a level-3 Windows DC still accepts a v1 answer; this server stops at
-// 3 instead, which is the hardening reading, and leaves the lever with the
-// administrator, who sets 2 in dc.conf for an estate that still has a client
-// speaking only NTLMv1. The default is 3, which is what this DC answered before
-// the policy was configurable.
+// Levels 0 to 3 make the *client* send NTLMv2 and leave the domain controller
+// accepting LM, NTLM and NTLMv2 alike; only 4 (refuse LM) and 5 (refuse LM and
+// NTLM) take the v1 answer away from the server. This DC follows that table
+// rather than refusing at 3, because a Windows 2000 machine whose own policy is
+// 0-2 sends a 24-byte v1 answer to the domain's default DC and has to be
+// logged on: refusing it there turned that machine's whole session setup into
+// LOGON_FAILURE, before the pipe it came for was ever reached. An administrator
+// whose estate is all NTLMv2 sets 5. The default is 3, the documented default of
+// a domain controller.
 constexpr int kDefaultLmCompatibilityLevel = 3;
 bool acceptsNtlmv1(int lmCompatibilityLevel);
 

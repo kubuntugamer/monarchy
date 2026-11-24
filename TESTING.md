@@ -179,12 +179,13 @@ recorded, not hidden:
   The session setup on that path is also where AD's NTLM policy decides whether
   a 2000 client's answer can be checked at all. A machine whose policy has not
   been raised to "Send NTLMv2 response only" answers a challenge with an NTLMv1
-  or NTLM2-session response, and this DC refuses those unless `dc.conf` sets
-  `lmCompatibilityLevel=2` (AD's scale: 0–2 accept it, 3–5 require NTLMv2; the
-  default here is 3, which is what this DC answered before the setting existed).
-  Measured with Samba's client configured `client ntlmv2 auth = no`: at level 2
-  it lists SYSVOL over SMB1 both with and without `client signing = required`,
-  and over SMB2; at the default it is refused `NT_STATUS_LOGON_FAILURE` while
+  or NTLM2-session response, and this DC accepts those at every
+  `lmCompatibilityLevel` below 5, as a Windows domain controller does: the levels
+  below 4 decide what a client sends, 4 refuses LM, and only 5 refuses NTLM too.
+  Measured with Samba's client configured `client ntlmv2 auth = no`: it lists
+  SYSVOL over SMB1 both with and without `client signing = required`, and over
+  SMB2, at the default level 3 as well as at 2 — and only a DC whose `dc.conf`
+  sets `lmCompatibilityLevel=5` refuses it `NT_STATUS_LOGON_FAILURE` while
   NTLMv2 keeps listing on both transports. The signing key was the part that had
   to be measured rather than read: an HMAC keyed by NTOWFv1 — the shape MS-NLMP
   suggests — was rejected `smb1_signing_good: BAD SIG: seq 1`, and the client's
@@ -198,10 +199,10 @@ recorded, not hidden:
   and anything else, including the all-zero response of a client with no LM
   hash, is plain NTLMv1 over the challenge as sent.
   `scripts/netlogon-conformance.py --lm-compat N` drives that with impacket's own
-  NTLMv1 answer: against a DC left at the default the logon is refused
-  `STATUS_WRONG_PASSWORD`, and against one whose `dc.conf` sets
-  `lmCompatibilityLevel=2` it is accepted, with the rest of the suite green at
-  17 checks in both runs.
+  NTLMv1 answer: against a DC left at the default 3 the logon is accepted, as it
+  is at 2 and at 4, and against one whose `dc.conf` sets
+  `lmCompatibilityLevel=5` it is refused `STATUS_WRONG_PASSWORD`, with the rest
+  of the suite green in every run.
 
   Reproducing that measurement needs both halves of the client pin, and getting
   either wrong reads like the server refusing. `-m NT1` sets only the maximum
@@ -231,10 +232,12 @@ recorded, not hidden:
   nothing else, which is why the setting that decides session setup made no
   difference here. That is the defect `52057e8` fixed — the network logon goes
   through `Ntlm::verifyResponse` like the SMB, LDAP and RPC acceptors now, and
-  the same drive on the tree after it gives STATUS_WRONG_PASSWORD at the default
-  level 3 and STATUS_SUCCESS once `dc.conf` sets `lmCompatibilityLevel=2`, the
-  password classes and the NTLMv2 logon unchanged in both runs. The v1 answer
-  was right; the pipe had a rule of its own.
+  the same drive on the tree after it gives STATUS_SUCCESS at the default level
+  3, at 2 and at 4, and STATUS_WRONG_PASSWORD only once `dc.conf` sets
+  `lmCompatibilityLevel=5`, the password classes and the NTLMv2 logon unchanged
+  in every run. The v1 answer was right; the rule that refused it at 3 belonged
+  to this server rather than to AD, and it is now AD's table: 0–4 accept, 5
+  refuses.
 
   The refusal is charged to the account, which is the part that would bite. With
   one NTLMv1 logon and nothing else, the account's badPwdCount went from 0 to 1

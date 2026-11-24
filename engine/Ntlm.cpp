@@ -353,7 +353,10 @@ bool v1SessionKeys(const QByteArray &ntHash, quint32 negotiateFlags, SessionKeys
 
 bool acceptsNtlmv1(int lmCompatibilityLevel)
 {
-    return lmCompatibilityLevel >= 0 && lmCompatibilityLevel <= 2;
+    // A domain controller refuses LM at 4 and LM and NTLM at 5; the levels
+    // below those govern what the *client* sends and never take the v1 answer
+    // away from the server (MS's own table of the setting).
+    return lmCompatibilityLevel >= 0 && lmCompatibilityLevel <= 4;
 }
 
 bool verifyResponse(const QByteArray &ntHash, const QString &user, const QString &domain,

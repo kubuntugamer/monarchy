@@ -2566,7 +2566,7 @@ QByteArray LdapServer::handleSaslBind(ClientState *st, int msgId, const QByteArr
                 return makeBindResponse(msgId, 49);
 
             // NTLMv1 is answered only when the domain's policy allows it (AD's
-            // LmCompatibilityLevel 0-2); the keys come with the verification.
+            // LmCompatibilityLevel 0-4); the keys come with the verification.
             Ntlm::SessionKeys keys;
             if (!Ntlm::verifyResponse(ntHash, authenticate.user, authenticate.domain, challenge,
                                       authenticate.ntResponse, authenticate.lmResponse,
