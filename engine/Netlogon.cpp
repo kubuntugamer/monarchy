@@ -1149,6 +1149,13 @@ QByteArray NetlogonServer::logonGetDomainInfo(const QByteArray &stub)
     QString computerName;
     if (!readStringArray(reader, &serverName) || !readUniqueString(reader, &computerName))
         return statusOnly(kStatusInvalidParameter);
+    // The name arrays are read inline, and the authenticator behind them is a
+    // four-aligned structure: NDR pads a string whose characters end two bytes
+    // short of that boundary. Windows writes `[string]` counts with the
+    // terminator, so a computer name of even length lands exactly there, and a
+    // reader that stopped at the characters took the padded word for the start
+    // of the credential and refused the call as if the channel were wrong.
+    reader.align(4);
     QByteArray credential;
     quint32 timestamp = 0;
     if (!reader.bytes(8, &credential) || !reader.u32(&timestamp))

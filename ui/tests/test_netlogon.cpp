@@ -73,7 +73,9 @@ QByteArray challengeRequest(const QString &computer, const QByteArray &clientCha
 {
     QByteArray stub;
     appendLe32(stub, 0); // NULL server_name
-    appendStringArray(stub, computer);
+    // The challenge is a byte array, aligned to one, so NDR pads nothing
+    // between it and the name whatever length that name has.
+    appendStringArray(stub, computer, false);
     stub.append(clientChallenge);
     return stub;
 }
@@ -94,8 +96,14 @@ QByteArray authenticateRequest(const QString &account, const QString &computer,
     appendLe16(stub, 2); // SEC_CHAN_WKSTA
     while (stub.size() % 4 != 0)
         stub.append('\0');
-    appendStringArray(stub, computer);
+    // The credential is a byte array, aligned to one: no padding follows the
+    // name, which Windows writes with its terminator and so ends two bytes
+    // short of a word whenever the computer name has an even number of
+    // characters.
+    appendStringArray(stub, computer, false);
     stub.append(credential);
+    while (stub.size() % 4 != 0) // negotiate_flags is aligned to four
+        stub.append('\0');
     appendLe32(stub, flags);
     return stub;
 }
@@ -344,22 +352,22 @@ struct ChannelFixture {
 // the server: challenge, session key from the machine hash, and the first
 // credential over the client challenge.
 ChannelFixture openChannel(NetlogonServer &server, const QByteArray &machineHash,
-                           quint32 flags = Netlogon::kNegStrongKeys | Netlogon::kNegSupportsAes)
+                           quint32 flags = Netlogon::kNegStrongKeys | Netlogon::kNegSupportsAes,
+                           const QString &computer = QStringLiteral("DC1"))
 {
     ChannelFixture out;
     out.flags = flags;
     out.requestedFlags = flags;
     const QByteArray clientChallenge = QByteArray::fromHex("1112131415161718");
     const QByteArray challengeReply = server.handleCall(
-        Netlogon::OpServerReqChallenge,
-        challengeRequest(QStringLiteral("DC1"), clientChallenge));
+        Netlogon::OpServerReqChallenge, challengeRequest(computer, clientChallenge));
     if (challengeReply.size() != 12 || readLe32(challengeReply, 8) != 0)
         return out;
     const QByteArray serverChallenge = challengeReply.left(8);
     out.sessionKey = expectedSessionKey(machineHash, clientChallenge, serverChallenge, flags);
     const QByteArray authReply = server.handleCall(
         Netlogon::OpServerAuthenticate3,
-        authenticateRequest(QStringLiteral("DC1$"), QStringLiteral("DC1"),
+        authenticateRequest(computer + QStringLiteral("$"), computer,
                             expectedCredential(clientChallenge, out.sessionKey, flags), flags));
     if (authReply.size() != 20 || readLe32(authReply, 16) != 0)
         return out;
@@ -490,6 +498,7 @@ private slots:
     void secureChannelNegotiatesCrypto();
     void logonGetCapabilitiesReportsTheChannelFlags();
     void logonGetDomainInfoAnswersTheDomainIdentity();
+    void logonGetDomainInfoReadsAnEvenLengthName();
     void sealsThePipeWithTheChannelKey();
     void legacySamLogonAuthenticatesSecureChannel_data();
     void legacySamLogonAuthenticatesSecureChannel();
@@ -1392,6 +1401,56 @@ void NetlogonTest::logonGetDomainInfoAnswersTheDomainIdentity()
     const QByteArray unsupported = server.handleCall(Netlogon::OpLogonGetDomainInfo, level2);
     QCOMPARE(unsupported.size(), 4);
     QCOMPARE(readLe32(unsupported, 0), quint32(0xc0000003u)); // STATUS_INVALID_INFO_CLASS
+}
+
+// MS-NRPC 3.5.4.4.10 (opnum 29). The two names travel as inline `[string]`
+// arrays and the authenticator behind them is a four-aligned structure, so NDR
+// pads a string whose characters stop two bytes short of that boundary. Windows
+// writes the count with the terminator, which makes a computer name of even
+// length exactly the case that pads: a reader that stopped at the characters
+// took the pad for the first half of the credential and answered
+// STATUS_ACCESS_DENIED on a channel that was current, and a client whose
+// disjoin asks this question first then reported it could not disable the
+// account it was leaving behind.
+void NetlogonTest::logonGetDomainInfoReadsAnEvenLengthName()
+{
+    NetlogonServer server;
+    Netlogon::Config config;
+    config.netbios = QStringLiteral("CORP");
+    config.realm = QStringLiteral("CORP.EXAMPLE.COM");
+    config.dnsDomain = QStringLiteral("corp.example.com");
+    config.dcName = QStringLiteral("DC1");
+    config.dcHost = QStringLiteral("dc1.corp.example.com");
+    config.domainSid = QStringLiteral("S-1-5-21-1-2-3");
+    server.setConfig(config);
+
+    const QByteArray ntHash = Ntlm::ntowfV1(QStringLiteral("Mach!neP@ss1"));
+    DirectoryObject machine = machineAccount(ntHash);
+    machine.id = QStringLiteral("CN=WBTEST,CN=Computers,DC=corp,DC=example,DC=com");
+    machine.name = QStringLiteral("WBTEST");
+    machine.attributes.insert(QStringLiteral("sAMAccountName"), QStringLiteral("WBTEST$"));
+    server.setObjectProvider([machine]() { return QList<DirectoryObject>{machine}; });
+
+    const QString computer = QStringLiteral("WBTEST"); // six characters: seven units, 14 bytes
+    const ChannelFixture channel = openChannel(
+        server, ntHash, Netlogon::kNegStrongKeys | Netlogon::kNegGetDomainInfo, computer);
+    QVERIFY(channel.ok);
+
+    const quint32 timestamp = 78;
+    QByteArray stub;
+    appendStringArray(stub, QStringLiteral("\\\\WBTEST"));
+    appendPointerString(stub, computer, 0x00020000u + quint32(stub.size()));
+    stub.append(nextCredential(channel.seed, timestamp, channel.sessionKey, channel.flags, false));
+    appendLe32(stub, timestamp);
+    stub.append(QByteArray(12, '\0')); // the client's own return_authenticator
+    appendLe32(stub, 1);              // level
+    appendLe32(stub, 1);              // the query union's discriminant
+    appendLe32(stub, 1);
+
+    const QByteArray reply = server.handleCall(Netlogon::OpLogonGetDomainInfo, stub);
+    QVERIFY(reply.size() > 200);
+    QCOMPARE(readLe32(reply, 12), quint32(1)); // the level, not a bare status
+    QCOMPARE(readLe32(reply, reply.size() - 4), quint32(0));
 }
 
 // The DCE/RPC framing a Netlogon client uses once its channel exists: a bind
