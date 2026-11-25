@@ -1201,9 +1201,13 @@ void Smb1Test::answersTheFilesystemRecordsAShareIsEnumeratedWith()
     QCOMPARE(readLe16(attribute, 33), quint16(0));       // TotalParameterCount
     QCOMPARE(readLe16(attribute, 39), quint16(0));       // ParameterCount
     QCOMPARE(readLe16(attribute, 41), quint16(0));       // ParameterOffset
-    QCOMPARE(readLe16(attribute, 53), quint16(info.size() + 1)); // ByteCount, pad included
-    QCOMPARE(readLe16(attribute, 47), quint16(56));      // DataOffset
-    QCOMPARE(attribute.mid(56, int(readLe16(attribute, 45))), info);
+    // No parameter block means no pad either: the record starts at the byte
+    // after ByteCount, and ByteCount is the record and nothing else.
+    QCOMPARE(readLe16(attribute, 53), quint16(info.size())); // ByteCount
+    QCOMPARE(readLe16(attribute, 47), quint16(55));      // DataOffset
+    QCOMPARE(int(readLe16(attribute, 47)) + int(readLe16(attribute, 53)),
+             attribute.size());
+    QCOMPARE(attribute.mid(55, int(readLe16(attribute, 45))), info);
 
     // The size record is what a listing prints free space from, and the device
     // record is what tells the redirector it is talking to a disk share.

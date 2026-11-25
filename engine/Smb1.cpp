@@ -1419,13 +1419,11 @@ QByteArray Session::fileSystemInfo(const QByteArray &message, const QByteArray &
     putLe16(words, 0);                         // ParameterOffset
     putLe16(words, 0);                         // ParameterDisplacement
     putLe16(words, quint16(info.size()));      // DataCount
-    putLe16(words, 56);                        // DataOffset
+    putLe16(words, 55);                        // DataOffset: 32 header + 1 count + 20 words + 2 count
     putLe16(words, 0);                         // DataDisplacement
     words.append(char(0));                     // SetupCount
     words.append(char(0));                     // Reserved2
-    QByteArray data(1, '\0'); // one pad byte so the record starts on an even offset
-    data.append(info);
-    return reply(message, kStatusSuccess, words, data);
+    return reply(message, kStatusSuccess, words, info);
 }
 
 // SMB_COM_QUERY_INFORMATION_DISK: word parameters only, no data. The numbers
