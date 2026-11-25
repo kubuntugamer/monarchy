@@ -513,6 +513,12 @@ bool readIdArray(const QByteArray &data, int *pos, QList<quint32> *values)
         return false;
     const quint32 count = readLe32At(data, *pos);
     const quint32 pointer = readLe32At(data, *pos + 4);
+    // The referent has to be the offset of the array it names — the maximum
+    // count that begins it — because that is how a Windows stub resolves a
+    // pointer. A unique-but-wrong value (0x0002e100) unmarshals to a wild
+    // address on the client, which is what a 2000 `net user` reported as 124.
+    if (pointer != 0 && pointer != quint32(*pos + 8))
+        return false;
     *pos += 8;
     values->clear();
     if (pointer == 0)
@@ -1096,9 +1102,15 @@ void SamrTest::samrDirectoryCalls()
     const QByteArray machineIds =
         server.handleCall(Samr::OpLookupIdsInDomain, lookupIdsStub(domainHandle, {2001}));
     QCOMPARE(lastWord(machineIds), 0u);
-    const int typeReferent = machineIds.indexOf(QByteArray::fromHex("30e10200"));
-    QVERIFY(typeReferent >= 0);
-    QCOMPARE(machineIds.mid(typeReferent + 8, 4), QByteArray::fromHex("09000000"));
+    // The types array closes the answer: count, pointer, maximum, value, status.
+    // The pointer names the array by its offset in this reply, the byte the
+    // maximum count starts at, which is what a client resolves it with.
+    const int typesAt = int(machineIds.size()) - 20;
+    QVERIFY(typesAt > 0);
+    QCOMPARE(readLe32At(machineIds, typesAt), 1u);     // Count
+    QCOMPARE(readLe32At(machineIds, typesAt + 4), quint32(typesAt + 8));
+    QCOMPARE(readLe32At(machineIds, typesAt + 8), 1u); // MaximumCount
+    QCOMPARE(readLe32At(machineIds, typesAt + 12), 9u); // SidTypeComputer
 
     // CloseHandle releases the context.
     QByteArray closeRequest = userHandle;

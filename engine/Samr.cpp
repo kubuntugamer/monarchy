@@ -302,6 +302,18 @@ bool readWireSid(Ndr::Reader &reader, QByteArray *sid)
     return true;
 }
 
+// A referent is the offset of its pointee from the start of the stub (MS-RPCE
+// 2.2.10.6), and a client resolves a pointer as stub + referent. Values that are
+// merely unique — 0x0002e100 and the like — read fine through a client that
+// walks the reply in order and put a Windows stub outside the buffer it was
+// given, which is how a 2000 member answered a lookup that carried a zero
+// status.
+void setLe32(QByteArray &data, int pos, quint32 value)
+{
+    for (int i = 0; i < 4; ++i)
+        data[pos + i] = char((value >> (8 * i)) & 0xff);
+}
+
 // SAMPR_ENUMERATION_BUFFER: context, buffer pointer, entries read, the array's
 // pointer and maximum count, one {RelativeId; RPC_UNICODE_STRING} per entry and
 // then the name buffers, in that order.
@@ -2506,14 +2518,17 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
         }
 
         // samr_Ids is {Count; [size_is(Count)] uint32 *Ids}. On this wire the
-        // referent follows its pointer: count, pointer, maximum count, elements.
-        // Probed against impacket's reader, which consumes the array in place.
+        // array follows its own pointer: count, pointer, maximum count,
+        // elements. Probed against impacket's reader, which consumes the array
+        // in place and ignores the pointer, so the value it receives is the one
+        // a Windows stub resolves — the offset of the array from the start of
+        // this reply.
         putLe32(fixed, quint32(names.size()));
         if (names.isEmpty()) {
             putLe32(fixed, 0);
         } else {
-            putLe32(fixed, 0x0002e100u);
-            putLe32(fixed, quint32(rids.size())); // MaximumCount
+            putLe32(fixed, quint32(fixed.size() + 4)); // Ids
+            putLe32(fixed, quint32(rids.size()));      // MaximumCount
             for (quint32 rid : rids)
                 putLe32(fixed, rid);
         }
@@ -2521,8 +2536,8 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
         if (types.isEmpty()) {
             putLe32(fixed, 0);
         } else {
-            putLe32(fixed, 0x0002e110u);
-            putLe32(fixed, quint32(types.size())); // MaximumCount
+            putLe32(fixed, quint32(fixed.size() + 4)); // Types
+            putLe32(fixed, quint32(types.size()));     // MaximumCount
             for (quint32 type : types)
                 putLe32(fixed, type);
         }
@@ -2594,11 +2609,15 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
 
         // SAMPR_RETURNED_USTRING_ARRAY: a conformant array of
         // RPC_UNICODE_STRING. The element structures are followed by their own
-        // character buffers, and the type array follows in the same shape.
+        // character buffers, and the type array follows in the same shape. The
+        // pointers carry the offset of what they name, the element buffers
+        // included: those are written after every element, so their offsets are
+        // only known once the blob has been appended.
         putLe32(fixed, quint32(rids.size()));
-        putLe32(fixed, rids.isEmpty() ? 0u : 0x0002e120u);
+        putLe32(fixed, rids.isEmpty() ? 0u : quint32(fixed.size() + 4)); // Names
         putLe32(fixed, quint32(rids.size())); // MaximumCount
         QByteArray stringBuffers;
+        QList<QPair<int, int>> stringReferents; // stub position, offset in the blob
         for (int i = 0; i < names.size(); ++i) {
             const QByteArray utf16 = Ndr::utf16le(names.at(i));
             const quint16 length = quint16(utf16.size());
@@ -2607,19 +2626,23 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
             fixed.append(char(length & 0xff));
             fixed.append(char((length >> 8) & 0xff));
             if (resolved.value(i)) {
-                putLe32(fixed, 0x0002e140u + quint32(i));
+                stringReferents.append(qMakePair(int(fixed.size()), int(stringBuffers.size())));
+                putLe32(fixed, 0); // patched once the blob is placed
                 appendVaryingString(stringBuffers, names.at(i));
             } else {
                 putLe32(fixed, 0);
             }
         }
+        const int buffersBase = int(fixed.size());
         fixed.append(stringBuffers);
+        for (const QPair<int, int> &referent : stringReferents)
+            setLe32(fixed, referent.first, quint32(buffersBase + referent.second));
         putLe32(fixed, quint32(types.size()));
         if (types.isEmpty()) {
             putLe32(fixed, 0);
         } else {
-            putLe32(fixed, 0x0002e130u);
-            putLe32(fixed, quint32(types.size())); // MaximumCount
+            putLe32(fixed, quint32(fixed.size() + 4)); // Types
+            putLe32(fixed, quint32(types.size()));     // MaximumCount
             for (quint32 type : types)
                 putLe32(fixed, type);
         }
