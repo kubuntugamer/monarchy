@@ -1405,22 +1405,25 @@ QByteArray Session::fileSystemInfo(const QByteArray &message, const QByteArray &
         return reply(message, kStatusNotSupported, QByteArray(), QByteArray());
     }
 
-    QByteArray params;
-    putLe16(params, 0); // EAErrorOffset
+    // SMB_QUERY_FS_INFORMATION has no parameter block (MS-CIFS 2.2.6.4.3):
+    // the answer is the level's record and nothing else. This reply used to
+    // carry two parameter bytes of EAErrorOffset, which is a Trans2 NT key's
+    // header rather than this subcommand's, and a 2000 redirector answered the
+    // whole enumeration with "the specified server cannot perform the
+    // requested operation" (58) without reading the record that followed.
     QByteArray words;
-    putLe16(words, quint16(params.size()));    // TotalParameterCount
+    putLe16(words, 0);                         // TotalParameterCount
     putLe16(words, quint16(info.size()));      // TotalDataCount
     putLe16(words, 0);                         // Reserved
-    putLe16(words, quint16(params.size()));    // ParameterCount
-    putLe16(words, 56);                        // ParameterOffset
+    putLe16(words, 0);                         // ParameterCount
+    putLe16(words, 0);                         // ParameterOffset
     putLe16(words, 0);                         // ParameterDisplacement
     putLe16(words, quint16(info.size()));      // DataCount
-    putLe16(words, quint16(56 + params.size())); // DataOffset
+    putLe16(words, 56);                        // DataOffset
     putLe16(words, 0);                         // DataDisplacement
     words.append(char(0));                     // SetupCount
     words.append(char(0));                     // Reserved2
-    QByteArray data(1, '\0'); // pad so parameters start at offset 56
-    data.append(params);
+    QByteArray data(1, '\0'); // one pad byte so the record starts on an even offset
     data.append(info);
     return reply(message, kStatusSuccess, words, data);
 }

@@ -1195,6 +1195,15 @@ void Smb1Test::answersTheFilesystemRecordsAShareIsEnumeratedWith()
     QCOMPARE(readLe32(info, 4), quint32(255));        // MaxFileNameLength
     QCOMPARE(readLe32(info, 8), quint32(8));          // name length, in bytes
     QCOMPARE(decodeUtf16(info.mid(12, 8)), QStringLiteral("NTFS"));
+    // The record is the whole answer: this subcommand has no parameter block,
+    // and a redirector that found two bytes of one answered the listing with
+    // ERROR_BAD_NET_RESP instead of reading the record.
+    QCOMPARE(readLe16(attribute, 33), quint16(0));       // TotalParameterCount
+    QCOMPARE(readLe16(attribute, 39), quint16(0));       // ParameterCount
+    QCOMPARE(readLe16(attribute, 41), quint16(0));       // ParameterOffset
+    QCOMPARE(readLe16(attribute, 53), quint16(info.size() + 1)); // ByteCount, pad included
+    QCOMPARE(readLe16(attribute, 47), quint16(56));      // DataOffset
+    QCOMPARE(attribute.mid(56, int(readLe16(attribute, 45))), info);
 
     // The size record is what a listing prints free space from, and the device
     // record is what tells the redirector it is talking to a disk share.
