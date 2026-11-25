@@ -1892,7 +1892,12 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
         reader.u16(&infoClass);
         Handle user;
         if (!lookupHandle(handle, Handle::User, &user)) {
-            fixed.append(char(0));
+            // The arm is `[out,ref,switch_is(level)] samr_UserInfo **info`: the
+            // inner pointer is a unique pointer, so a refusal sends a
+            // four-byte null referent before the status, never a single zero
+            // octet. A one-octet marker puts the status where the client reads
+            // a pointer and the call fails to unmarshal at all.
+            putLe32(fixed, 0); // NULL user-information pointer
             putLe32(fixed, kStatusInvalidHandle);
             return fixed;
         }
@@ -2329,11 +2334,14 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
                                          .arg(user.dn));
                 return fixed;
             }
-            fixed.append(char(0));
+            emit requestReceived(QStringLiteral("QueryInformationUser2(class %1) refused: "
+                                                "no arm for that class")
+                                     .arg(infoClass));
+            putLe32(fixed, 0); // NULL user-information pointer
             putLe32(fixed, 0xc0000003u); // STATUS_INVALID_INFO_CLASS
             return fixed;
         }
-        fixed.append(char(0));
+        putLe32(fixed, 0); // NULL user-information pointer
         putLe32(fixed, kStatusNoSuchUser);
         return fixed;
     }

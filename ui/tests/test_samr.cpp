@@ -971,6 +971,34 @@ void SamrTest::samrDirectoryCalls()
     QCOMPARE(parametersReply.size(), 20);
     QCOMPARE(parametersReply.mid(8, 8), QByteArray(8, '\0'));
 
+    // A class with no arm (18 is the NT one-way function, which this endpoint
+    // does not serve) is refused with STATUS_INVALID_INFO_CLASS, and the
+    // refusal is the same shape a success has in front of its arm: the reply is
+    // `[out,ref,switch_is(level)] samr_UserInfo **info`, so the inner unique
+    // pointer is four octets and a refusal sends a null one. A single zero octet
+    // there put the status inside the pointer's own four octets, so a client
+    // read a non-null pointer with no referent behind it and the call failed to
+    // unmarshal — which is what a Windows client reported as a name it could not
+    // read, not as an unsupported class.
+    QByteArray unsupportedRequest = userHandle;
+    unsupportedRequest.append(char(18));
+    unsupportedRequest.append(QByteArray(2, '\0'));
+    const QByteArray unsupportedReply =
+        server.handleCall(Samr::OpQueryInformationUser2, unsupportedRequest);
+    QCOMPARE(unsupportedReply, QByteArray::fromHex("00000000030000c0"));
+    // The pre-revision form (opnum 36) takes the same arguments and answers the
+    // same bytes, which is what a Windows 2000 client calls when it reads an
+    // account at the older information levels.
+    QByteArray oldFormRequest = userHandle;
+    oldFormRequest.append(char(21));
+    oldFormRequest.append(QByteArray(2, '\0'));
+    QCOMPARE(server.handleCall(Samr::OpQueryInformationUser, oldFormRequest), allReply);
+    QByteArray oldFormUnsupported = userHandle;
+    oldFormUnsupported.append(char(18));
+    oldFormUnsupported.append(QByteArray(2, '\0'));
+    QCOMPARE(server.handleCall(Samr::OpQueryInformationUser, oldFormUnsupported),
+             QByteArray::fromHex("00000000030000c0"));
+
     // Class 1: five counted strings around the primary group, which falls back
     // to Domain Users for an account that names none.
     QByteArray generalRequest = userHandle;
