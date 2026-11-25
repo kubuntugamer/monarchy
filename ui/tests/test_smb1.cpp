@@ -1064,11 +1064,11 @@ void Smb1Test::acceptsTheKerberosTicketAWindows2000MemberOffers()
     // server that used the first 16 answered ACCESS_DENIED to this very message
     // ("smb1_signing_good: BAD SIG: seq 1") whenever the ticket was AES-256.
     const QByteArray signedRequest = signedMessage(
-        treeConnectMessage(QStringLiteral("\\\\dc1\\IPC$")), contextKey, 1);
+        treeConnectMessage(QStringLiteral("\\\\dc1\\IPC$")), contextKey, 2);
     const QByteArray treeReply = session.feed(signedRequest);
     QCOMPARE(statusOf(treeReply), quint32(0));
-    QVERIFY(signatureMatches(treeReply, contextKey, 2));
-    QVERIFY(!signatureMatches(treeReply, contextKey.left(16), 2));
+    QVERIFY(signatureMatches(treeReply, contextKey, 3));
+    QVERIFY(!signatureMatches(treeReply, contextKey.left(16), 3));
 }
 
 // Windows 2000 sets a named pipe's handle state on the handle it has already
@@ -1341,13 +1341,16 @@ void Smb1Test::signsAPreExtendedSecuritySessionTheWayTheClientKeysIt()
     QCOMPARE(readLe16(payloadOf(reply), 10) & 0x0004, quint16(0));
     QCOMPARE(payloadOf(reply).mid(14, 8), QByteArray(8, '\0'));
 
-    // One sequence numbers both directions, and the client's first signed
-    // message is its tree connect: seq 1, answered by seq 2.
+    // One sequence numbers both directions, and the setup exchange consumes
+    // the first two numbers even though its answer carries no MAC, so the
+    // client's first signed message is its tree connect at seq 2, answered by
+    // seq 3. Windows 2000 counted it that way; numbering the answer as if it
+    // had not happened put this side one behind.
     const QByteArray treeReply = session.feed(signedMessage(
-        treeConnectMessage(QStringLiteral("\\\\dc1\\SYSVOL")), macKey, 1));
+        treeConnectMessage(QStringLiteral("\\\\dc1\\SYSVOL")), macKey, 2));
     QCOMPARE(statusOf(treeReply), quint32(0));
-    QVERIFY2(signatureMatches(treeReply, macKey, 2), "the reply to seq 1 is not seq 2");
-    QVERIFY2(!signatureMatches(treeReply, baseKey, 2),
+    QVERIFY2(signatureMatches(treeReply, macKey, 3), "the reply to seq 2 is not seq 3");
+    QVERIFY2(!signatureMatches(treeReply, baseKey, 3),
              "the reply was signed with the bare session base key");
 }
 
@@ -1390,17 +1393,19 @@ void Smb1Test::signsAndVerifiesASignedSession()
     QCOMPARE(readLe16(payloadOf(acceptReply), 10) & 0x0004, quint16(0));
     QCOMPARE(payloadOf(acceptReply).mid(14, 8), QByteArray(8, '\0'));
 
-    // One sequence numbers both directions, and the client's first signed
-    // message is its tree connect: seq 1, answered by seq 2.
+    // One sequence numbers both directions. The setup exchange consumes 0 and
+    // 1 — the answer is unsigned, but it still occupies its number — so the
+    // client's first signed message is its tree connect at seq 2, answered by
+    // seq 3.
     const QByteArray treeReply = session.feed(signedMessage(
-        treeConnectMessage(QStringLiteral("\\\\dc1\\SYSVOL")), key, 1));
+        treeConnectMessage(QStringLiteral("\\\\dc1\\SYSVOL")), key, 2));
     QCOMPARE(statusOf(treeReply), quint32(0));
-    QVERIFY2(signatureMatches(treeReply, key, 2), "the reply to seq 1 is not seq 2");
+    QVERIFY2(signatureMatches(treeReply, key, 3), "the reply to seq 2 is not seq 3");
 
     // A signature that does not cover the message is refused before dispatch, so
     // a signed request cannot be altered in flight and still be executed.
     QByteArray forged = signedMessage(
-        treeConnectMessage(QStringLiteral("\\\\dc1\\SYSVOL")), key, 3);
+        treeConnectMessage(QStringLiteral("\\\\dc1\\SYSVOL")), key, 4);
     forged[24] = char(0x77); // a TID the signature above never covered
     QCOMPARE(statusOf(session.feed(forged)), Smb1::kStatusAccessDenied);
 
@@ -1409,7 +1414,7 @@ void Smb1Test::signsAndVerifiesASignedSession()
     const QByteArray afterForgery =
         session.feed(treeConnectMessage(QStringLiteral("\\\\dc1\\SYSVOL")));
     QCOMPARE(statusOf(afterForgery), quint32(0));
-    QVERIFY(signatureMatches(afterForgery, key, 4));
+    QVERIFY(signatureMatches(afterForgery, key, 5));
 
     // A session that never signalled intent — Windows 2000 with no signing
     // policy — is served too, and its replies claim no signature.

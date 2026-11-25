@@ -233,7 +233,12 @@ QByteArray Session::reply(const QByteArray &request, quint32 status, const QByte
     // The key, the identity and the counter belong to the session the request
     // names, not to the connection: a Windows 2000 member signs its machine
     // channel and its user session with two different keys over one socket.
-    SessionState *session = sessionState(readLe16(request, 28));
+    // A reply that opens a session names it with the UID argument, so the
+    // session whose key and number this answer spends is that one: the request
+    // carried no session of its own (UID 0), and looking only at the request
+    // found none and numbered nothing.
+    const quint16 replyUid = uid >= 0 ? quint16(uid) : readLe16(request, 28);
+    SessionState *session = sessionState(replyUid);
     const bool signedReply = sign && m_signingActive && session
                              && session->authenticated && !session->key.isEmpty();
     putLe16(out, quint16((readLe16(request, 10) & ~0x0004) | (signedReply ? 0x0004 : 0)));
@@ -242,7 +247,7 @@ QByteArray Session::reply(const QByteArray &request, quint32 status, const QByte
     putLe16(out, 0);  // reserved
     putLe16(out, tid >= 0 ? quint16(tid) : readLe16(request, 24)); // TID
     putLe16(out, readLe16(request, 26)); // PID
-    putLe16(out, uid >= 0 ? quint16(uid) : readLe16(request, 28)); // UID
+    putLe16(out, replyUid); // UID
     putLe16(out, readLe16(request, 30)); // MID
     out.append(char(words.size() / 2));
     out.append(words);
@@ -263,6 +268,17 @@ QByteArray Session::reply(const QByteArray &request, quint32 status, const QByte
         macInput.append(out);
         const QByteArray digest = QCryptographicHash::hash(macInput, QCryptographicHash::Md5);
         out.replace(14, 8, digest.left(8));
+    } else if (session && session->authenticated && !session->key.isEmpty()) {
+        // A message without a MAC still occupies its number. The session setup
+        // answer hands out the key and is deliberately sent unsigned, but the
+        // setup exchange is numbered all the same — the request took the number
+        // before it and this answer takes the next one — so the client's first
+        // post-setup message is 2. Skipping this bump left the two sides one
+        // apart, and a Windows 2000 member's tree connect was refused for a
+        // signature computed over the number this side had not reached
+        // (Samba's server lands in the same place: smb1_signing_activate sets
+        // its counter to 2).
+        ++session->signingSeq;
     }
     return nbtFrame(out);
 }

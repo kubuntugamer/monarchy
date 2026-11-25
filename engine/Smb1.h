@@ -170,10 +170,13 @@ private:
         QString user;
         QByteArray challenge;
         QByteArray key;
-        // One counter for both directions: MS-CIFS numbers each signed message
-        // in one sequence, so the reply to a request carries the number after
-        // it. Measured against Samba's client, which signed its tree connect as
-        // seq 1 and expected our reply as seq 2.
+        // One counter for both directions: MS-CIFS numbers each message in one
+        // sequence, so the reply to a request carries the number after it. The
+        // setup exchange takes the first two numbers, the request one before
+        // this session existed and the answer one this side still spends even
+        // when it carries no MAC, which leaves a freshly set-up session at 2 —
+        // where Samba's server puts its own counter (smb1_signing_activate) and
+        // where a Windows 2000 member signed its first tree connect.
         quint32 signingSeq = 1;
     };
     SessionState *sessionState(quint16 uid);
