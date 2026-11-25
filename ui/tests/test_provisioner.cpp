@@ -157,6 +157,11 @@ void ProvisionerTest::buildsDomainFromScratch()
     QVERIFY(spns.contains(QStringLiteral("HOST/testdc1.test.example.org")));
     QVERIFY(spns.contains(QStringLiteral("GC/testdc1.test.example.org")));
     QVERIFY(spns.contains(QStringLiteral("cifs/testdc1.test.example.org")));
+    // A client that opens \\\\testdc1\\share names the bare host in its TGS-REQ.
+    // With only the qualified form here the KDC answers S_PRINCIPAL_UNKNOWN and
+    // that connection falls back to NTLM.
+    QVERIFY(spns.contains(QStringLiteral("cifs/testdc1")));
+    QVERIFY(spns.contains(QStringLiteral("GC/testdc1")));
 
     // A ready-to-use client configuration points at this DC's KDC port.
     QVERIFY(QFile::exists(result.krb5ConfPath));

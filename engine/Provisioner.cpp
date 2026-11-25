@@ -596,9 +596,13 @@ ProvisionResult provisionDomain(const ProvisionConfig &config)
     // member's own dynamic update cannot start.
     dc.attributes.insert(
         QStringLiteral("servicePrincipalName"),
+        // The bare host name carries its own tickets: a Windows client that
+        // opens \\\\<name>\\share asks for cifs/<name>, not cifs/<name>.<domain>,
+        // and a KDC that only knows the FQDN answers S_PRINCIPAL_UNKNOWN and
+        // leaves that connection on NTLM. AD registers both forms.
         QStringLiteral("ldap/%1; ldap/%1.%2; ldap/%1.%2/%2; HOST/%1; HOST/%1.%2; "
-                       "GC/%1.%2; cifs/%1.%2; DNS/%1.%2; DNS/ns1.%2; RestrictedKrbHost/%1; "
-                       "RestrictedKrbHost/%1.%2")
+                       "GC/%1; GC/%1.%2; cifs/%1; cifs/%1.%2; DNS/%1.%2; DNS/ns1.%2; "
+                       "RestrictedKrbHost/%1; RestrictedKrbHost/%1.%2")
             .arg(b.dcName.toLower(), b.dnsDomain));
 
     // The DC belongs to Domain Controllers. `member` holds distinguished names
