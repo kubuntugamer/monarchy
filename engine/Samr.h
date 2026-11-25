@@ -90,6 +90,10 @@ enum Opnum : quint16 {
     // as samr_PwInfo { uint16 min_password_length; uint32 password_properties; }.
     // A Windows 2000 join asks for it after creating its machine account.
     OpGetUserPwInfo = 44,
+    // SamrRemoveMemberFromForeignDomain (45): one member named by SID, taken out
+    // of every group in the domain. A Windows 2000 client issues it before
+    // SamrDeleteUser.
+    OpRemoveMemberFromForeignDomain = 45,
     OpDeleteUser = 35,
     // SamrQueryInformationUser (36) is the pre-revision form of the (2) call:
     // same [in] handle + [in] class, same [out] Buffer union + NTSTATUS.

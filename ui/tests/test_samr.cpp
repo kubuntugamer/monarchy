@@ -1365,6 +1365,35 @@ void SamrTest::samrWritesAccountsAndGroups()
     QCOMPARE(readLe32At(members, 4), 1u);          // MemberCount
     QCOMPARE(readLe32At(members, 20), 1001u);      // the member's RID
 
+    // SamrRemoveMemberFromForeignDomain names the member by SID and takes it out
+    // of every group in the domain. A Windows 2000 client calls it on the way to
+    // deleting an account — `net user TMPCD$ /delete /domain` issues it and only
+    // then SamrDeleteUser — and with no arm this was answered NOT_SUPPORTED, so
+    // the client closed the connection and printed "System error 50" without
+    // ever asking for the delete.
+    QByteArray removeForeign = domainHandle;
+    appendLe32(removeForeign, 5); // sub-authority count, as a conformant array length
+    removeForeign.append(QByteArray::fromHex("0105000000000005"));
+    for (quint32 sub : {21u, 1u, 2u, 3u, 1001u})
+        appendLe32(removeForeign, sub);
+    QCOMPARE(lastWord(server.handleCall(Samr::OpRemoveMemberFromForeignDomain,
+                                        removeForeign)),
+             0u);
+    QCOMPARE(readLe32At(server.handleCall(Samr::OpGetMembersInGroup, groupHandle), 4), 0u);
+    // A SID no object carries has nothing to take away and is not an error the
+    // client's delete path can act on.
+    QByteArray unknownMember = domainHandle;
+    appendLe32(unknownMember, 5);
+    unknownMember.append(QByteArray::fromHex("0105000000000005"));
+    for (quint32 sub : {21u, 1u, 2u, 3u, 4242u})
+        appendLe32(unknownMember, sub);
+    QCOMPARE(lastWord(server.handleCall(Samr::OpRemoveMemberFromForeignDomain,
+                                       unknownMember)),
+             0u);
+    // The membership is put back so the rest of this test measures what it did
+    // before.
+    QCOMPARE(lastWord(server.handleCall(Samr::OpAddMemberToGroup, addMember)), 0u);
+
     // An alias is a domain-local group: the same object kind, told apart by
     // groupType, and it takes its members as SIDs rather than RIDs.
     const QByteArray aliasReply = server.handleCall(Samr::OpCreateAliasInDomain,

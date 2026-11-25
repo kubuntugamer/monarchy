@@ -1592,6 +1592,77 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
         emit requestReceived(QStringLiteral("EnumerateUsers (%1)").arg(page.size()));
         return fixed;
     }
+    // SamrRemoveMemberFromForeignDomain (opnum 45): a member named by SID,
+    // removed from every group in the domain. A Windows 2000 client calls this
+    // on the way to deleting an account — `net user TMPCD$ /delete /domain`
+    // issues it and only then SamrDeleteUser — and with no arm here the call was
+    // answered NOT_SUPPORTED, so the client closed the connection and printed
+    // "System error 50" without ever asking for the delete.
+    case Samr::OpRemoveMemberFromForeignDomain: {
+        QByteArray handle;
+        if (!reader.bytes(kHandleSize, &handle))
+            return {};
+        QByteArray memberSid;
+        if (!readWireSid(reader, &memberSid))
+            return {};
+        Handle domain;
+        if (!lookupHandle(handle, Handle::Domain, &domain)) {
+            putLe32(fixed, kStatusInvalidHandle);
+            return fixed;
+        }
+        // The member is named only by SID, so its object is found by relative id
+        // inside this domain. A SID no object carries has no memberships to
+        // take away, which is the answer the client's delete path acts on: it
+        // proceeds to the delete.
+        const QByteArray domainSid = Ndr::sidFromString(
+            domain.dn == kBuiltinDomainSid ? kBuiltinDomainSid : m_config.domainSid);
+        quint32 rid = 0;
+        if (memberSid.size() >= 12 && domainSid.size() >= 12
+            && memberSid.size() > domainSid.size()
+            && memberSid.mid(2, 6) == domainSid.mid(2, 6)
+            && memberSid.mid(8, domainSid.size() - 12)
+                   == domainSid.mid(8, domainSid.size() - 12)) {
+            rid = quint32(quint8(memberSid.at(memberSid.size() - 4)))
+                  | (quint32(quint8(memberSid.at(memberSid.size() - 3))) << 8)
+                  | (quint32(quint8(memberSid.at(memberSid.size() - 2))) << 16)
+                  | (quint32(quint8(memberSid.at(memberSid.size() - 1))) << 24);
+        }
+        QString memberDn;
+        const QList<DirectoryObject> all = directory();
+        for (const DirectoryObject &object : all) {
+            if (object.id.isEmpty() || rid == 0 || ridOf(object) != rid)
+                continue;
+            memberDn = object.id;
+            break;
+        }
+        int removed = 0;
+        QString error;
+        for (const DirectoryObject &group : all) {
+            if (!memberDn.isEmpty() && group.kind == ObjectKind::Group && !group.id.isEmpty()) {
+                bool member = false;
+                for (const QString &candidate : group.members) {
+                    if (candidate.compare(memberDn, Qt::CaseInsensitive) == 0)
+                        member = true;
+                }
+                if (!member)
+                    continue;
+                if (!m_writes.removeMember
+                    || !m_writes.removeMember(group.id, memberDn, &error)) {
+                    putLe32(fixed, kStatusNotSupported);
+                    emit requestReceived(QStringLiteral(
+                        "RemoveMemberFromForeignDomain %1: no store").arg(memberDn));
+                    return fixed;
+                }
+                ++removed;
+            }
+        }
+        putLe32(fixed, kStatusSuccess);
+        emit requestReceived(QStringLiteral("RemoveMemberFromForeignDomain %1 (%2 groups)")
+                                 .arg(memberDn.isEmpty() ? QStringLiteral("unknown SID")
+                                                        : memberDn)
+                                 .arg(removed));
+        return fixed;
+    }
     // SamrEnumerateGroupsInDomain (opnum 11): the same enumeration buffer as the
     // user call, over the groups the store holds.
     case Samr::OpEnumerateGroupsInDomain: {
