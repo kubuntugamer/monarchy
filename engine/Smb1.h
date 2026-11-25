@@ -124,6 +124,10 @@ private:
     // listing needs. MS-CIFS 2.2.6.3.
     QByteArray find(const QByteArray &message, quint16 subcommand,
                     const QByteArray &parameters, const QString &shareRoot);
+    // QUERY_FS_INFORMATION: the volume, size, device and attribute records a
+    // redirector reads about the share before it will enumerate it.
+    QByteArray fileSystemInfo(const QByteArray &message, const QByteArray &parameters,
+                              const QString &shareName);
     QByteArray unsupportedReply(const QByteArray &message);
     // Which rule refused a logon: the domain's LmCompatibilityLevel refusing an
     // NTLMv1 answer is a configuration fact, while the same status from a level

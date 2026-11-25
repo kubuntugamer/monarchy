@@ -1226,6 +1226,14 @@ QByteArray Session::trans2(const QByteArray &message)
     if (subcommand == 0x0001 || subcommand == 0x0002 || subcommand == 0x0004)
         return find(message, subcommand, parameters, shareRoot);
 
+    // QUERY_FS_INFORMATION asks what the share is, not what is in it. A Windows
+    // 2000 redirector reads the filesystem attributes (0x0105) before it will
+    // enumerate a share, and with no arm for this subcommand every `dir` on an
+    // existing share answered "the network request is not supported" six
+    // milliseconds after a successful tree connect.
+    if (subcommand == 0x0003)
+        return fileSystemInfo(message, parameters, shareName);
+
     // QUERY_PATH_INFORMATION names the file; QUERY_FILE_INFORMATION names the
     // handle the client already has, which is what a 2000 client asks for
     // before reading a file it just created.
@@ -1335,6 +1343,85 @@ QByteArray Session::trans2(const QByteArray &message)
     QByteArray data(1, '\0'); // pad so parameters start at offset 56
     data.append(params);
     data.append(infoBytes);
+    return reply(message, kStatusSuccess, words, data);
+}
+
+QByteArray Session::fileSystemInfo(const QByteArray &message, const QByteArray &parameters,
+                                  const QString &shareName)
+{
+    const quint16 level = readLe16(parameters, 0);
+    const auto utf16 = [](const QString &text) {
+        QByteArray bytes;
+        for (QChar ch : text) {
+            bytes.append(char(ch.unicode() & 0xff));
+            bytes.append(char((ch.unicode() >> 8) & 0xff));
+        }
+        return bytes;
+    };
+
+    QByteArray info;
+    switch (level) {
+    case 0x0102: { // SMB_QUERY_FS_VOLUME_INFO
+        const QByteArray label = utf16(shareName.toUpper());
+        putLe32(info, 0);                              // VolumeCreationTime, low
+        putLe32(info, 0);                              // VolumeCreationTime, high
+        putLe32(info, 0);                              // VolumeSerialNumber
+        putLe32(info, quint32(label.size()));          // VolumeLabelSize, in bytes
+        putLe16(info, 0);                              // Reserved
+        info.append(label);
+        break;
+    }
+    case 0x0103: { // SMB_QUERY_FS_SIZE_INFO
+        // Allocation units rather than a measurement: the share's own free
+        // space is not the host's, and these are the numbers a client needs to
+        // print its line and continue.
+        const quint64 totalUnits = 0x00400000ull; // 16 GiB at 4096-byte units
+        const quint64 freeUnits = 0x00200000ull;
+        putLe32(info, quint32(totalUnits & 0xffffffffu));
+        putLe32(info, quint32(totalUnits >> 32));
+        putLe32(info, quint32(freeUnits & 0xffffffffu));
+        putLe32(info, quint32(freeUnits >> 32));
+        putLe32(info, 1);    // SectorsPerAllocationUnit
+        putLe32(info, 4096); // BytesPerSector
+        break;
+    }
+    case 0x0104: // SMB_QUERY_FS_DEVICE_INFO
+        putLe32(info, 0x00000007u); // FILE_DEVICE_DISK
+        putLe32(info, 0);           // Characteristics
+        break;
+    case 0x0105: { // SMB_QUERY_FS_ATTRIBUTE_INFO
+        // Case is preserved on disk and names are stored as UTF-16, which is
+        // what this share actually does; the filesystem name is the one Samba
+        // reports for a filesystem it did not name itself, so a redirector
+        // takes the same paths here as against it.
+        const QByteArray name = utf16(QStringLiteral("NTFS"));
+        putLe32(info, 0x00000006u); // FILE_CASE_PRESERVED_NAMES | FILE_UNICODE_ON_DISK
+        putLe32(info, 255);         // MaxFileNameLength, in bytes
+        putLe32(info, quint32(name.size()));
+        info.append(name);
+        break;
+    }
+    default:
+        return reply(message, kStatusNotSupported, QByteArray(), QByteArray());
+    }
+
+    QByteArray params;
+    putLe16(params, 0); // EAErrorOffset
+    QByteArray words;
+    putLe16(words, quint16(params.size()));    // TotalParameterCount
+    putLe16(words, quint16(info.size()));      // TotalDataCount
+    putLe16(words, 0);                         // Reserved
+    putLe16(words, quint16(params.size()));    // ParameterCount
+    putLe16(words, 56);                        // ParameterOffset
+    putLe16(words, 0);                         // ParameterDisplacement
+    putLe16(words, quint16(info.size()));      // DataCount
+    putLe16(words, quint16(56 + params.size())); // DataOffset
+    putLe16(words, 0);                         // DataDisplacement
+    words.append(char(0));                     // SetupCount
+    words.append(char(0));                     // Reserved2
+    QByteArray data(1, '\0'); // pad so parameters start at offset 56
+    data.append(params);
+    data.append(info);
     return reply(message, kStatusSuccess, words, data);
 }
 

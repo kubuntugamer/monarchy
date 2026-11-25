@@ -269,6 +269,23 @@ QByteArray queryFileMessage(quint16 tid, quint16 fid, quint16 level)
     return smb(Smb1::CmdTrans2, tid, g_uid, words, data);
 }
 
+QByteArray queryFileSystemMessage(quint16 tid, quint16 level)
+{
+    QByteArray parameters;
+    putLe16(parameters, level);
+    QByteArray words(28, '\0');
+    words[26] = char(1); // SetupCount
+    words[18] = char(parameters.size() & 0xff);
+    words[19] = char((parameters.size() >> 8) & 0xff);
+    const quint16 parameterOffset = quint16(32 + 1 + 30 + 2 + 1);
+    words[20] = char(parameterOffset & 0xff);
+    words[21] = char((parameterOffset >> 8) & 0xff);
+    putLe16(words, 0x0003); // QUERY_FS_INFORMATION
+    QByteArray data(1, '\0');
+    data.append(parameters);
+    return smb(Smb1::CmdTrans2, tid, g_uid, words, data);
+}
+
 QString decodeUtf16(const QByteArray &bytes)
 {
     QString out;
@@ -502,6 +519,7 @@ class Smb1Test : public QObject
 private slots:
     void readsAPolicyFileFromSysvol();
     void opensATerminatedNameAndReportsAttributes();
+    void answersTheFilesystemRecordsAShareIsEnumeratedWith();
     void listsADirectoryOverFindFirst2();
     void refusesAnAnonymousTreeConnect();
     void acceptsTheNullSessionAWindows2000LogonStartsWith();
@@ -1155,6 +1173,51 @@ void Smb1Test::setsTheStateOfAnOpenPipe()
 // NETLOGON answers NO_SUCH_FILE, which is what Windows answers rather than an
 // empty success. The chain bytes matter as much as the names: the client walks
 // NextEntryOffset and reads the name at the offset its information level fixes.
+void Smb1Test::answersTheFilesystemRecordsAShareIsEnumeratedWith()
+{
+    QScopedPointer<Smb1::Session> session(authenticatedSession());
+    QVERIFY(session);
+    const quint16 tid = connectShare(session.data(), QStringLiteral("SYSVOL"));
+    QVERIFY(tid != 0);
+
+    // A Windows 2000 redirector asks for SMB_QUERY_FS_ATTRIBUTE_INFO before it
+    // will enumerate a share. With no arm for this subcommand the answer was
+    // NOT_SUPPORTED, and every `dir` on an existing share printed "the network
+    // request is not supported" six milliseconds after a tree connect that had
+    // succeeded.
+    const QByteArray attributeReply =
+        session->feed(queryFileSystemMessage(tid, 0x0105));
+    QCOMPARE(statusOf(attributeReply), quint32(0));
+    const QByteArray attribute = payloadOf(attributeReply);
+    const QByteArray info = attribute.mid(readLe16(attribute, 33 + 14),
+                                         readLe16(attribute, 33 + 12));
+    QCOMPARE(readLe32(info, 0), quint32(0x00000006)); // case preserved | unicode
+    QCOMPARE(readLe32(info, 4), quint32(255));        // MaxFileNameLength
+    QCOMPARE(readLe32(info, 8), quint32(8));          // name length, in bytes
+    QCOMPARE(decodeUtf16(info.mid(12, 8)), QStringLiteral("NTFS"));
+
+    // The size record is what a listing prints free space from, and the device
+    // record is what tells the redirector it is talking to a disk share.
+    const QByteArray sizeReply = session->feed(queryFileSystemMessage(tid, 0x0103));
+    QCOMPARE(statusOf(sizeReply), quint32(0));
+    const QByteArray size = payloadOf(sizeReply);
+    const QByteArray sizeInfo = size.mid(readLe16(size, 33 + 14), readLe16(size, 33 + 12));
+    QCOMPARE(sizeInfo.size(), 24);
+    QCOMPARE(readLe32(sizeInfo, 16), quint32(1));    // SectorsPerAllocationUnit
+    QCOMPARE(readLe32(sizeInfo, 20), quint32(4096)); // BytesPerSector
+
+    const QByteArray deviceReply = session->feed(queryFileSystemMessage(tid, 0x0104));
+    QCOMPARE(statusOf(deviceReply), quint32(0));
+    const QByteArray device = payloadOf(deviceReply);
+    const QByteArray deviceInfo = device.mid(readLe16(device, 33 + 14),
+                                             readLe16(device, 33 + 12));
+    QCOMPARE(readLe32(deviceInfo, 0), quint32(0x00000007)); // FILE_DEVICE_DISK
+
+    // A level this server does not answer is refused, not answered empty.
+    QCOMPARE(statusOf(session->feed(queryFileSystemMessage(tid, 0x0106))),
+             Smb1::kStatusNotSupported);
+}
+
 void Smb1Test::listsADirectoryOverFindFirst2()
 {
     QDir root(m_root.path());
