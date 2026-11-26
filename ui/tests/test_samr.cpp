@@ -698,6 +698,10 @@ void SamrTest::samrServesTheDomainPasswordPolicy()
     request.append(char(0));
     const QByteArray reply = server.handleCall(Samr::OpQueryInformationDomain, request);
     QCOMPARE(lastWord(reply), 0u);
+    // The union is behind a pointer: the referent names the tag word at offset
+    // 4, and the arm begins at 8 behind the tag and its alignment pad.
+    QCOMPARE(readLe32At(reply, 0), 4u);
+    QCOMPARE(reply.mid(4, 2), QByteArray::fromHex("0100")); // tag: DomainPasswordInformation
     QByteArray expected;
     expected.append(char(12));
     expected.append(char(0));

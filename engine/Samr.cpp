@@ -1278,7 +1278,11 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
             return fixed;
         }
         auto beginArm = [&fixed](quint16 tag) {
-            putLe32(fixed, 0x0002e400u + tag); // union referent
+            // The pointer names the union, and a union begins with its
+            // discriminant: MS-RPCE 2.2.10.6 makes the referent the offset of
+            // the pointee from the start of the stub, so it is 4 here — the tag
+            // is at 4, two alignment bytes follow it, and the arm starts at 8.
+            putLe32(fixed, 4);
             fixed.append(char(tag & 0xff));
             fixed.append(char((tag >> 8) & 0xff));
             fixed.append(char(0));
