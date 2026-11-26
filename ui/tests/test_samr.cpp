@@ -868,7 +868,10 @@ void SamrTest::samrDirectoryCalls()
     const QByteArray pwInfo = server.handleCall(Samr::OpGetUserPwInfo, userHandle);
     QCOMPARE(pwInfo.size(), 16);
     QCOMPARE(lastWord(pwInfo), 0u);
-    QVERIFY(pwInfo.left(4) != QByteArray(4, '\0'));
+    // The pointer names the offset of its own data, which is the word behind it.
+    // A client resolves it as stub + referent, so a unique-but-wrong value here
+    // sends it outside a 16-byte reply and the call fails to unmarshal.
+    QCOMPARE(readLe32At(pwInfo, 0), 4u);
     QCOMPARE(quint8(pwInfo.at(4)), quint8(7));  // minPwdLength
     QCOMPARE(quint8(pwInfo.at(5)), quint8(0));
     QCOMPARE(pwInfo.mid(8, 4), QByteArray::fromHex("01000000")); // pwdProperties
@@ -879,6 +882,7 @@ void SamrTest::samrDirectoryCalls()
     const QByteArray nameReply =
         server.handleCall(Samr::OpQueryInformationUser2, nameRequest);
     QCOMPARE(lastWord(nameReply), 0u);
+    QCOMPARE(readLe32At(nameReply, 0), 4u); // union at the tag that follows it
     QCOMPARE(quint8(nameReply.at(4)), quint8(6)); // tag: SamrUserInformationName
     const QString nameText = utf16Text(nameReply);
     QVERIFY(nameText.contains(QStringLiteral("alice")));
@@ -893,6 +897,7 @@ void SamrTest::samrDirectoryCalls()
     const QByteArray allReply =
         server.handleCall(Samr::OpQueryInformationUser2, allRequest);
     QCOMPARE(lastWord(allReply), 0u);
+    QCOMPARE(readLe32At(allReply, 0), 4u); // union at the tag that follows it
     QCOMPARE(quint8(allReply.at(4)), quint8(21)); // tag: SamrUserAllInformation
     QVERIFY(utf16Text(allReply).contains(QStringLiteral("alice")));
     QVERIFY(allReply.contains(QByteArray::fromHex("e9030000"))); // RID 1001
@@ -909,6 +914,10 @@ void SamrTest::samrDirectoryCalls()
     hours.append(QByteArray::fromHex("15000000")); // 21
     hours.append(QByteArray(21, char(0xff)));
     QVERIFY(allReply.contains(hours));
+    // And the pointer to that week is where the week is: every pointer in the
+    // aggregate named a made-up value (0x0002e1f0 was 188912 in a 470-byte
+    // reply), which a 2000 client answered with 124 without reading the record.
+    QCOMPARE(readLe32At(allReply, 8 + 180), quint32(allReply.indexOf(hours)));
 
     // The per-field records a property sheet reads before it opens the
     // aggregate, and the ones `rpcclient queryuser` asks for by number: the
@@ -1068,10 +1077,14 @@ void SamrTest::samrDirectoryCalls()
     pos = 0;
     QVERIFY(readIdArray(partial, &pos, &rids));
     QCOMPARE(rids, (QList<quint32>{1001, 0}));
-    QCOMPARE(lastWord(server.handleCall(
-                 Samr::OpLookupNamesInDomain,
-                 lookupNamesStub(domainHandle, {QStringLiteral("nosuch")}))),
-             0xc0000073u); // STATUS_NONE_MAPPED
+    // Nothing mapped means no array at all: an answer with one element of RID 0
+    // reads as a mapped name with no account, and a 2000 client replied to that
+    // with 124 instead of "not found".
+    const QByteArray noneMapped = server.handleCall(
+        Samr::OpLookupNamesInDomain, lookupNamesStub(domainHandle, {QStringLiteral("nosuch")}));
+    QCOMPARE(lastWord(noneMapped), 0xc0000073u); // STATUS_NONE_MAPPED
+    QCOMPARE(noneMapped.left(16), QByteArray(16, '\0'));
+    QCOMPARE(noneMapped.size(), 20);
 
     // LookupIdsInDomain is the inverse mapping, RIDs to account names.
     const QByteArray idsReply = server.handleCall(

@@ -451,21 +451,61 @@ QByteArray logonHoursForWire(const QByteArray &stored)
 }
 
 // An RPC_UNICODE_STRING as it appears inside a structure: Length,
-// MaximumLength and a referent, with the characters deferred. An empty string
-// is the NULL pointer AD sends for an attribute that is not set.
+// MaximumLength and a pointer to characters written after the structure. An
+// empty string is the NULL pointer AD sends for an attribute that is not set.
+// The pointer's value is not known until the characters have been placed, so it
+// is recorded here as {stub position, offset within the character blob} and
+// filled in by appendArmWithStrings.
 void appendCountedString(QByteArray &out, QByteArray &deferred, const QString &text,
-                         quint32 referent)
+                         QList<QPair<int, int>> &strings)
 {
     const bool present = !text.isEmpty();
     const QByteArray utf16 = Ndr::utf16le(text);
     putLe16(out, quint16(utf16.size()));
     putLe16(out, quint16(utf16.size()));
-    putLe32(out, present ? referent : 0u);
-    if (present)
-        appendVaryingString(deferred, text);
+    if (!present) {
+        putLe32(out, 0);
+        return;
+    }
+    strings.append(qMakePair(int(out.size()), int(deferred.size())));
+    putLe32(out, 0); // patched once the blob is placed
+    appendVaryingString(deferred, text);
 }
 
-void appendAllUserInfo(const AllUserInfo &info, QByteArray &out, QByteArray &deferred)
+// A pointer to something written after the structure that holds it, such as the
+// logon-hours bitmap: the same record, without the string header.
+void appendDeferredPointer(QByteArray &out, const QByteArray &deferred,
+                           QList<QPair<int, int>> &strings)
+{
+    strings.append(qMakePair(int(out.size()), int(deferred.size())));
+    putLe32(out, 0); // patched once the blob is placed
+}
+
+// Places an arm's fixed part and its character buffers in the reply, giving
+// every recorded pointer the offset of its own data: the blob lands directly
+// behind the arm, so each offset is the arm's own base plus the arm's length
+// plus the offset recorded for it.
+void placeStrings(QByteArray &reply, const QByteArray &blob,
+                  const QList<QPair<int, int>> &strings)
+{
+    const int base = int(reply.size());
+    for (const QPair<int, int> &string : strings)
+        setLe32(reply, string.first, quint32(base + string.second));
+    reply.append(blob);
+}
+
+void appendArmWithStrings(QByteArray &reply, QByteArray &arm, const QByteArray &blob,
+                          const QList<QPair<int, int>> &strings)
+{
+    const int blobBase = int(reply.size()) + int(arm.size());
+    for (const QPair<int, int> &string : strings)
+        setLe32(arm, string.first, quint32(blobBase + string.second));
+    reply.append(arm);
+    reply.append(blob);
+}
+
+void appendAllUserInfo(const AllUserInfo &info, QByteArray &out, QByteArray &deferred,
+                       QList<QPair<int, int>> &strings)
 {
     putLe64(out, info.lastLogon);
     putLe64(out, info.lastLogoff);
@@ -474,18 +514,17 @@ void appendAllUserInfo(const AllUserInfo &info, QByteArray &out, QByteArray &def
     putLe64(out, info.passwordCanChange);
     putLe64(out, info.passwordMustChange);
 
-    quint32 referent = 0x0002e200u;
     for (const QString &text : {info.userName, info.fullName, info.homeDirectory,
                                 info.homeDrive, info.scriptPath, info.profilePath,
                                 info.adminComment, info.workstations, info.userComment,
                                 info.parameters}) {
-        appendCountedString(out, deferred, text, referent++);
+        appendCountedString(out, deferred, text, strings);
     }
     // The two OWF hashes and private_data are never served: AD returns them
     // only under an access right this endpoint does not model.
     const QString empty;
     for (int i = 0; i < 3; ++i)
-        appendCountedString(out, deferred, empty, 0);
+        appendCountedString(out, deferred, empty, strings);
 
     // SAMPR_SR_SECURITY_DESCRIPTOR: a self-relative descriptor the caller has
     // to read separately, so a NULL here says "not carried in this answer".
@@ -503,7 +542,7 @@ void appendAllUserInfo(const AllUserInfo &info, QByteArray &out, QByteArray &def
     const QByteArray hours = logonHoursForWire(info.logonHours);
     putLe16(out, quint16(hours.size() * 8));
     out.append(QByteArray(2, '\0'));
-    putLe32(out, referent++);
+    appendDeferredPointer(out, deferred, strings);
     // The array is [size_is(1260), length_is(units_per_week/8)] (MS-SAMR
     // 2.2.7.5): the maximum count is the fixed 1260 from the IDL, the offset is
     // zero, and the actual count is the week in bytes.
@@ -994,6 +1033,7 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
     Ndr::Reader reader(stub);
     QByteArray fixed;
     QByteArray deferred;
+    QList<QPair<int, int>> strings;
 
     switch (opnum) {
     case Samr::OpConnect:
@@ -1274,9 +1314,9 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
             beginArm(2);
             putLe32(fixed, 0xffffffffu); // ForceLogoff: never (NTTIME -1)
             putLe32(fixed, 0x7fffffffu);
-            appendCountedString(fixed, deferred, QString(), 0); // OemInformation
-            appendCountedString(fixed, deferred, m_config.netbios, 0x0002e430u);
-            appendCountedString(fixed, deferred, QString(), 0); // Primary (BDC only)
+            appendCountedString(fixed, deferred, QString(), strings); // OemInformation
+            appendCountedString(fixed, deferred, m_config.netbios, strings);
+            appendCountedString(fixed, deferred, QString(), strings); // Primary (BDC only)
             // udlong (hyper): NDR aligns 8-byte primitives, so pad after the
             // 12-byte string headers.
             while (fixed.size() % 8)
@@ -1290,7 +1330,7 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
             putLe32(fixed, quint32(users().size()));
             putLe32(fixed, quint32(groups().size()));
             putLe32(fixed, 0u); // aliases
-            fixed.append(deferred);
+            placeStrings(fixed, deferred, strings);
             putLe32(fixed, kStatusSuccess);
             emit requestReceived(QStringLiteral("QueryInformationDomain(general)"));
             return fixed;
@@ -1305,7 +1345,7 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
             putLe32(fixed, utf16.isEmpty() ? 0u : 0x0002e460u);
             if (!utf16.isEmpty())
                 appendVaryingString(deferred, m_config.netbios);
-            fixed.append(deferred);
+            placeStrings(fixed, deferred, strings);
             putLe32(fixed, kStatusSuccess);
             emit requestReceived(QStringLiteral("QueryInformationDomain(name)"));
             return fixed;
@@ -1531,7 +1571,7 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
         }
         const LdapServer::PasswordPolicy policy =
             LdapServer::passwordPolicyFrom(domainObject());
-        putLe32(fixed, 0x0002e580u); // referent
+        putLe32(fixed, quint32(fixed.size() + 4)); // samr_PwInfo, directly behind this word
         fixed.append(char(policy.minLength & 0xff));
         fixed.append(char((policy.minLength >> 8) & 0xff));
         fixed.append(char(0));
@@ -2000,7 +2040,7 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
                 if (fullName.isEmpty())
                     fullName = object.name;
 
-                putLe32(fixed, 0x0002d520u); // union referent
+                putLe32(fixed, quint32(fixed.size() + 4)); // union, at the tag that follows
                 fixed.append(char(6));       // tag: SamrUserInformationName
                 fixed.append(char(0));
                 fixed.append(char(0));
@@ -2023,7 +2063,7 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
                     appendVaryingString(deferred, account);
                 if (!fullUtf16.isEmpty())
                     appendVaryingString(deferred, fullName);
-                fixed.append(deferred);
+                placeStrings(fixed, deferred, strings);
                 putLe32(fixed, kStatusSuccess);
                 return fixed;
             }
@@ -2031,7 +2071,7 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
             // the arm is one ULONG. The tag is a USHORT padded back out to four
             // bytes, as impacket's reader expects it.
             if (infoClass == 16) {
-                putLe32(fixed, 0x0002d530u); // union referent
+                putLe32(fixed, quint32(fixed.size() + 4)); // union, at the tag that follows
                 fixed.append(char(16));      // tag: SamrUserControlInformation
                 fixed.append(char(0));
                 fixed.append(char(0));
@@ -2059,7 +2099,7 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
                 if (primaryGroup == 0)
                     primaryGroup = 513; // Domain Users
 
-                putLe32(fixed, 0x0002ea00u); // union referent
+                putLe32(fixed, quint32(fixed.size() + 4)); // union, at the tag that follows
                 fixed.append(char(infoClass));
                 fixed.append(char(0));
                 fixed.append(char(0));
@@ -2067,26 +2107,26 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
 
                 QByteArray arm;
                 QByteArray armDeferred;
-                quint32 referent = 0x0002ea10u;
+                QList<QPair<int, int>> strings;
                 if (infoClass == 1) {
                     // samr_UserInfo1: the two names, the primary group, the
                     // administrator's comment and the user's own.
-                    appendCountedString(arm, armDeferred, account, referent++);
-                    appendCountedString(arm, armDeferred, fullName, referent++);
+                    appendCountedString(arm, armDeferred, account, strings);
+                    appendCountedString(arm, armDeferred, fullName, strings);
                     putLe32(arm, primaryGroup);
                     appendCountedString(arm, armDeferred,
                                         object.attributes.value(QStringLiteral("description")),
-                                        referent++);
+                                        strings);
                     appendCountedString(arm, armDeferred,
                                         object.attributes.value(QStringLiteral("comment")),
-                                        referent++);
+                                        strings);
                 } else if (infoClass == 2) {
                     // samr_UserInfo2: the user's comment, a reserved string AD
                     // accepts and never stores, and the two locale numbers.
                     appendCountedString(arm, armDeferred,
                                         object.attributes.value(QStringLiteral("comment")),
-                                        referent++);
-                    appendCountedString(arm, armDeferred, QString(), 0);
+                                        strings);
+                    appendCountedString(arm, armDeferred, QString(), strings);
                     putLe16(arm, quint16(
                                      object.attributes.value(QStringLiteral("countryCode"))
                                          .toUInt()));
@@ -2100,28 +2140,28 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
                     // out in that order rather than class 3's.
                     const quint32 accountControl =
                         object.attributes.value(QStringLiteral("userAccountControl")).toUInt();
-                    appendCountedString(arm, armDeferred, account, referent++);
-                    appendCountedString(arm, armDeferred, fullName, referent++);
+                    appendCountedString(arm, armDeferred, account, strings);
+                    appendCountedString(arm, armDeferred, fullName, strings);
                     putLe32(arm, ridOf(object));
                     putLe32(arm, primaryGroup);
                     appendCountedString(arm, armDeferred,
                                         object.attributes.value(QStringLiteral("homeDirectory")),
-                                        referent++);
+                                        strings);
                     appendCountedString(arm, armDeferred,
                                         object.attributes.value(QStringLiteral("homeDrive")),
-                                        referent++);
+                                        strings);
                     appendCountedString(arm, armDeferred,
                                         object.attributes.value(QStringLiteral("scriptPath")),
-                                        referent++);
+                                        strings);
                     appendCountedString(arm, armDeferred,
                                         object.attributes.value(QStringLiteral("profilePath")),
-                                        referent++);
+                                        strings);
                     appendCountedString(arm, armDeferred,
                                         object.attributes.value(QStringLiteral("description")),
-                                        referent++);
+                                        strings);
                     appendCountedString(arm, armDeferred,
                                         object.attributes.value(QStringLiteral("userWorkstations")),
-                                        referent++);
+                                        strings);
                     putLe64(arm, object.attributes.value(QStringLiteral("lastLogon")).toULongLong());
                     putLe64(arm,
                             object.attributes.value(QStringLiteral("lastLogoff")).toULongLong());
@@ -2129,7 +2169,7 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
                         object.attributes.value(QStringLiteral("logonHours")).toLatin1()));
                     putLe16(arm, quint16(hours.size() * 8));
                     arm.append(QByteArray(2, '\0'));
-                    putLe32(arm, referent++);
+                    appendDeferredPointer(arm, armDeferred, strings);
                     putLe16(arm, quint16(
                                      object.attributes.value(QStringLiteral("badPwdCount"))
                                          .toUInt()));
@@ -2163,25 +2203,25 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
                         object.attributes.value(QStringLiteral("userAccountControl")).toUInt();
                     const LdapServer::PasswordPolicy policy =
                         LdapServer::passwordPolicyFrom(domainObject());
-                    appendCountedString(arm, armDeferred, account, referent++);
-                    appendCountedString(arm, armDeferred, fullName, referent++);
+                    appendCountedString(arm, armDeferred, account, strings);
+                    appendCountedString(arm, armDeferred, fullName, strings);
                     putLe32(arm, ridOf(object));
                     putLe32(arm, primaryGroup);
                     appendCountedString(arm, armDeferred,
                                         object.attributes.value(QStringLiteral("homeDirectory")),
-                                        referent++);
+                                        strings);
                     appendCountedString(arm, armDeferred,
                                         object.attributes.value(QStringLiteral("homeDrive")),
-                                        referent++);
+                                        strings);
                     appendCountedString(arm, armDeferred,
                                         object.attributes.value(QStringLiteral("scriptPath")),
-                                        referent++);
+                                        strings);
                     appendCountedString(arm, armDeferred,
                                         object.attributes.value(QStringLiteral("profilePath")),
-                                        referent++);
+                                        strings);
                     appendCountedString(arm, armDeferred,
                                         object.attributes.value(QStringLiteral("userWorkstations")),
-                                        referent++);
+                                        strings);
                     // lastLogon is per-DC NTTIME as stored; the password
                     // instants are the domain policy's window around
                     // pwdLastSet, the same three the aggregate reports.
@@ -2195,7 +2235,7 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
                         object.attributes.value(QStringLiteral("logonHours")).toLatin1()));
                     putLe16(arm, quint16(hours.size() * 8));
                     arm.append(QByteArray(2, '\0'));
-                    putLe32(arm, referent++);
+                    appendDeferredPointer(arm, armDeferred, strings);
                     putLe16(arm, quint16(
                                      object.attributes.value(QStringLiteral("badPwdCount"))
                                          .toUInt()));
@@ -2213,8 +2253,7 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
                         armDeferred.append('\0');
                 }
 
-                fixed.append(arm);
-                fixed.append(armDeferred);
+                appendArmWithStrings(fixed, arm, armDeferred, strings);
                 putLe32(fixed, kStatusSuccess);
                 emit requestReceived(QStringLiteral("QueryInformationUser2(%1, class %2)")
                                          .arg(user.dn)
@@ -2234,7 +2273,7 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
                 const auto attribute = [&object](const char *name) {
                     return object.attributes.value(QLatin1String(name));
                 };
-                putLe32(fixed, 0x0002eb00u); // union referent
+                putLe32(fixed, quint32(fixed.size() + 4)); // union, at the tag that follows
                 fixed.append(char(infoClass));
                 fixed.append(char(0));
                 fixed.append(char(0));
@@ -2254,27 +2293,26 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
                 } else {
                     QByteArray arm;
                     QByteArray armDeferred;
-                    quint32 referent = 0x0002eb10u;
+                    QList<QPair<int, int>> strings;
                     if (infoClass == 7) {
                         QString account =
                             object.attributes.value(QStringLiteral("sAMAccountName"));
                         if (account.isEmpty())
                             account = object.name;
-                        appendCountedString(arm, armDeferred, account, referent++);
+                        appendCountedString(arm, armDeferred, account, strings);
                     } else if (infoClass == 10) {
                         appendCountedString(arm, armDeferred, attribute("homeDirectory"),
-                                            referent++);
-                        appendCountedString(arm, armDeferred, attribute("homeDrive"), referent++);
+                                            strings);
+                        appendCountedString(arm, armDeferred, attribute("homeDrive"), strings);
                     } else {
                         const char *name = infoClass == 11   ? "scriptPath"
                                            : infoClass == 12 ? "profilePath"
                                            : infoClass == 13 ? "description"
                                            : infoClass == 14 ? "userWorkstations"
                                                              : "userParameters";
-                        appendCountedString(arm, armDeferred, attribute(name), referent++);
+                        appendCountedString(arm, armDeferred, attribute(name), strings);
                     }
-                    fixed.append(arm);
-                    fixed.append(armDeferred);
+                    appendArmWithStrings(fixed, arm, armDeferred, strings);
                 }
                 putLe32(fixed, kStatusSuccess);
                 emit requestReceived(QStringLiteral("QueryInformationUser2(%1, class %2)")
@@ -2289,7 +2327,7 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
                 if (fullName.isEmpty())
                     fullName = object.name;
                 const QByteArray utf16 = Ndr::utf16le(fullName);
-                putLe32(fixed, 0x0002d540u); // union referent
+                putLe32(fixed, quint32(fixed.size() + 4)); // union, at the tag that follows
                 fixed.append(char(8));      // tag: SamrUserFullNameInformation
                 fixed.append(char(0));
                 fixed.append(char(0));
@@ -2301,7 +2339,7 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
                 putLe32(fixed, utf16.isEmpty() ? 0u : 0x0002d541u);
                 if (!utf16.isEmpty())
                     appendVaryingString(deferred, fullName);
-                fixed.append(deferred);
+                placeStrings(fixed, deferred, strings);
                 putLe32(fixed, kStatusSuccess);
                 return fixed;
             }
@@ -2312,21 +2350,21 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
             if (infoClass == 4) {
                 const QByteArray hours = logonHoursForWire(QByteArray::fromHex(
                     object.attributes.value(QStringLiteral("logonHours")).toLatin1()));
-                putLe32(fixed, 0x0002e1e8u); // union referent
+                putLe32(fixed, quint32(fixed.size() + 4)); // union, at the tag that follows
                 fixed.append(char(4));       // tag: SamrUserLogonHoursInformation
                 fixed.append(char(0));
                 fixed.append(char(0));
                 fixed.append(char(0));
                 putLe16(fixed, quint16(hours.size() * 8));
                 fixed.append(QByteArray(2, '\0'));
-                putLe32(fixed, 0x0002e1e9u); // array referent
+                putLe32(fixed, quint32(fixed.size() + 4)); // week, directly behind this word
                 putLe32(deferred, 1260);
                 putLe32(deferred, 0);
                 putLe32(deferred, quint32(hours.size()));
                 deferred.append(hours);
                 while (deferred.size() % 4 != 0)
                     deferred.append('\0');
-                fixed.append(deferred);
+                placeStrings(fixed, deferred, strings);
                 putLe32(fixed, kStatusSuccess);
                 emit requestReceived(QStringLiteral("QueryInformationUser2(%1, logon hours)")
                                          .arg(user.dn));
@@ -2402,16 +2440,16 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
                                          == 16;
                 info.fieldsPresent = kFieldsPresentStandard;
 
-                putLe32(fixed, 0x0002e1f0u); // union referent
+                putLe32(fixed, quint32(fixed.size() + 4)); // union, at the tag that follows
                 fixed.append(char(21));      // tag: SamrUserAllInformation
                 fixed.append(char(0));
                 fixed.append(char(0));
                 fixed.append(char(0));
                 QByteArray arm;
                 QByteArray armDeferred;
-                appendAllUserInfo(info, arm, armDeferred);
-                fixed.append(arm);
-                fixed.append(armDeferred);
+                QList<QPair<int, int>> strings;
+                appendAllUserInfo(info, arm, armDeferred, strings);
+                appendArmWithStrings(fixed, arm, armDeferred, strings);
                 putLe32(fixed, kStatusSuccess);
                 emit requestReceived(QStringLiteral("QueryInformationUser2(%1, all)")
                                          .arg(user.dn));
@@ -2523,27 +2561,40 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
         // in place and ignores the pointer, so the value it receives is the one
         // a Windows stub resolves — the offset of the array from the start of
         // this reply.
+        //
+        // A lookup where no name mapped carries no array at all: both counts
+        // zero and both pointers NULL. Answering with one element of RID 0 and
+        // type 0 — which is what this arm did — reads as a mapped name with no
+        // account, and a 2000 client answered that with 124 (the same error as
+        // an unmarshalled pointer) instead of the "not found" the status word
+        // asked for.
+        const quint32 status = mapped == 0 ? kStatusNoneMapped
+                              : (mapped < int(names.size()) ? kStatusSomeNotMapped
+                                                            : kStatusSuccess);
+        if (status == kStatusNoneMapped) {
+            putLe32(fixed, 0); // RelativeIds.Count
+            putLe32(fixed, 0); // RelativeIds.Ids
+            putLe32(fixed, 0); // Types.Count
+            putLe32(fixed, 0); // Types.Ids
+            putLe32(fixed, status);
+            emit requestReceived(QStringLiteral("LookupNames(none of %1 mapped)")
+                                     .arg(names.size()));
+            return fixed;
+        }
         putLe32(fixed, quint32(names.size()));
-        if (names.isEmpty()) {
-            putLe32(fixed, 0);
-        } else {
-            putLe32(fixed, quint32(fixed.size() + 4)); // Ids
-            putLe32(fixed, quint32(rids.size()));      // MaximumCount
+        putLe32(fixed, names.isEmpty() ? 0u : quint32(fixed.size() + 4)); // Ids
+        if (!names.isEmpty()) {
+            putLe32(fixed, quint32(rids.size())); // MaximumCount
             for (quint32 rid : rids)
                 putLe32(fixed, rid);
         }
         putLe32(fixed, quint32(types.size()));
-        if (types.isEmpty()) {
-            putLe32(fixed, 0);
-        } else {
-            putLe32(fixed, quint32(fixed.size() + 4)); // Types
-            putLe32(fixed, quint32(types.size()));     // MaximumCount
+        putLe32(fixed, types.isEmpty() ? 0u : quint32(fixed.size() + 4)); // Types
+        if (!types.isEmpty()) {
+            putLe32(fixed, quint32(types.size())); // MaximumCount
             for (quint32 type : types)
                 putLe32(fixed, type);
         }
-        const quint32 status = mapped == 0 ? kStatusNoneMapped
-                              : (mapped < int(names.size()) ? kStatusSomeNotMapped
-                                                            : kStatusSuccess);
         putLe32(fixed, status);
         emit requestReceived(QStringLiteral("LookupNames(%1 of %2 mapped)")
                                  .arg(mapped)
@@ -3057,7 +3108,7 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
             putLe32(fixed, 7u); // SE_GROUP_MANDATORY|ENABLED_BY_DEFAULT|ENABLED
             putLe32(fixed, quint32(found.members.size()));
             putUnicode(comment, 0x0002e620u);
-            fixed.append(deferred);
+            placeStrings(fixed, deferred, strings);
             putLe32(fixed, kStatusSuccess);
             emit requestReceived(QStringLiteral("QueryInformationGroup(%1, all)").arg(name));
             return fixed;
@@ -3065,7 +3116,7 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
         case 2: { // GroupNameInformation
             beginArm(2);
             putUnicode(name, 0x0002e630u);
-            fixed.append(deferred);
+            placeStrings(fixed, deferred, strings);
             putLe32(fixed, kStatusSuccess);
             emit requestReceived(QStringLiteral("QueryInformationGroup(%1, name)").arg(name));
             return fixed;
@@ -3080,7 +3131,7 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
         case 4: { // GroupAdminCommentInformation
             beginArm(4);
             putUnicode(comment, 0x0002e640u);
-            fixed.append(deferred);
+            placeStrings(fixed, deferred, strings);
             putLe32(fixed, kStatusSuccess);
             emit requestReceived(QStringLiteral("QueryInformationGroup(%1, comment)").arg(name));
             return fixed;
@@ -3158,7 +3209,7 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
                                              .size()
                                        : found.members.size()));
             putUnicode(comment, 0x0002e720u);
-            fixed.append(deferred);
+            placeStrings(fixed, deferred, strings);
             putLe32(fixed, kStatusSuccess);
             emit requestReceived(QStringLiteral("QueryInformationAlias(%1, general)").arg(name));
             return fixed;
@@ -3166,7 +3217,7 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
         case 2: { // AliasNameInformation
             beginArm(2);
             putUnicode(name, 0x0002e730u);
-            fixed.append(deferred);
+            placeStrings(fixed, deferred, strings);
             putLe32(fixed, kStatusSuccess);
             emit requestReceived(QStringLiteral("QueryInformationAlias(%1, name)").arg(name));
             return fixed;
@@ -3174,7 +3225,7 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
         case 3: { // AliasAdminCommentInformation
             beginArm(3);
             putUnicode(comment, 0x0002e740u);
-            fixed.append(deferred);
+            placeStrings(fixed, deferred, strings);
             putLe32(fixed, kStatusSuccess);
             emit requestReceived(QStringLiteral("QueryInformationAlias(%1, comment)").arg(name));
             return fixed;
