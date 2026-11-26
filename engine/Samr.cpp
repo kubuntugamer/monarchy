@@ -102,6 +102,60 @@ quint32 accountControlFor(quint32 accountType)
     }
 }
 
+// The other direction of the same problem: SAMR's acct_flags and AD's
+// userAccountControl are different bit sets that coincide only in their low
+// digits. A guest reads "Account active", the account type and "password never
+// expires" off this word, so copying the directory value across told it that a
+// plain user's password never expires (0x200 here is ACB_PWNOEXP, there is
+// NORMAL_ACCOUNT) and left the type bits clear.
+quint32 accountFlagsFor(quint32 control)
+{
+    quint32 flags = 0;
+    if (control & 0x00000002u)
+        flags |= 0x00000001u; // ACCOUNTDISABLE -> ACB_DISABLED
+    if (control & 0x00000008u)
+        flags |= 0x00000002u; // HOMEDIR_REQUIRED -> ACB_HOMDIRREQ
+    if (control & 0x00000020u)
+        flags |= 0x00000004u; // PASSWD_NOTREQD -> ACB_PWNOTREQ
+    if (control & 0x00000100u)
+        flags |= 0x00000008u; // TEMP_DUPLICATE_ACCOUNT -> ACB_TEMPDUP
+    if (control & 0x00000200u)
+        flags |= 0x00000010u; // NORMAL_ACCOUNT -> ACB_NORMAL
+    if (control & 0x00020000u)
+        flags |= 0x00000020u; // MNS_LOGON_ACCOUNT -> ACB_MNS
+    if (control & 0x00000800u)
+        flags |= 0x00000040u; // INTERDOMAIN_TRUST_ACCOUNT -> ACB_DOMTRUST
+    if (control & 0x00001000u)
+        flags |= 0x00000080u; // WORKSTATION_TRUST_ACCOUNT -> ACB_WSTRUST
+    if (control & 0x00002000u)
+        flags |= 0x00000100u; // SERVER_TRUST_ACCOUNT -> ACB_SVRTRUST
+    if (control & 0x00010000u)
+        flags |= 0x00000200u; // DONT_EXPIRE_PASSWORD -> ACB_PWNOEXP
+    if (control & 0x00000080u)
+        flags |= 0x00000800u; // ENCRYPTED_TEXT_PWD_ALLOWED -> ACB_ENC_TXT_PWD_ALLOWED
+    if (control & 0x00040000u)
+        flags |= 0x00001000u; // SMARTCARD_REQUIRED -> ACB_SMARTCARD_REQUIRED
+    if (control & 0x00080000u)
+        flags |= 0x00002000u; // TRUSTED_FOR_DELEGATION -> ACB_TRUSTED_FOR_DELEGATION
+    if (control & 0x00100000u)
+        flags |= 0x00004000u; // NOT_DELEGATED -> ACB_NOT_DELEGATED
+    if (control & 0x00200000u)
+        flags |= 0x00008000u; // USE_DES_KEY_ONLY -> ACB_USE_DES_KEY_ONLY
+    if (control & 0x00400000u)
+        flags |= 0x00010000u; // DONT_REQUIRE_PREAUTH -> ACB_DONT_REQUIRE_PREAUTH
+    if (control & 0x00800000u)
+        flags |= 0x00020000u; // PASSWORD_EXPIRED -> ACB_PW_EXPIRED
+    if (control & 0x01000000u)
+        flags |= 0x00040000u; // TRUSTED_TO_AUTH_FOR_DELEGATION
+    if (control & 0x04000000u)
+        flags |= 0x00100000u; // PARTIAL_SECRETS_ACCOUNT
+    // Every account the directory holds is one of the types, and a value that
+    // names none is still an ordinary user rather than an account of no kind.
+    if ((flags & 0x000001f8u) == 0)
+        flags |= 0x00000010u; // ACB_NORMAL
+    return flags;
+}
+
 // SID_NAME_USE as MS-SAMR reports it for a relative identifier.
 bool isAlias(const DirectoryObject &object);
 
@@ -412,7 +466,8 @@ struct AllUserInfo {
     QString parameters;
     quint32 userId = 0;
     quint32 primaryGroupId = 0;
-    quint32 accountControl = 0;
+    quint32 accountControl = 0; // AD's userAccountControl, which the policy uses
+    quint32 accountFlags = 0;    // the same state in SAMR's acct_flags numbering
     quint32 fieldsPresent = 0;
     quint16 badPasswordCount = 0;
     quint16 logonCount = 0;
@@ -533,7 +588,7 @@ void appendAllUserInfo(const AllUserInfo &info, QByteArray &out, QByteArray &def
 
     putLe32(out, info.userId);
     putLe32(out, info.primaryGroupId);
-    putLe32(out, info.accountControl);
+    putLe32(out, info.accountFlags);
     putLe32(out, info.fieldsPresent);
 
     // SAMPR_LOGON_HOURS: the length is in bits, the units are one byte per
@@ -2196,7 +2251,7 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
                     putLe64(arm, pwdLastSet == 0 ? 0 : ntTimeFromUnix(pwdLastSet));
                     putLe64(arm,
                             object.attributes.value(QStringLiteral("accountExpires")).toULongLong());
-                    putLe32(arm, accountControl);
+                    putLe32(arm, accountFlagsFor(accountControl));
                     putLe32(armDeferred, 1260);
                     putLe32(armDeferred, 0);
                     putLe32(armDeferred, quint32(hours.size()));
@@ -2253,7 +2308,7 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
                     putLe16(arm, quint16(
                                      object.attributes.value(QStringLiteral("logonCount"))
                                          .toUInt()));
-                    putLe32(arm, accountControl);
+                    putLe32(arm, accountFlagsFor(accountControl));
                     // The week is the last deferred buffer: maximum count 1260
                     // from the IDL, offset zero, one octet per hour.
                     putLe32(armDeferred, 1260);
@@ -2416,6 +2471,7 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
                     info.primaryGroupId = 513; // Domain Users
                 info.accountControl =
                     object.attributes.value(QStringLiteral("userAccountControl")).toUInt();
+                info.accountFlags = accountFlagsFor(info.accountControl);
                 // The logon statistics a DC keeps on the account: when it last
                 // logged on and how many times, and how many passwords were
                 // refused. SamLogon writes them, so this reads the same values

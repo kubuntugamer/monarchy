@@ -911,6 +911,11 @@ void SamrTest::samrDirectoryCalls()
     // The password-presence and expired-flag bits are not in it: MS-SAMR
     // 3.1.5.5.5 forbids a server from ever returning those.
     QCOMPARE(readLe32At(allReply, 8 + 172), 0x00ffffffu); // fields present
+    // acct_flags sits just before WhichFields and speaks SAMR's numbering, not
+    // the directory's: this account is NORMAL_ACCOUNT (0x200) in AD and must
+    // read ACB_NORMAL (0x10) here, where 0x200 would mean "password does not
+    // expire" and 0x10 would mean LOCKOUT in the directory.
+    QCOMPARE(readLe32At(allReply, 8 + 168), 0x10u); // acct_flags: ACB_NORMAL
     // LastLogon, badPwdCount and logonCount are the stored values: the arm is
     // the 196-byte aggregate that starts after the referent and tag.
     QVERIFY(allReply.contains(QByteArray::fromHex("8877665544332211"))); // lastLogon
