@@ -841,6 +841,19 @@ void SamrTest::samrDirectoryCalls()
     QVERIFY(lockoutReply.contains(halfHour));
     QVERIFY(lockoutReply.contains(QByteArray::fromHex("03000000"))); // threshold 3
 
+    // QueryInformationDomain class 3 is the forced-logoff instant, which a DC
+    // that forces none answers as the NTTIME "never": `net accounts /domain`
+    // reads it and stops the command when the class is refused.
+    QByteArray logoffRequest = domainHandle;
+    logoffRequest.append(char(3));
+    logoffRequest.append(QByteArray(2, '\0'));
+    const QByteArray logoffReply =
+        server.handleCall(Samr::OpQueryInformationDomain, logoffRequest);
+    QCOMPARE(lastWord(logoffReply), 0u);
+    QCOMPARE(readLe32At(logoffReply, 0), 4u);
+    QCOMPARE(logoffReply.mid(4, 2), QByteArray::fromHex("0300")); // tag
+    QCOMPARE(logoffReply.mid(8, 8), QByteArray::fromHex("ffffffffffffff7f"));
+
     // EnumerateUsersInDomain: both accounts with their RIDs.
     const QByteArray usersReply =
         server.handleCall(Samr::OpEnumerateUsersInDomain, enumUsersStub(domainHandle));

@@ -1420,6 +1420,18 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
             emit requestReceived(QStringLiteral("QueryInformationDomain(general)"));
             return fixed;
         }
+        case 3: { // DomainLogoffInformation: the instant a client is forced
+            // off this domain's accounts. This DC forces none, which the wire
+            // spells as the NTTIME "never" — the same value class 2 carries as
+            // ForceLogoff. `net accounts /domain` reads this class for its
+            // "Forced logoff" line and stops the whole command when it is
+            // refused.
+            beginArm(3);
+            putLe64(fixed, 0x7fffffffffffffffull);
+            putLe32(fixed, kStatusSuccess);
+            emit requestReceived(QStringLiteral("QueryInformationDomain(logoff)"));
+            return fixed;
+        }
         case 5: { // DomainNameInformation: the NetBIOS name, as AD reports it
             const QByteArray utf16 = Ndr::utf16le(m_config.netbios);
             beginArm(5);
