@@ -872,6 +872,34 @@ void SamrTest::samrDirectoryCalls()
         QCOMPARE(reply.mid(8, 8), QByteArray(8, '\0')); // empty lsa_String
     }
 
+    // Class 9 is the server state and class 11 the general record with the
+    // lockout policy appended; both used to be refused, which stops the walk a
+    // one-call reader makes over the domain.
+    QByteArray stateRequest = domainHandle;
+    stateRequest.append(char(9));
+    stateRequest.append(QByteArray(2, '\0'));
+    const QByteArray stateReply =
+        server.handleCall(Samr::OpQueryInformationDomain, stateRequest);
+    QCOMPARE(lastWord(stateReply), 0u);
+    QCOMPARE(quint8(stateReply.at(4)), quint8(9));
+    QCOMPARE(readLe32At(stateReply, 8), 1u); // DOMAIN_SERVER_ENABLED
+
+    QByteArray general2Request = domainHandle;
+    general2Request.append(char(11));
+    general2Request.append(QByteArray(2, '\0'));
+    const QByteArray general2Reply =
+        server.handleCall(Samr::OpQueryInformationDomain, general2Request);
+    QCOMPARE(lastWord(general2Reply), 0u);
+    QCOMPARE(quint8(general2Reply.at(4)), quint8(11));
+    QVERIFY(utf16Text(general2Reply).contains(config.netbios));
+    // The union header, ForceLogoff, the three 8-byte string headers, then the
+    // sequence number: the state word follows at 48.
+    const int counts = 8 + 8 + 3 * 8 + 8;
+    QCOMPARE(readLe32At(general2Reply, counts), 1u);     // state
+    QCOMPARE(readLe32At(general2Reply, counts + 4), 3u); // PDC
+    QCOMPARE(general2Reply.mid(counts + 24, 8), halfHour); // lockout duration
+    QCOMPARE(readLe32At(general2Reply, counts + 40) & 0xffffu, 3u); // threshold
+
     // EnumerateUsersInDomain: both accounts with their RIDs.
     const QByteArray usersReply =
         server.handleCall(Samr::OpEnumerateUsersInDomain, enumUsersStub(domainHandle));

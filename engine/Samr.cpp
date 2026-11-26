@@ -1571,6 +1571,54 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
             emit requestReceived(QStringLiteral("QueryInformationDomain(role)"));
             return fixed;
         }
+        case 9: { // DomainServerStateInformation: whether logons are accepted
+            beginArm(9);
+            putLe32(fixed, 1u); // DOMAIN_SERVER_ENABLED, a [v1_enum]
+            putLe32(fixed, kStatusSuccess);
+            emit requestReceived(QStringLiteral("QueryInformationDomain(state)"));
+            return fixed;
+        }
+        case 11: { // DomainGeneralInformation2: class 2's structure with the
+            // lockout policy appended, so one call answers everything a
+            // command like `net accounts /domain` prints. The arm repeats
+            // class 2 field for field and then adds the two intervals and the
+            // threshold class 12 carries on its own.
+            const DirectoryObject domain = domainObject();
+            const qint64 duration =
+                domain.attributes.value(QStringLiteral("lockoutDuration")).toLongLong();
+            const qint64 window =
+                domain.attributes.value(QStringLiteral("lockoutObservationWindow")).toLongLong();
+            const quint32 threshold =
+                domain.attributes.value(QStringLiteral("lockoutThreshold")).toUInt();
+            beginArm(11);
+            putLe32(fixed, 0xffffffffu); // ForceLogoff: never (NTTIME -1)
+            putLe32(fixed, 0x7fffffffu);
+            appendCountedString(fixed, deferred, QString(), strings); // OemInformation
+            appendCountedString(fixed, deferred, m_config.netbios, strings);
+            appendCountedString(fixed, deferred, QString(), strings); // Primary (BDC only)
+            while (fixed.size() % 8)
+                fixed.append(char(0));
+            putLe32(fixed, 1u); // sequence_num
+            putLe32(fixed, 0u);
+            putLe32(fixed, 1u); // domain_server_state: DOMAIN_SERVER_ENABLED
+            putLe32(fixed, 3u); // role: DOMAIN_SERVER_ROLE_PRIMARY
+            putLe32(fixed, 0u); // unknown3
+            putLe32(fixed, quint32(users().size()));
+            putLe32(fixed, quint32(groups().size()));
+            putLe32(fixed, 0u); // aliases
+            // The lockout members are hyper: 8-aligned here, and reported as
+            // magnitudes of the negative values the directory stores.
+            putLe64(fixed, quint64(duration < 0 ? -duration : duration));
+            putLe64(fixed, quint64(window < 0 ? -window : window));
+            fixed.append(char(threshold & 0xff));
+            fixed.append(char(0)); // padding before the status word
+            fixed.append(char(0));
+            fixed.append(char(0));
+            placeStrings(fixed, deferred, strings);
+            putLe32(fixed, kStatusSuccess);
+            emit requestReceived(QStringLiteral("QueryInformationDomain(general2)"));
+            return fixed;
+        }
         case 12: { // DomainLockoutInformation: the policy the domain object carries
             // AD stores the two intervals as negative 100-nanosecond values and
             // SAMR reports their magnitude, so a 30-minute duration is
