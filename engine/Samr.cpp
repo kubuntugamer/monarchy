@@ -527,6 +527,23 @@ void appendCountedString(QByteArray &out, QByteArray &deferred, const QString &t
     appendVaryingString(deferred, text);
 }
 
+// A counted string a WhichFields bit names present, even when it is empty: the
+// pointer is never NULL, and an empty value is a conformant array of no
+// characters (max 0, offset 0, actual 0). MS-SAMR 3.1.5.5.5.2 obliges a server
+// to carry every field it names, and a DC's own answer gives such a field a
+// buffer rather than a NULL (measured against Samba 4.24.7, whose empty
+// full_name and home_directory both point at a three-word zero header).
+void appendPresentCountedString(QByteArray &out, QByteArray &deferred, const QString &text,
+                                QList<QPair<int, int>> &strings)
+{
+    const QByteArray utf16 = Ndr::utf16le(text);
+    putLe16(out, quint16(utf16.size()));
+    putLe16(out, quint16(utf16.size()));
+    strings.append(qMakePair(int(out.size()), int(deferred.size())));
+    putLe32(out, 0); // patched once the blob is placed
+    appendVaryingString(deferred, text);
+}
+
 // A pointer to something written after the structure that holds it, such as the
 // logon-hours bitmap: the same record, without the string header.
 void appendDeferredPointer(QByteArray &out, const QByteArray &deferred,
@@ -571,10 +588,12 @@ void appendAllUserInfo(const AllUserInfo &info, QByteArray &out, QByteArray &def
 
     for (const QString &text : {info.userName, info.fullName, info.homeDirectory,
                                 info.homeDrive, info.scriptPath, info.profilePath,
-                                info.adminComment, info.workstations, info.userComment,
-                                info.parameters}) {
-        appendCountedString(out, deferred, text, strings);
+                                info.adminComment, info.workstations, info.userComment}) {
+        appendPresentCountedString(out, deferred, text, strings);
     }
+    // Parameters is a binary string, and a DC leaves it NULL when the account
+    // has none even though it names the field present.
+    appendCountedString(out, deferred, info.parameters, strings);
     // The two OWF hashes and private_data are never served: AD returns them
     // only under an access right this endpoint does not model.
     const QString empty;

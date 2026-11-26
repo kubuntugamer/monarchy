@@ -916,6 +916,12 @@ void SamrTest::samrDirectoryCalls()
     // read ACB_NORMAL (0x10) here, where 0x200 would mean "password does not
     // expire" and 0x10 would mean LOCKOUT in the directory.
     QCOMPARE(readLe32At(allReply, 8 + 168), 0x10u); // acct_flags: ACB_NORMAL
+    // A field the mask names present is never a NULL pointer: this account has
+    // no home directory, and the arm still carries a buffer for it — a
+    // conformant array of no characters, the shape a DC's own answer uses.
+    const quint32 homeDirectory = readLe32At(allReply, 8 + 48 + 2 * 8 + 4);
+    QVERIFY(homeDirectory != 0);
+    QCOMPARE(allReply.mid(int(homeDirectory), 12), QByteArray(12, '\0'));
     // LastLogon, badPwdCount and logonCount are the stored values: the arm is
     // the 196-byte aggregate that starts after the referent and tag.
     QVERIFY(allReply.contains(QByteArray::fromHex("8877665544332211"))); // lastLogon
