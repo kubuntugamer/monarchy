@@ -52,6 +52,9 @@ struct WriteBackend {
 enum Opnum : quint16 {
     OpConnect = 0,
     OpCloseHandle = 1,
+    // SamrQuerySecurityObject (3): the descriptor behind a handle. `net user`
+    // asks for a user's DACL after it has read the record.
+    OpQuerySecurityObject = 3,
     OpLookupDomainInSamServer = 5,
     OpEnumerateDomainsInSamServer = 6,
     OpOpenDomain = 7,

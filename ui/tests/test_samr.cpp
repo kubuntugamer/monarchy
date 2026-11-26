@@ -954,6 +954,25 @@ void SamrTest::samrDirectoryCalls()
     // reply), which a 2000 client answered with 124 without reading the record.
     QCOMPARE(readLe32At(allReply, 8 + 180), quint32(allReply.indexOf(hours)));
 
+    // QuerySecurityObject (opnum 3): `net user /domain` asks for the account's
+    // descriptor once it has the record, and a reply that carries no stub at
+    // all makes it exit 124 before it prints anything. The reference DC sends a
+    // 40-byte reply — the descriptor's referent, its length, the array referent
+    // and maximum count, a 20-byte self-relative header with no owner, group or
+    // DACL, four bytes of padding and the status.
+    QByteArray securityRequest = userHandle;
+    securityRequest.append(QByteArray::fromHex("04000000")); // DACL_SECURITY_INFORMATION
+    const QByteArray securityReply =
+        server.handleCall(Samr::OpQuerySecurityObject, securityRequest);
+    QCOMPARE(securityReply.size(), 40);
+    QCOMPARE(lastWord(securityReply), 0u);
+    QCOMPARE(readLe32At(securityReply, 0), 4u);   // descriptor at stub 4
+    QCOMPARE(readLe32At(securityReply, 4), 20u);  // Length
+    QCOMPARE(readLe32At(securityReply, 8), 16u);  // array at stub 16
+    QCOMPARE(readLe32At(securityReply, 12), 20u); // MaximumCount
+    QCOMPARE(securityReply.mid(16, 20),
+             QByteArray::fromHex("01000080") + QByteArray(16, '\0'));
+
     // The per-field records a property sheet reads before it opens the
     // aggregate, and the ones `rpcclient queryuser` asks for by number: the
     // general, preferences and logon records, the logon record's predecessor,

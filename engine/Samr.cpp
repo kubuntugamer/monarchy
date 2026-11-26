@@ -1229,6 +1229,46 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
         putLe32(fixed, kStatusSuccess);
         return fixed;
     }
+    // SamrQuerySecurityObject (opnum 3): `net user /domain` asks for the
+    // account's DACL after it has read the record, and stops the whole command
+    // when the answer carries no descriptor. The reference DC answers with a
+    // self-relative header and nothing behind it — revision 1, SE_SELF_RELATIVE
+    // with no DACL flag, all four offsets zero — which is 20 bytes and parses
+    // as a security descriptor that grants nothing.
+    case Samr::OpQuerySecurityObject: {
+        QByteArray handle;
+        if (!reader.bytes(kHandleSize, &handle))
+            return {};
+        quint32 securityInformation = 0;
+        reader.u32(&securityInformation);
+        const auto it = m_handles.constFind(handle);
+        if (it == m_handles.constEnd() || it->kind == Handle::None) {
+            fixed.append(char(0)); // NULL descriptor referent
+            putLe32(fixed, kStatusInvalidHandle);
+            return fixed;
+        }
+        // [out,ref] PSAMPR_SR_SECURITY_DESCRIPTOR: a referent, the length, the
+        // array's referent and maximum count, then the bytes.
+        QByteArray sd;
+        sd.append(char(1));           // SECURITY_DESCRIPTOR_REVISION
+        sd.append(char(0));           // Sbz1
+        putLe16(sd, quint16(0x8000)); // SE_SELF_RELATIVE, no DACL present
+        for (int i = 0; i < 4; ++i)
+            putLe32(sd, 0); // Owner, Group, Sacl, Dacl
+        // Both referents name where their pointee sits in this stub: the
+        // descriptor starts at 4, behind its own referent, and the bytes at 16.
+        putLe32(fixed, 4);                  // descriptor referent
+        putLe32(fixed, quint32(sd.size())); // Length
+        putLe32(fixed, 16);                 // array referent
+        putLe32(fixed, quint32(sd.size())); // array MaximumCount
+        fixed.append(sd);
+        while (fixed.size() % 4 != 0)
+            fixed.append('\0');
+        putLe32(fixed, kStatusSuccess);
+        emit requestReceived(QStringLiteral("QuerySecurityObject(0x%1)")
+                                 .arg(securityInformation, 8, 16, QLatin1Char('0')));
+        return fixed;
+    }
     case Samr::OpLookupDomainInSamServer: {
         QByteArray handle;
         if (!reader.bytes(kHandleSize, &handle))
