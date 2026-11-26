@@ -235,6 +235,23 @@ QByteArray ntCreateMessage(quint16 tid, const QString &name)
     return smb(Smb1::CmdNtCreateAndX, tid, g_uid, words, data);
 }
 
+// MS-CIFS AndX: a client may pack the create behind the tree connect, with an
+// SMB header of its own at the offset the first message names, and TID 0xFFFF
+// because the tree it needs does not exist until the connect is answered.
+QByteArray chainedTreeConnectMessage(const QString &path, const QString &name)
+{
+    QByteArray out = treeConnectMessage(path);
+    if (out.size() % 2)
+        out.append(char(0)); // the AndX offset is word-aligned
+    const quint16 offset = quint16(out.size());
+    out[33] = char(Smb1::CmdNtCreateAndX); // AndXCommand
+    out[34] = char(0);                    // AndXReserved
+    out[35] = char(offset & 0xff);        // AndXOffset
+    out[36] = char((offset >> 8) & 0xff);
+    out.append(ntCreateMessage(0xffff, name));
+    return out;
+}
+
 // A Windows client includes the UTF-16 terminator in NameLength, so the name
 // arrives with a trailing NUL. It must still resolve to the file.
 QByteArray terminatedNtCreateMessage(quint16 tid, const QString &name)
@@ -532,6 +549,7 @@ private slots:
     void namesItselfAfterTheSecurityBlob();
     void acceptsTheKerberosTicketAWindows2000MemberOffers();
     void setsTheStateOfAnOpenPipe();
+    void answersAChainedTreeConnectAndCreate();
     void signsAndVerifiesASignedSession();
     void signsAPreExtendedSecuritySessionTheWayTheClientKeysIt();
     void servesTwoSessionsOnOneConnection();
@@ -1093,6 +1111,28 @@ void Smb1Test::acceptsTheKerberosTicketAWindows2000MemberOffers()
 // opened, before it binds DCE/RPC on that pipe. The DC answered NOT_SUPPORTED,
 // and dcpromo stopped at "The RPC server is unavailable" having just opened
 // \pipe\NETLOGON: the bind it wanted to send next was never sent.
+// A Windows 2000 redirector opens a pipe with both commands in one message: the
+// tree connect, and the create that needs the tree it is about to be given. An
+// answer to the first alone is a message the client is still waiting on.
+void Smb1Test::answersAChainedTreeConnectAndCreate()
+{
+    QScopedPointer<Smb1::Session> session(pipeSession());
+    QVERIFY(session);
+    const QByteArray reply = session->feed(chainedTreeConnectMessage(
+        QStringLiteral("\\\\dc1\\IPC$"), QStringLiteral("pipe\\NETLOGON")));
+    const QByteArray message = payloadOf(reply);
+    QCOMPARE(readLe32(message, 5), quint32(0)); // the tree connect succeeded
+    // The connect's AndX block names the command that follows and where its
+    // answer begins.
+    QCOMPARE(quint8(message.at(33)), quint8(Smb1::CmdNtCreateAndX));
+    const quint16 link = readLe16(message, 35);
+    QVERIFY2(link > 32 && link < message.size(), qPrintable(QString::number(link)));
+    const QByteArray second = message.mid(link);
+    QCOMPARE(readLe32(second, 5), quint32(0));             // the create succeeded
+    QCOMPARE(readLe16(second, 24), readLe16(message, 24)); // on the new tree
+    QVERIFY(readLe16(second, 38) != 0);                    // with a FID
+}
+
 void Smb1Test::setsTheStateOfAnOpenPipe()
 {
     QScopedPointer<Smb1::Session> session(pipeSession());

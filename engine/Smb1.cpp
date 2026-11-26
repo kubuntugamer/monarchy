@@ -310,7 +310,7 @@ bool Session::signatureValid(const QByteArray &message, quint32 sequence,
     return digest.left(8) == message.mid(14, 8);
 }
 
-QByteArray Session::feed(const QByteArray &message)
+QByteArray Session::feed(const QByteArray &message, int chainDepth)
 {
     const Header header = parseHeader(message);
     if (!header.valid)
@@ -340,39 +340,122 @@ QByteArray Session::feed(const QByteArray &message)
         ++requestSession->signingSeq;
     }
 
+    QByteArray answer;
     switch (header.command) {
     case CmdNegotiate:
-        return negotiate(message);
+        answer = negotiate(message);
+        break;
     case CmdSessionSetupAndX:
-        return sessionSetup(message);
+        answer = sessionSetup(message);
+        break;
     case CmdTreeConnectAndX:
-        return treeConnect(message);
+        answer = treeConnect(message);
+        break;
     case CmdTreeDisconnect:
-        return treeDisconnect(message);
+        answer = treeDisconnect(message);
+        break;
     case CmdLogoffAndX:
-        return logoff(message);
+        answer = logoff(message);
+        break;
     case CmdEcho:
-        return echo(message);
+        answer = echo(message);
+        break;
     case CmdQueryDisk:
-        return queryDisk(message);
+        answer = queryDisk(message);
+        break;
     case CmdNtCreateAndX:
-        return ntCreate(message);
+        answer = ntCreate(message);
+        break;
     case CmdClose:
-        return closeFile(message);
+        answer = closeFile(message);
+        break;
     case CmdReadAndX:
-        return readAndX(message);
+        answer = readAndX(message);
+        break;
     case CmdWriteAndX:
-        return writeAndX(message);
+        answer = writeAndX(message);
+        break;
     case CmdTrans:
-        return transact(message);
+        answer = transact(message);
+        break;
     case CmdTrans2:
-        return trans2(message);
+        answer = trans2(message);
+        break;
     default:
         if (!qEnvironmentVariableIsEmpty("MONARCHY_SMB1_TRACE"))
             qWarning("SMB1 unhandled cmd %u wc=%d words=%s", header.command,
                      int(header.words.size() / 2), header.words.toHex().constData());
-        return unsupportedReply(message);
+        answer = unsupportedReply(message);
+        break;
     }
+
+    // AndX chaining (MS-CIFS 2.2.4.3, 3.2.4.2): the AndX block at the head of the
+    // words may name a second command and the byte offset of its header, and a
+    // client expects both answered. Windows 2000 opens a pipe that way — tree
+    // connect and NT create in one message, the create naming TID 0xFFFF — and a
+    // server that answers only the first leaves the create unanswered and the
+    // caller waiting on a request the other side believes it already sent.
+    // Only the commands that declare an AndX block carry one at the head of
+    // their words; in the others the first word is a field of its own.
+    const bool hasAndX = header.command == CmdSessionSetupAndX
+                         || header.command == CmdTreeConnectAndX
+                         || header.command == CmdLogoffAndX
+                         || header.command == CmdNtCreateAndX
+                         || header.command == CmdReadAndX || header.command == CmdWriteAndX;
+    if (hasAndX && chainDepth < 2 && answer.size() >= 41 && header.words.size() >= 4) {
+        const quint8 next = quint8(header.words.at(0));
+        const quint16 offset = readLe16(header.words, 2);
+        if (next != 0xff && offset >= 32 && offset + 32 <= message.size()) {
+            QByteArray chained = message.mid(offset);
+            // The chained command cannot know the tree the connect is about to
+            // hand out, so it asks for the one this answer names.
+            if (readLe16(chained, 24) == 0xffff)
+                chained.replace(24, 2, answer.mid(28, 2));
+            const QByteArray second = feed(chained, chainDepth + 1);
+            if (second.size() > 4) {
+                // The replies are framed one message at a time; a chain is one
+                // SMB message holding two answers, so it is put together
+                // unframed and framed once at the end.
+                QByteArray firstSmb = answer.mid(4);
+                const QByteArray secondSmb = second.mid(4);
+                // An AndX offset is word-aligned, so an odd-length answer gets
+                // one pad byte and a ByteCount that counts it.
+                if (firstSmb.size() % 2) {
+                    const int byteCountAt = 33 + 2 * quint8(firstSmb.at(32));
+                    const quint16 byteCount = readLe16(firstSmb, byteCountAt);
+                    firstSmb.append(char(0));
+                    firstSmb[byteCountAt] = char((byteCount + 1) & 0xff);
+                    firstSmb[byteCountAt + 1] = char(((byteCount + 1) >> 8) & 0xff);
+                }
+                firstSmb[33] = char(next);
+                firstSmb[34] = char(0);
+                const quint16 link = quint16(firstSmb.size());
+                firstSmb[35] = char(link & 0xff);
+                firstSmb[36] = char((link >> 8) & 0xff);
+                resign(firstSmb);
+                firstSmb.append(secondSmb);
+                answer = nbtFrame(firstSmb);
+            }
+        }
+    }
+    return answer;
+}
+
+void Session::resign(QByteArray &reply)
+{
+    if (reply.size() < 32 || !(readLe16(reply, 10) & 0x0004))
+        return;
+    SessionState *session = sessionState(readLe16(reply, 28));
+    if (!session || session->key.isEmpty())
+        return;
+    // The sequence number stays in the field; only the MAC over the edited
+    // words is recomputed, so the client's counter is unaffected.
+    const QByteArray sequence = reply.mid(14, 4) + QByteArray(4, '\0');
+    QByteArray zeroed = reply;
+    zeroed.replace(14, 8, sequence);
+    QByteArray macInput = session->key;
+    macInput.append(zeroed);
+    reply.replace(14, 8, QCryptographicHash::hash(macInput, QCryptographicHash::Md5).left(8));
 }
 
 QByteArray Session::negotiate(const QByteArray &message)

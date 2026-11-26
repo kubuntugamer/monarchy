@@ -84,7 +84,10 @@ public:
 
     static bool isSmb1(const QByteArray &message);
 
-    QByteArray feed(const QByteArray &message);
+    QByteArray feed(const QByteArray &message, int chainDepth = 0);
+    // Recomputes the signature of a reply whose words were edited after it was
+    // built, keeping the sequence number it already carries.
+    void resign(QByteArray &reply);
 
     void setNotifier(std::function<void(const QString &)> notifier)
     {
