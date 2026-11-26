@@ -156,6 +156,60 @@ quint32 accountFlagsFor(quint32 control)
     return flags;
 }
 
+// The account-type bits of a SAMR acct_flags word, in the directory's
+// numbering: TEMP_DUPLICATE 0x100, NORMAL 0x200, INTERDOMAIN_TRUST 0x800,
+// WORKSTATION_TRUST 0x1000, SERVER_TRUST 0x2000.
+constexpr quint32 kAccountTypeBits = 0x00003f00u;
+
+// A written acct_flags word back into the directory's userAccountControl. A
+// client that names no account type is still describing the account it opened,
+// so the type it already has is kept rather than cleared.
+quint32 accountControlFromFlags(quint32 flags, quint32 stored)
+{
+    quint32 control = 0;
+    if (flags & 0x00000001u)
+        control |= 0x00000002u; // ACB_DISABLED -> ACCOUNTDISABLE
+    if (flags & 0x00000002u)
+        control |= 0x00000008u; // ACB_HOMDIRREQ -> HOMEDIR_REQUIRED
+    if (flags & 0x00000004u)
+        control |= 0x00000020u; // ACB_PWNOTREQ -> PASSWD_NOTREQD
+    if (flags & 0x00000008u)
+        control |= 0x00000100u; // ACB_TEMPDUP -> TEMP_DUPLICATE_ACCOUNT
+    if (flags & 0x00000010u)
+        control |= 0x00000200u; // ACB_NORMAL -> NORMAL_ACCOUNT
+    if (flags & 0x00000020u)
+        control |= 0x00020000u; // ACB_MNS -> MNS_LOGON_ACCOUNT
+    if (flags & 0x00000040u)
+        control |= 0x00000800u; // ACB_DOMTRUST -> INTERDOMAIN_TRUST_ACCOUNT
+    if (flags & 0x00000080u)
+        control |= 0x00001000u; // ACB_WSTRUST -> WORKSTATION_TRUST_ACCOUNT
+    if (flags & 0x00000100u)
+        control |= 0x00002000u; // ACB_SVRTRUST -> SERVER_TRUST_ACCOUNT
+    if (flags & 0x00000200u)
+        control |= 0x00010000u; // ACB_PWNOEXP -> DONT_EXPIRE_PASSWORD
+    if (flags & 0x00000800u)
+        control |= 0x00000080u; // ACB_ENC_TXT_PWD_ALLOWED -> ENCRYPTED_TEXT_PWD_ALLOWED
+    if (flags & 0x00001000u)
+        control |= 0x00040000u; // ACB_SMARTCARD_REQUIRED -> SMARTCARD_REQUIRED
+    if (flags & 0x00002000u)
+        control |= 0x00080000u; // ACB_TRUSTED_FOR_DELEGATION
+    if (flags & 0x00004000u)
+        control |= 0x00100000u; // ACB_NOT_DELEGATED -> NOT_DELEGATED
+    if (flags & 0x00008000u)
+        control |= 0x00200000u; // ACB_USE_DES_KEY_ONLY -> USE_DES_KEY_ONLY
+    if (flags & 0x00010000u)
+        control |= 0x00400000u; // ACB_DONT_REQUIRE_PREAUTH -> DONT_REQUIRE_PREAUTH
+    if (flags & 0x00020000u)
+        control |= 0x00800000u; // ACB_PW_EXPIRED -> PASSWORD_EXPIRED
+    if (flags & 0x00040000u)
+        control |= 0x01000000u; // ACB_TRUSTED_TO_AUTH_FOR_DELEGATION
+    if (flags & 0x00100000u)
+        control |= 0x04000000u; // ACB_PARTIAL_SECRETS_ACCOUNT
+    if ((control & kAccountTypeBits) == 0)
+        control |= stored & kAccountTypeBits;
+    return control;
+}
+
 // SID_NAME_USE as MS-SAMR reports it for a relative identifier.
 bool isAlias(const DirectoryObject &object);
 
@@ -2173,8 +2227,9 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
                 fixed.append(char(0));
                 fixed.append(char(0));
                 fixed.append(char(0));
-                putLe32(fixed,
-                        object.attributes.value(QStringLiteral("userAccountControl")).toUInt());
+                putLe32(fixed, accountFlagsFor(
+                                   object.attributes.value(QStringLiteral("userAccountControl"))
+                                       .toUInt()));
                 putLe32(fixed, kStatusSuccess);
                 return fixed;
             }
@@ -3473,11 +3528,17 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
         }
         // A handle outlives the account if something else deleted it, so the
         // object is looked up again rather than trusted from the handle alone.
+        // Its current value is kept: a set that names no account type still
+        // describes the account it opened, and acct_flags need converting.
         const QList<DirectoryObject> all = directory();
-        const bool found = std::any_of(all.begin(), all.end(), [&user](const DirectoryObject &o) {
-            return o.id.compare(user.dn, Qt::CaseInsensitive) == 0;
-        });
-        if (!found) {
+        const DirectoryObject *target = nullptr;
+        for (const DirectoryObject &o : all) {
+            if (o.id.compare(user.dn, Qt::CaseInsensitive) == 0) {
+                target = &o;
+                break;
+            }
+        }
+        if (!target) {
             putLe32(fixed, kStatusNoSuchUser);
             return fixed;
         }
@@ -3718,12 +3779,17 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
                                                         : QStringLiteral("userParameters");
             return writeAttribute(attribute, text);
         }
-        case 16: { // SamrUserControlInformation: USER_ACCOUNT_* flags
-            quint32 control = 0;
-            if (!reader.u32(&control))
+        case 16: { // SamrUserControlInformation: SAMR's acct_flags, not the
+            // directory's userAccountControl bits. `net user NAME /active:no`
+            // sends ACB_DISABLED (0x1) here, and storing it as written left the
+            // account enabled in a bit set that means nothing in AD.
+            quint32 flags = 0;
+            if (!reader.u32(&flags))
                 return {};
+            const quint32 stored =
+                target->attributes.value(QStringLiteral("userAccountControl")).toUInt();
             return writeAttribute(QStringLiteral("userAccountControl"),
-                                  QString::number(control));
+                                  QString::number(accountControlFromFlags(flags, stored)));
         }
         case 17: { // SamrUserExpiresInformation: accountExpires, a FILETIME
             quint64 expires = 0;
@@ -3823,7 +3889,9 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
             carry(0x00400000u, QStringLiteral("countryCode"), QString::number(info.countryCode));
             carry(0x00800000u, QStringLiteral("codePage"), QString::number(info.codePage));
             carry(0x00100000u, QStringLiteral("userAccountControl"),
-                  QString::number(info.accountControl));
+                  QString::number(accountControlFromFlags(
+                      info.accountControl,
+                      target->attributes.value(QStringLiteral("userAccountControl")).toUInt())));
             // 0 and 0x7fffffffffffffff both mean "never" in AD.
             carry(0x00080000u, QStringLiteral("accountExpires"),
                   (info.accountExpires == 0

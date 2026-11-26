@@ -216,7 +216,9 @@ QByteArray aliasMemberStub(const QByteArray &aliasHandle, const QByteArray &sid)
 // write: info class 16, union tag 16, then the ULONG arm.
 QByteArray controlStub(const QByteArray &userHandle)
 {
-    return userHandle + QByteArray::fromHex("10001000") + QByteArray::fromHex("02020000");
+    // ACB_DISABLED | ACB_NORMAL: the word a client that disables the account
+    // writes, in SAMR's acct_flags numbering.
+    return userHandle + QByteArray::fromHex("10001000") + QByteArray::fromHex("11000000");
 }
 
 // SamrSetInformationUser2, class 8 (full name), captured from impacket: the
@@ -1635,7 +1637,8 @@ void SamrTest::samrSetPasswordAndAccountControl()
     const QByteArray userHandle =
         server.handleCall(Samr::OpOpenUser, openUserStub(domainHandle, 1001)).left(20);
 
-    // Account flags: 514 = ACCOUNTDISABLE | NORMAL_ACCOUNT disables the account.
+    // Account flags: ACB_DISABLED | ACB_NORMAL (0x11) disables the account, and
+    // reaches the directory as ACCOUNTDISABLE | NORMAL_ACCOUNT (514).
     QCOMPARE(lastWord(server.handleCall(Samr::OpSetInformationUser2, controlStub(userHandle))),
              0u);
     QCOMPARE(store.at(0).attributes.value(QStringLiteral("userAccountControl")),
@@ -1648,7 +1651,7 @@ void SamrTest::samrSetPasswordAndAccountControl()
     const QByteArray queryReply = server.handleCall(Samr::OpQueryInformationUser2, query);
     QCOMPARE(lastWord(queryReply), 0u);
     QCOMPARE(quint8(queryReply.at(4)), quint8(16)); // tag: SamrUserControlInformation
-    QCOMPARE(readLe32At(queryReply, 8), 514u);
+    QCOMPARE(readLe32At(queryReply, 8), 0x11u); // acct_flags, not the directory bits
 
     // The full name follows the same string layout the query uses.
     QCOMPARE(lastWord(server.handleCall(
@@ -1972,7 +1975,7 @@ void SamrTest::samrWritesTheAggregateUserInformation()
     fields.workstations = QStringLiteral("WS01,WS02");
     fields.parameters = QStringLiteral("a=b");
     fields.primaryGroupId = 513;
-    fields.accountControl = 514;
+    fields.accountControl = 0x11; // acct_flags: ACB_DISABLED | ACB_NORMAL
     fields.accountExpires = 0;
     fields.countryCode = 39;
     fields.codePage = 1252;
