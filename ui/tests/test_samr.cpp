@@ -905,10 +905,12 @@ void SamrTest::samrDirectoryCalls()
     QCOMPARE(quint8(allReply.at(4)), quint8(21)); // tag: SamrUserAllInformation
     QVERIFY(utf16Text(allReply).contains(QStringLiteral("alice")));
     QVERIFY(allReply.contains(QByteArray::fromHex("e9030000"))); // RID 1001
-    // WhichFields sits in the arm after the account flags, and the
-    // password-presence and expired-flag bits are not in it: MS-SAMR 3.1.5.5.5
-    // forbids a server from ever returning those.
-    QCOMPARE(readLe32At(allReply, 8 + 172), 0x00ffe7ffu); // fields present
+    // WhichFields sits in the arm after the account flags: every field through
+    // CODE_PAGE, including LAST_LOGON and LAST_LOGOFF, whose values the arm
+    // carries and whose bits USER_READ_LOGON requires (MS-SAMR 3.1.5.5.5.2).
+    // The password-presence and expired-flag bits are not in it: MS-SAMR
+    // 3.1.5.5.5 forbids a server from ever returning those.
+    QCOMPARE(readLe32At(allReply, 8 + 172), 0x00ffffffu); // fields present
     // LastLogon, badPwdCount and logonCount are the stored values: the arm is
     // the 196-byte aggregate that starts after the referent and tag.
     QVERIFY(allReply.contains(QByteArray::fromHex("8877665544332211"))); // lastLogon

@@ -563,11 +563,14 @@ void appendAllUserInfo(const AllUserInfo &info, QByteArray &out, QByteArray &def
     out.append(char(0));                       // PrivateDataSensitive
 }
 
-// The bits of samr_FieldsPresent that an answer actually fills in. The two
-// password-presence bits and the expired flag are absent on purpose: MS-SAMR
-// 3.1.5.5.5 lists them, with private data and the security descriptor, as bits a
-// server MUST never return, and a client that finds one in a query answer is
-// entitled to read the record as a set-record and refuse it.
+// The bits of samr_FieldsPresent that an answer actually fills in: every field
+// up to CODE_PAGE. MS-SAMR 3.1.5.5.5.2 makes the bit set depend on the access
+// the caller holds, and the guest opens the user with USER_READ_LOGON, so
+// LAST_LOGON and LAST_LOGOFF belong here with the values the arm already
+// carries — a 2000 client answers a set of fields that leaves them out with
+// 124 without reading the record. The two password-presence bits and the
+// expired flag stay out on purpose: MS-SAMR 3.1.5.5.5 lists them, with private
+// data and the security descriptor, as bits a server MUST never return.
 constexpr quint32 kFieldsPresentStandard =
     0x1u      // ACCOUNT_NAME
     | 0x2u    // FULL_NAME
@@ -580,6 +583,8 @@ constexpr quint32 kFieldsPresentStandard =
     | 0x100u  // LOGON_SCRIPT
     | 0x200u  // PROFILE_PATH
     | 0x400u  // WORKSTATIONS
+    | 0x800u  // LAST_LOGON
+    | 0x1000u // LAST_LOGOFF
     | 0x2000u // LOGON_HOURS
     | 0x4000u // BAD_PWD_COUNT
     | 0x8000u // NUM_LOGONS
