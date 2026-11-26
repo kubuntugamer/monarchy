@@ -563,7 +563,11 @@ void appendAllUserInfo(const AllUserInfo &info, QByteArray &out, QByteArray &def
     out.append(char(0));                       // PrivateDataSensitive
 }
 
-// The bits of samr_FieldsPresent that an answer actually fills in.
+// The bits of samr_FieldsPresent that an answer actually fills in. The two
+// password-presence bits and the expired flag are absent on purpose: MS-SAMR
+// 3.1.5.5.5 lists them, with private data and the security descriptor, as bits a
+// server MUST never return, and a client that finds one in a query answer is
+// entitled to read the record as a set-record and refuse it.
 constexpr quint32 kFieldsPresentStandard =
     0x1u      // ACCOUNT_NAME
     | 0x2u    // FULL_NAME
@@ -586,9 +590,7 @@ constexpr quint32 kFieldsPresentStandard =
     | 0x100000u // ACCT_FLAGS
     | 0x200000u // PARAMETERS
     | 0x400000u // COUNTRY_CODE
-    | 0x800000u // CODE_PAGE
-    | 0x1000000u // NT_PASSWORD_PRESENT
-    | 0x8000000u; // EXPIRED_FLAG
+    | 0x800000u; // CODE_PAGE
 
 // ---------- reading the aggregate write ----------
 //
