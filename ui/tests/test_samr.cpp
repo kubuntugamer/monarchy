@@ -856,6 +856,22 @@ void SamrTest::samrDirectoryCalls()
     QCOMPARE(logoffReply.mid(4, 2), QByteArray::fromHex("0300")); // tag
     QCOMPARE(logoffReply.mid(8, 8), QByteArray::fromHex("ffffffffffffff7f"));
 
+    // Classes 4 and 6 are one string each: the domain comment and the PDC a
+    // BDC names. This directory keeps no comment and this DC is the PDC, so
+    // both answer the empty string — a zero length, a zero maximum and a NULL
+    // buffer pointer, never a refused class, which stops `net accounts`.
+    for (int level : {4, 6}) {
+        QByteArray request = domainHandle;
+        request.append(char(level));
+        request.append(QByteArray(2, '\0'));
+        const QByteArray reply =
+            server.handleCall(Samr::OpQueryInformationDomain, request);
+        QCOMPARE(lastWord(reply), 0u);
+        QCOMPARE(readLe32At(reply, 0), 4u);
+        QCOMPARE(quint8(reply.at(4)), quint8(level));
+        QCOMPARE(reply.mid(8, 8), QByteArray(8, '\0')); // empty lsa_String
+    }
+
     // EnumerateUsersInDomain: both accounts with their RIDs.
     const QByteArray usersReply =
         server.handleCall(Samr::OpEnumerateUsersInDomain, enumUsersStub(domainHandle));

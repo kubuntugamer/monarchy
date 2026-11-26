@@ -1541,6 +1541,26 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
             emit requestReceived(QStringLiteral("QueryInformationDomain(name)"));
             return fixed;
         }
+        case 4: { // DomainOemInformation: the domain comment AD keeps on the
+            // domain NC. The directory model has no such attribute, so the
+            // answer is the empty string the reference DC sends for a domain
+            // with no comment — never a NULL pointer, which a client reads as
+            // a missing arm rather than an empty one.
+            beginArm(4);
+            fixed.append(QByteArray(8, '\0')); // Length, MaximumLength, NULL buffer
+            putLe32(fixed, kStatusSuccess);
+            emit requestReceived(QStringLiteral("QueryInformationDomain(oem)"));
+            return fixed;
+        }
+        case 6: { // DomainPrimaryInformation: the PDC a BDC points at. This
+            // DC holds the PDC role, so it names no primary — the empty string
+            // the reference DC sends, on the same wire shape as class 5.
+            beginArm(6);
+            fixed.append(QByteArray(8, '\0')); // Length, MaximumLength, NULL buffer
+            putLe32(fixed, kStatusSuccess);
+            emit requestReceived(QStringLiteral("QueryInformationDomain(primary)"));
+            return fixed;
+        }
         case 7: { // DomainServerRoleInformation: this DC holds the PDC role
             beginArm(7);
             fixed.append(char(3)); // DOMAIN_SERVER_ROLE_PRIMARY
