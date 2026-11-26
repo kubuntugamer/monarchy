@@ -212,6 +212,25 @@ QByteArray aliasMemberStub(const QByteArray &aliasHandle, const QByteArray &sid)
     return stub;
 }
 
+// SamrGetAliasMembership: a [ref] lsa_SidArray behind the domain handle — the
+// struct's referent, the count, the array's referent and maximum count, one
+// referent per SID, then the SIDs.
+QByteArray aliasMembershipStub(const QByteArray &domainHandle, const QList<QByteArray> &sids)
+{
+    QByteArray stub = domainHandle;
+    appendLe32(stub, 24);                   // lsa_SidArray referent
+    appendLe32(stub, quint32(sids.size())); // num_sids
+    appendLe32(stub, 32);                   // element array referent
+    appendLe32(stub, quint32(sids.size())); // maximum count
+    for (int i = 0; i < sids.size(); ++i)
+        appendLe32(stub, quint32(40 + 4 * i)); // one referent per lsa_SidPtr
+    for (const QByteArray &sid : sids) {
+        appendLe32(stub, quint32((sid.size() - 8) / 4)); // sub-authorities
+        stub.append(sid);
+    }
+    return stub;
+}
+
 // SamrSetInformationUser2, captured from impacket for a control-information
 // write: info class 16, union tag 16, then the ULONG arm.
 QByteArray controlStub(const QByteArray &userHandle)
@@ -1340,6 +1359,29 @@ void SamrTest::samrServesTheBuiltinDomain()
     QCOMPARE(lastWord(members), 0u);
     QCOMPARE(readLe32At(members, 0), 1u);
     QVERIFY(members.contains(Ndr::sidFromString(QStringLiteral("S-1-5-21-1-2-3-512"))));
+
+    // GetAliasMembership (opnum 16) answers the reverse question: which aliases
+    // a SID is on, as samr_Ids. `net user /domain` asks it after
+    // GetGroupsForUser, and a refused call stops the command.
+    const QByteArray domainAdminsSid = Ndr::sidFromString(QStringLiteral("S-1-5-21-1-2-3-512"));
+    const QByteArray membership =
+        server.handleCall(Samr::OpGetAliasMembership,
+                          aliasMembershipStub(builtinHandle, {domainAdminsSid}));
+    QCOMPARE(lastWord(membership), 0u);
+    QCOMPARE(readLe32At(membership, 0), 4u);  // ids at stub 4
+    QCOMPARE(readLe32At(membership, 4), 1u);  // Count
+    QCOMPARE(readLe32At(membership, 8), 16u); // array at stub 16
+    QCOMPARE(readLe32At(membership, 12), 1u); // MaximumCount
+    QCOMPARE(readLe32At(membership, 16), 544u); // Administrators
+    // A SID no alias holds comes back as an empty list, not a refusal.
+    const QByteArray outsider =
+        server.handleCall(Samr::OpGetAliasMembership,
+                          aliasMembershipStub(builtinHandle,
+                                              {Ndr::sidFromString(
+                                                  QStringLiteral("S-1-5-21-1-2-3-4242"))}));
+    QCOMPARE(lastWord(outsider), 0u);
+    QCOMPARE(readLe32At(outsider, 4), 0u); // Count
+    QCOMPARE(readLe32At(outsider, 8), 0u); // NULL array
 
     // Everything that would write is refused: there is nowhere to persist a
     // BUILTIN write, so accepting it would lose the change.

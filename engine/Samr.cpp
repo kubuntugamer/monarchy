@@ -1148,6 +1148,40 @@ QByteArray SamrServer::newHandle(Handle::Kind kind, const QString &dn, quint32 r
     return id;
 }
 
+QList<QByteArray> SamrServer::aliasMemberSids(const QString &aliasDn, quint32 aliasRid) const
+{
+    QList<QByteArray> sids;
+    QStringList members;
+    if (isBuiltinAlias(aliasDn)) {
+        for (const DirectoryObject &candidate : builtinAliasObjects(directory())) {
+            if (candidate.id.compare(aliasDn, Qt::CaseInsensitive) == 0) {
+                members = candidate.members;
+                break;
+            }
+        }
+        return builtinMemberSids(aliasRid, m_config.domainSid, directory(), members);
+    }
+    for (const DirectoryObject &object : aliases()) {
+        if (object.id.compare(aliasDn, Qt::CaseInsensitive) == 0) {
+            members = object.members;
+            break;
+        }
+    }
+    const QList<DirectoryObject> all = directory();
+    for (const QString &member : members) {
+        for (const DirectoryObject &candidate : all) {
+            if (candidate.id.compare(member, Qt::CaseInsensitive) != 0)
+                continue;
+            const QByteArray sid = Ndr::sidFromString(
+                candidate.attributes.value(QStringLiteral("objectSid")));
+            if (!sid.isEmpty())
+                sids.append(sid);
+            break;
+        }
+    }
+    return sids;
+}
+
 bool SamrServer::lookupHandle(const QByteArray &handle, Handle::Kind kind, Handle *out) const
 {
     if (handle.size() != kHandleSize)
@@ -2066,6 +2100,75 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
         emit requestReceived(QStringLiteral("EnumerateAliases (%1)").arg(page.size()));
         return fixed;
     }
+    // SamrGetAliasMembership (opnum 16): which domain-local groups a set of
+    // SIDs belongs to, as samr_Ids. `net user /domain` asks it after
+    // GetGroupsForUser to fill its "Local Group memberships" line, and stops
+    // the command when the call is refused.
+    case Samr::OpGetAliasMembership: {
+        QByteArray handle;
+        if (!reader.bytes(kHandleSize, &handle))
+            return {};
+        // [in,ref] lsa_SidArray: a referent, the count, the array's referent and
+        // maximum count, one referent per SID, then the SIDs.
+        quint32 sidArrayReferent = 0;
+        quint32 count = 0;
+        if (!reader.u32(&sidArrayReferent) || !reader.u32(&count))
+            return {};
+        if (count > 0) {
+            quint32 arrayReferent = 0;
+            quint32 maximum = 0;
+            if (!reader.u32(&arrayReferent) || !reader.u32(&maximum))
+                return {};
+            for (quint32 i = 0; i < count; ++i) {
+                quint32 element = 0;
+                if (!reader.u32(&element))
+                    return {};
+            }
+        }
+        QList<QByteArray> sids;
+        for (quint32 i = 0; i < count; ++i) {
+            QByteArray sid;
+            if (!readWireSid(reader, &sid))
+                return {};
+            sids.append(sid);
+        }
+        Handle domain;
+        if (!lookupHandle(handle, Handle::Domain, &domain)) {
+            putLe32(fixed, 0); // NULL rids referent
+            putLe32(fixed, kStatusInvalidHandle);
+            return fixed;
+        }
+        // Each alias this domain has, in RID order, joined once when any of the
+        // given SIDs is on its member list.
+        const QList<DirectoryObject> pool =
+            domain.dn == kBuiltinDomainSid ? builtinAliasObjects(directory()) : aliases();
+        QList<quint32> rids;
+        for (const DirectoryObject &alias : pool) {
+            const QList<QByteArray> members = aliasMemberSids(alias.id, ridOf(alias));
+            for (const QByteArray &sid : sids) {
+                if (!members.contains(sid))
+                    continue;
+                rids.append(ridOf(alias));
+                break;
+            }
+        }
+        // [out,ref] samr_Ids: a referent, the count, then the conformant array.
+        putLe32(fixed, 4);                   // ids at stub 4
+        putLe32(fixed, quint32(rids.size())); // Count
+        if (rids.isEmpty()) {
+            putLe32(fixed, 0); // NULL array pointer
+        } else {
+            putLe32(fixed, 16);                   // array at stub 16
+            putLe32(fixed, quint32(rids.size())); // MaximumCount
+            for (quint32 rid : rids)
+                putLe32(fixed, rid);
+        }
+        putLe32(fixed, kStatusSuccess);
+        emit requestReceived(QStringLiteral("GetAliasMembership(%1 -> %2)")
+                                 .arg(sids.size())
+                                 .arg(rids.size()));
+        return fixed;
+    }
     case Samr::OpOpenAlias: {
         QByteArray handle;
         if (!reader.bytes(kHandleSize, &handle))
@@ -2183,37 +2286,7 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
             putLe32(fixed, kStatusInvalidHandle);
             return fixed;
         }
-        QList<QByteArray> sids;
-        if (isBuiltinAlias(alias.dn)) {
-            QStringList stored;
-            for (const DirectoryObject &candidate : builtinAliasObjects(directory())) {
-                if (candidate.id.compare(alias.dn, Qt::CaseInsensitive) == 0) {
-                    stored = candidate.members;
-                    break;
-                }
-            }
-            sids = builtinMemberSids(alias.rid, m_config.domainSid, directory(), stored);
-        } else {
-            QStringList members;
-            for (const DirectoryObject &object : aliases()) {
-                if (object.id.compare(alias.dn, Qt::CaseInsensitive) == 0) {
-                    members = object.members;
-                    break;
-                }
-            }
-            const QList<DirectoryObject> all = directory();
-            for (const QString &member : members) {
-                for (const DirectoryObject &candidate : all) {
-                    if (candidate.id.compare(member, Qt::CaseInsensitive) != 0)
-                        continue;
-                    const QByteArray sid = Ndr::sidFromString(
-                        candidate.attributes.value(QStringLiteral("objectSid")));
-                    if (!sid.isEmpty())
-                        sids.append(sid);
-                    break;
-                }
-            }
-        }
+        const QList<QByteArray> sids = aliasMemberSids(alias.dn, alias.rid);
         putLe32(fixed, quint32(sids.size()));
         if (sids.isEmpty()) {
             putLe32(fixed, 0);

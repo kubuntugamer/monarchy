@@ -69,6 +69,10 @@ enum Opnum : quint16 {
     // the group calls and are told apart by the group's groupType.
     OpCreateAliasInDomain = 14,
     OpEnumerateAliasesInDomain = 15,
+    // SamrGetAliasMembership (16): which domain-local groups a set of SIDs
+    // belongs to. `net user /domain` asks for it after GetGroupsForUser to
+    // print the local group memberships its account has.
+    OpGetAliasMembership = 16,
     OpEnumerateUsersInDomain = 13,
     // MS-SAMR function 0x14/0x15, after OpenGroup (0x13).
     OpQueryInformationGroup = 20,
@@ -167,6 +171,9 @@ private:
     };
 
     QList<DirectoryObject> directory() const;
+    // The SIDs a domain-local group carries, for a stored alias and for one of
+    // the BUILTIN aliases the directory does not store itself.
+    QList<QByteArray> aliasMemberSids(const QString &aliasDn, quint32 aliasRid) const;
     // The domain NC object: the lockout policy and the domain-wide attributes
     // live on it.
     DirectoryObject domainObject() const;
