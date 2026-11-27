@@ -861,9 +861,9 @@ void SamrTest::samrDirectoryCalls()
     QVERIFY(lockoutReply.contains(halfHour));
     QVERIFY(lockoutReply.contains(QByteArray::fromHex("03000000"))); // threshold 3
 
-    // QueryInformationDomain class 3 is the forced-logoff instant, which a DC
-    // that forces none answers as the NTTIME "never": `net accounts /domain`
-    // reads it and stops the command when the class is refused.
+    // QueryInformationDomain class 3 is the forced-logoff interval, a relative
+    // time a DC that forces none answers with zero, as the reference DC does:
+    // `net accounts /domain` reads it for its "Forced logoff" line.
     QByteArray logoffRequest = domainHandle;
     logoffRequest.append(char(3));
     logoffRequest.append(QByteArray(2, '\0'));
@@ -872,7 +872,7 @@ void SamrTest::samrDirectoryCalls()
     QCOMPARE(lastWord(logoffReply), 0u);
     QCOMPARE(readLe32At(logoffReply, 0), 4u);
     QCOMPARE(logoffReply.mid(4, 2), QByteArray::fromHex("0300")); // tag
-    QCOMPARE(logoffReply.mid(8, 8), QByteArray::fromHex("ffffffffffffff7f"));
+    QCOMPARE(logoffReply.mid(8, 8), QByteArray(8, '\0'));
 
     // Classes 4 and 6 are one string each: the domain comment and the PDC a
     // BDC names. This directory keeps no comment and this DC is the PDC, so
