@@ -105,6 +105,10 @@ enum Opnum : quint16 {
     // SamrQueryInformationUser (36) is the pre-revision form of the (2) call:
     // same [in] handle + [in] class, same [out] Buffer union + NTSTATUS.
     OpQueryInformationUser = 36,
+    // SamrQueryInformationDomain2 (46) is the (2) form of the domain query:
+    // same [in] handle + [in] level, same [out] Buffer union, and it is the
+    // call `net accounts /domain` makes for its lockout line.
+    OpQueryInformationDomain2 = 46,
     OpQueryInformationUser2 = 47,
     OpCreateUser2 = 50,
     // Both set-information calls take the same union: 37 is

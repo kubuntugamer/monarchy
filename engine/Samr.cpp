@@ -1465,7 +1465,11 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
     // SamrQueryInformationDomain (opnum 8). The out parameter is a pointer to
     // the union: a referent, the class as a USHORT, two alignment bytes, then
     // the arm. Only the classes this directory can answer truthfully are served.
-    case Samr::OpQueryInformationDomain: {
+    // SamrQueryInformationDomain2 (opnum 46) is the (2) form of the same query:
+    // the same handle and level in, the same union and status out. A Windows
+    // 2000 client asks it for the lockout policy, which is class 12 here.
+    case Samr::OpQueryInformationDomain:
+    case Samr::OpQueryInformationDomain2: {
         QByteArray handle;
         if (!reader.bytes(kHandleSize, &handle))
             return {};

@@ -862,8 +862,9 @@ void SamrTest::samrDirectoryCalls()
     QVERIFY(lockoutReply.contains(QByteArray::fromHex("03000000"))); // threshold 3
 
     // QueryInformationDomain class 3 is the forced-logoff interval, a relative
-    // time a DC that forces none answers with zero, as the reference DC does:
-    // `net accounts /domain` reads it for its "Forced logoff" line.
+    // time a DC that forces none answers with zero: `net accounts /domain`
+    // reads it for its "Forced logoff" line and stops the command when the
+    // class is refused.
     QByteArray logoffRequest = domainHandle;
     logoffRequest.append(char(3));
     logoffRequest.append(QByteArray(2, '\0'));
@@ -873,6 +874,19 @@ void SamrTest::samrDirectoryCalls()
     QCOMPARE(readLe32At(logoffReply, 0), 4u);
     QCOMPARE(logoffReply.mid(4, 2), QByteArray::fromHex("0300")); // tag
     QCOMPARE(logoffReply.mid(8, 8), QByteArray(8, '\0'));
+
+    // SamrQueryInformationDomain2 (opnum 46) asks the same union through the
+    // (2) call, and class 12 is the one `net accounts /domain` makes there: a
+    // call with no arm is answered with no bytes, which the client reports as
+    // error 124.
+    const QByteArray domain2Reply =
+        server.handleCall(Samr::OpQueryInformationDomain2, lockoutRequest);
+    QCOMPARE(lastWord(domain2Reply), 0u);
+    QCOMPARE(readLe32At(domain2Reply, 0), 4u);
+    QCOMPARE(domain2Reply.mid(4, 2), QByteArray::fromHex("0c00")); // tag
+    QCOMPARE(domain2Reply.mid(8, 8), halfHour);
+    QCOMPARE(domain2Reply.mid(16, 8), halfHour);
+    QCOMPARE(domain2Reply.mid(24, 2), QByteArray::fromHex("0300")); // threshold
 
     // Classes 4 and 6 are one string each: the domain comment and the PDC a
     // BDC names. This directory keeps no comment and this DC is the PDC, so
