@@ -2108,22 +2108,21 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
         QByteArray handle;
         if (!reader.bytes(kHandleSize, &handle))
             return {};
-        // [in,ref] lsa_SidArray: a referent, the count, the array's referent and
-        // maximum count, one referent per SID, then the SIDs.
-        quint32 sidArrayReferent = 0;
+        // [in] lsa_SidArray: the count, the array's referent and maximum
+        // count, one referent per lsa_SidPtr, then each SID. The count comes
+        // first — `{ uint32 num_sids; lsa_SidPtr *sids; }` — so reading a
+        // referent here made the count a pointer value and ran the element
+        // loop off the stub.
         quint32 count = 0;
-        if (!reader.u32(&sidArrayReferent) || !reader.u32(&count))
+        quint32 sidArrayReferent = 0;
+        quint32 maximum = 0;
+        if (!reader.u32(&count) || !reader.u32(&sidArrayReferent)
+            || !reader.u32(&maximum))
             return {};
-        if (count > 0) {
-            quint32 arrayReferent = 0;
-            quint32 maximum = 0;
-            if (!reader.u32(&arrayReferent) || !reader.u32(&maximum))
+        for (quint32 i = 0; i < count; ++i) {
+            quint32 element = 0;
+            if (!reader.u32(&element))
                 return {};
-            for (quint32 i = 0; i < count; ++i) {
-                quint32 element = 0;
-                if (!reader.u32(&element))
-                    return {};
-            }
         }
         QList<QByteArray> sids;
         for (quint32 i = 0; i < count; ++i) {
@@ -2152,17 +2151,14 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
                 break;
             }
         }
-        // [out,ref] samr_Ids: a referent, the count, then the conformant array.
-        putLe32(fixed, 4);                   // ids at stub 4
+        // [out] samr_Ids: the count, the array's referent, its maximum count,
+        // then the conformant array. The referent stays non-NULL on an empty
+        // list, the way the reference DC answers it.
         putLe32(fixed, quint32(rids.size())); // Count
-        if (rids.isEmpty()) {
-            putLe32(fixed, 0); // NULL array pointer
-        } else {
-            putLe32(fixed, 16);                   // array at stub 16
-            putLe32(fixed, quint32(rids.size())); // MaximumCount
-            for (quint32 rid : rids)
-                putLe32(fixed, rid);
-        }
+        putLe32(fixed, 12);                   // ids at stub 12, behind the header
+        putLe32(fixed, quint32(rids.size())); // MaximumCount
+        for (quint32 rid : rids)
+            putLe32(fixed, rid);
         putLe32(fixed, kStatusSuccess);
         emit requestReceived(QStringLiteral("GetAliasMembership(%1 -> %2)")
                                  .arg(sids.size())
