@@ -770,6 +770,47 @@ void SamrTest::samrServesTheDomainPasswordPolicy()
                                                    -36288000000000LL, -864000000000LL))),
              0u);
     QCOMPARE(written.value(QStringLiteral("pwdProperties")), QStringLiteral("0"));
+
+    // A class-12 set carries the lockout intervals in the same negative form,
+    // -18000000000 for 30 minutes and 0x8000000000000000 for "never", and the
+    // directory keeps both as sent: flipping the sign is what made a written
+    // 30-minute lockout read back as no limit.
+    written.clear();
+    const auto lockoutStub = [](const QByteArray &handle, qint64 duration, qint64 window,
+                                quint16 threshold) {
+        QByteArray stub = handle;
+        stub.append(char(12));
+        stub.append(char(0));
+        while (stub.size() % 8) // the two hypers are 8-aligned
+            stub.append(char(0));
+        for (int i = 0; i < 8; ++i)
+            stub.append(char((quint64(duration) >> (8 * i)) & 0xff));
+        for (int i = 0; i < 8; ++i)
+            stub.append(char((quint64(window) >> (8 * i)) & 0xff));
+        stub.append(char(threshold & 0xff));
+        stub.append(char((threshold >> 8) & 0xff));
+        return stub;
+    };
+    QCOMPARE(lastWord(server.handleCall(
+                 Samr::OpSetInformationDomain,
+                 lockoutStub(domainHandle, -18000000000LL, -18000000000LL, 3))),
+             0u);
+    QCOMPARE(written.value(QStringLiteral("lockoutDuration")), QStringLiteral("-18000000000"));
+    QCOMPARE(written.value(QStringLiteral("lockoutObservationWindow")),
+             QStringLiteral("-18000000000"));
+    QCOMPARE(written.value(QStringLiteral("lockoutThreshold")), QStringLiteral("3"));
+
+    // "Never" is the most negative value, and it survives the round trip as
+    // the same word rather than an overflowed magnitude.
+    written.clear();
+    constexpr qint64 kNever = -9223372036854775807LL - 1;
+    QCOMPARE(lastWord(server.handleCall(
+                 Samr::OpSetInformationDomain,
+                 lockoutStub(domainHandle, kNever, kNever, 0))),
+             0u);
+    QCOMPARE(written.value(QStringLiteral("lockoutDuration")),
+             QStringLiteral("-9223372036854775808"));
+    QCOMPARE(written.value(QStringLiteral("lockoutThreshold")), QStringLiteral("0"));
 }
 
 void SamrTest::samrDirectoryCalls()
@@ -847,8 +888,10 @@ void SamrTest::samrDirectoryCalls()
     const QByteArray domainHandle = domainReply.left(20);
 
     // QueryInformationDomain class 12 reports the domain's lockout policy: the
-    // intervals AD stores as negative values come back as their magnitude, and
-    // the threshold as the number of refusals that locks an account.
+    // intervals are delta times, negative 100-nanosecond values, and come back
+    // as the directory stores them — the client writes -18000000000 for 30
+    // minutes and treats a positive value as no limit. The threshold is the
+    // number of refusals that locks an account.
     QByteArray lockoutRequest = domainHandle;
     lockoutRequest.append(char(12));
     lockoutRequest.append(QByteArray(2, '\0'));
@@ -857,7 +900,7 @@ void SamrTest::samrDirectoryCalls()
     QCOMPARE(lastWord(lockoutReply), 0u);
     QByteArray halfHour(8, '\0');
     for (int i = 0; i < 8; ++i)
-        halfHour[i] = char((18000000000ull >> (8 * i)) & 0xff);
+        halfHour[i] = char((quint64(-18000000000LL) >> (8 * i)) & 0xff);
     QVERIFY(lockoutReply.contains(halfHour));
     QVERIFY(lockoutReply.contains(QByteArray::fromHex("03000000"))); // threshold 3
 

@@ -1643,10 +1643,12 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
             putLe32(fixed, quint32(users().size()));
             putLe32(fixed, quint32(groups().size()));
             putLe32(fixed, 0u); // aliases
-            // The lockout members are hyper: 8-aligned here, and reported as
-            // magnitudes of the negative values the directory stores.
-            putLe64(fixed, quint64(duration < 0 ? -duration : duration));
-            putLe64(fixed, quint64(window < 0 ? -window : window));
+            // The lockout members are hyper: 8-aligned here, and carry the
+            // intervals as MS-SAMR defines them, a negative delta time, which
+            // is the form the directory already stores, so they go back as
+            // read.
+            putLe64(fixed, quint64(duration));
+            putLe64(fixed, quint64(window));
             fixed.append(char(threshold & 0xff));
             fixed.append(char(0)); // padding before the status word
             fixed.append(char(0));
@@ -1657,11 +1659,14 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
             return fixed;
         }
         case 12: { // DomainLockoutInformation: the policy the domain object carries
-            // AD stores the two intervals as negative 100-nanosecond values and
-            // SAMR reports their magnitude, so a 30-minute duration is
-            // -18000000000 on disk and 18000000000 on the wire. The threshold
-            // is the number of refusals that locks the account; zero means a
-            // bad password is counted but never locks it.
+            // Both intervals are delta times, which MS-SAMR defines as negative
+            // 100-nanosecond values, and the client encodes them that way:
+            // `net accounts /domain /lockoutduration:30` writes -18000000000
+            // and reads a positive 18000000000 as no limit at all. AD's
+            // attributes hold the same negative form, so the arm hands back
+            // the stored value unchanged. The threshold is the number of
+            // refusals that locks the account; zero means a bad password is
+            // counted but never locks it.
             const DirectoryObject domain = domainObject();
             const qint64 duration =
                 domain.attributes.value(QStringLiteral("lockoutDuration")).toLongLong();
@@ -1670,8 +1675,8 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
             const quint32 threshold =
                 domain.attributes.value(QStringLiteral("lockoutThreshold")).toUInt();
             beginArm(12);
-            putLe64(fixed, quint64(duration < 0 ? -duration : duration)); // LockoutDuration
-            putLe64(fixed, quint64(window < 0 ? -window : window)); // LockoutObservationWindow
+            putLe64(fixed, quint64(duration)); // LockoutDuration: negative delta
+            putLe64(fixed, quint64(window));   // LockoutObservationWindow, likewise
             fixed.append(char(threshold & 0xff));                   // LockoutThreshold
             fixed.append(char(0));
             fixed.append(char(0));
@@ -1787,9 +1792,12 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
         const DirectoryObject target = domainObject();
         const QString dn = target.id.isEmpty() ? m_config.baseDn : target.id;
         QMap<QString, QString> changes;
-        changes.insert(QStringLiteral("lockoutDuration"), QString::number(-qint64(duration)));
-        changes.insert(QStringLiteral("lockoutObservationWindow"),
-                       QString::number(-qint64(window)));
+        // The client sends the intervals already in the directory's form, a
+        // negative delta (0x8000000000000000 for "never"), so they are stored
+        // as sent rather than flipped: the query above returns them the same
+        // way, and a 30-minute lockout reads back as the 30 minutes written.
+        changes.insert(QStringLiteral("lockoutDuration"), QString::number(qint64(duration)));
+        changes.insert(QStringLiteral("lockoutObservationWindow"), QString::number(qint64(window)));
         changes.insert(QStringLiteral("lockoutThreshold"), QString::number(threshold));
         bool ok = !dn.isEmpty();
         QString error;
