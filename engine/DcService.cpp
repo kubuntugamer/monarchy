@@ -47,6 +47,10 @@ DcService::DcService(QObject *parent)
 // and the schedule, not a fixed interval.
 void DcService::runReplicaCycle()
 {
+    // The KCC looks at the site before the pull: a partner the last cycle's
+    // configuration NC made known here becomes a source now, not at the next
+    // start of the daemon.
+    synchronizeTopology();
     if (!m_replicationAgent || m_replicationAgent->source().isEmpty())
         return;
     QString error;
@@ -61,6 +65,45 @@ void DcService::runReplicaCycle()
 QString DcService::ntdsSettingsDn() const
 {
     return m_ldapServer ? ReplicaTopology::ntdsSettingsDn(m_ldapServer->objects()) : QString();
+}
+
+QString DcService::ownNtdsSettingsDn() const
+{
+    if (!m_ldapServer)
+        return QString();
+    const QString server = QStringLiteral("CN=%1,CN=Servers,")
+                               .arg(m_dcHost.section(QLatin1Char('.'), 0, 0).toUpper());
+    for (const DirectoryObject &object : m_ldapServer->objects()) {
+        if (object.id.startsWith(QStringLiteral("CN=NTDS Settings,"), Qt::CaseInsensitive)
+            && object.id.contains(server, Qt::CaseInsensitive)) {
+            return object.id;
+        }
+    }
+    // A store provisioned before the Server object carried the DC's name still
+    // has exactly one DSA, which is this one.
+    return ntdsSettingsDn();
+}
+
+void DcService::synchronizeTopology()
+{
+    if (!m_ldapServer || !m_drsServer)
+        return;
+    const QString selfDn = ownNtdsSettingsDn();
+    if (selfDn.isEmpty())
+        return;
+    const QList<ReplicaSource> created = ReplicaTopology::synchronize(m_ldapServer, selfDn);
+    if (created.isEmpty())
+        return;
+    if (!m_storePath.isEmpty())
+        m_ldapServer->saveToFile(m_storePath);
+    for (const ReplicaSource &link : created) {
+        emit statusMessage(tr("The KCC added a connection from %1 in this site.")
+                               .arg(link.address));
+        // Registering it is what makes it pulled from; the connection object is
+        // already in the store, and the agent's handler records it again as a
+        // no-op.
+        m_drsServer->addReplicaSource(link);
+    }
 }
 
 bool DcService::storeReplicaLink(const ReplicaSource &link)
@@ -426,6 +469,7 @@ bool DcService::start(const QString &dcDir)
 
     const QString dcHost = dcConfig.value(QStringLiteral("dcHost"),
                                           QStringLiteral("dc1.") + dnsDomain).toString();
+    m_dcHost = dcHost;
     const QString dcIp = dcConfig.value(QStringLiteral("dcIp"),
                                         QStringLiteral("127.0.0.1")).toString();
     // A development DC keeps its RPC endpoints — SAMR, LSAD, Netlogon, DRSR and
@@ -1160,6 +1204,10 @@ bool DcService::start(const QString &dcDir)
                                .arg(m_replicationAgent->source())
                                .arg(m_replicaIntervalSeconds));
     }
+
+    // Topology first, then the links: a partner another DC published in this
+    // site is a source even when nobody registered it at this DC.
+    synchronizeTopology();
 
     // Links an administrator registered earlier are connection objects in the
     // directory, so they are read back here and pulled from again instead of

@@ -44,6 +44,32 @@ void buildStore(LdapServer *ldap)
     ldap->setObjects({rootDse, object(kBaseDn, QStringLiteral("top;domain")), ntds});
 }
 
+QString serverDn(const QString &label)
+{
+    return QStringLiteral("CN=%1,CN=Servers,CN=Default-First-Site-Name,CN=Sites,%2")
+        .arg(label, kConfigNc);
+}
+
+QString dsaDn(const QString &label)
+{
+    return QStringLiteral("CN=NTDS Settings,%1").arg(serverDn(label));
+}
+
+// The two objects a DC publishes in the configuration NC: its Server object,
+// which carries the address a partner pulls from, and its NTDS Settings.
+void publishDc(LdapServer *ldap, const QString &label, const QString &host)
+{
+    DirectoryObject server = object(serverDn(label), QStringLiteral("top;server"));
+    server.attributes.insert(QStringLiteral("dNSHostName"), host);
+    DirectoryObject ntds = object(dsaDn(label), QStringLiteral("top;nTDSDSA"));
+    ntds.attributes.insert(QStringLiteral("cn"), QStringLiteral("NTDS Settings"));
+
+    QList<DirectoryObject> objects = ldap->objects();
+    objects.append(server);
+    objects.append(ntds);
+    ldap->setObjects(objects);
+}
+
 } // namespace
 
 class ReplicaTopologyTest : public QObject
@@ -177,6 +203,111 @@ private slots:
         QVERIFY(!ReplicaTopology::store(&ldap, link, &error));
         QVERIFY(error.contains(QStringLiteral("NTDS Settings")));
         QVERIFY(ReplicaTopology::links(ldap.objects(), {kBaseDn}).isEmpty());
+    }
+
+    // Two DCs in one site pull from each other: that is the whole intrasite
+    // topology a site that small has, and neither needs an administrator to
+    // name the other.
+    void kccGivesTwoDcsInASiteEachOther()
+    {
+        LdapServer ldap;
+        buildStore(&ldap);
+        publishDc(&ldap, QStringLiteral("DC1"), QStringLiteral("dc1.corp.example.com"));
+        publishDc(&ldap, QStringLiteral("DC2"), QStringLiteral("dc2.corp.example.com"));
+
+        const QList<ReplicaSource> created = ReplicaTopology::synchronize(&ldap, kNtdsDn);
+        QCOMPARE(created.size(), 1);
+        QCOMPARE(created.at(0).address, QStringLiteral("dc2.corp.example.com"));
+        QCOMPARE(created.at(0).sourceDsaDn, dsaDn(QStringLiteral("DC2")));
+
+        const QString expectedDn =
+            QStringLiteral("CN=dc2.corp.example.com,%1").arg(kNtdsDn);
+        bool found = false;
+        for (const DirectoryObject &o : ldap.objects()) {
+            if (o.id.compare(expectedDn, Qt::CaseInsensitive) != 0)
+                continue;
+            found = true;
+            QCOMPARE(o.attributes.value(QStringLiteral("fromServer")), dsaDn(QStringLiteral("DC2")));
+            // NTDSCONN_OPT_IS_GENERATED says the KCC owns this object.
+            QCOMPARE(o.attributes.value(QStringLiteral("options")), QStringLiteral("1"));
+            QCOMPARE(o.attributes.value(QStringLiteral("enabledConnection")),
+                     QStringLiteral("TRUE"));
+            // FLAG_CONFIG_ALLOW_RENAME | FLAG_CONFIG_ALLOW_MOVE.
+            QCOMPARE(o.attributes.value(QStringLiteral("systemFlags")),
+                     QStringLiteral("1610612736"));
+        }
+        QVERIFY(found);
+
+        // The KCC runs again after every cycle; it must not add a second path to
+        // a source this DSA already has.
+        QVERIFY(ReplicaTopology::synchronize(&ldap, kNtdsDn).isEmpty());
+    }
+
+    // Three DCs form a ring, which for three is also the full mesh: each one's
+    // predecessor is the same choice in every store, because the order is the
+    // fixed NTDS Settings DN order and nothing process-local.
+    void kccFormsARingOfThree()
+    {
+        LdapServer ldap;
+        buildStore(&ldap);
+        publishDc(&ldap, QStringLiteral("DC1"), QStringLiteral("dc1.corp.example.com"));
+        publishDc(&ldap, QStringLiteral("DC2"), QStringLiteral("dc2.corp.example.com"));
+        publishDc(&ldap, QStringLiteral("DC3"), QStringLiteral("dc3.corp.example.com"));
+
+        const QList<ReplicaTopology::PublishedDsa> dsas =
+            ReplicaTopology::intrasiteDsas(ldap.objects(), kNtdsDn);
+        QCOMPARE(dsas.size(), 3);
+        QCOMPARE(dsas.at(0).ntdsDn, dsaDn(QStringLiteral("DC1")));
+        QCOMPARE(dsas.at(2).ntdsDn, dsaDn(QStringLiteral("DC3")));
+
+        // DC1 pulls from DC3, DC3 from DC2, DC2 from DC1: a closed ring.
+        QList<ReplicaSource> from = ReplicaTopology::intrasiteTopology(ldap.objects(), kNtdsDn);
+        QCOMPARE(from.size(), 1);
+        QCOMPARE(from.at(0).sourceDsaDn, dsaDn(QStringLiteral("DC3")));
+        from = ReplicaTopology::intrasiteTopology(ldap.objects(), dsaDn(QStringLiteral("DC2")));
+        QCOMPARE(from.size(), 1);
+        QCOMPARE(from.at(0).sourceDsaDn, dsaDn(QStringLiteral("DC1")));
+        from = ReplicaTopology::intrasiteTopology(ldap.objects(), dsaDn(QStringLiteral("DC3")));
+        QCOMPARE(from.size(), 1);
+        QCOMPARE(from.at(0).sourceDsaDn, dsaDn(QStringLiteral("DC2")));
+    }
+
+    // A connection an administrator made is a path the KCC uses and does not
+    // touch: MS-ADTS 6.2 says it creates repsFrom from those objects, not that
+    // it replaces them with its own.
+    void kccLeavesAnAdministratorsConnectionAlone()
+    {
+        LdapServer ldap;
+        buildStore(&ldap);
+        publishDc(&ldap, QStringLiteral("DC1"), QStringLiteral("dc1.corp.example.com"));
+        publishDc(&ldap, QStringLiteral("DC2"), QStringLiteral("dc2.corp.example.com"));
+
+        ReplicaSource adminLink;
+        adminLink.ncDn = kBaseDn;
+        adminLink.address = QStringLiteral("dc2.corp.example.com");
+        adminLink.options = 16; // DRS_WRIT_REP
+        adminLink.sourceDsaDn = dsaDn(QStringLiteral("DC2"));
+        QString error;
+        QVERIFY2(ReplicaTopology::store(&ldap, adminLink, &error), qPrintable(error));
+
+        QVERIFY(ReplicaTopology::synchronize(&ldap, kNtdsDn).isEmpty());
+        for (const DirectoryObject &o : ldap.objects()) {
+            if (o.id.compare(QStringLiteral("CN=dc2.corp.example.com,%1").arg(kNtdsDn),
+                             Qt::CaseInsensitive)
+                == 0) {
+                QCOMPARE(o.attributes.value(QStringLiteral("options")), QStringLiteral("16"));
+                QVERIFY(!o.attributes.contains(QStringLiteral("enabledConnection")));
+            }
+        }
+    }
+
+    void kccDoesNothingWhenTheSiteHoldsOnlyThisDc()
+    {
+        LdapServer ldap;
+        buildStore(&ldap);
+        publishDc(&ldap, QStringLiteral("DC1"), QStringLiteral("dc1.corp.example.com"));
+        QVERIFY(ReplicaTopology::intrasiteTopology(ldap.objects(), kNtdsDn).isEmpty());
+        QVERIFY(ReplicaTopology::synchronize(&ldap, kNtdsDn).isEmpty());
     }
 };
 

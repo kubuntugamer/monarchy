@@ -406,9 +406,23 @@ The gaps above are not independent. Working outward from what exists:
    replication run: `ReplicationAgent` takes a partner from `dc.conf` or a wire
    `DsReplicaAdd` on a timer and pulls all three naming contexts — domain,
    configuration and schema — with a cursor each, verified against two
-   provisioned DCs (§1). So what remains is the KCC's topology, and proving the
-   path against Samba or Windows peers, which is what makes a domain a domain
-   rather than one server.
+   provisioned DCs (§1).
+   The KCC's **intrasite** pass is now served too: at start-up and before each
+   pull the daemon reads every DSA another DC published in this site and stores
+   the connection its topology needs as its own object —
+   `NTDSCONN_OPT_IS_GENERATED`, `enabledConnection`, `systemFlags`
+   `FLAG_CONFIG_ALLOW_RENAME | FLAG_CONFIG_ALLOW_MOVE`, the site's schedule when
+   the store publishes `CN=NTDS Site Settings`, and `fromServer` naming the
+   source DSA — then registers it as a source in that same cycle, so a partner
+   the configuration NC only just brought in becomes a pull instead of needing
+   `DsReplicaAdd` at both ends. Two DCs in a site get a connection from each
+   other and three form a ring (which for three is also the full mesh): the edge
+   is the predecessor in the sorted NTDS Settings DN order, so every DC computes
+   the same one without process state. An administrator's connection object is
+   used and neither duplicated nor rewritten. Remaining: the inter-site half —
+   sites, subnets, site links with their cost and schedule, and bridgehead
+   selection — and proving the path against Samba or Windows peers, which is
+   what makes a domain a domain rather than one server.
 
 After those: GPO processing, FSMO, sites and the KCC, interdomain trust
 replication, WINS-era name resolution if 2000 parity is taken literally, and the

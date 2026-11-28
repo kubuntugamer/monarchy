@@ -99,6 +99,17 @@ private:
     bool storeReplicaLink(const ReplicaSource &link);
     void removeReplicaLink(const QString &address);
     void loadReplicaLinks();
+    // The KCC pass: every DSA another DC published in this site is a source this
+    // one can reach, so the connections its intrasite topology needs are added
+    // here instead of waiting for an administrator to call DsReplicaAdd on each
+    // DC in turn. Run at start-up and before each pull, because a partner the
+    // configuration NC only just learned of should become a source in that same
+    // cycle.
+    void synchronizeTopology();
+    // This DSA's own NTDS Settings object: the one under this DC's Server
+    // object, so a partner's DSA replicated into the store is never mistaken
+    // for it.
+    QString ownNtdsSettingsDn() const;
     // The NTDS Settings object of this DSA: the parent a connection object is
     // written under, found in the store rather than spelled out from dc.conf.
     QString ntdsSettingsDn() const;
@@ -127,6 +138,9 @@ private:
     QString m_storePath;
     QString m_zonePath;
     QString m_baseDn;
+    // This DC's own host name, as dc.conf names it: the Server object it
+    // publishes, and the one the KCC must not link to itself.
+    QString m_dcHost;
 };
 
 #endif // DCSERVICE_H

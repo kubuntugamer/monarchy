@@ -44,6 +44,33 @@ bool remove(LdapServer *ldap, const QString &address, QString *error);
 QList<ReplicaSource> links(const QList<DirectoryObject> &objects,
                            const QStringList &namingContexts);
 
+// One DSA published in the configuration NC: the host name its Server object
+// carries and the NTDS Settings object that is its vertex.
+struct PublishedDsa {
+    QString host;
+    QString ntdsDn;
+};
+
+// Every DSA in the site this one belongs to, sorted by NTDS Settings DN. The
+// sort is what makes the topology each DC computes the same one: no process
+// state and no private knowledge, only the DN order both stores agree on.
+QList<PublishedDsa> intrasiteDsas(const QList<DirectoryObject> &objects,
+                                  const QString &selfNtdsDn);
+
+// The inbound connection this DSA's KCC computes for itself: the predecessor in
+// that order, so two DSAs pull from each other and three form a ring, which for
+// three is also the full mesh every site that small has. Empty when the site
+// holds only this DSA.
+QList<ReplicaSource> intrasiteTopology(const QList<DirectoryObject> &objects,
+                                       const QString &selfNtdsDn);
+
+// Store the connections intrasiteTopology names that are not already there, as
+// the KCC's own: NTDSCONN_OPT_IS_GENERATED set, enabled, and with
+// FLAG_CONFIG_ALLOW_RENAME | FLAG_CONFIG_ALLOW_MOVE. A source an administrator
+// already gave this DSA — any connection object naming that DSA or address — is
+// left alone rather than duplicated. Returns the links it created.
+QList<ReplicaSource> synchronize(LdapServer *ldap, const QString &selfNtdsDn);
+
 } // namespace ReplicaTopology
 
 #endif // REPLICATOPOLOGY_H

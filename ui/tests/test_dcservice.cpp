@@ -16,8 +16,10 @@
 
 #include "DcService.h"
 #include "Drs.h"
+#include "LdapServer.h"
 #include "Ndr.h"
 #include "Provisioner.h"
+#include "ReplicaTopology.h"
 #include "ldap_wire_helpers.h"
 
 namespace {
@@ -209,6 +211,7 @@ private slots:
     void readsEveryShapeOfForwardersKey();
     void writerAndReaderAgreeOnForwarders();
     void keepsReplicaLinkAsAConnectionObject();
+    void kccAddsTheConnectionASecondDcInTheSiteNeeds();
     void commitsClientWritesWhileItRuns();
 };
 
@@ -623,6 +626,101 @@ void DcServiceTest::keepsReplicaLinkAsAConnectionObject()
         QVERIFY2(none, "the daemon did not report that no partner is left after the deletion");
         again.stop();
     }
+}
+
+// Replication is what makes a partner's own Server object appear in this store,
+// and the KCC's job is to turn that into a link without an administrator naming
+// it at both ends. This drives the daemon-side wiring that the topology unit
+// cases cannot see: the pass at start-up, the message it reports, and the link
+// landing in the store as a generated connection object.
+void DcServiceTest::kccAddsTheConnectionASecondDcInTheSiteNeeds()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+
+    ProvisionConfig config;
+    config.realm = QStringLiteral("KCC.EXAMPLE.ORG");
+    config.netbiosDomain = QStringLiteral("KCC");
+    config.adminPassword = QStringLiteral("Secret123!");
+    config.targetDir = dir.path();
+    config.devPorts = true;
+    const ProvisionResult result = provisionDomain(config);
+    QVERIFY2(result.ok, qPrintable(result.error));
+    moveTakenPorts(dir.path());
+
+    // The store as the daemon left it, plus the objects replication would bring
+    // from a second DC in the same site.
+    const QString storePath = dir.path() + QStringLiteral("/private/directory.json");
+    const QString configNc =
+        QStringLiteral("CN=Configuration,%1").arg(result.baseDn);
+    const QString serversDn =
+        QStringLiteral("CN=Servers,CN=Default-First-Site-Name,CN=Sites,%1").arg(configNc);
+    const QString partnerHost =
+        QStringLiteral("dc2.%1").arg(result.dnsDomain.toLower());
+    {
+        LdapServer store;
+        QVERIFY2(store.loadFromFile(storePath), qPrintable(storePath));
+        QList<DirectoryObject> objects = store.objects();
+
+        DirectoryObject server;
+        server.id = QStringLiteral("CN=DC2,%1").arg(serversDn);
+        server.name = QStringLiteral("DC2");
+        server.attributes.insert(QStringLiteral("objectClass"), QStringLiteral("top;server"));
+        server.attributes.insert(QStringLiteral("cn"), QStringLiteral("DC2"));
+        server.attributes.insert(QStringLiteral("dNSHostName"), partnerHost);
+        objects.append(server);
+
+        DirectoryObject ntds;
+        ntds.id = QStringLiteral("CN=NTDS Settings,%1").arg(server.id);
+        ntds.name = QStringLiteral("NTDS Settings");
+        ntds.attributes.insert(QStringLiteral("objectClass"), QStringLiteral("top;nTDSDSA"));
+        objects.append(ntds);
+
+        store.setObjects(objects);
+        QVERIFY2(store.saveToFile(storePath), qPrintable(storePath));
+    }
+
+    const QString selfDn = QStringLiteral("CN=NTDS Settings,CN=%1,%2")
+                               .arg(result.dcHost.section(QLatin1Char('.'), 0, 0).toUpper(),
+                                    serversDn);
+    {
+        DcService service;
+        QSignalSpy messages(&service, &DcService::statusMessage);
+        QVERIFY2(service.start(dir.path()),
+                 "the daemon refused to start with a partner published in its site");
+
+        bool connected = false;
+        bool pulling = false;
+        for (const QString &line : spokenMessages(messages)) {
+            if (line.contains(QStringLiteral("The KCC added a connection"))
+                && line.contains(partnerHost))
+                connected = true;
+            if (line.contains(partnerHost) && line.contains(QStringLiteral("registered")))
+                pulling = true;
+        }
+        QVERIFY2(connected, "the KCC never added the connection its site needs");
+        QVERIFY2(pulling, "the connection the KCC added was not registered as a source");
+        service.stop();
+    }
+
+    // What the next start reads: a generated connection object under this DSA's
+    // own NTDS Settings, naming DC2 and marked as the KCC's to manage.
+    LdapServer reread;
+    QVERIFY2(reread.loadFromFile(storePath), qPrintable(storePath));
+    bool found = false;
+    for (const DirectoryObject &object : reread.objects()) {
+        if (!object.id.endsWith(QLatin1Char(',') + selfDn, Qt::CaseInsensitive))
+            continue;
+        if (!object.id.contains(partnerHost, Qt::CaseInsensitive))
+            continue;
+        found = true;
+        QCOMPARE(object.attributes.value(QStringLiteral("options")), QStringLiteral("1"));
+        QCOMPARE(object.attributes.value(QStringLiteral("enabledConnection")),
+                 QStringLiteral("TRUE"));
+        QCOMPARE(object.attributes.value(QStringLiteral("fromServer")),
+                 QStringLiteral("CN=NTDS Settings,CN=DC2,%1").arg(serversDn));
+    }
+    QVERIFY2(found, "no KCC connection object for the partner was kept in the store");
 }
 
 // A DC persists what a client changed before it answers. This matters to the
