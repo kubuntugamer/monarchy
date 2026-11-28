@@ -750,23 +750,52 @@ ProvisionResult provisionDomain(const ProvisionConfig &config)
             b.add(builtinDn, QStringLiteral("Builtin"), QStringLiteral("Builtin-Domain"),
                   ObjectKind::Container, QStringLiteral("Console Root"));
         b.objectClass(builtin, {QStringLiteral("top"), QStringLiteral("builtinDomain")});
-        static const struct { const char *name; quint32 rid; } kAliases[] = {
-            {"Administrators", 544},
-            {"Users", 545},
-            {"Guests", 546},
-            {"Power Users", 547},
-            {"Account Operators", 548},
-            {"Server Operators", 549},
-            {"Print Operators", 550},
-            {"Backup Operators", 551},
-            {"Replicator", 552},
-            {"Remote Desktop Users", 555},
-            {"Network Configuration Operators", 556},
-            {"Performance Monitor Users", 558},
-            {"Performance Log Users", 559},
-            {"IIS_IUSRS", 568},
-            {"Event Log Readers", 573},
-            {"Certificate Service DCOM Access", 574},
+        // Each alias carries the comment NT5's SAM seeds it with
+        // (SAMP_ALIAS_COMMENT_* in the server's sampmsgs.mc, punctuation
+        // included; the seven RIDs added after NT5 take Samba 4.24.7's
+        // source4/setup/provision_users.ldif wording). It is stored here as well
+        // as seeded by Samr::builtinAliasTable() so a search on CN=Builtin
+        // reads the same comment a SAMR alias query reports — `net localgroup
+        // "Administrators" /domain` prints it on its Comment line.
+        static const struct {
+            const char *name;
+            quint32 rid;
+            const char *comment;
+        } kAliases[] = {
+            {"Administrators", 544,
+             "Administrators have complete and unrestricted access to the computer/domain"},
+            {"Users", 545,
+             "Users are prevented from making accidental or intentional system-wide changes.  "
+             "Thus, Users can run certified applications, but not most legacy applications"},
+            {"Guests", 546,
+             "Guests have the same access as members of the Users group by default, except "
+             "for the Guest account which is further restricted"},
+            {"Power Users", 547,
+             "Power Users possess most administrative powers with some restrictions.  Thus, "
+             "Power Users can run legacy applications in addition to certified applications"},
+            {"Account Operators", 548, "Members can administer domain user and group accounts"},
+            {"Server Operators", 549, "Members can administer domain servers"},
+            {"Print Operators", 550, "Members can administer domain printers"},
+            {"Backup Operators", 551,
+             "Backup Operators can override security restrictions for the sole purpose of "
+             "backing up or restoring files"},
+            {"Replicator", 552, "Supports file replication in a domain"},
+            {"Remote Desktop Users", 555,
+             "Members in this group are granted the right to logon remotely"},
+            {"Network Configuration Operators", 556,
+             "Members in this group can have some administrative privileges to manage "
+             "configuration of networking features"},
+            {"Performance Monitor Users", 558,
+             "Members of this group have remote access to monitor this computer"},
+            {"Performance Log Users", 559,
+             "Members of this group have remote access to schedule logging of performance "
+             "counters on this computer"},
+            {"IIS_IUSRS", 568, "Built-in group used by Internet Information Services."},
+            {"Event Log Readers", 573,
+             "Members of this group can read event logs from local machine"},
+            {"Certificate Service DCOM Access", 574,
+             "Members of this group are allowed to connect to Certification Authorities in the "
+             "enterprise"},
         };
         for (const auto &alias : kAliases) {
             const QString name = QString::fromLatin1(alias.name);
@@ -780,6 +809,8 @@ ProvisionResult provisionDomain(const ProvisionConfig &config)
                                      QStringLiteral("S-1-5-32-%1").arg(alias.rid));
             // A domain-local security group, which is what SAMR calls an alias.
             object.attributes.insert(QStringLiteral("groupType"), QStringLiteral("-2147483644"));
+            object.attributes.insert(QStringLiteral("description"),
+                                     QString::fromLatin1(alias.comment));
         }
     }
 

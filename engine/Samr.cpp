@@ -252,19 +252,52 @@ const QString kBuiltinDomainSid = QStringLiteral("S-1-5-32");
 struct BuiltinAlias {
     const char *name;
     quint32 rid;
+    const char *comment;
 };
 
+// Each alias's comment is the text NT5's own SAM seeds it with — the
+// SAMP_ALIAS_COMMENT_* messages in the server's sampmsgs.mc, copied with their
+// punctuation (the double space after a full stop is how they are written) —
+// because that is what `net localgroup "Administrators" /domain` prints on its
+// `Comment` line, and an alias with no comment printed an empty label there.
+// The seven aliases NT5 has no message for (555, 556, 558, 559, 568, 573 and
+// 574, all added after it) carry the comments Samba 4.24.7's
+// source4/setup/provision_users.ldif gives the same well-known groups.
 const QList<BuiltinAlias> &builtinAliasTable()
 {
     static const QList<BuiltinAlias> table = {
-        {"Administrators", 544},                {"Users", 545},
-        {"Guests", 546},                        {"Power Users", 547},
-        {"Account Operators", 548},             {"Server Operators", 549},
-        {"Print Operators", 550},               {"Backup Operators", 551},
-        {"Replicator", 552},                    {"Remote Desktop Users", 555},
-        {"Network Configuration Operators", 556}, {"Performance Monitor Users", 558},
-        {"Performance Log Users", 559},         {"IIS_IUSRS", 568},
-        {"Event Log Readers", 573},             {"Certificate Service DCOM Access", 574},
+        {"Administrators", 544,
+         "Administrators have complete and unrestricted access to the computer/domain"},
+        {"Users", 545,
+         "Users are prevented from making accidental or intentional system-wide changes.  "
+         "Thus, Users can run certified applications, but not most legacy applications"},
+        {"Guests", 546,
+         "Guests have the same access as members of the Users group by default, except "
+         "for the Guest account which is further restricted"},
+        {"Power Users", 547,
+         "Power Users possess most administrative powers with some restrictions.  Thus, "
+         "Power Users can run legacy applications in addition to certified applications"},
+        {"Account Operators", 548, "Members can administer domain user and group accounts"},
+        {"Server Operators", 549, "Members can administer domain servers"},
+        {"Print Operators", 550, "Members can administer domain printers"},
+        {"Backup Operators", 551,
+         "Backup Operators can override security restrictions for the sole purpose of "
+         "backing up or restoring files"},
+        {"Replicator", 552, "Supports file replication in a domain"},
+        {"Remote Desktop Users", 555, "Members in this group are granted the right to logon remotely"},
+        {"Network Configuration Operators", 556,
+         "Members in this group can have some administrative privileges to manage "
+         "configuration of networking features"},
+        {"Performance Monitor Users", 558,
+         "Members of this group have remote access to monitor this computer"},
+        {"Performance Log Users", 559,
+         "Members of this group have remote access to schedule logging of performance "
+         "counters on this computer"},
+        {"IIS_IUSRS", 568, "Built-in group used by Internet Information Services."},
+        {"Event Log Readers", 573, "Members of this group can read event logs from local machine"},
+        {"Certificate Service DCOM Access", 574,
+         "Members of this group are allowed to connect to Certification Authorities in the "
+         "enterprise"},
     };
     return table;
 }
@@ -284,6 +317,8 @@ QList<DirectoryObject> builtinAliasObjects(const QList<DirectoryObject> &stored)
         object.attributes.insert(QStringLiteral("objectSid"), object.id);
         object.attributes.insert(QStringLiteral("sAMAccountName"), object.name);
         object.attributes.insert(QStringLiteral("groupType"), QStringLiteral("4"));
+        object.attributes.insert(QStringLiteral("description"),
+                                 QString::fromLatin1(entry.comment));
         // The memberships this directory keeps for the alias, when it keeps them:
         // the stored object under CN=Builtin is what a write lands on, and what
         // it holds is added to the memberships AD seeds. The SID stays the
@@ -300,8 +335,12 @@ QList<DirectoryObject> builtinAliasObjects(const QList<DirectoryObject> &stored)
             if (!sameSid && !sameName)
                 continue;
             object.members = candidate.members;
-            object.attributes.insert(QStringLiteral("description"),
-                                     candidate.attributes.value(QStringLiteral("description")));
+            // A description the directory holds is the alias's own, and wins
+            // over the seeded one; an alias whose object carries none keeps
+            // the seeded comment rather than losing it.
+            const QString comment = candidate.attributes.value(QStringLiteral("description"));
+            if (!comment.isEmpty())
+                object.attributes.insert(QStringLiteral("description"), comment);
             break;
         }
         result.append(object);

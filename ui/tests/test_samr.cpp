@@ -1490,6 +1490,19 @@ void SamrTest::samrServesTheBuiltinDomain()
     QCOMPARE(readLe32At(general, 0), 4u);
     QCOMPARE(int(readLe32At(general, 12)),
              int(general.indexOf(Ndr::utf16le(QStringLiteral("Administrators")))) - 12);
+    // The comment `net localgroup "Administrators" /domain` prints on its Comment
+    // line is the one NT5's SAM seeds the alias with, and it is referred to the
+    // same way the name is: a pointer to the array that holds the characters.
+    const QString seededComment = QStringLiteral(
+        "Administrators have complete and unrestricted access to the computer/domain");
+    QVERIFY(utf16Text(general).contains(seededComment));
+    const QByteArray comment =
+        server.handleCall(Samr::OpQueryInformationAlias, queryAliasStub(aliasHandle, 3));
+    QCOMPARE(lastWord(comment), 0u);
+    QCOMPARE(readLe32At(comment, 0), 4u);
+    QCOMPARE(varyingStringAt(comment, 12), seededComment);
+    QCOMPARE(int(readLe32At(comment, 12)),
+             int(comment.indexOf(Ndr::utf16le(seededComment))) - 12);
     const QByteArray members = server.handleCall(Samr::OpGetMembersInAlias, aliasHandle);
     QCOMPARE(lastWord(members), 0u);
     QCOMPARE(readLe32At(members, 0), 1u);

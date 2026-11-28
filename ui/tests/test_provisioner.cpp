@@ -138,6 +138,18 @@ void ProvisionerTest::buildsDomainFromScratch()
     QVERIFY(domainAdmins);
     QVERIFY(domainAdmins->members.contains(adminDn));
 
+    // The BUILTIN aliases are stored with the comment NT5's SAM seeds them with,
+    // so a search under CN=Builtin reads the same text a SAMR alias query
+    // reports and `net localgroup "Administrators" /domain` prints.
+    const DirectoryObject *builtinAdmins =
+        findByDn(objects, QStringLiteral("CN=Administrators,CN=Builtin,%1").arg(result.baseDn));
+    QVERIFY(builtinAdmins);
+    QCOMPARE(builtinAdmins->attributes.value(QStringLiteral("description")),
+             QStringLiteral("Administrators have complete and unrestricted access to the "
+                            "computer/domain"));
+    QCOMPARE(builtinAdmins->attributes.value(QStringLiteral("objectSid")),
+             QStringLiteral("S-1-5-32-544"));
+
     const DirectoryObject *dc =
         findByDn(objects, QStringLiteral("CN=TESTDC1,OU=Domain Controllers,%1").arg(result.baseDn));
     QVERIFY(dc);
