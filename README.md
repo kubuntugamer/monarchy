@@ -55,8 +55,8 @@ exactly as it would to a remote domain controller. Ordinary Kerberos clients
   AD's native bindings — DNS 53, LDAP 389, Kerberos 88, kpasswd 464, SMB 445,
   epm 135, SAMR/LSAD 49152/49153 — because the daemon runs as a root service with
   `CAP_NET_BIND_SERVICE`; `--dev-ports` provisions the unprivileged set
-  (1389/1053/8888/1035/1036, GC 13268, SMB 31445, mapper 31035) a rootless
-  console run or a second DC on the same host can bind). Accounts carry
+  (1389/1053/8888/1035/1036, GC 13268, SMB 31445, mapper 31035, srvsvc 31036) a
+  rootless console run or a second DC on the same host can bind). Accounts carry
   AES-128/AES-256 (RFC 3962, PBKDF2 + n-fold string-to-key) and RC4-HMAC
   (etype 23, derived from the same NT hash the directory already stores) keys,
   so one password drives simple bind, NTLMv2 and Kerberos with no second
@@ -291,8 +291,8 @@ by DNS name; the two are compared as machines, not as strings, so the port
 `--replica-port` records applies to the connection the KCC later writes under
 the published name. When the peer already runs a DC on this host, give this
 one the whole unprivileged binding set (`--dev-ports`, which now moves the
-Global Catalog and the mapper and SMB ports too) or set the four ports by hand
-in `dc.conf`.
+Global Catalog, the mapper, SMB and the share enumerator too) or set the four
+ports by hand in `dc.conf`.
 
 ```sh
 dig @127.0.0.1 -p 1053 SRV _ldap._tcp.dc._msdcs.corp.example.com +short

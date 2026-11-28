@@ -23,8 +23,8 @@ struct ProvisionConfig {
     // Windows' dynamic-RPC range, 49152/49153 — because a domain controller
     // is a root service with CAP_NET_BIND_SERVICE. `--dev-ports` provisions
     // the unprivileged set (1389/1053/8888/1035/1036, GC 13268 and SMB/mapper
-    // 31445/31035) that a rootless console, test run, or second DC on the
-    // same host can bind instead.
+    // 31445/31035, srvsvc 31036) that a rootless console, test run, or second
+    // DC on the same host can bind instead.
     quint16 ldapPort = 389;
     quint16 dnsPort = 53;
     quint16 kdcPort = 88;
@@ -32,12 +32,13 @@ struct ProvisionConfig {
     quint16 lsadPort = 49153;
     quint16 epmPort = 135;
     quint16 smbPort = 445;
-    // Netlogon and DRSUAPI have no privileged variant, so they keep the same
-    // number in both port sets. A host that already runs a DC still needs to
-    // move them for a second instance, which is what the daemon reads back out
-    // of dc.conf.
+    // Netlogon, DRSUAPI and the share enumerator have no privileged variant, so
+    // nothing forces them off their numbers — but a host that already runs a DC
+    // still needs to move them for a second instance, which is what the daemon
+    // reads back out of dc.conf.
     quint16 netlogonPort = 1037;
     quint16 drsPort = 1038;
+    quint16 srvsvcPort = 1039;
     bool devPorts = false;
     // Upstream resolvers for out-of-zone DNS (address or address:port). Empty
     // leaves detection to the host's resolv.conf at runtime.

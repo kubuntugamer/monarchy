@@ -324,7 +324,10 @@ namespace {
 // port, so a second DC on the same host can take the whole set without meeting
 // the first one. The Global Catalog (3268) is already unprivileged but is still
 // a fixed binding two DCs on one host cannot share, so it moves with the rest.
-// kpasswd is 464 on a real DC; a rootless dev run moves it too.
+// kpasswd is 464 on a real DC; a rootless dev run moves it too. srvsvc (1039)
+// and Netlogon/DRS (1037/1038) have no privileged variant, but they are fixed
+// numbers a second DC on the same host still collides on, so the set moves the
+// enumerator with them.
 struct ServicePorts {
     quint16 ldap = 389;
     quint16 dns = 53;
@@ -335,6 +338,7 @@ struct ServicePorts {
     quint16 kpasswd = 464;
     quint16 epm = 135;
     quint16 smb = 445;
+    quint16 srvsvc = 1039;
 };
 
 ServicePorts servicePorts(const ProvisionConfig &config)
@@ -349,6 +353,7 @@ ServicePorts servicePorts(const ProvisionConfig &config)
     ports.gc = config.devPorts ? 13268 : 3268;
     ports.epm = config.devPorts && config.epmPort == 135 ? 31035 : config.epmPort;
     ports.smb = config.devPorts && config.smbPort == 445 ? 31445 : config.smbPort;
+    ports.srvsvc = config.devPorts && config.srvsvcPort == 1039 ? 31036 : config.srvsvcPort;
     return ports;
 }
 
@@ -1095,6 +1100,7 @@ ProvisionResult provisionDomain(const ProvisionConfig &config)
     conf.setValue(QStringLiteral("lsadPort"), lsadPort);
     conf.setValue(QStringLiteral("epmPort"), ports.epm);
     conf.setValue(QStringLiteral("smbPort"), ports.smb);
+    conf.setValue(QStringLiteral("srvsvcPort"), ports.srvsvc);
     conf.setValue(QStringLiteral("netlogonPort"), config.netlogonPort);
     conf.setValue(QStringLiteral("drsPort"), config.drsPort);
     conf.setValue(QStringLiteral("kdcPort"), kdcPort);
@@ -1549,6 +1555,7 @@ ProvisionResult promoteDomain(const ProvisionConfig &config)
     conf.setValue(QStringLiteral("lsadPort"), ports.lsad);
     conf.setValue(QStringLiteral("epmPort"), ports.epm);
     conf.setValue(QStringLiteral("smbPort"), ports.smb);
+    conf.setValue(QStringLiteral("srvsvcPort"), ports.srvsvc);
     conf.setValue(QStringLiteral("netlogonPort"), config.netlogonPort);
     conf.setValue(QStringLiteral("drsPort"), config.drsPort);
     conf.setValue(QStringLiteral("kdcPort"), ports.kdc);

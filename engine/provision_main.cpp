@@ -62,8 +62,9 @@ int main(int argc, char *argv[])
     QCommandLineOption devPortsOption(QStringLiteral("dev-ports"),
                                 QStringLiteral("Provision the unprivileged port set "
                                                "(1389/1053/8888/1035/1036, GC 13268, "
-                                               "SMB/mapper 31445/31035) a rootless console "
-                                               "run or a second DC on this host can bind."));
+                                               "SMB/mapper/srvsvc 31445/31035/31036) a "
+                                               "rootless console run or a second DC on "
+                                               "this host can bind."));
     QCommandLineOption forwarderOption(QStringLiteral("forwarder"),
                                 QStringLiteral("Upstream resolver for out-of-zone DNS "
                                                "(repeatable; address or address:port)."),

@@ -730,6 +730,9 @@ void ProvisionerTest::devPortsMoveEveryFixedBinding()
     QCOMPARE(conf.value(QStringLiteral("gcPort")).toInt(), 13268);
     QCOMPARE(conf.value(QStringLiteral("epmPort")).toInt(), 31035);
     QCOMPARE(conf.value(QStringLiteral("smbPort")).toInt(), 31445);
+    // The share enumerator is not privileged, but 1039 is fixed too: a second
+    // DC beside the first met it as a bind failure rather than a moved port.
+    QCOMPARE(conf.value(QStringLiteral("srvsvcPort")).toInt(), 31036);
 
     // A port the caller set explicitly is theirs, not the set's: the dev set
     // only fills in bindings still at their native value.
