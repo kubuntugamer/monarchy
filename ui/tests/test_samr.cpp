@@ -75,9 +75,29 @@ void appendLe32(QByteArray &out, quint32 value)
 quint32 readLe32At(const QByteArray &data, int at)
 {
     return quint32(quint8(data.at(at))) | (quint32(quint8(data.at(at + 1))) << 8)
-           | (quint32(quint8(data.at(at + 2))) << 16)
-           | (quint32(quint8(data.at(at + 3))) << 24);
+           | (quint32(quint8(data.at(at + 2))) << 16) | (quint32(quint8(data.at(at + 3))) << 24);
 }
+
+// A referent is the offset of its pointee from the start of the stub (MS-RPCE
+// 2.2.10.6), so a client resolves one as stub + referent. This reads the
+// varying string a pointer word names, the way such a client would: maximum
+// count, offset, actual count, then the characters.
+QString varyingStringAt(const QByteArray &stub, int at)
+{
+    const int offset = int(readLe32At(stub, at));
+    if (offset <= 0 || offset + 12 > stub.size())
+        return QString();
+    const quint32 actual = readLe32At(stub, offset + 8);
+    if (offset + 12 + int(actual) * 2 > stub.size())
+        return QString();
+    QString text;
+    for (quint32 i = 0; i < actual; ++i) {
+        const int pos = offset + 12 + int(i) * 2;
+        text.append(QChar(quint16(quint8(stub.at(pos)) | (quint8(stub.at(pos + 1)) << 8))));
+    }
+    return text;
+}
+
 
 // A varying UTF-16 string as NDR writes it: max count, offset, actual count,
 // then the characters padded to a 4-byte boundary.
@@ -1298,6 +1318,16 @@ void SamrTest::samrDirectoryCalls()
     QCOMPARE(readLe32At(machineIds, typesAt + 8), 1u); // MaximumCount
     QCOMPARE(readLe32At(machineIds, typesAt + 12), 9u); // SidTypeComputer
 
+    // GetGroupsForUser (opnum 39) answers a SAMPR_GET_GROUPS_BUFFER: the buffer
+    // sits behind its own referent and the {RelativeId; Attributes} array
+    // behind the buffer's, so stub + referent names each of them.
+    const QByteArray groupsReply = server.handleCall(Samr::OpGetGroupsForUser, userHandle);
+    QCOMPARE(lastWord(groupsReply), 0u);
+    QCOMPARE(readLe32At(groupsReply, 0), 4u); // the SAMPR_GET_GROUPS_BUFFER
+    const quint32 groupCount = readLe32At(groupsReply, 4);
+    QCOMPARE(readLe32At(groupsReply, 8), groupCount == 0 ? 0u : 12u);
+    QCOMPARE(groupsReply.size(), 20 + 8 * int(groupCount));
+
     // CloseHandle releases the context.
     QByteArray closeRequest = userHandle;
     closeRequest.append(QByteArray(4, '\0'));
@@ -1354,6 +1384,12 @@ void SamrTest::samrServesTheBuiltinDomain()
     const QString domainText = utf16Text(domains);
     QVERIFY(domainText.contains(QStringLiteral("Builtin")));
     QVERIFY(domainText.contains(QStringLiteral("CORP")));
+    // Every pointer in the answer is the offset of what it names: the buffer at
+    // 8, its entry array at 20 and each name buffer behind the two entries.
+    QCOMPARE(readLe32At(domains, 4), 8u);
+    QCOMPARE(readLe32At(domains, 12), 20u);
+    QCOMPARE(varyingStringAt(domains, 28), QStringLiteral("Builtin"));
+    QCOMPARE(varyingStringAt(domains, 40), QStringLiteral("CORP"));
 
     // Its SID is the well-known one, and that SID opens it by name or directly.
     const QByteArray builtinSid = Ndr::sidFromString(QStringLiteral("S-1-5-32"));
@@ -1415,6 +1451,10 @@ void SamrTest::samrServesTheBuiltinDomain()
     QCOMPARE(lastWord(members), 0u);
     QCOMPARE(readLe32At(members, 0), 1u);
     QVERIFY(members.contains(Ndr::sidFromString(QStringLiteral("S-1-5-21-1-2-3-512"))));
+    // The array pointer names the maximum count word, and the one element
+    // pointer names the SID behind it — offsets, not ordinals.
+    QCOMPARE(readLe32At(members, 4), 8u);
+    QCOMPARE(readLe32At(members, 12), 16u);
 
     // GetAliasMembership (opnum 16) answers the reverse question: which aliases
     // a SID is on, as samr_Ids. `net user /domain` asks it after
@@ -1637,6 +1677,9 @@ void SamrTest::samrWritesAccountsAndGroups()
     QCOMPARE(lastWord(aliasPage), 0u);
     QCOMPARE(readLe32At(aliasPage, 8), 1u); // EntriesRead
     QVERIFY(aliasPage.contains(Ndr::utf16le(QStringLiteral("engineers"))));
+    QCOMPARE(readLe32At(aliasPage, 4), 8u);   // the enumeration buffer
+    QCOMPARE(readLe32At(aliasPage, 12), 20u); // the entry array
+    QCOMPARE(varyingStringAt(aliasPage, 28), QStringLiteral("engineers"));
     const QByteArray groupPage =
         server.handleCall(Samr::OpEnumerateGroupsInDomain,
                           domainHandle + QByteArray::fromHex("0000000000000000ffffffff"));

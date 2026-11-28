@@ -422,36 +422,6 @@ void setLe32(QByteArray &data, int pos, quint32 value)
         data[pos + i] = char((value >> (8 * i)) & 0xff);
 }
 
-// SAMPR_ENUMERATION_BUFFER: context, buffer pointer, entries read, the array's
-// pointer and maximum count, one {RelativeId; RPC_UNICODE_STRING} per entry and
-// then the name buffers, in that order.
-void appendEnumeration(QByteArray &out, const QList<DirectoryObject> &page, quint32 context,
-                       quint32 referent)
-{
-    putLe32(out, context);
-    putLe32(out, referent);
-    putLe32(out, quint32(page.size()));
-    putLe32(out, referent + 1);
-    putLe32(out, quint32(page.size()));
-    QByteArray names;
-    for (int i = 0; i < page.size(); ++i) {
-        const DirectoryObject &object = page.at(i);
-        putLe32(out, ridOf(object));
-        QString name = object.attributes.value(QStringLiteral("sAMAccountName"));
-        if (name.isEmpty())
-            name = object.name;
-        const QByteArray utf16 = Ndr::utf16le(name);
-        out.append(char(utf16.size() & 0xff));
-        out.append(char((utf16.size() >> 8) & 0xff));
-        out.append(char(utf16.size() & 0xff));
-        out.append(char((utf16.size() >> 8) & 0xff));
-        putLe32(out, referent + 2 + quint32(i));
-        appendVaryingString(names, name);
-    }
-    out.append(names);
-    putLe32(out, quint32(page.size())); // CountReturned
-}
-
 // MS-SAMR 2.2.11.1: a samr_CryptPassword holds the UTF-16LE password padded to
 // 512 bytes with its length in bytes in the last four, RC4-ciphered under the
 // RPC session key. samr_CryptPasswordEx appends a 16-byte confounder and keys
@@ -618,6 +588,34 @@ void placeStrings(QByteArray &reply, const QByteArray &blob,
     for (const QPair<int, int> &string : strings)
         setLe32(reply, string.first, quint32(base + string.second));
     reply.append(blob);
+}
+
+// SAMPR_ENUMERATION_BUFFER, shared by the enumerations that answer with it:
+// the context, a pointer to the buffer, the buffer's three words — entries
+// read, a pointer to the entry array, its maximum count — one
+// {RelativeId; RPC_UNICODE_STRING} per entry and the name arrays behind them.
+// Every pointer is the offset of its pointee from the start of the stub
+// (MS-RPCE 2.2.10.6), so a value that is merely unique names bytes outside the
+// buffer a Windows stub was given.
+void appendEnumeration(QByteArray &out, const QList<QPair<quint32, QString>> &page,
+                       quint32 context)
+{
+    const int base = int(out.size());
+    const int buffer = base + 8;     // the SAMPR_ENUMERATION_BUFFER
+    const int entries = buffer + 12; // the entry array, behind its own maximum count
+    putLe32(out, context);
+    putLe32(out, quint32(buffer));
+    putLe32(out, quint32(page.size())); // EntriesRead
+    putLe32(out, quint32(entries));     // the entry array
+    putLe32(out, quint32(page.size())); // Memsize
+    QByteArray deferred;
+    QList<QPair<int, int>> strings;
+    for (const QPair<quint32, QString> &entry : page) {
+        putLe32(out, entry.first);
+        appendCountedString(out, deferred, entry.second, strings);
+    }
+    placeStrings(out, deferred, strings);
+    putLe32(out, quint32(page.size())); // CountReturned
 }
 
 void appendArmWithStrings(QByteArray &reply, QByteArray &arm, const QByteArray &blob,
@@ -1357,7 +1355,7 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
             putLe32(fixed, kStatusInvalidParameter);
             return fixed;
         }
-        putLe32(fixed, 0x0002d4c5u); // referent for the SID
+        putLe32(fixed, quint32(fixed.size() + 4)); // the SID, behind its own maximum count
         putLe32(fixed, quint32((sid.size() - 8) / 4)); // max_count: sub-authorities
         fixed.append(sid);
         putLe32(fixed, kStatusSuccess);
@@ -1388,27 +1386,10 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
             names.append(QStringLiteral("Builtin"));
             names.append(m_config.netbios);
         }
-        putLe32(fixed, 0);            // EnumerationContext: nothing follows
-        putLe32(fixed, 0x0002d4c6u);  // Buffer referent
-        putLe32(fixed, quint32(names.size()));
-        putLe32(fixed, 0x0002d4c7u);  // entry array referent
-        putLe32(fixed, quint32(names.size()));
-        QList<QByteArray> strings;
-        for (const QString &name : names) {
-            putLe32(fixed, 0); // RelativeId: a domain entry has none
-            const QByteArray utf16 = Ndr::utf16le(name);
-            fixed.append(char(utf16.size() & 0xff));
-            fixed.append(char((utf16.size() >> 8) & 0xff));
-            fixed.append(char(utf16.size() & 0xff));
-            fixed.append(char((utf16.size() >> 8) & 0xff));
-            putLe32(fixed, 0x0002d4c8u); // name buffer referent
-            QByteArray deferredString;
-            appendVaryingString(deferredString, name);
-            strings.append(deferredString);
-        }
-        for (const QByteArray &bytes : strings)
-            fixed.append(bytes);
-        putLe32(fixed, quint32(names.size())); // CountReturned
+        QList<QPair<quint32, QString>> entries;
+        for (const QString &name : names)
+            entries.append(qMakePair(0u, name)); // a domain entry carries no RID
+        appendEnumeration(fixed, entries, 0);
         putLe32(fixed, kStatusSuccess);
         emit requestReceived(QStringLiteral("EnumerateDomains"));
         return fixed;
@@ -1841,9 +1822,9 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
         }
         // SAMPR_GET_GROUPS_BUFFER: referent, MembershipCount, then the array's
         // pointer, its maximum count and one {RelativeId; Attributes} per group.
-        putLe32(fixed, 0x0002e470u);
+        putLe32(fixed, 4);                            // the SAMPR_GET_GROUPS_BUFFER
         putLe32(fixed, quint32(rids.size()));
-        putLe32(fixed, rids.isEmpty() ? 0u : 0x0002e480u);
+        putLe32(fixed, rids.isEmpty() ? 0u : 12u);    // the groups, behind their maximum count
         putLe32(fixed, quint32(rids.size()));
         for (quint32 rid : rids) {
             putLe32(fixed, rid);
@@ -1917,33 +1898,14 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
         for (int i = start; i < all.size(); ++i)
             page.append(all.at(i));
 
-        putLe32(fixed, 0);           // EnumerationContext: one page, nothing follows
-        putLe32(fixed, 0x0002d4d0u); // Buffer referent
-        putLe32(fixed, quint32(page.size()));
-        putLe32(fixed, 0x0002d4d1u); // entry array referent
-        putLe32(fixed, quint32(page.size()));
-        QList<QByteArray> strings;
+        QList<QPair<quint32, QString>> entries;
         for (const DirectoryObject &user : page) {
-            const QString sidText = user.attributes.value(QStringLiteral("objectSid"));
-            const QStringList parts = sidText.split(QLatin1Char('-'));
-            const quint32 rid = parts.isEmpty() ? 0 : parts.last().toUInt();
-            putLe32(fixed, rid);
             QString name = user.attributes.value(QStringLiteral("sAMAccountName"));
             if (name.isEmpty())
                 name = user.name;
-            const QByteArray utf16 = Ndr::utf16le(name);
-            fixed.append(char(utf16.size() & 0xff));
-            fixed.append(char((utf16.size() >> 8) & 0xff));
-            fixed.append(char(utf16.size() & 0xff));
-            fixed.append(char((utf16.size() >> 8) & 0xff));
-            putLe32(fixed, 0x0002d500u + quint32(strings.size()));
-            QByteArray deferredString;
-            appendVaryingString(deferredString, name);
-            strings.append(deferredString);
+            entries.append(qMakePair(ridOf(user), name));
         }
-        for (const QByteArray &bytes : strings)
-            fixed.append(bytes);
-        putLe32(fixed, quint32(page.size())); // CountReturned
+        appendEnumeration(fixed, entries, 0);
         putLe32(fixed, kStatusSuccess);
         emit requestReceived(QStringLiteral("EnumerateUsers (%1)").arg(page.size()));
         return fixed;
@@ -2050,30 +2012,14 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
         for (int i = start; i < all.size(); ++i)
             page.append(all.at(i));
 
-        putLe32(fixed, 0);           // EnumerationContext
-        putLe32(fixed, 0x0002d4e0u); // Buffer referent
-        putLe32(fixed, quint32(page.size()));
-        putLe32(fixed, 0x0002d4e1u); // entry array referent
-        putLe32(fixed, quint32(page.size()));
-        QList<QByteArray> strings;
+        QList<QPair<quint32, QString>> entries;
         for (const DirectoryObject &group : page) {
-            putLe32(fixed, ridOf(group));
             QString name = group.attributes.value(QStringLiteral("sAMAccountName"));
             if (name.isEmpty())
                 name = group.name;
-            const QByteArray utf16 = Ndr::utf16le(name);
-            fixed.append(char(utf16.size() & 0xff));
-            fixed.append(char((utf16.size() >> 8) & 0xff));
-            fixed.append(char(utf16.size() & 0xff));
-            fixed.append(char((utf16.size() >> 8) & 0xff));
-            putLe32(fixed, 0x0002d4f0u + quint32(strings.size()));
-            QByteArray deferredString;
-            appendVaryingString(deferredString, name);
-            strings.append(deferredString);
+            entries.append(qMakePair(ridOf(group), name));
         }
-        for (const QByteArray &bytes : strings)
-            fixed.append(bytes);
-        putLe32(fixed, quint32(page.size())); // CountReturned
+        appendEnumeration(fixed, entries, 0);
         putLe32(fixed, kStatusSuccess);
         emit requestReceived(QStringLiteral("EnumerateGroups (%1)").arg(page.size()));
         return fixed;
@@ -2106,7 +2052,14 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
         QList<DirectoryObject> page;
         for (int i = int(context); i < all.size(); ++i)
             page.append(all.at(i));
-        appendEnumeration(fixed, page, 0, 0x0002d510u);
+        QList<QPair<quint32, QString>> entries;
+        for (const DirectoryObject &alias : page) {
+            QString name = alias.attributes.value(QStringLiteral("sAMAccountName"));
+            if (name.isEmpty())
+                name = alias.name;
+            entries.append(qMakePair(ridOf(alias), name));
+        }
+        appendEnumeration(fixed, entries, 0);
         putLe32(fixed, kStatusSuccess);
         emit requestReceived(QStringLiteral("EnumerateAliases (%1)").arg(page.size()));
         return fixed;
@@ -2298,10 +2251,14 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
         if (sids.isEmpty()) {
             putLe32(fixed, 0);
         } else {
-            putLe32(fixed, 0x0002e300u);        // array referent
-            putLe32(fixed, quint32(sids.size())); // maximum count
-            for (int i = 0; i < sids.size(); ++i)
-                putLe32(fixed, 0x0002e310u + quint32(i));
+            const int array = int(fixed.size()) + 4; // behind the maximum count
+            putLe32(fixed, quint32(array));          // the SID pointers
+            putLe32(fixed, quint32(sids.size()));    // maximum count
+            quint32 at = quint32(array + 4 + 4 * int(sids.size()));
+            for (const QByteArray &sid : sids) {
+                putLe32(fixed, at);
+                at += 12 + 4 * quint32(sid.size() >= 2 ? quint8(sid.at(1)) : 0);
+            }
             for (const QByteArray &sid : sids)
                 putWireSid(fixed, sid);
         }
