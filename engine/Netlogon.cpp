@@ -1069,6 +1069,8 @@ QByteArray NetlogonServer::serverAuthenticate(const QByteArray &stub, quint16 op
     channel.requestedFlags = requested;
     channel.accountName = accountName;
     channel.sid = account.attributes.value(QStringLiteral("objectSid"));
+    channel.computerName = computerName;
+    channel.channelType = channelType;
     m_channels.insert(accountName.toLower(), channel);
     m_channels.insert(computerName.toLower(), channel);
     m_challenges.remove(computerName.toLower());
@@ -1353,6 +1355,92 @@ QByteArray NetlogonServer::serverPasswordSet2(const QByteArray &stub)
     putLe32(out, timestamp);
     putLe32(out, kStatusSuccess);
     emit requestReceived(QStringLiteral("ServerPasswordSet2(%1)").arg(accountName));
+    return out;
+}
+
+// MS-NRPC 3.5.4.4.9 (opnum 42): the current and previous NT one-way functions
+// of the account the channel was opened for, so a DC that is establishing or
+// rotating a trust can put both sides on the same secret. On a trust channel
+// the account is the interdomain one and what is read is the trusted domain
+// object's incoming password - the very secret this DC checks that channel
+// against.
+//
+// The cipher is DES with the session key whatever the channel negotiated for
+// its own credentials: Samba's netlogon_creds_crypt_samr_Password says so in one
+// line ("Even with NETLOGON_NEG_SUPPORTS_AES or NETLOGON_NEG_ARCFOUR this uses
+// DES"), and a client handed anything else derives a hash it cannot use. The
+// previous password is the current one because this store keeps one secret per
+// direction, which is also what Samba sends when the trusted domain object
+// holds only a current entry.
+QByteArray NetlogonServer::serverTrustPasswordsGet(const QByteArray &stub)
+{
+    Ndr::Reader reader(stub);
+    QString serverName;
+    QString accountName;
+    QString computerName;
+    quint16 channelType = 0;
+    if (!readUniqueString(reader, &serverName))
+        return statusOnly(kStatusInvalidParameter);
+    if (!readStringArray(reader, &accountName))
+        return statusOnly(kStatusInvalidParameter);
+    if (!reader.u16(&channelType))
+        return statusOnly(kStatusInvalidParameter);
+    reader.align(4);
+    if (!readStringArray(reader, &computerName))
+        return statusOnly(kStatusInvalidParameter);
+    QByteArray credential;
+    quint32 timestamp = 0;
+    if (!reader.bytes(8, &credential) || !reader.u32(&timestamp))
+        return statusOnly(kStatusInvalidParameter);
+    Q_UNUSED(serverName)
+
+    auto channel = m_channels.find(accountName.toLower());
+    if (channel == m_channels.end())
+        return statusOnly(kStatusNoTrustSamAccount);
+    if (channel->accountName.compare(accountName, Qt::CaseInsensitive) != 0
+        || channel->computerName.compare(computerName, Qt::CaseInsensitive) != 0
+        || channel->channelType != channelType)
+        return statusOnly(kStatusInvalidParameter);
+    QByteArray reply;
+    if (!stepAuthenticator(&channel.value(), timestamp, credential, &reply))
+        return statusOnly(kStatusAccessDenied);
+
+    QByteArray owf;
+    QByteArray previousOwf;
+    if (channelType == kSecChanDomain || channelType == kSecChanDnsDomain) {
+        const DirectoryObject trust = findTrustPrincipal(accountName);
+        if (trust.id.isEmpty())
+            return statusOnly(kStatusAccountDisabled);
+        owf = QByteArray::fromHex(trust.attributes.value(QStringLiteral("ntHash")).toLatin1());
+        // One secret per direction is all this store keeps, so the previous
+        // slot reports the same value; a trusted domain object with only a
+        // current entry is answered that way too.
+        previousOwf = owf;
+    } else {
+        const DirectoryObject account = findAccount(accountName);
+        if (account.id.isEmpty() || !machineCredential(account, &owf))
+            return statusOnly(kStatusAccountDisabled);
+        // A machine account that has never rolled its password reports the
+        // empty password's hash there, as a DC does.
+        previousOwf = Ntlm::ntowfV1(QString());
+    }
+    if (owf.size() != 16 || previousOwf.size() != 16)
+        return statusOnly(kStatusAccountDisabled);
+
+    // An all-zero hash stays zero, as Samba's cipher leaves it: encrypting it
+    // would hand a client a value that looks like a password.
+    const auto encrypted = [&](QByteArray hash) {
+        if (hash == QByteArray(16, '\0'))
+            return hash;
+        return Des::encryptOwfHash(hash, channel->sessionKey);
+    };
+
+    QByteArray out = reply;
+    putLe32(out, timestamp);
+    out.append(encrypted(owf));          // new_owf_password
+    out.append(encrypted(previousOwf));  // old_owf_password
+    putLe32(out, kStatusSuccess);
+    emit requestReceived(QStringLiteral("ServerTrustPasswordsGet(%1)").arg(accountName));
     return out;
 }
 
@@ -1965,6 +2053,8 @@ QByteArray NetlogonServer::handleCall(quint16 opnum, const QByteArray &stub,
         return serverAuthenticate(stub, opnum);
     case Netlogon::OpServerPasswordSet2:
         return serverPasswordSet2(stub);
+    case Netlogon::OpServerTrustPasswordsGet:
+        return serverTrustPasswordsGet(stub);
     case Netlogon::OpLogonGetCapabilities:
         return logonGetCapabilities(stub);
     case Netlogon::OpLogonSamLogonEx:

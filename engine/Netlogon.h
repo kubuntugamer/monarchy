@@ -74,6 +74,7 @@ enum Opnum : quint16 {
     OpServerAuthenticate2 = 15,
     OpServerAuthenticate3 = 26,
     OpServerPasswordSet2 = 30,
+    OpServerTrustPasswordsGet = 42,
     OpGetAnyDCName = 13,
     OpLogonGetCapabilities = 21,
     OpLogonGetTrustRid = 23,
@@ -166,6 +167,12 @@ private:
         quint32 requestedFlags = 0;
         QString accountName;
         QString sid;
+        // The computer and channel type the channel was established with.
+        // NetrServerTrustPasswordsGet names both, and Samba refuses a call that
+        // names a different computer or type than the channel holds; without
+        // them a channel could be asked about an account it never proved.
+        QString computerName;
+        quint16 channelType = 0;
     };
 
     DirectoryObject findAccount(const QString &name) const;
@@ -180,6 +187,7 @@ private:
     QByteArray serverReqChallenge(const QByteArray &stub);
     QByteArray serverAuthenticate(const QByteArray &stub, quint16 opnum);
     QByteArray serverPasswordSet2(const QByteArray &stub);
+    QByteArray serverTrustPasswordsGet(const QByteArray &stub);
     QByteArray getAnyDcName(const QByteArray &stub);
     QByteArray dsrGetSiteName(const QByteArray &stub);
     QByteArray dsrEnumerateDomainTrusts(const QByteArray &stub);

@@ -88,12 +88,13 @@ void appendPointerString(QByteArray &out, const QString &text, quint32 referent)
 }
 
 QByteArray authenticateRequest(const QString &account, const QString &computer,
-                               const QByteArray &credential, quint32 flags)
+                               const QByteArray &credential, quint32 flags,
+                               quint16 channelType = 2)
 {
     QByteArray stub;
     appendLe32(stub, 0); // NULL server_name
     appendStringArray(stub, account, false);
-    appendLe16(stub, 2); // SEC_CHAN_WKSTA
+    appendLe16(stub, channelType);
     while (stub.size() % 4 != 0)
         stub.append('\0');
     // The credential is a byte array, aligned to one: no padding follows the
@@ -320,6 +321,23 @@ QByteArray passwordSetRequest(const QString &account, const QString &computer,
     return stub;
 }
 
+// NetrServerTrustPasswordsGet's request: the same head as a password write,
+// without the buffer (MS-NRPC 3.5.4.4.9).
+QByteArray passwordGetRequest(const QString &account, const QString &computer,
+                             const QByteArray &credential, quint32 timestamp,
+                             quint16 channelType = 3) // SEC_CHAN_DOMAIN
+{
+    QByteArray stub;
+    appendLe32(stub, 0); // NULL server_name
+    appendStringArray(stub, account, false);
+    appendLe16(stub, channelType);
+    while (stub.size() % 4 != 0) stub.append('\0');
+    appendStringArray(stub, computer);
+    stub.append(credential);
+    appendLe32(stub, timestamp);
+    return stub;
+}
+
 QByteArray getDcNameRequest(const QString &domain)
 {
     QByteArray stub;
@@ -520,6 +538,8 @@ private slots:
     void dcLocatorNamesThisDc();
     void trustChannelUsesTheTrustSecret();
     void trustPasswordSet2RotatesTheIncomingSecret();
+    void trustPasswordsGetReadsTheIncomingSecret();
+    void passwordGetServesAMachineChannelsOwnHash();
     void reportsTheTrustAccountRid();
     void answersTheLegacyLocatorCalls();
 };
@@ -1888,6 +1908,130 @@ void NetlogonTest::trustPasswordSet2RotatesTheIncomingSecret()
              derived.attributes.value(QStringLiteral("aes256Key")));
     QCOMPARE(written.value(QStringLiteral("kerberosSalt")),
              derived.attributes.value(QStringLiteral("kerberosSalt")));
+}
+
+// NetrServerTrustPasswordsGet (opnum 42) is how a DC establishing or rotating a
+// trust reads the secret this DC holds for it: the trusted domain object's
+// incoming password reaches the peer as its NT one-way function, DES-encrypted
+// under the channel's session key - the pair the trust channel itself
+// authenticates with. The store keeps one secret per direction, so the previous
+// slot carries the current value, which is what Samba answers when a trusted
+// domain object holds only a current entry.
+void NetlogonTest::trustPasswordsGetReadsTheIncomingSecret()
+{
+    NetlogonServer server;
+    Netlogon::Config config;
+    config.netbios = QStringLiteral("CORP");
+    config.realm = QStringLiteral("CORP.EXAMPLE.COM");
+    config.domainSid = QStringLiteral("S-1-5-21-1-2-3");
+    server.setConfig(config);
+
+    DirectoryObject trust;
+    trust.id = QStringLiteral("CN=FABRIKAM,CN=System,DC=corp,DC=example,DC=com");
+    trust.name = QStringLiteral("FABRIKAM");
+    trust.attributes.insert(QStringLiteral("objectClass"),
+                            QStringLiteral("top;leaf;trustedDomain"));
+    trust.attributes.insert(QStringLiteral("flatName"), QStringLiteral("FABRIKAM"));
+    trust.attributes.insert(QStringLiteral("trustPartner"), QStringLiteral("fabrikam.local"));
+    trust.attributes.insert(QStringLiteral("trustDirection"), QStringLiteral("3"));
+    trust.attributes.insert(QStringLiteral("securityIdentifier"),
+                            QStringLiteral("S-1-5-21-9-8-7"));
+    const QString secret = QStringLiteral("Trust!Secret9");
+    trust.attributes.insert(QStringLiteral("trustAuthIncoming"),
+                            QStringLiteral("2:")
+                                + QString::fromLatin1(secret.toUtf8().toHex()));
+    server.setObjectProvider([trust]() { return QList<DirectoryObject>{trust}; });
+
+    const QByteArray secretHash = Ntlm::ntowfV1(secret);
+    const QByteArray clientChallenge = QByteArray::fromHex("1020304050607080");
+    const QByteArray challengeReply = server.handleCall(
+        Netlogon::OpServerReqChallenge,
+        challengeRequest(QStringLiteral("PARTNERDC"), clientChallenge));
+    QCOMPARE(readLe32(challengeReply, 8), quint32(0));
+    const quint32 flags = Netlogon::kNegStrongKeys | Netlogon::kNegSupportsAes;
+    const QByteArray sessionKey =
+        expectedSessionKey(secretHash, clientChallenge, challengeReply.left(8), flags);
+    const QByteArray authReply = server.handleCall(
+        Netlogon::OpServerAuthenticate3,
+        authenticateRequest(QStringLiteral("FABRIKAM$"), QStringLiteral("PARTNERDC"),
+                            expectedCredential(clientChallenge, sessionKey, flags), flags, 3));
+    QCOMPARE(readLe32(authReply, authReply.size() - 4), quint32(0));
+
+    const quint32 timestamp = 123;
+    const QByteArray seed = expectedCredential(clientChallenge, sessionKey, flags);
+    const QByteArray credential =
+        nextCredential(seed, timestamp, sessionKey, flags, false);
+
+    // An account the channel was not opened for has no channel here.
+    const QByteArray unknown = server.handleCall(
+        Netlogon::OpServerTrustPasswordsGet,
+        passwordGetRequest(QStringLiteral("CONTOSO$"), QStringLiteral("PARTNERDC"), credential,
+                           timestamp));
+    QCOMPARE(readLe32(unknown, 0), quint32(0xc000018bu)); // STATUS_NO_TRUST_SAM_ACCOUNT
+    // A channel type other than the one the channel was established with is
+    // not this channel either, and neither is another computer's name.
+    const QByteArray wrongType = server.handleCall(
+        Netlogon::OpServerTrustPasswordsGet,
+        passwordGetRequest(QStringLiteral("FABRIKAM$"), QStringLiteral("PARTNERDC"), credential,
+                           timestamp, 2));
+    QCOMPARE(readLe32(wrongType, 0), quint32(0xc000000du)); // STATUS_INVALID_PARAMETER
+    const QByteArray wrongComputer = server.handleCall(
+        Netlogon::OpServerTrustPasswordsGet,
+        passwordGetRequest(QStringLiteral("FABRIKAM$"), QStringLiteral("OTHERDC"), credential,
+                           timestamp));
+    QCOMPARE(readLe32(wrongComputer, 0), quint32(0xc000000du));
+    // A credential that is not the next in the chain is refused without
+    // advancing it, so the same credential is still the valid one below.
+    const QByteArray wrongCredential = server.handleCall(
+        Netlogon::OpServerTrustPasswordsGet,
+        passwordGetRequest(QStringLiteral("FABRIKAM$"), QStringLiteral("PARTNERDC"),
+                           QByteArray(8, '\0'), timestamp));
+    QCOMPARE(readLe32(wrongCredential, 0), quint32(0xc0000022u)); // STATUS_ACCESS_DENIED
+
+    const QByteArray reply = server.handleCall(
+        Netlogon::OpServerTrustPasswordsGet,
+        passwordGetRequest(QStringLiteral("FABRIKAM$"), QStringLiteral("PARTNERDC"), credential,
+                           timestamp));
+    QCOMPARE(reply.size(), 48);
+    QCOMPARE(readLe32(reply, 8), timestamp);
+    const QByteArray expected = Des::encryptOwfHash(secretHash, sessionKey);
+    QCOMPARE(reply.mid(12, 16), expected); // new
+    QCOMPARE(reply.mid(28, 16), expected); // previous, the same secret
+    QCOMPARE(readLe32(reply, 44), quint32(0));
+}
+
+// The same call on a machine channel answers the machine account's own hash;
+// a machine has no previous password here, so that slot carries the hash of the
+// empty password, which is what a DC has never rolled over reports.
+void NetlogonTest::passwordGetServesAMachineChannelsOwnHash()
+{
+    NetlogonServer server;
+    Netlogon::Config config;
+    config.netbios = QStringLiteral("CORP");
+    config.realm = QStringLiteral("CORP.EXAMPLE.COM");
+    config.dcName = QStringLiteral("DC1");
+    config.domainSid = QStringLiteral("S-1-5-21-1-2-3");
+    server.setConfig(config);
+
+    const QByteArray machineHash = Ntlm::ntowfV1(QStringLiteral("Mach!neP@ss1"));
+    const DirectoryObject machine = machineAccount(machineHash);
+    server.setObjectProvider([machine]() { return QList<DirectoryObject>{machine}; });
+
+    const ChannelFixture channel = openChannel(server, machineHash);
+    QVERIFY(channel.ok);
+    const quint32 timestamp = 55;
+    const QByteArray reply = server.handleCall(
+        Netlogon::OpServerTrustPasswordsGet,
+        passwordGetRequest(QStringLiteral("DC1$"), QStringLiteral("DC1"),
+                           nextCredential(channel.seed, timestamp, channel.sessionKey, channel.flags,
+                                          false),
+                           timestamp, 2 /* SEC_CHAN_WKSTA */));
+    QCOMPARE(reply.size(), 48);
+    QCOMPARE(readLe32(reply, 8), timestamp);
+    QCOMPARE(reply.mid(12, 16), Des::encryptOwfHash(machineHash, channel.sessionKey));
+    QCOMPARE(reply.mid(28, 16),
+             Des::encryptOwfHash(Ntlm::ntowfV1(QString()), channel.sessionKey));
+    QCOMPARE(readLe32(reply, 44), quint32(0));
 }
 
 // NetrLogonGetTrustRid names the disabled account kept for an inbound trust;
