@@ -140,12 +140,18 @@ private:
     QByteArray drsDomainControllerInfo(const QByteArray &stub);
     QByteArray drsCrackNames(const QByteArray &stub);
 
+    // The DC's own name, which the DSA's GUID and the DN DsGetDomainControllerInfo
+    // answers with are keyed on. A Samr::Config's netbios field names the
+    // domain, not the DC, so the server name is kept apart from it.
+    QString dsaName() const;
+
     QList<DirectoryObject> directory() const;
     quint64 storeUsn(const DirectoryObject &object) const;
     QString baseDn() const { return m_config.baseDn; }
 
     Samr::Config m_config;
     QString m_dnsDomain;
+    QString m_serverName;
     QUuid m_invocationId;
     QUuid m_sourceDsaGuid;
     RpcServer *m_rpc = nullptr;

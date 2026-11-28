@@ -1168,10 +1168,10 @@ QByteArray DrsServer::drsGetNCChanges(const QByteArray &stub)
     const quint32 outVersion = version >= 8 ? 6u : 1u;
     const quint32 ret = targeted ? kExtRetSuccess : kExtRetNone;
     const QUuid invocation = m_invocationId.isNull()
-        ? Drs::invocationId(m_config.domainSid, m_config.netbios)
+        ? Drs::invocationId(m_config.domainSid, dsaName())
         : m_invocationId;
     const QUuid sourceDsa = m_sourceDsaGuid.isNull()
-        ? Drs::sourceDsaGuid(m_config.domainSid, m_config.netbios)
+        ? Drs::sourceDsaGuid(m_config.domainSid, dsaName())
         : m_sourceDsaGuid;
 
     // The object chain is rendered first: cNumBytes reports the size of the
@@ -1879,7 +1879,7 @@ QByteArray DrsServer::drsDomainControllerInfo(const QByteArray &stub)
     if (supported && infoLevel != 0xffffffffu) {
         const QString dnsDomain =
             m_dnsDomain.isEmpty() ? m_config.realm.toLower() : m_dnsDomain;
-        const QString dcName = m_config.netbios;
+        const QString dcName = dsaName();
         const QString site = QStringLiteral("Default-First-Site-Name");
         const QString configDn = QStringLiteral("CN=Configuration,") + baseDn();
         const QString siteDn =
@@ -1890,7 +1890,7 @@ QByteArray DrsServer::drsDomainControllerInfo(const QByteArray &stub)
         const QString computerDn =
             QStringLiteral("CN=%1,OU=Domain Controllers,%2").arg(dcName, baseDn());
         const QUuid dsaGuid = m_sourceDsaGuid.isNull()
-            ? Drs::sourceDsaGuid(m_config.domainSid, m_config.netbios)
+            ? Drs::sourceDsaGuid(m_config.domainSid, dsaName())
             : m_sourceDsaGuid;
 
         const QString hostName =
@@ -2146,11 +2146,19 @@ void DrsServer::setDomainNames(const QString &netbios, const QString &serverName
                                const QString &dnsDomain)
 {
     m_config.netbios = netbios;
+    m_serverName = serverName;
     m_dnsDomain = dnsDomain;
     // The NTLM CHALLENGE the bind answers with is built by the RPC layer from
     // these names: without them the target info carries no MsvAvDnsComputerName
     // and clients that derive an SPN from it (impacket) abort the handshake.
     m_rpc->setDomainNames(netbios, serverName, dnsDomain);
+}
+
+QString DrsServer::dsaName() const
+{
+    // Without a server name (a bare server in a test) the domain's NetBIOS name
+    // is the only name there is; a running DC always sets one.
+    return m_serverName.isEmpty() ? m_config.netbios : m_serverName;
 }
 
 void DrsServer::setObjectProvider(std::function<QList<DirectoryObject>()> provider)

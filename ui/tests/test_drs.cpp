@@ -1346,6 +1346,80 @@ private slots:
         QCOMPARE(readLe32(reply, reply.size() - 4), quint32(0)); // ErrorCode
     }
 
+    // A second DC has a name of its own, and its DSA's identity follows that
+    // name rather than the domain's NetBIOS name: two DCs of one domain that
+    // derived the same GUID from it would look like one DSA to a partner.
+    void domainControllerInfoNamesTheDcItRunsOn()
+    {
+        DrsServer server;
+        server.setConfig(config());
+        server.setDomainNames(QStringLiteral("CORP"), QStringLiteral("DC2"),
+                              QStringLiteral("corp.example.com"));
+        server.setObjectProvider([this]() { return fixture(); });
+
+        const QByteArray handle = server.handleCall(0, bindRequest()).mid(64, 20);
+        const QByteArray reply =
+            server.handleCall(16, domainControllerInfoRequest(handle));
+
+        Ndr::Reader reader(reply);
+        quint32 version = 0, tag = 0, items = 0, itemsRef = 0;
+        QVERIFY(reader.u32(&version));
+        QVERIFY(reader.u32(&tag));
+        QVERIFY(reader.u32(&items));
+        QVERIFY(reader.u32(&itemsRef));
+        QCOMPARE(version, quint32(2));
+        QCOMPARE(tag, quint32(2));
+        QCOMPARE(items, quint32(1));
+        QVERIFY(itemsRef != 0);
+
+        quint32 maxCount = 0;
+        QVERIFY(reader.u32(&maxCount));
+        QCOMPARE(maxCount, quint32(1));
+        for (int i = 0; i < 7; ++i) {
+            quint32 ref = 0;
+            QVERIFY(reader.u32(&ref));
+            QVERIFY(ref != 0);
+        }
+        for (int i = 0; i < 3; ++i) {
+            quint32 flag = 0;
+            QVERIFY(reader.u32(&flag));
+            QCOMPARE(flag, quint32(1));
+        }
+
+        reader.skip(48); // the site, computer and server object GUIDs
+        QByteArray ntdsGuid;
+        QVERIFY(reader.bytes(16, &ntdsGuid));
+        QByteArray expectedBytes;
+        appendGuid(expectedBytes,
+                   Drs::sourceDsaGuid(config().domainSid, QStringLiteral("DC2")));
+        QCOMPARE(ntdsGuid, expectedBytes);
+        // The domain's own name is not this DSA's identity.
+        QVERIFY(ntdsGuid != [this]() {
+            QByteArray other;
+            appendGuid(other, Drs::sourceDsaGuid(config().domainSid, config().netbios));
+            return other;
+        }());
+
+        // NetBIOS name, DNS host name, site, then the four object DNs, all
+        // naming this DC.
+        QCOMPARE(readWideString(&reader), QStringLiteral("DC2"));
+        QCOMPARE(readWideString(&reader), QStringLiteral("dc2.corp.example.com"));
+        QCOMPARE(readWideString(&reader), QStringLiteral("Default-First-Site-Name"));
+        QCOMPARE(readWideString(&reader),
+                 QStringLiteral("CN=Default-First-Site-Name,CN=Sites,"
+                                "CN=Configuration,DC=corp,DC=example,DC=com"));
+        QCOMPARE(readWideString(&reader),
+                 QStringLiteral("CN=DC2,OU=Domain Controllers,"
+                                "DC=corp,DC=example,DC=com"));
+        QCOMPARE(readWideString(&reader),
+                 QStringLiteral("CN=DC2,CN=Servers,CN=Default-First-Site-Name,"
+                                "CN=Sites,CN=Configuration,DC=corp,DC=example,DC=com"));
+        QCOMPARE(readWideString(&reader),
+                 QStringLiteral("CN=NTDS Settings,CN=DC2,CN=Servers,"
+                                "CN=Default-First-Site-Name,CN=Sites,"
+                                "CN=Configuration,DC=corp,DC=example,DC=com"));
+    }
+
     void crackNamesTranslatesFqdnToCanonical()
     {
         DrsServer server;
