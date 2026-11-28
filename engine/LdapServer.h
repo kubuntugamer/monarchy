@@ -13,6 +13,7 @@
 #include <QList>
 #include <QMap>
 #include <QString>
+#include <QStringList>
 #include <QUuid>
 
 #include <functional>
@@ -24,6 +25,15 @@
 class Kdc;
 class LdapListener;
 class QUdpSocket;
+
+// This store keeps a multi-valued attribute as one ';'-joined string. Two
+// writers made that string two ways (';' from the provisioner, '; ' from a
+// modify) and one reader only understood the second, so an object whose class
+// list the provisioner wrote was served as a single value named
+// "top;server" — neither a class a filter matches nor the multi-valued list a
+// Windows DC returns. Every reader and writer of a list goes through these.
+QStringList splitAttributeValues(const QString &stored);
+QString joinAttributeValues(const QStringList &values);
 
 // A minimal in-process LDAP server (RFC 4511 subset) so Monarchy can act as a DC
 // on this machine without root or external packages. Supports Bind (simple) and

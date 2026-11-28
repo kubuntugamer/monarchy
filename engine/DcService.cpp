@@ -656,7 +656,7 @@ bool DcService::start(const QString &dcDir)
             spns.append(qualified);
             QMap<QString, QString> attributes;
             attributes.insert(QStringLiteral("servicePrincipalName"),
-                              spns.join(QStringLiteral("; ")));
+                              joinAttributeValues(spns));
             if (!m_ldapServer->modifyObject(object.id, attributes)) {
                 emit statusMessage(
                     tr("Could not add the %1 service principal.").arg(qualified));
@@ -869,7 +869,7 @@ bool DcService::start(const QString &dcDir)
     lsadWrites.setRights = [this, persist](const QString &dn, const QStringList &rights,
                                            QString *error) {
         const bool ok = m_ldapServer->modifyObject(
-            dn, {{QStringLiteral("userRight"), rights.join(QStringLiteral("; "))}});
+            dn, {{QStringLiteral("userRight"), joinAttributeValues(rights)}});
         if (!ok && error)
             *error = QStringLiteral("account not found (%1)").arg(dn);
         if (ok)

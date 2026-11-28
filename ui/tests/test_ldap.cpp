@@ -292,6 +292,7 @@ private slots:
     void udpSearchThatIsNotALocatorPingIsRefused();
     void servesTheObjectGuidItDerives();
     void publishesTheStoredDomainGuid();
+    void anAddKeepsEveryObjectClassValue();
 };
 
 // The password policy is the domain object's: minPwdLength, pwdHistoryLength and
@@ -1690,6 +1691,59 @@ void LdapTest::udpSearchThatIsNotALocatorPingIsRefused()
     QCOMPARE(operationTag(reply), 0x65); // searchResDone
     QCOMPARE(resultCode(reply), 53);     // unwillingToPerform
     QVERIFY(reply.contains("Operation not allowed through UDP"));
+}
+
+// An attribute's values are a set on the wire: RFC 4511 §4.7 sends one
+// AttributeValue per value, and an add that named `top` and `server` created an
+// object whose whole class list was `top` — the rest of the set was dropped
+// silently. A reader then served what survived as one joined string, so no
+// class filter could match the object a client had just created. Both halves go
+// through the same list now: every value is kept, and each is served as its own
+// AttributeValue the way a Windows DC serves a multi-valued attribute.
+void LdapTest::anAddKeepsEveryObjectClassValue()
+{
+    LdapServer server;
+    server.setObjects(sampleObjects());
+    QVERIFY(server.listen(0));
+
+    QTcpSocket client;
+    client.connectToHost(QHostAddress::LocalHost, server.serverPort());
+    QVERIFY(client.waitForConnected(3000));
+    Reader reader(&client);
+    authenticate(client, reader, QByteArray(kSampleAdministratorDn));
+
+    const QByteArray dn = "CN=DC2,CN=Servers,DC=corp,DC=example,DC=com";
+    client.write(addRequest(2, dn,
+                            {{QByteArrayLiteral("objectClass"),
+                              {QByteArrayLiteral("top"), QByteArrayLiteral("server")}},
+                             {QByteArrayLiteral("cn"), {QByteArrayLiteral("DC2")}},
+                             {QByteArrayLiteral("dNSHostName"),
+                              {QByteArrayLiteral("dc2.corp.example.com")}}}));
+    const QByteArray added = reader.next();
+    QVERIFY(!added.isEmpty());
+    QCOMPARE(operationTag(added), 0x69); // addResponse
+    QCOMPARE(resultCode(added), 0);
+
+    client.write(equalitySearch(3, "DC=corp,DC=example,DC=com", "objectClass", "server"));
+    QList<QByteArray> hits;
+    while (true) {
+        const QByteArray message = reader.next();
+        if (message.isEmpty())
+            break;
+        if (operationTag(message) == 0x64)
+            hits.append(message);
+        if (operationTag(message) == 0x65)
+            break;
+    }
+    QCOMPARE(hits.size(), 1);
+    QCOMPARE(entryDn(hits.first()), QString::fromUtf8(dn));
+
+    // The list reads back whole and in the order it was written, one value per
+    // class, so a client that inspects it sees the object it created.
+    const QList<QByteArray> classes = entryAttribute(hits.first(), QByteArray("objectClass"));
+    QCOMPARE(classes.size(), 2);
+    QCOMPARE(classes.value(0), QByteArray("top"));
+    QCOMPARE(classes.value(1), QByteArray("server"));
 }
 
 QTEST_MAIN(LdapTest)

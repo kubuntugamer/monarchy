@@ -220,8 +220,8 @@ void ProvisionerTest::buildsDomainFromScratch()
     const DirectoryObject *ntds = findByDn(objects, ntdsDn);
     QVERIFY(ntds);
     QCOMPARE(ntds->type, QStringLiteral("NTDS Settings"));
-    QCOMPARE(ntds->attributes.value(QStringLiteral("objectClass")),
-             QStringLiteral("top;nTDSDSA"));
+    QCOMPARE(splitAttributeValues(ntds->attributes.value(QStringLiteral("objectClass"))),
+             QStringList({QStringLiteral("top"), QStringLiteral("nTDSDSA")}));
     QCOMPARE(ntds->attributes.value(QStringLiteral("options")), QStringLiteral("1")); // IS_GC
     // A GUID string without the braces, which is how AD stores invocationId.
     QCOMPARE(ntds->attributes.value(QStringLiteral("invocationId")).size(), 36);
@@ -236,8 +236,8 @@ void ProvisionerTest::buildsDomainFromScratch()
     const DirectoryObject *partitions =
         findByDn(objects, QStringLiteral("CN=Partitions,CN=Configuration,%1").arg(result.baseDn));
     QVERIFY(partitions);
-    QCOMPARE(partitions->attributes.value(QStringLiteral("objectClass")),
-             QStringLiteral("top;crossRefContainer"));
+    QCOMPARE(splitAttributeValues(partitions->attributes.value(QStringLiteral("objectClass"))),
+             QStringList({QStringLiteral("top"), QStringLiteral("crossRefContainer")}));
     QCOMPARE(partitions->attributes.value(QStringLiteral("fSMORoleOwner")), ntdsDn);
 
     // All five FSMO roles name the DSA, not three of them: a client that reads

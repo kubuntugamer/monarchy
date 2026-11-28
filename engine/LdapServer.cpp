@@ -35,6 +35,22 @@
 #include <algorithm>
 #include <functional>
 
+QStringList splitAttributeValues(const QString &stored)
+{
+    QStringList out;
+    for (const QString &part : stored.split(QLatin1Char(';'), Qt::SkipEmptyParts)) {
+        const QString trimmed = part.trimmed();
+        if (!trimmed.isEmpty())
+            out.append(trimmed);
+    }
+    return out;
+}
+
+QString joinAttributeValues(const QStringList &values)
+{
+    return values.join(QStringLiteral("; "));
+}
+
 // Largest LDAP message this server will assemble. Framing has to be bounded:
 // a claimed length is reserved in the read buffer before any of it arrives, so
 // an unbounded one lets a single client decide the server's memory use.
@@ -304,8 +320,8 @@ bool valueEquals(const DirectoryObject &o, const QString &attr, const QString &w
     if (value.compare(wanted, Qt::CaseInsensitive) == 0)
         return true;
     // Multi-valued attributes are stored as ';'-joined lists.
-    for (const QString &candidate : value.split(QLatin1Char(';'), Qt::SkipEmptyParts)) {
-        if (candidate.trimmed().compare(wanted.trimmed(), Qt::CaseInsensitive) == 0)
+    for (const QString &candidate : splitAttributeValues(value)) {
+        if (candidate.compare(wanted.trimmed(), Qt::CaseInsensitive) == 0)
             return true;
     }
     // objectCategory is a DN, and a client names the category either in full or
@@ -449,8 +465,7 @@ Pred parseFilter(const QByteArray &d, int &pos) {
             // enabled list — and every extensible match used to fall through to
             // the parser's match-everything default, which made the negation
             // reject every user on the page.
-            QStringList candidates = attributeValue(o, attr).split(QLatin1Char(';'),
-                                                                   Qt::SkipEmptyParts);
+            QStringList candidates = splitAttributeValues(attributeValue(o, attr));
             if (dnAttributes) {
                 const QStringList rdns = o.id.split(QLatin1Char(','), Qt::SkipEmptyParts);
                 for (const QString &rdn : rdns) {
@@ -507,7 +522,7 @@ Pred parseFilter(const QByteArray &d, int &pos) {
             const QString value = attributeValue(o, attr);
             if (value.isEmpty())
                 return false;
-            for (const QString &candidate : value.split(QLatin1Char(';'), Qt::SkipEmptyParts)) {
+            for (const QString &candidate : splitAttributeValues(value)) {
                 bool haveNum = false;
                 bool wantNum = false;
                 const qlonglong have = candidate.trimmed().toLongLong(&haveNum);
@@ -1938,8 +1953,7 @@ int LdapServer::applyModify(const QString &dn, const QList<ModifyChange> &change
         if (isServerOnlyAttribute(change.type))
             return 19; // constraintViolation: password material is server-made
 
-        QStringList values = object.attributes.value(change.type)
-                                 .split(QStringLiteral("; "), Qt::SkipEmptyParts);
+        QStringList values = splitAttributeValues(object.attributes.value(change.type));
         if (change.operation == 2) {
             values = change.values;
         } else if (change.operation == 0) {
@@ -1958,7 +1972,7 @@ int LdapServer::applyModify(const QString &dn, const QList<ModifyChange> &change
         if (values.isEmpty())
             object.attributes.remove(change.type);
         else
-            object.attributes.insert(change.type, values.join(QStringLiteral("; ")));
+            object.attributes.insert(change.type, joinAttributeValues(values));
         if (type == QLatin1String("cn") && !values.isEmpty())
             object.name = values.first();
         if (type == QLatin1String("description") && !values.isEmpty())
@@ -3356,20 +3370,26 @@ QByteArray LdapServer::handleAdd(int msgId, const QByteArray &payload) {
         int vlen = readLength(payload, pos);
         int vend = pos + vlen;
         Q_UNUSED(vtag); Q_UNUSED(vlen)
-        QString val;
+        // An attribute's value set arrives as one AttributeValue per value, and
+        // every one of them is the attribute's: keeping only the first turned a
+        // `top`/`server` add into an object whose class list was `top`, which
+        // then matched no class filter and read back as one value — the class
+        // check the KCC does reads exactly that list.
+        QStringList values;
         QByteArray rawValue;
         while (pos < vend) {
             int t = readTag(payload, pos);
             int l = readLength(payload, pos);
             QByteArray b = payload.mid(pos, l);
             pos += l;
-            if (val.isEmpty()) val = QString::fromUtf8(b);
+            values.append(QString::fromUtf8(b));
             if (rawValue.isNull()) rawValue = b;
             Q_UNUSED(t)
         }
         pos = aend;
         if (isServerOnlyAttribute(type))
             continue; // derived by the server, ignore a client's attempt
+        const QString val = values.value(0);
         if (isPasswordAttribute(type)) {
             // Never store the plaintext: keep a salted verifier instead.
             const QString password = decodePasswordValue(rawValue, val);
@@ -3383,13 +3403,22 @@ QByteArray LdapServer::handleAdd(int msgId, const QByteArray &payload) {
                                   policyForDn(dn).historyLength);
             continue;
         }
-        obj.attributes.insert(type, val);
+        obj.attributes.insert(type, joinAttributeValues(values));
         if (type.compare(QStringLiteral("cn"), Qt::CaseInsensitive) == 0) obj.name = val;
         if (type.compare(QStringLiteral("description"), Qt::CaseInsensitive) == 0) obj.description = val;
         if (type.compare(QStringLiteral("objectClass"), Qt::CaseInsensitive) == 0) {
-            if (val.contains(QStringLiteral("user"), Qt::CaseInsensitive)) obj.kind = ObjectKind::User;
-            else if (val.contains(QStringLiteral("group"), Qt::CaseInsensitive)) obj.kind = ObjectKind::Group;
-            else if (val.contains(QStringLiteral("computer"), Qt::CaseInsensitive)) obj.kind = ObjectKind::Computer;
+            // The most specific class decides the kind, so the whole list is
+            // consulted rather than the first RDN-like entry a client sends.
+            const auto hasClass = [&values](const char *name) {
+                for (const QString &candidate : values) {
+                    if (candidate.trimmed().compare(QLatin1String(name), Qt::CaseInsensitive) == 0)
+                        return true;
+                }
+                return false;
+            };
+            if (hasClass("computer")) obj.kind = ObjectKind::Computer;
+            else if (hasClass("group")) obj.kind = ObjectKind::Group;
+            else if (hasClass("user")) obj.kind = ObjectKind::User;
         }
     }
     // An entry with an account name is a security principal and needs its
@@ -3709,7 +3738,7 @@ QByteArray LdapServer::makeSearchEntry(int msgId, const DirectoryObject &o,
             continue;
         if (!wanted(it.key()))
             continue;
-        QStringList values = it.value().split(QStringLiteral("; "), Qt::SkipEmptyParts);
+        QStringList values = splitAttributeValues(it.value());
         // The rootDSE is a cached object rebuilt only on a write, so the time
         // stamped into it at startup would go stale. RFC 4512 expects
         // currentTime to be the server's clock at the moment of the query, so

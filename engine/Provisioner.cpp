@@ -97,7 +97,7 @@ struct DomainBuilder {
 
     void objectClass(DirectoryObject &object, const QStringList &classes)
     {
-        object.attributes.insert(QStringLiteral("objectClass"), classes.join(QLatin1Char(';')));
+        object.attributes.insert(QStringLiteral("objectClass"), joinAttributeValues(classes));
     }
 
     DirectoryObject &addUser(const QString &cn, qint32 rid, const QString &account,
@@ -140,7 +140,7 @@ struct DomainBuilder {
         group.attributes.insert(QStringLiteral("groupType"), QStringLiteral("-2147483646")); // global security
         group.attributes.insert(QStringLiteral("description"), description);
         if (!members.isEmpty())
-            group.attributes.insert(QStringLiteral("member"), members.join(QStringLiteral("; ")));
+            group.attributes.insert(QStringLiteral("member"), joinAttributeValues(members));
         return group;
     }
 };
