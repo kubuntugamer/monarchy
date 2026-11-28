@@ -2143,6 +2143,14 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
         // which sit directly behind it.
         putLe32(fixed, quint32(page.size()));
         putLe32(fixed, page.isEmpty() ? 0u : quint32(base + 28));
+        // The entries are a conformant array — `[size_is(count)]
+        // samr_DispEntryFullGroup *entries` in samr.idl — so its referent
+        // begins with the maximum count and the elements follow it
+        // (MS-RPCE 2.2.10.3). Without this word a client reads the first
+        // entry's idx as the maximum count and decodes one entry from inside
+        // the first, which is a silently unusable answer rather than a fault.
+        if (!page.isEmpty())
+            putLe32(fixed, quint32(page.size()));
         QByteArray deferred;
         QList<QPair<int, int>> strings;
         for (int i = 0; i < page.size(); ++i) {

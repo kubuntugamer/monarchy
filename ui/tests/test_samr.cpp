@@ -1569,18 +1569,21 @@ void SamrTest::samrPagesTheDomainGroupList()
     QCOMPARE(readLe32At(reply, 16), 1024u); // the 0x20-entry batch offered
     QCOMPARE(readLe32At(reply, 20), 3u);    // Count
     QCOMPARE(readLe32At(reply, 24), 28u);   // the entries, behind the count
+    // The entries are a conformant array, so the referent starts with its
+    // maximum count (samr.idl: `[size_is(count)] samr_DispEntryFullGroup`).
+    QCOMPARE(readLe32At(reply, 28), 3u);
 
     // Entry 0: idx, rid, attributes, then the name and the description, whose
     // characters sit in the blob after the entry array.
-    QCOMPARE(readLe32At(reply, 28), 1u);
-    QCOMPARE(readLe32At(reply, 32), 512u);
-    QCOMPARE(readLe32At(reply, 36), 7u); // SE_GROUP_MANDATORY|ENABLED_BY_DEFAULT|ENABLED
-    QCOMPARE(varyingStringAt(reply, 44), QStringLiteral("Administrators"));
-    QCOMPARE(varyingStringAt(reply, 52), QStringLiteral("Administer the domain"));
-    QCOMPARE(readLe32At(reply, 56), 2u);
-    QCOMPARE(varyingStringAt(reply, 72), QStringLiteral("Users"));
-    QCOMPARE(readLe32At(reply, 84), 3u);
-    QCOMPARE(varyingStringAt(reply, 100), QStringLiteral("Guests"));
+    QCOMPARE(readLe32At(reply, 32), 1u);
+    QCOMPARE(readLe32At(reply, 36), 512u);
+    QCOMPARE(readLe32At(reply, 40), 7u); // SE_GROUP_MANDATORY|ENABLED_BY_DEFAULT|ENABLED
+    QCOMPARE(varyingStringAt(reply, 48), QStringLiteral("Administrators"));
+    QCOMPARE(varyingStringAt(reply, 56), QStringLiteral("Administer the domain"));
+    QCOMPARE(readLe32At(reply, 60), 2u);
+    QCOMPARE(varyingStringAt(reply, 76), QStringLiteral("Users"));
+    QCOMPARE(readLe32At(reply, 88), 3u);
+    QCOMPARE(varyingStringAt(reply, 104), QStringLiteral("Guests"));
     // The alias has no entry of its own.
     QVERIFY(!reply.contains(QByteArrayLiteral("R\x00e\x00m\x00o\x00t\x00e\x00")));
 
@@ -1590,8 +1593,9 @@ void SamrTest::samrPagesTheDomainGroupList()
         server.handleCall(Samr::OpQueryDisplayInfo2,
                           queryDisplayInfo2Stub(domainHandle, 3, 2, 1, 0x1000));
     QCOMPARE(readLe32At(page, 20), 1u);  // Count
-    QCOMPARE(readLe32At(page, 28), 3u);  // idx of the first entry of this page
-    QCOMPARE(varyingStringAt(page, 44), QStringLiteral("Guests"));
+    QCOMPARE(readLe32At(page, 28), 1u);  // the array's maximum count
+    QCOMPARE(readLe32At(page, 32), 3u);  // idx of the first entry of this page
+    QCOMPARE(varyingStringAt(page, 48), QStringLiteral("Guests"));
 
     // The batch the client offers to take limits the page too: 0x40 bytes is
     // two entries of the 0x20 the DC counts per entry. The size word reports
