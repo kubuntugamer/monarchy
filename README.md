@@ -54,8 +54,9 @@ exactly as it would to a remote domain controller. Ordinary Kerberos clients
   for a provisioned domain (`kdcPort` from `dc.conf`; provisioning defaults to
   AD's native bindings — DNS 53, LDAP 389, Kerberos 88, kpasswd 464, SMB 445,
   epm 135, SAMR/LSAD 49152/49153 — because the daemon runs as a root service with
-  `CAP_NET_BIND_SERVICE`; `--dev-ports` provisions the unprivileged set a
-  rootless console run can bind). Accounts carry
+  `CAP_NET_BIND_SERVICE`; `--dev-ports` provisions the unprivileged set
+  (1389/1053/8888/1035/1036, GC 13268, SMB 31445, mapper 31035) a rootless
+  console run or a second DC on the same host can bind). Accounts carry
   AES-128/AES-256 (RFC 3962, PBKDF2 + n-fold string-to-key) and RC4-HMAC
   (etype 23, derived from the same NT hash the directory already stores) keys,
   so one password drives simple bind, NTLMv2 and Kerberos with no second

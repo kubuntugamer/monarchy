@@ -318,11 +318,13 @@ bool validateNetbiosDomain(const QString &domain, QString *error)
 namespace {
 
 // The ports a DC binds. `--dev-ports` selects the unprivileged binding set; a
-// caller that set a port explicitly keeps it. epm (135) and SMB (445) have no
-// unprivileged equivalent and stay native, and the Global Catalog has none
-// either: 3268 is already above 1024, so it is the same number in a dev run as
-// on a real DC. kpasswd is 464 on a real DC; a rootless dev run moves it with
-// the rest.
+// caller that set a port explicitly keeps it. The mapper (135) and SMB (445)
+// are well-known and need CAP_NET_BIND_SERVICE, so a dev run moves them to
+// 31035/31445 — 31000 is free of every well-known and every Windows dynamic
+// port, so a second DC on the same host can take the whole set without meeting
+// the first one. The Global Catalog (3268) is already unprivileged but is still
+// a fixed binding two DCs on one host cannot share, so it moves with the rest.
+// kpasswd is 464 on a real DC; a rootless dev run moves it too.
 struct ServicePorts {
     quint16 ldap = 389;
     quint16 dns = 53;
@@ -331,6 +333,8 @@ struct ServicePorts {
     quint16 lsad = 49153;
     quint16 gc = 3268;
     quint16 kpasswd = 464;
+    quint16 epm = 135;
+    quint16 smb = 445;
 };
 
 ServicePorts servicePorts(const ProvisionConfig &config)
@@ -342,6 +346,9 @@ ServicePorts servicePorts(const ProvisionConfig &config)
     ports.samr = config.devPorts && config.samrPort == 49152 ? 1035 : config.samrPort;
     ports.lsad = config.devPorts && config.lsadPort == 49153 ? 1036 : config.lsadPort;
     ports.kpasswd = config.devPorts ? 1464 : 464;
+    ports.gc = config.devPorts ? 13268 : 3268;
+    ports.epm = config.devPorts && config.epmPort == 135 ? 31035 : config.epmPort;
+    ports.smb = config.devPorts && config.smbPort == 445 ? 31445 : config.smbPort;
     return ports;
 }
 
@@ -1082,12 +1089,12 @@ ProvisionResult provisionDomain(const ProvisionConfig &config)
         conf.setValue(QStringLiteral("forwarders"), config.forwarders.join(QStringLiteral(", ")));
     // The DC serves SAMR, LSAD, the endpoint mapper and SMB2 the way a Windows
     // DC does: dynamic-RPC ports for the two SAM/LSA interfaces, well-known
-    // 135/445 for the mapper and the pipe host. Under `--dev-ports` the
-    // unprivileged pair keeps a rootless console or test run bindable.
+    // 135/445 for the mapper and the pipe host. Under `--dev-ports` the mapper
+    // and the pipe host move too, so a second DC on this host can bind them.
     conf.setValue(QStringLiteral("samrPort"), samrPort);
     conf.setValue(QStringLiteral("lsadPort"), lsadPort);
-    conf.setValue(QStringLiteral("epmPort"), config.epmPort);
-    conf.setValue(QStringLiteral("smbPort"), config.smbPort);
+    conf.setValue(QStringLiteral("epmPort"), ports.epm);
+    conf.setValue(QStringLiteral("smbPort"), ports.smb);
     conf.setValue(QStringLiteral("netlogonPort"), config.netlogonPort);
     conf.setValue(QStringLiteral("drsPort"), config.drsPort);
     conf.setValue(QStringLiteral("kdcPort"), kdcPort);
@@ -1540,8 +1547,8 @@ ProvisionResult promoteDomain(const ProvisionConfig &config)
         conf.setValue(QStringLiteral("forwarders"), forwarders.join(QStringLiteral(", ")));
     conf.setValue(QStringLiteral("samrPort"), ports.samr);
     conf.setValue(QStringLiteral("lsadPort"), ports.lsad);
-    conf.setValue(QStringLiteral("epmPort"), config.epmPort);
-    conf.setValue(QStringLiteral("smbPort"), config.smbPort);
+    conf.setValue(QStringLiteral("epmPort"), ports.epm);
+    conf.setValue(QStringLiteral("smbPort"), ports.smb);
     conf.setValue(QStringLiteral("netlogonPort"), config.netlogonPort);
     conf.setValue(QStringLiteral("drsPort"), config.drsPort);
     conf.setValue(QStringLiteral("kdcPort"), ports.kdc);

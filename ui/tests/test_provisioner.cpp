@@ -63,6 +63,7 @@ private slots:
     void usesConfiguredControllerHost();
     void publishesItsIdentityAndGlobalCatalog();
     void promotesASecondControllerFromACopy();
+    void devPortsMoveEveryFixedBinding();
 };
 
 void ProvisionerTest::buildsDomainFromScratch()
@@ -701,6 +702,45 @@ void ProvisionerTest::promotesASecondControllerFromACopy()
     const ProvisionResult inPlace = promoteDomain(ontoSource);
     QVERIFY(!inPlace.ok);
     QVERIFY(inPlace.error.contains(QStringLiteral("must not be the directory")));
+}
+
+void ProvisionerTest::devPortsMoveEveryFixedBinding()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+
+    ProvisionConfig config = testConfig(dir.path());
+    config.devPorts = true;
+    config.epmPort = 135;
+    config.smbPort = 445;
+    const ProvisionResult result = provisionDomain(config);
+    QVERIFY2(result.ok, qPrintable(result.error));
+
+    // Every binding a second DC on this host would collide on moves with the
+    // set, not just the SAM/LSA pair: the mapper and the pipe host need
+    // CAP_NET_BIND_SERVICE, and port 3268 is fixed even though it is already
+    // above 1024.
+    QSettings conf(result.configPath, QSettings::IniFormat);
+    QCOMPARE(conf.value(QStringLiteral("ldapPort")).toInt(), 1389);
+    QCOMPARE(conf.value(QStringLiteral("dnsPort")).toInt(), 1053);
+    QCOMPARE(conf.value(QStringLiteral("kdcPort")).toInt(), 8888);
+    QCOMPARE(conf.value(QStringLiteral("samrPort")).toInt(), 1035);
+    QCOMPARE(conf.value(QStringLiteral("lsadPort")).toInt(), 1036);
+    QCOMPARE(conf.value(QStringLiteral("kpasswdPort")).toInt(), 1464);
+    QCOMPARE(conf.value(QStringLiteral("gcPort")).toInt(), 13268);
+    QCOMPARE(conf.value(QStringLiteral("epmPort")).toInt(), 31035);
+    QCOMPARE(conf.value(QStringLiteral("smbPort")).toInt(), 31445);
+
+    // A port the caller set explicitly is theirs, not the set's: the dev set
+    // only fills in bindings still at their native value.
+    ProvisionConfig moved = testConfig(dir.path() + QStringLiteral("/moved"));
+    moved.devPorts = true;
+    moved.epmPort = 31000;
+    const ProvisionResult custom = provisionDomain(moved);
+    QVERIFY2(custom.ok, qPrintable(custom.error));
+    QSettings customConf(custom.configPath, QSettings::IniFormat);
+    QCOMPARE(customConf.value(QStringLiteral("epmPort")).toInt(), 31000);
+    QCOMPARE(customConf.value(QStringLiteral("smbPort")).toInt(), 31445);
 }
 
 QTEST_GUILESS_MAIN(ProvisionerTest)

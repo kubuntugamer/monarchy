@@ -19,11 +19,12 @@ struct ProvisionConfig {
     QString dcIp = QStringLiteral("127.0.0.1");
     // The ports the daemon serves. Provisioning defaults to AD's native
     // bindings — DNS 53, LDAP 389, Kerberos 88, SMB 445, the endpoint mapper
-    // 135 and, like real DCs register SAMR/LSAD in Windows' dynamic-RPC
-    // range, 49152/49153 — because a domain controller is a root service
-    // with CAP_NET_BIND_SERVICE. `--dev-ports` provisions the unprivileged
-    // set (1389/1053/8888/1035/1036; epm and SMB stay on 135/445) that a
-    // rootless console or test run can bind instead.
+    // 135, the Global Catalog 3268 and, like real DCs register SAMR/LSAD in
+    // Windows' dynamic-RPC range, 49152/49153 — because a domain controller
+    // is a root service with CAP_NET_BIND_SERVICE. `--dev-ports` provisions
+    // the unprivileged set (1389/1053/8888/1035/1036, GC 13268 and SMB/mapper
+    // 31445/31035) that a rootless console, test run, or second DC on the
+    // same host can bind instead.
     quint16 ldapPort = 389;
     quint16 dnsPort = 53;
     quint16 kdcPort = 88;
