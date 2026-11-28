@@ -1817,6 +1817,31 @@ bool LdapServer::addAccount(DirectoryObject *object, QString *error)
     return true;
 }
 
+bool LdapServer::setDerivedAttributes(const QString &dn,
+                                      const QMap<QString, QString> &attributes,
+                                      QString *error) {
+    for (DirectoryObject &object : m_objects) {
+        if (object.id.compare(dn, Qt::CaseInsensitive) != 0)
+            continue;
+        // Written verbatim: these are keystrings and one-way functions, not
+        // lists a split on '; ' would take apart.
+        for (auto it = attributes.constBegin(); it != attributes.constEnd(); ++it) {
+            if (it.value().isEmpty())
+                object.attributes.remove(it.key());
+            else
+                object.attributes.insert(it.key(), it.value());
+        }
+        object.attributes.insert(QStringLiteral("uSNChanged"), QString::number(nextUsn()));
+        object.attributes.insert(QStringLiteral("whenChanged"),
+                                 QDateTime::currentDateTimeUtc().toString(Qt::ISODate));
+        ensureRootDse();
+        return true;
+    }
+    if (error)
+        *error = QStringLiteral("no such object (%1)").arg(dn);
+    return false;
+}
+
 bool LdapServer::setNtHash(const QString &dn, const QByteArray &ntHash, QString *error) {
     if (ntHash.size() != 16) {
         if (error)

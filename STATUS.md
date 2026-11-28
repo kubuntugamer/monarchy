@@ -35,6 +35,7 @@ clients, so a reply only this tree's encoder understands fails the check.
 | PAC: LOGON_INFO, CLIENT_INFO, UPN_DNS_INFO, server+KDC signatures, `readIdentity()`, write authorization from the PAC | `engine/Pac.cpp` | `krb5_pac_verify` / `krb5_pac_get_buffer` (MIT), plus ACL behaviour tests; an element's fields carry the `[0]`/`[1]` tags RFC 4120 §5.2.6 requires, without which a strict decoder (impacket/pyasn1) refuses the whole ticket; each `PAC_SIGNATURE_DATA` buffer is exactly its 4-byte checksum type plus the signature — 20 bytes for RC4-HMAC, 16 for AES — which is what MS-PAC 2.8 gives and what a verifier reads off `cbBufferSize`, checked by opening our own AS-REP and TGS-REP with impacket and recomputing both signatures |
 | GSSAPI SASL layers (RFC 4752/4121/1964) with wrapped LDAP sessions, RC4 and AES, including RFC 4121 §4.2.5 rotation: a sender may rotate the token body to the right by RRC, and the receiver moves those first RRC octets back to the end. Heimdal seals Samba's LDAP PDUs that way (RRC=28) while MIT sends RRC=0, so this is measured both ways | `engine/LdapServer.cpp`, `engine/Gss.cpp` | `cfxUnwrapsARotatedToken` in `monarchy-kerberos-tests` (a rotated sealed token opens, the same body announced as RRC=0 does not, and reverting the direction fails the case); MIT seals/opens the unrotated tokens independently; a real `net ads join` gets past its sealed search and modify |
 | **Cross-realm trust** (direct): referral TGT `krbtgt/PEER@OURS`, inter-realm keys, inbound `krbtgt/OURS@PEER`, PAC re-signed at the boundary | `engine/Kdc.cpp`, `engine/Krb5.cpp` | MIT `kinit` into ALPHA, service ticket from BETA, AP-REQ accepted by BETA's directory |
+| **Trust passwords age on their own clock**: a trust's secret is replaced every 30 days, the interval Windows uses (MS-ADTS 6.1.6.2), swept at start-up and hourly — the new clear secret is written in both directions, the inter-realm `krbtgt` keys are re-derived from it, and the `X$` account beside the trust is dated by the same password, which is what the next rotation is measured from. A secret one second short of 30 days is left alone, and a trust with no incoming secret or no account to date it is never rotated on a guess. The write goes through the server's own attribute path, because the keys are server-derived attributes the LDAP modify path refuses a client. Telling the peer is not done: a rotation here is the PDC-side change, and the partner catches up when it next reads the secret over the channel | `engine/TrustPassword.{h,cpp}`, `engine/DcService.cpp`, `engine/Lsad.cpp` | `rotatesATrustPasswordOnceTheSecretIsThirtyDaysOld` and `aRotationRewritesBothSecretsAndTheirKeys` in `monarchy-lsad-tests` (the arithmetic at the boundary, no account and no incoming secret left alone, both directions rewritten, keys equal to a fresh `storeTrustKeys` derivation, a generated password printable and never repeated); `rotatesATrustPasswordThatIsThirtyDaysOld` in `monarchy-dcservice-tests` starts a daemon on a store whose trust account was dated thirty days earlier and asserts the message, the changed secret, the keys and the re-dated account |
 | **Workstation logon restriction**: the `userWorkstations` list an account carries (the "Log On To" list) is enforced, not merely stored and returned. Netlogon's `NetrLogonSamLogon` answers `STATUS_INVALID_WORKSTATION` when the verified account names workstations and the caller's `NETLOGON_LOGON_INFO` workstation is not among them; matching is case-insensitive after trimming, a blank entry names nobody, an account with no value is unrestricted, and a restricted account whose caller names no workstation is refused rather than waved through. The check sits after the password and after the week, so a wrong password is still answered as a wrong password. It is not applied to the LDAP or Kerberos paths, because neither carries a workstation name the directory can trust | `engine/WorkstationRestriction.{h,cpp}`, `engine/Netlogon.cpp` | `monarchy-workstation-tests` (the list parsing, blank entries, unset and unnamed cases), `refusesALogonFromAnotherWorkstation` and `allowsALogonFromAListedWorkstation` in `monarchy-netlogon-tests` |
 | **Account logon hours**: the 21-byte week an account carries is enforced at logon, not merely stored and reported. The KDC refuses an AS-REQ outside it with `KDC_ERR_CLIENT_REVOKED`, LDAP refuses simple and NTLM binds with `invalidCredentials(49)`, and Netlogon's `NetrLogonSamLogon` answers `STATUS_ACCOUNT_RESTRICTION` without stamping `lastLogon` — every check sits after the password is verified, so a refused hour is indistinguishable from a wrong password. Bits count in UTC from Sunday 00:00; an account with no value is unrestricted, and a value shorter than 21 bytes says nothing about the hours it does not cover | `engine/LogonHours.{h,cpp}`, `engine/Kdc.cpp`, `engine/LdapServer.cpp`, `engine/Netlogon.cpp` | `monarchy-logonhours-tests` (the week mapping, all 168 bits, both boundaries, unset and truncated values), `refusesALogonOutsideLogonHours` in `monarchy-netlogon-tests`; live, MIT `kinit` against a provisioned DC is refused `Client's credentials have been revoked` when the week excludes the current hour and succeeds when it includes it, and an LDAP simple bind answers 49 and 0 for the same two weeks |
 | **EDNS0 (RFC 6891)**: a query that carries an OPT is answered with one — the root owner name, type 41, this server's own UDP payload size in the class field (`1232`, the size the flag day agreed on, so a client does not build a reply this host's path MTU would drop), version 0, and the client's DO bit echoed. A query with an EDNS version this server does not implement is answered `BADVERS` (16) — header rcode 0 with extended rcode 1 in the OPT, and no answer — rather than answered as if the version were understood, which is how a client concludes a server speaks one it does not. A query with no OPT is answered with no OPT, so a pre-EDNS client sees exactly what it expects. The reply is then bounded by the size the client declared (next row). There is still no DNSSEC data to carry whatever the DO bit says | `engine/DnsServer.cpp` (`findOpt()`, `buildResponse()`) | `answersAnEdnsQuery` in `monarchy-dns-tests` (OPT returned with size 1232 and DO echoed, DO clear when the client cleared it, `BADVERS` for version 1, and no OPT for a pre-EDNS query); live, `dig +edns=0` reads `EDNS: version: 0, udp: 1232`, `dig +dnssec` reads `flags: do`, and `dig +edns=1` prints `;; BADVERS, retrying with EDNS version 0.` and then succeeds |
@@ -163,14 +164,17 @@ naming-context split, non-zero exit on any failure) |`
   from the other. What is still missing: `LsarQueryForestTrustInfo` has nothing
   to return (no forest trust, no transited realms beyond one hop, no SID
   filtering or selective authentication), the internal-encryption query levels
-  are refused with `STATUS_INVALID_INFO_CLASS` rather than guessed at, nothing
-  rolls the trust password on the 30-day timer a DC uses — the write itself is
-  served: a partner DC that opens the trust channel and calls
+  are refused with `STATUS_INVALID_INFO_CLASS` rather than guessed at, the
+  password write is served (a partner DC that opens the trust channel and calls
   `NetrServerPasswordSet2` with the interdomain account gets the new secret
   stored as the trust's incoming one and the inter-realm keys re-derived from
   it, though the `NL_PASSWORD_VERSION` the client puts in front of the password
   in the 512-byte buffer is not recorded, because the store keeps one secret
-  per direction — and the channel has been driven against Samba's client and
+  per direction), and this DC rotates its own side on the 30-day clock — but the
+  rotation is not pushed to the peer: nothing here opens a trust channel
+  outward, so a partner learns the new secret the next time it reads it, and the
+  `last_update_time` inside the auth blob is not stored, so a peer reading auth
+  info is told zero. The channel has been driven against Samba's client and
   MIT's KDC, not against a Windows DC. `LsarSetInformationPolicy`
   sets the modification time and the audit-full flag and refuses the rest (the
   domain name and SID are reported, not settable), as does
@@ -306,7 +310,8 @@ either dialect: a GPO is delivered but not edited over the SMB1 path.
   implementations.
 - **PKINIT** (needs an X.509/CMS path and a CA), **S4U2Self/S4U2Proxy**.
 - **Multi-hop/transitive trusts**, transited-realm encoding beyond one hop, SID
-  filtering, selective authentication, automatic trust-password rotation.
+  filtering, selective authentication, pushing a rotated trust password to the
+  peer (this side's clock is served, §1).
 - **Read authorization from the session's identity** (writes now answer to it:
   the PAC on a Kerberos session, the bound account's groups on a password bind,
   and nothing for Anonymous Logon, with AD's SELF right on `unicodePwd`), PAC
@@ -372,7 +377,9 @@ The gaps above are not independent. Working outward from what exists:
 5. ~~LSAD~~ — the policy calls, both translation directions, account rights,
    privileges, secrets and the policy security descriptor, verified against
    Samba's reference NDR decoder and impacket by `scripts/lsad-conformance.py`.
-   Remaining here: the timer that rotates a trust password every 30 days.
+   A trust's password is rotated on the 30-day clock a Windows DC uses
+   (§1). Remaining here: the push to the peer, which needs a channel this DC
+   opens outward and has no live partner to open it against.
 6. ~~Netlogon~~ — secure channel, machine-password write, SamLogon validation
    and the DC locator calls are served and verified (§1). The locator's
    **CLDAP ping over UDP** is answered too: both shapes real clients send —

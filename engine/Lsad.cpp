@@ -1802,7 +1802,13 @@ QByteArray LsadServer::handleCall(quint16 opnum, const QByteArray &stub,
             // channel, never for an interactive logon, as Windows keeps it.
             account.attributes.insert(QStringLiteral("userAccountControl"),
                                       QStringLiteral("546"));
-            account.attributes.insert(QStringLiteral("pwdLastSet"), QStringLiteral("0"));
+            // The trust password was just set, so the account's own clock
+            // starts here: pwdLastSet is what the 30-day trust rotation reads
+            // (MS-ADTS 6.1.6.2), and a zero there would say the password had
+            // never been set and make the trust due at the next sweep.
+            account.attributes.insert(
+                QStringLiteral("pwdLastSet"),
+                QString::number(QDateTime::currentSecsSinceEpoch()));
             account.attributes.insert(
                 QStringLiteral("ntHash"),
                 QString::fromLatin1(Ntlm::ntowfV1(QString::fromUtf8(clearSecret)).toHex()));

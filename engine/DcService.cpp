@@ -35,6 +35,7 @@
 
 #include "ReplicaTopology.h"
 #include "ReplicationAgent.h"
+#include "TrustPassword.h"
 #include "resultsmodel.h"
 
 DcService::DcService(QObject *parent)
@@ -138,6 +139,63 @@ void DcService::removeReplicaLink(const QString &address)
     if (!m_storePath.isEmpty())
         m_ldapServer->saveToFile(m_storePath);
     emit statusMessage(tr("Replication link to %1 retired from the directory.").arg(address));
+}
+
+// The trust clock: every 30 days the DC that holds the PDC emulator role gives
+// an interdomain trust a new password (MS-ADTS 6.1.6.2) and stores it as the
+// trust's secret, which is what the channel a peer opens authenticates with
+// (Netlogon reads trustAuthIncoming). The account beside the trust carries the
+// same password, so its pwdLastSet is the instant the next rotation is measured
+// from — set here every time, because that is the write which dates it.
+void DcService::rotateTrustPasswords()
+{
+    if (!m_ldapServer)
+        return;
+    const QList<DirectoryObject> objects = m_ldapServer->objects();
+    const QList<TrustPassword::Rotation> due =
+        TrustPassword::due(objects, QDateTime::currentSecsSinceEpoch());
+    if (due.isEmpty())
+        return;
+    const QString realm = m_ldapServer->identity().realm;
+    bool changed = false;
+    for (const TrustPassword::Rotation &rotation : due) {
+        DirectoryObject trust;
+        for (const DirectoryObject &object : objects) {
+            if (object.id.compare(rotation.trustDn, Qt::CaseInsensitive) == 0) {
+                trust = object;
+                break;
+            }
+        }
+        if (trust.id.isEmpty())
+            continue;
+        const QString password = TrustPassword::generate();
+        // The secret and the inter-realm keys derived from it are attributes the
+        // server makes, not ones a client may write: the LDAP modify path
+        // refuses them whatever rights the caller holds.
+        QString error;
+        if (!m_ldapServer->setDerivedAttributes(
+                rotation.trustDn,
+                TrustPassword::rotationAttributes(trust, realm, password), &error)) {
+            emit statusMessage(tr("The trust password for %1 could not be written: %2")
+                                   .arg(rotation.flatName, error));
+            continue;
+        }
+        // The secret is on the trust object now; the account beside it is dated
+        // by the same password, because a write to it is what moves pwdLastSet.
+        if (!m_ldapServer->setNtHash(rotation.accountDn, Ntlm::ntowfV1(password),
+                                     &error)) {
+            emit statusMessage(tr("The trust password for %1 was changed, but its "
+                                  "account was not dated: %2")
+                                   .arg(rotation.flatName, error));
+            continue;
+        }
+        changed = true;
+        emit statusMessage(tr("Changed the trust password for %1 after %2 days.")
+                               .arg(rotation.flatName)
+                               .arg(rotation.ageSeconds / (24 * 60 * 60)));
+    }
+    if (changed && !m_storePath.isEmpty())
+        m_ldapServer->saveToFile(m_storePath);
 }
 
 void DcService::loadReplicaLinks()
@@ -410,6 +468,10 @@ void DcService::stop()
 {
     if (!m_started)
         return;
+    // A stopped daemon sweeps nothing: the trust clock starts again with the
+    // next start, and a rotation it missed is due then.
+    if (m_trustTimer)
+        m_trustTimer->stop();
     // Persist to the configured location, which is private/ for a
     // provisioned domain, so edits survive a restart of that domain.
     if (m_ldapServer && m_ldapServer->isListening()) {
@@ -889,10 +951,13 @@ bool DcService::start(const QString &dcDir)
         persist();
         return true;
     };
+    // A trust secret comes with the inter-realm keys derived from it, and those
+    // are server-derived attributes the LDAP modify path refuses — so this is
+    // the store write from the call that owns them, not a client's modify.
     lsadWrites.updateTrust = [this, persist](const QString &dn,
                                               const QMap<QString, QString> &attributes,
                                               QString *error) {
-        const bool ok = m_ldapServer->modifyObject(dn, attributes);
+        const bool ok = m_ldapServer->setDerivedAttributes(dn, attributes, error);
         if (!ok && error)
             *error = QStringLiteral("trust not found (%1)").arg(dn);
         if (ok)
@@ -969,7 +1034,7 @@ bool DcService::start(const QString &dcDir)
     netlogonWrites.updateTrust = [this, persist](const QString &dn,
                                                  const QMap<QString, QString> &attributes,
                                                  QString *error) {
-        const bool ok = m_ldapServer->modifyObject(dn, attributes);
+        const bool ok = m_ldapServer->setDerivedAttributes(dn, attributes, error);
         if (!ok && error)
             *error = QStringLiteral("trust not found (%1)").arg(dn);
         if (ok)
@@ -1208,6 +1273,16 @@ bool DcService::start(const QString &dcDir)
     // Topology first, then the links: a partner another DC published in this
     // site is a source even when nobody registered it at this DC.
     synchronizeTopology();
+
+    // A trust's password has its own clock, so it is swept at start-up and then
+    // hourly: a trust that reaches 30 days is rotated within the hour instead of
+    // waiting for the next restart.
+    rotateTrustPasswords();
+    if (!m_trustTimer) {
+        m_trustTimer = new QTimer(this);
+        connect(m_trustTimer, &QTimer::timeout, this, &DcService::rotateTrustPasswords);
+    }
+    m_trustTimer->start(60 * 60 * 1000);
 
     // Links an administrator registered earlier are connection objects in the
     // directory, so they are read back here and pulled from again instead of

@@ -3,8 +3,10 @@
 
 #include <QtTest>
 
+#include "Krb5.h"
 #include "Lsad.h"
 #include "Ntlm.h"
+#include "TrustPassword.h"
 
 namespace {
 
@@ -288,6 +290,8 @@ private slots:
     void enumeratesEveryAccountAndPagesOnLength();
     void createsQueriesEnumeratesAndDeletesATrust();
     void refusesDuplicateAndUnknownTrusts();
+    void rotatesATrustPasswordOnceTheSecretIsThirtyDaysOld();
+    void aRotationRewritesBothSecretsAndTheirKeys();
 };
 
 void LsadTest::answersTheDomainIdentity()
@@ -765,6 +769,106 @@ void LsadTest::enumeratesEveryAccountAndPagesOnLength()
     QCOMPARE(lastWord(rest), 0u);
     QCOMPARE(readLe32At(rest, 0), 2u);
     QCOMPARE(readLe32At(rest, 4), 1u);
+}
+
+// A trust password has a clock: the PDC role changes it every 30 days
+// (MS-ADTS 6.1.6.2). What decides "due" is the instant this store already
+// keeps for the password — the account beside the trust carries the same secret,
+// and its pwdLastSet moves whenever that secret is written — so the arithmetic
+// is the rule: at 30 days exactly it is due, a second earlier it is not, and a
+// trust with no account or no incoming secret is never rotated on a guess.
+void LsadTest::rotatesATrustPasswordOnceTheSecretIsThirtyDaysOld()
+{
+    const QString baseDn = QStringLiteral("DC=corp,DC=example,DC=com");
+    const qint64 now = 1795409914;
+
+    DirectoryObject trust;
+    trust.id = QStringLiteral("CN=FABRIKAM,CN=System,%1").arg(baseDn);
+    trust.name = QStringLiteral("FABRIKAM");
+    trust.attributes.insert(QStringLiteral("objectClass"),
+                            QStringLiteral("top;leaf;trustedDomain"));
+    trust.attributes.insert(QStringLiteral("flatName"), QStringLiteral("FABRIKAM"));
+    trust.attributes.insert(QStringLiteral("trustPartner"),
+                            QStringLiteral("fabrikam.example.com"));
+    trust.attributes.insert(QStringLiteral("trustDirection"), QStringLiteral("3"));
+    trust.attributes.insert(QStringLiteral("trustAuthIncoming"),
+                            QStringLiteral("2:")
+                                + QString::fromLatin1("oldtrustpass").toUtf8().toHex());
+
+    DirectoryObject account;
+    account.id = QStringLiteral("CN=FABRIKAM$,CN=Users,%1").arg(baseDn);
+    account.attributes.insert(QStringLiteral("pwdLastSet"),
+                              QString::number(now - TrustPassword::kLifetimeSeconds));
+
+    QList<DirectoryObject> store{trust, account};
+    QList<TrustPassword::Rotation> due = TrustPassword::due(store, now);
+    QCOMPARE(due.size(), 1);
+    QCOMPARE(due.first().trustDn, trust.id);
+    QCOMPARE(due.first().accountDn, account.id);
+    QCOMPARE(due.first().partner, QStringLiteral("fabrikam.example.com"));
+    QCOMPARE(due.first().flatName, QStringLiteral("FABRIKAM"));
+    QCOMPARE(due.first().ageSeconds, TrustPassword::kLifetimeSeconds);
+
+    // One second short of the interval is a password that is still current.
+    QVERIFY(TrustPassword::due(store, now - 1).isEmpty());
+
+    // A password set yesterday is not due either.
+    store[1].attributes.insert(QStringLiteral("pwdLastSet"),
+                               QString::number(now - 24 * 60 * 60));
+    QVERIFY(TrustPassword::due(store, now).isEmpty());
+
+    // No account dates nothing, and an outbound-only trust has no incoming
+    // secret to change: both are left alone rather than rotated on a guess.
+    QVERIFY(TrustPassword::due({trust}, now).isEmpty());
+    DirectoryObject outbound = trust;
+    outbound.attributes.remove(QStringLiteral("trustAuthIncoming"));
+    QVERIFY(TrustPassword::due({outbound, account}, now).isEmpty());
+}
+
+// What a rotation writes: the same new secret in both directions (a trust keeps
+// one password, and the peer ends up with the same one) and the inter-realm keys
+// re-derived from it, which is what the KDC signs a cross-realm ticket with.
+void LsadTest::aRotationRewritesBothSecretsAndTheirKeys()
+{
+    const QString realm = QStringLiteral("CORP.EXAMPLE.COM");
+    const QString partner = QStringLiteral("fabrikam.example.com");
+    DirectoryObject trust;
+    trust.id = QStringLiteral("CN=FABRIKAM,CN=System,DC=corp,DC=example,DC=com");
+    trust.attributes.insert(QStringLiteral("objectClass"),
+                            QStringLiteral("top;leaf;trustedDomain"));
+    trust.attributes.insert(QStringLiteral("trustPartner"), partner);
+    trust.attributes.insert(QStringLiteral("trustAuthIncoming"),
+                            QStringLiteral("2:")
+                                + QString::fromLatin1("oldtrustpass").toUtf8().toHex());
+
+    const QString password = QStringLiteral("RotatedTrustPassw0rd");
+    const QMap<QString, QString> updates =
+        TrustPassword::rotationAttributes(trust, realm, password);
+    const QString expected = QStringLiteral("2:") + QString::fromLatin1(password.toUtf8().toHex());
+    QCOMPARE(updates.value(QStringLiteral("trustAuthIncoming")), expected);
+    QCOMPARE(updates.value(QStringLiteral("trustAuthOutgoing")), expected);
+    QVERIFY(updates.value(QStringLiteral("trustAuthIncoming"))
+            != trust.attributes.value(QStringLiteral("trustAuthIncoming")));
+
+    // The NT one-way function the channel compares against, and the keys the
+    // KDC uses, are the same values a fresh storeTrustKeys derives.
+    QCOMPARE(updates.value(QStringLiteral("ntHash")),
+             QString::fromLatin1(Ntlm::ntowfV1(password).toHex()));
+    DirectoryObject derived;
+    Krb5::storeTrustKeys(derived, password, realm, partner);
+    QCOMPARE(updates.value(QStringLiteral("aes256Key")),
+             derived.attributes.value(QStringLiteral("aes256Key")));
+    QVERIFY(!updates.value(QStringLiteral("aes128Key")).isEmpty());
+    QVERIFY(!updates.value(QStringLiteral("kerberosSalt")).isEmpty());
+
+    // A generated password is printable, thirty characters, and not repeated:
+    // a rotation that drew the same secret twice would be no rotation at all.
+    const QString first = TrustPassword::generate();
+    const QString second = TrustPassword::generate();
+    QCOMPARE(first.size(), 30);
+    QVERIFY(!first.contains(QLatin1Char(':')));
+    QVERIFY(!first.contains(QLatin1Char(';')));
+    QVERIFY(first != second);
 }
 
 QTEST_MAIN(LsadTest)

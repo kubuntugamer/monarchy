@@ -597,9 +597,14 @@ with that key and carrying a PAC re-signed for the trust boundary, and an
 incoming `krbtgt/OURS@PEER` TGT is opened with the same key. That object is
 what `LsarCreateTrustedDomainEx` over `lsarpc` writes, secret and keys
 included, so a trust can be created over the protocol rather than by editing
-the store. Not implemented: transited-realm encoding beyond one hop, SID
-filtering, selective authentication and automatic trust-password rollover;
-`LsarSetInformationTrustedDomain` rewrites the secret and keys on request.
+the store. A trust's password ages on its own clock: every 30 days the secret
+is replaced, the inter-realm keys re-derived from it and the `X$` account beside
+the trust re-dated, swept at start-up and hourly, as a Windows DC's PDC role
+does (MS-ADTS 6.1.6.2); `LsarSetInformationTrustedDomain` also rewrites the
+secret and keys on request. Not implemented: transited-realm encoding beyond
+one hop, SID filtering, selective authentication, and pushing a rotated secret
+to the peer — nothing here opens a trust channel outward, so the partner learns
+it the next time it reads the secret.
 
 Both SASL security layers are implemented: RFC 4752/4121/1964 for GSSAPI and
 MS-NLMP §3.4 signing and sealing for NTLM, each carried in the RFC 4422
@@ -830,8 +835,8 @@ the caller names.
 `monarchy-rpc-probe` is the development endpoint used to drive that interop by
 hand, and `STATUS.md` is the 0.1.0 release contract.
 
-Not yet implemented: PKINIT and S4U, the rest of SAMR, trust-password rotation
-and the Netlogon trust channel,
+Not yet implemented: PKINIT and S4U, the rest of SAMR, pushing a rotated trust
+password to a peer,
 `DsReplicaAdd` and multi-DC replication (two Monarchy DCs, or
 Samba/Windows peers),
 NTLM over raw SMB/DCE, GPO editing and client-side extension processing, the

@@ -106,6 +106,11 @@ private:
     // configuration NC only just learned of should become a source in that same
     // cycle.
     void synchronizeTopology();
+    // The trust clock: a trust password older than 30 days is replaced, the
+    // inter-realm keys re-derived and the account beside the trust dated, which
+    // is what the next rotation is measured from (MS-ADTS 6.1.6.2). Swept at
+    // start-up and hourly, because the interval is measured in days.
+    void rotateTrustPasswords();
     // This DSA's own NTDS Settings object: the one under this DC's Server
     // object, so a partner's DSA replicated into the store is never mistaken
     // for it.
@@ -128,6 +133,7 @@ private:
     Smb2Server *m_smbServer = nullptr;
     ReplicationAgent *m_replicationAgent = nullptr;
     QTimer *m_replicaTimer = nullptr;
+    QTimer *m_trustTimer = nullptr;
     int m_replicaIntervalSeconds = 300;
     QByteArray m_replicaSchedule;
     quint32 m_replicaFlags = 0;

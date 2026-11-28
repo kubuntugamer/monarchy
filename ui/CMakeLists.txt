@@ -45,6 +45,8 @@ add_library(monarchy-ui-core STATIC
     ../engine/NtlmClient.cpp
     ../engine/ReplicaTopology.h
     ../engine/ReplicaTopology.cpp
+    ../engine/TrustPassword.h
+    ../engine/TrustPassword.cpp
     ../engine/ReplicationAgent.h
     ../engine/ReplicationAgent.cpp
     ../engine/Aes.h

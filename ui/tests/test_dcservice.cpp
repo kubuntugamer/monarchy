@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <QtTest>
+#include <QDateTime>
 #include <QFile>
 #include <QMap>
 #include <QProcess>
@@ -18,6 +19,7 @@
 #include "Drs.h"
 #include "LdapServer.h"
 #include "Ndr.h"
+#include "Ntlm.h"
 #include "Provisioner.h"
 #include "ReplicaTopology.h"
 #include "ldap_wire_helpers.h"
@@ -212,6 +214,7 @@ private slots:
     void writerAndReaderAgreeOnForwarders();
     void keepsReplicaLinkAsAConnectionObject();
     void kccAddsTheConnectionASecondDcInTheSiteNeeds();
+    void rotatesATrustPasswordThatIsThirtyDaysOld();
     void commitsClientWritesWhileItRuns();
 };
 
@@ -721,6 +724,118 @@ void DcServiceTest::kccAddsTheConnectionASecondDcInTheSiteNeeds()
                  QStringLiteral("CN=NTDS Settings,CN=DC2,%1").arg(serversDn));
     }
     QVERIFY2(found, "no KCC connection object for the partner was kept in the store");
+}
+
+// A trust's password is not a static secret: the DC that holds the PDC emulator
+// role changes it every 30 days (MS-ADTS 6.1.6.2). The topology unit cases can
+// see the rule; this drives the daemon-side sweep — a store carrying a trust
+// whose account was last dated thirty days ago is started, and what the peer's
+// channel reads afterwards has to be a different secret with a dated account.
+void DcServiceTest::rotatesATrustPasswordThatIsThirtyDaysOld()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+
+    ProvisionConfig config;
+    config.realm = QStringLiteral("TRUSTPW.EXAMPLE.ORG");
+    config.netbiosDomain = QStringLiteral("TRUSTPW");
+    config.adminPassword = QStringLiteral("Secret123!");
+    config.targetDir = dir.path();
+    config.devPorts = true;
+    const ProvisionResult result = provisionDomain(config);
+    QVERIFY2(result.ok, qPrintable(result.error));
+    moveTakenPorts(dir.path());
+
+    const QString storePath = dir.path() + QStringLiteral("/private/directory.json");
+    const QString trustDn =
+        QStringLiteral("CN=FABRIKAM,CN=System,%1").arg(result.baseDn);
+    const QString accountDn =
+        QStringLiteral("CN=FABRIKAM$,CN=Users,%1").arg(result.baseDn);
+    const QString oldSecret =
+        QStringLiteral("2:") + QString::fromLatin1("oldtrustpass").toUtf8().toHex();
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
+    {
+        LdapServer store;
+        QVERIFY2(store.loadFromFile(storePath), qPrintable(storePath));
+        QList<DirectoryObject> objects = store.objects();
+
+        DirectoryObject trust;
+        trust.id = trustDn;
+        trust.name = QStringLiteral("FABRIKAM");
+        trust.attributes.insert(QStringLiteral("objectClass"),
+                                QStringLiteral("top;leaf;trustedDomain"));
+        trust.attributes.insert(QStringLiteral("cn"), QStringLiteral("FABRIKAM"));
+        trust.attributes.insert(QStringLiteral("distinguishedName"), trustDn);
+        trust.attributes.insert(QStringLiteral("flatName"), QStringLiteral("FABRIKAM"));
+        trust.attributes.insert(QStringLiteral("trustPartner"),
+                                QStringLiteral("fabrikam.example.org"));
+        trust.attributes.insert(QStringLiteral("trustDirection"), QStringLiteral("3"));
+        trust.attributes.insert(QStringLiteral("trustType"), QStringLiteral("2"));
+        trust.attributes.insert(QStringLiteral("trustAuthIncoming"), oldSecret);
+        trust.attributes.insert(QStringLiteral("trustAuthOutgoing"), oldSecret);
+        objects.append(trust);
+
+        DirectoryObject account;
+        account.id = accountDn;
+        account.name = QStringLiteral("FABRIKAM$");
+        account.kind = ObjectKind::User;
+        account.attributes.insert(QStringLiteral("objectClass"),
+                                  QStringLiteral("top;person;organizationalPerson;user"));
+        account.attributes.insert(QStringLiteral("cn"), QStringLiteral("FABRIKAM$"));
+        account.attributes.insert(QStringLiteral("sAMAccountName"),
+                                  QStringLiteral("FABRIKAM$"));
+        account.attributes.insert(QStringLiteral("userAccountControl"),
+                                  QStringLiteral("546"));
+        account.attributes.insert(QStringLiteral("ntHash"),
+                                  QString::fromLatin1(Ntlm::ntowfV1(
+                                      QStringLiteral("oldtrustpass")).toHex()));
+        account.attributes.insert(QStringLiteral("pwdLastSet"),
+                                  QString::number(now - 30 * 24 * 60 * 60));
+        objects.append(account);
+
+        store.setObjects(objects);
+        QVERIFY2(store.saveToFile(storePath), qPrintable(storePath));
+    }
+
+    {
+        DcService service;
+        QSignalSpy messages(&service, &DcService::statusMessage);
+        QVERIFY2(service.start(dir.path()),
+                 "the daemon refused to start on a domain carrying a trust");
+        bool rotated = false;
+        QStringList seen;
+        for (const QString &line : spokenMessages(messages)) {
+            seen.append(line);
+            if (line.contains(QStringLiteral("Changed the trust password for FABRIKAM"))
+                && line.contains(QStringLiteral("30 days")))
+                rotated = true;
+        }
+        QVERIFY2(rotated,
+                 qPrintable(QStringLiteral("the trust whose password was thirty days old "
+                                           "was not rotated: ")
+                            + seen.join(QStringLiteral(" | "))));
+        service.stop();
+    }
+
+    // What the peer's channel reads next: a different clear secret in both
+    // directions, the keys derived from it, and an account dated by the write.
+    LdapServer reread;
+    QVERIFY2(reread.loadFromFile(storePath), qPrintable(storePath));
+    QString incoming;
+    qint64 accountSet = 0;
+    for (const DirectoryObject &object : reread.objects()) {
+        if (object.id.compare(trustDn, Qt::CaseInsensitive) == 0) {
+            incoming = object.attributes.value(QStringLiteral("trustAuthIncoming"));
+            QCOMPARE(object.attributes.value(QStringLiteral("trustAuthOutgoing")), incoming);
+            QVERIFY(!object.attributes.value(QStringLiteral("aes256Key")).isEmpty());
+        }
+        if (object.id.compare(accountDn, Qt::CaseInsensitive) == 0)
+            accountSet = object.attributes.value(QStringLiteral("pwdLastSet")).toLongLong();
+    }
+    QVERIFY2(!incoming.isEmpty(), "the trust lost its secret");
+    QVERIFY2(incoming != oldSecret, "the trust password was not changed");
+    QVERIFY2(incoming.startsWith(QStringLiteral("2:")), "the new secret is not a clear secret");
+    QVERIFY2(accountSet >= now, "the trust account was not dated by the rotation");
 }
 
 // A DC persists what a client changed before it answers. This matters to the

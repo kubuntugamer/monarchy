@@ -161,6 +161,13 @@ public:
     // cannot be derived from a hash, so they are dropped rather than left
     // behind, which would keep the old password working.
     bool setNtHash(const QString &dn, const QByteArray &ntHash, QString *error);
+    // The attributes this server derives for an object it owns — a trust's
+    // inter-realm keys and the NT one-way function beside them — are not a
+    // client's to write: the LDAP modify path refuses them whatever rights the
+    // caller holds. The calls that own them (setting a trust secret, the 30-day
+    // rotation) store them here, which no LDAP request can reach.
+    bool setDerivedAttributes(const QString &dn, const QMap<QString, QString> &attributes,
+                              QString *error);
 
     // Kerberos acceptor: SASL GSSAPI (and GSS-SPNEGO) binds are verified by the
     // KDC against the service principal keys stored in this directory.
