@@ -62,6 +62,7 @@ private slots:
     void rejectsWrongCredentials();
     void usesConfiguredControllerHost();
     void publishesItsIdentityAndGlobalCatalog();
+    void promotesASecondControllerFromACopy();
 };
 
 void ProvisionerTest::buildsDomainFromScratch()
@@ -590,6 +591,116 @@ void ProvisionerTest::publishesItsIdentityAndGlobalCatalog()
              result.dcHost);
     QCOMPARE(probe.gcRootDse.first().attrs.value(QStringLiteral("isGlobalCatalogReady")).value(0),
              QStringLiteral("TRUE"));
+}
+
+// A second DC starts from a copy of the first one's directory, so it is the
+// same domain: same SID, same domain object, same key material — and it is a
+// different controller, with its own account, its own DSA and a dc.conf that
+// pulls from the copy's source.
+void ProvisionerTest::promotesASecondControllerFromACopy()
+{
+    QTemporaryDir firstDir;
+    QTemporaryDir secondDir;
+    QVERIFY(firstDir.isValid());
+    QVERIFY(secondDir.isValid());
+
+    ProvisionConfig first = testConfig(firstDir.path());
+    first.dcHost = QStringLiteral("dc1");
+    const ProvisionResult original = provisionDomain(first);
+    QVERIFY2(original.ok, qPrintable(original.error));
+
+    ProvisionConfig second = testConfig(secondDir.path());
+    second.promoteFrom = firstDir.path();
+    second.dcHost = QStringLiteral("dc2");
+    second.replicaHost = QStringLiteral("192.0.2.10");
+    second.replicaPort = 1038;
+    const ProvisionResult promoted = promoteDomain(second);
+    QVERIFY2(promoted.ok, qPrintable(promoted.error));
+
+    // Same domain, not a second one that shares a name.
+    QCOMPARE(promoted.domainSid, original.domainSid);
+    QCOMPARE(promoted.baseDn, original.baseDn);
+    QCOMPARE(promoted.dcHost, QStringLiteral("dc2.") + original.dnsDomain);
+    QCOMPARE(promoted.objectCount, original.objectCount + 3);
+
+    LdapServer store;
+    QVERIFY(store.loadFromFile(promoted.storePath));
+    const auto find = [&store](const QString &dn) {
+        return findByDn(store.objects(), dn);
+    };
+
+    // Two DSAs in one site: the copy's, and this controller's beside it.
+    const QString site = QStringLiteral("CN=Default-First-Site-Name,CN=Sites,CN=Configuration,%1")
+                             .arg(original.baseDn);
+    QVERIFY(find(QStringLiteral("CN=NTDS Settings,CN=DC1,CN=Servers,%1").arg(site)));
+    QVERIFY(find(QStringLiteral("CN=NTDS Settings,CN=DC2,CN=Servers,%1").arg(site)));
+
+    const DirectoryObject *account = find(QStringLiteral(
+        "CN=DC2,OU=Domain Controllers,%1").arg(original.baseDn));
+    QVERIFY(account);
+    QCOMPARE(account->attributes.value(QStringLiteral("sAMAccountName")),
+             QStringLiteral("DC2$"));
+    QCOMPARE(account->attributes.value(QStringLiteral("objectSid")),
+             original.domainSid + QStringLiteral("-1001"));
+    QCOMPARE(account->attributes.value(QStringLiteral("dNSHostName")), promoted.dcHost);
+    // A DC has its own service keys, and they are not the first DC's.
+    QVERIFY(!account->attributes.value(QStringLiteral("aes256Key")).isEmpty());
+    QVERIFY(account->attributes.value(QStringLiteral("servicePrincipalName"))
+                .contains(QStringLiteral("ldap/dc2.")));
+
+    const DirectoryObject *controllers = find(
+        QStringLiteral("CN=Domain Controllers,CN=Users,%1").arg(original.baseDn));
+    QVERIFY(controllers);
+    QCOMPARE(controllers->members.size(), 2);
+    QVERIFY(controllers->members.first().startsWith(QStringLiteral("CN=DC1,")));
+    QVERIFY(controllers->members.last().startsWith(QStringLiteral("CN=DC2,")));
+
+    // The configured pull: named partner, its DRS port, an interval.
+    QSettings conf(promoted.configPath, QSettings::IniFormat);
+    QCOMPARE(conf.value(QStringLiteral("dcName")).toString(), QStringLiteral("DC2"));
+    QCOMPARE(conf.value(QStringLiteral("replicaHost")).toString(), QStringLiteral("192.0.2.10"));
+    QCOMPARE(conf.value(QStringLiteral("replicaPort")).toInt(), 1038);
+    QCOMPARE(conf.value(QStringLiteral("replicaUser")).toString(),
+             QStringLiteral("Administrator"));
+    QCOMPARE(conf.value(QStringLiteral("siteName")).toString(),
+             QStringLiteral("Default-First-Site-Name"));
+
+    // The media copy carries the domain's secrets: the promoted DC can verify
+    // the domain's accounts, and the pull credential is its own addition.
+    QFile secretsFile(promoted.secretsPath);
+    QVERIFY(secretsFile.open(QIODevice::ReadOnly));
+    const QJsonObject secrets = QJsonDocument::fromJson(secretsFile.readAll()).object();
+    QCOMPARE(secrets.value(QStringLiteral("domainSid")).toString(), original.domainSid);
+    QCOMPARE(secrets.value(QStringLiteral("replicaPassword")).toString(),
+             QStringLiteral("Secret123!"));
+    QCOMPARE(secrets.value(QStringLiteral("passwordScheme")).toString(),
+             QStringLiteral("sha256-salted-1000"));
+    QVERIFY(!secrets.value(QStringLiteral("passwordHash")).toString().isEmpty());
+
+    LdapServer loaded;
+    QVERIFY(loaded.loadFromFile(promoted.storePath));
+    QVERIFY(loaded.loadSecretsFromFile(promoted.secretsPath));
+
+    // It refuses to write over a directory it just wrote, and refuses to
+    // promote a name the copied directory already publishes as a controller.
+    const ProvisionResult overwrite = promoteDomain(second);
+    QVERIFY(!overwrite.ok);
+    QVERIFY(overwrite.error.contains(QStringLiteral("already provisioned")));
+
+    ProvisionConfig fromPromoted = second;
+    fromPromoted.promoteFrom = secondDir.path();
+    fromPromoted.targetDir = secondDir.path() + QStringLiteral("/third");
+    const ProvisionResult duplicate = promoteDomain(fromPromoted);
+    QVERIFY(!duplicate.ok);
+    QVERIFY(duplicate.error.contains(QStringLiteral("already a controller")));
+
+    // Promoting into the directory being copied from would destroy the source.
+    ProvisionConfig ontoSource = second;
+    ontoSource.targetDir = firstDir.path();
+    ontoSource.force = true;
+    const ProvisionResult inPlace = promoteDomain(ontoSource);
+    QVERIFY(!inPlace.ok);
+    QVERIFY(inPlace.error.contains(QStringLiteral("must not be the directory")));
 }
 
 QTEST_GUILESS_MAIN(ProvisionerTest)

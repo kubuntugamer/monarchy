@@ -69,6 +69,25 @@ int main(int argc, char *argv[])
                                 QStringLiteral("address"));
     QCommandLineOption forceOption(QStringLiteral("force"),
                                    QStringLiteral("Overwrite an existing domain store."));
+    QCommandLineOption promoteOption(
+        QStringLiteral("promote-from"),
+        QStringLiteral("Promote a second domain controller from a copy of an existing "
+                       "controller's directory. The copy's realm, SID, naming contexts and "
+                       "site are used; --adminpass is the credential this DC pulls with."),
+        QStringLiteral("path"));
+    QCommandLineOption replicaHostOption(
+        QStringLiteral("replica-host"),
+        QStringLiteral("Host of the DC a promoted DC pulls from (default: the copied "
+                       "dc.conf's dcHost)."),
+        QStringLiteral("host"));
+    QCommandLineOption replicaPortOption(
+        QStringLiteral("replica-port"),
+        QStringLiteral("DRS port of that DC (default: the copied dc.conf's drsPort)."),
+        QStringLiteral("port"));
+    QCommandLineOption replicaUserOption(
+        QStringLiteral("replica-user"),
+        QStringLiteral("Account a promoted DC pulls as (default: Administrator)."),
+        QStringLiteral("user"));
 
     parser.addOption(realmOption);
     parser.addOption(domainOption);
@@ -83,6 +102,10 @@ int main(int argc, char *argv[])
     parser.addOption(devPortsOption);
     parser.addOption(forwarderOption);
     parser.addOption(forceOption);
+    parser.addOption(promoteOption);
+    parser.addOption(replicaHostOption);
+    parser.addOption(replicaPortOption);
+    parser.addOption(replicaUserOption);
     parser.addPositionalArgument(QStringLiteral("targetdir"),
                                  QStringLiteral("Target directory (same as --targetdir)."),
                                  QStringLiteral("[targetdir]"));
@@ -131,6 +154,13 @@ int main(int argc, char *argv[])
     if (config.forwarders.isEmpty())
         config.forwarders = DnsServer::systemForwarders();
     config.force = parser.isSet(forceOption);
+    config.promoteFrom = parser.value(promoteOption);
+    config.replicaHost = parser.value(replicaHostOption);
+    if (parser.isSet(replicaPortOption))
+        config.replicaPort = quint16(parser.value(replicaPortOption).toUInt());
+    if (parser.isSet(replicaUserOption))
+        config.replicaUser = parser.value(replicaUserOption);
+    const bool promote = !config.promoteFrom.trimmed().isEmpty();
 
     QTextStream out(stdout);
     QTextStream err(stderr);
@@ -140,19 +170,27 @@ int main(int argc, char *argv[])
         return 2;
     }
     if (config.adminPassword.isEmpty()) {
-        err << "monarchy-provision: an Administrator password is required "
-               "(--adminpass, --adminpass-stdin or MONARCHY_ADMINPASS)\n";
+        // For a promote the password is the pull credential rather than a new
+        // administrator's; without it the DC would start and never replicate.
+        err << (promote
+                    ? "monarchy-provision: the password a promoted DC pulls with is "
+                      "required (--adminpass, --adminpass-stdin or MONARCHY_ADMINPASS)\n"
+                    : "monarchy-provision: an Administrator password is required "
+                      "(--adminpass, --adminpass-stdin or MONARCHY_ADMINPASS)\n");
         return 2;
     }
 
-    const ProvisionResult result = provisionDomain(config);
+    const ProvisionResult result = promote ? promoteDomain(config) : provisionDomain(config);
     if (!result.ok) {
         err << "monarchy-provision: " << result.error << '\n';
         return 1;
     }
 
-    out << "Provisioned " << config.realm << " (" << config.netbiosDomain << ")\n"
-        << "  base DN:   " << result.baseDn << '\n'
+    if (promote)
+        out << "Promoted " << result.dcHost << " into " << result.dnsDomain << "\n";
+    else
+        out << "Provisioned " << config.realm << " (" << config.netbiosDomain << ")\n";
+    out << "  base DN:   " << result.baseDn << '\n'
         << "  domain SID: " << result.domainSid << '\n'
         << "  objects:   " << result.objectCount << '\n'
         << "  store:     " << result.storePath << '\n'

@@ -46,6 +46,21 @@ struct ProvisionConfig {
     // <domain-label>DC1.<domain> name.
     QString dcHost;
     bool force = false;
+
+    // Promote: a second DC for a domain that already exists, built from a copy
+    // of that domain's directory the way AD's install-from-media build does.
+    // `promoteFrom` names the existing DC's provisioned directory; the realm,
+    // SID, naming contexts, site and the first DC's own objects are read from
+    // it rather than invented, so the two stores agree on every identity a
+    // domain has one of. The copy differs only in the objects that name this
+    // DC, and in a dc.conf that makes it pull.
+    QString promoteFrom;
+    // The DC the copy came from, which this one pulls from. Empty reads the
+    // source directory's dc.conf. `adminPassword` is the credential that pull
+    // authenticates with, so it must be a password the source DC's store holds.
+    QString replicaHost;
+    quint16 replicaPort = 0; // 0 reads the source's drsPort
+    QString replicaUser = QStringLiteral("Administrator");
 };
 
 struct ProvisionResult {
@@ -92,5 +107,16 @@ bool generateSelfSignedCertificate(const QString &certPath, const QString &keyPa
 // Provisions the domain described by `config` into `config.targetDir`.
 // Refuses to overwrite an existing directory store unless `config.force` is set.
 ProvisionResult provisionDomain(const ProvisionConfig &config);
+
+// Promotes a second domain controller from a copy of an existing one's
+// directory: `config.promoteFrom` is that directory, `config.targetDir` the new
+// DC's. The copied store keeps everything a domain has exactly one of — SIDs,
+// GUIDs, the domain object, the policies, krbtgt's key, the first DC's server
+// and NTDS Settings objects — and gains this DC's server object, its NTDS
+// Settings object and its computer account under a fresh RID. The resulting
+// dc.conf points the pull at the source DC, so the KCC's next pass in this site
+// takes changes from it without an administrator registering anything.
+// Refuses to overwrite an existing directory store unless `config.force` is set.
+ProvisionResult promoteDomain(const ProvisionConfig &config);
 
 #endif // PROVISIONER_H

@@ -23,6 +23,8 @@
 #include <QStringList>
 #include <QUuid>
 
+#include <algorithm>
+
 namespace {
 
 QString rdnEscape(const QString &value)
@@ -313,6 +315,136 @@ bool validateNetbiosDomain(const QString &domain, QString *error)
     return true;
 }
 
+namespace {
+
+// The ports a DC binds. `--dev-ports` selects the unprivileged binding set; a
+// caller that set a port explicitly keeps it. epm (135) and SMB (445) have no
+// unprivileged equivalent and stay native, and the Global Catalog has none
+// either: 3268 is already above 1024, so it is the same number in a dev run as
+// on a real DC. kpasswd is 464 on a real DC; a rootless dev run moves it with
+// the rest.
+struct ServicePorts {
+    quint16 ldap = 389;
+    quint16 dns = 53;
+    quint16 kdc = 88;
+    quint16 samr = 49152;
+    quint16 lsad = 49153;
+    quint16 gc = 3268;
+    quint16 kpasswd = 464;
+};
+
+ServicePorts servicePorts(const ProvisionConfig &config)
+{
+    ServicePorts ports;
+    ports.ldap = config.devPorts && config.ldapPort == 389 ? 1389 : config.ldapPort;
+    ports.dns = config.devPorts && config.dnsPort == 53 ? 1053 : config.dnsPort;
+    ports.kdc = config.devPorts && config.kdcPort == 88 ? 8888 : config.kdcPort;
+    ports.samr = config.devPorts && config.samrPort == 49152 ? 1035 : config.samrPort;
+    ports.lsad = config.devPorts && config.lsadPort == 49153 ? 1036 : config.lsadPort;
+    ports.kpasswd = config.devPorts ? 1464 : 464;
+    return ports;
+}
+
+// The DC's computer account, DNS records, TLS certificate and SPNs all use the
+// same host. Callers may name it explicitly, as a host label or a full FQDN;
+// otherwise keep the historical <domain-label>DC1 name.
+bool resolveControllerHost(const QString &dnsDomain, const QString &requested,
+                           QString *dcLabel, QString *dcHost, QString *error)
+{
+    const QString requestedHost = requested.trimmed().toLower();
+    if (requestedHost.isEmpty()) {
+        *dcLabel = firstLabel(dnsDomain).toUpper() + QStringLiteral("DC1");
+        *dcHost = dcLabel->toLower() + QLatin1Char('.') + dnsDomain;
+        return true;
+    }
+    const QString suffix = QLatin1Char('.') + dnsDomain;
+    *dcHost = requestedHost.contains(QLatin1Char('.')) ? requestedHost
+                                                       : requestedHost + suffix;
+    if (!dcHost->endsWith(suffix)) {
+        *error = QStringLiteral("domain controller FQDN %1 must end in %2")
+                     .arg(requested, suffix);
+        return false;
+    }
+    *dcLabel = dcHost->left(dcHost->size() - suffix.size());
+    if (dcLabel->contains(QLatin1Char('.')) || !validDnsLabel(*dcLabel)) {
+        *error = QStringLiteral("domain controller host must be one DNS label: %1")
+                     .arg(requested);
+        return false;
+    }
+    if (dcLabel->size() > 15) {
+        *error = QStringLiteral("domain controller host must be 15 characters or fewer: %1")
+                     .arg(requested);
+        return false;
+    }
+    *dcLabel = dcLabel->toUpper();
+    return true;
+}
+
+// A krb5.conf that points at one DC, so `kinit` needs no hand-written realm
+// stanza. The KDC port is the one that machine actually serves.
+bool writeKrb5Conf(const QString &path, const QString &realm, const QString &dnsDomain,
+                   const QString &dcIp, quint16 kdcPort, quint16 kpasswdPort,
+                   QString *error)
+{
+    const QString contents =
+        QStringLiteral("[libdefaults]\n"
+                       "    default_realm = %1\n"
+                       "    dns_lookup_kdc = false\n"
+                       "    dns_lookup_realm = false\n"
+                       "    default_tkt_enctypes = aes256-cts-hmac-sha1-96 "
+                       "aes128-cts-hmac-sha1-96 rc4-hmac\n"
+                       "    default_tgs_enctypes = aes256-cts-hmac-sha1-96 "
+                       "aes128-cts-hmac-sha1-96 rc4-hmac\n"
+                       "    permitted_enctypes = aes256-cts-hmac-sha1-96 "
+                       "aes128-cts-hmac-sha1-96 rc4-hmac\n"
+                       "\n"
+                       "[realms]\n"
+                       "    %1 = {\n"
+                       "        kdc = %2:%3\n"
+                       "        kpasswd_server = %2:%5\n"
+                       "    }\n"
+                       "\n"
+                       "[domain_realm]\n"
+                       "    .%4 = %1\n"
+                       "    %4 = %1\n")
+            .arg(realm, dcIp)
+            .arg(kdcPort)
+            .arg(dnsDomain)
+            .arg(kpasswdPort);
+    return writeFile(path, contents.toUtf8(), error);
+}
+
+// Every file under `from`, at the same relative path under `to`. Symlinks are
+// copied as the files they name, because a directory a client browses is not
+// allowed to point outside the share.
+bool copyTree(const QString &from, const QString &to, QString *error)
+{
+    const QDir source(from);
+    if (!source.exists())
+        return true;
+    if (!QDir().mkpath(to)) {
+        *error = QStringLiteral("cannot create directory %1").arg(to);
+        return false;
+    }
+    const QFileInfoList entries =
+        source.entryInfoList(QDir::Files | QDir::Dirs | QDir::NoDotAndDotDot);
+    for (const QFileInfo &entry : entries) {
+        const QString destination = to + QLatin1Char('/') + entry.fileName();
+        if (entry.isDir()) {
+            if (!copyTree(entry.absoluteFilePath(), destination, error))
+                return false;
+            continue;
+        }
+        if (!QFile::copy(entry.absoluteFilePath(), destination)) {
+            *error = QStringLiteral("cannot copy %1").arg(entry.absoluteFilePath());
+            return false;
+        }
+    }
+    return true;
+}
+
+} // namespace
+
 ProvisionResult provisionDomain(const ProvisionConfig &config)
 {
     ProvisionResult result;
@@ -340,50 +472,22 @@ ProvisionResult provisionDomain(const ProvisionConfig &config)
     }
 
     // The DC's computer account, DNS records, TLS certificate and SPNs all use
-    // the same host. Callers may name it explicitly; otherwise keep the
-    // historical <domain-label>DC1 name.
+    // the same host.
     QString dcLabel;
     QString dcHost;
-    const QString requestedHost = config.dcHost.trimmed().toLower();
-    if (requestedHost.isEmpty()) {
-        dcLabel = firstLabel(result.dnsDomain).toUpper() + QStringLiteral("DC1");
-        dcHost = dcLabel.toLower() + QLatin1Char('.') + result.dnsDomain;
-    } else {
-        const QString suffix = QLatin1Char('.') + result.dnsDomain;
-        dcHost = requestedHost.contains(QLatin1Char('.')) ? requestedHost
-                                                          : requestedHost + suffix;
-        if (!dcHost.endsWith(suffix)) {
-            result.error = QStringLiteral("domain controller FQDN %1 must end in %2")
-                               .arg(config.dcHost, suffix);
-            return result;
-        }
-        dcLabel = dcHost.left(dcHost.size() - suffix.size());
-        if (dcLabel.contains(QLatin1Char('.')) || !validDnsLabel(dcLabel)) {
-            result.error = QStringLiteral("domain controller host must be one DNS label: %1")
-                               .arg(config.dcHost);
-            return result;
-        }
-        if (dcLabel.size() > 15) {
-            result.error = QStringLiteral("domain controller host must be 15 characters or fewer: %1")
-                               .arg(dcLabel);
-            return result;
-        }
-        dcLabel = dcLabel.toUpper();
+    if (!resolveControllerHost(result.dnsDomain, config.dcHost, &dcLabel, &dcHost, &error)) {
+        result.error = error;
+        return result;
     }
 
-    // `--dev-ports` selects the unprivileged binding set. A caller that set a
-    // port explicitly keeps it; epm (135) and SMB (445) have no unprivileged
-    // equivalent and stay native.
-    const quint16 ldapPort = config.devPorts && config.ldapPort == 389 ? 1389 : config.ldapPort;
-    const quint16 dnsPort = config.devPorts && config.dnsPort == 53 ? 1053 : config.dnsPort;
-    const quint16 kdcPort = config.devPorts && config.kdcPort == 88 ? 8888 : config.kdcPort;
-    const quint16 samrPort = config.devPorts && config.samrPort == 49152 ? 1035 : config.samrPort;
-    const quint16 lsadPort = config.devPorts && config.lsadPort == 49153 ? 1036 : config.lsadPort;
-    // The Global Catalog has no unprivileged equivalent: 3268 is already above
-    // 1024, so it is the same number in a dev run as on a real DC.
-    const quint16 gcPort = 3268;
-    // kpasswd is 464 on a real DC; a rootless dev run moves it with the rest.
-    const quint16 kpasswdPort = config.devPorts ? 1464 : 464;
+    const ServicePorts ports = servicePorts(config);
+    const quint16 ldapPort = ports.ldap;
+    const quint16 dnsPort = ports.dns;
+    const quint16 kdcPort = ports.kdc;
+    const quint16 samrPort = ports.samr;
+    const quint16 lsadPort = ports.lsad;
+    const quint16 gcPort = ports.gc;
+    const quint16 kpasswdPort = ports.kpasswd;
 
     QString target = config.targetDir;
     if (target.isEmpty()) {
@@ -955,37 +1059,10 @@ ProvisionResult provisionDomain(const ProvisionConfig &config)
     // A krb5.conf that points at this DC, so `kinit` needs no hand-written
     // realm stanza. The KDC port is the one this machine actually serves.
     result.krb5ConfPath = target + QStringLiteral("/krb5.conf");
-    {
-        const QString realm = result.dnsDomain.toUpper();
-        const QString contents =
-            QStringLiteral("[libdefaults]\n"
-                           "    default_realm = %1\n"
-                           "    dns_lookup_kdc = false\n"
-                           "    dns_lookup_realm = false\n"
-                           "    default_tkt_enctypes = aes256-cts-hmac-sha1-96 "
-                           "aes128-cts-hmac-sha1-96 rc4-hmac\n"
-                           "    default_tgs_enctypes = aes256-cts-hmac-sha1-96 "
-                           "aes128-cts-hmac-sha1-96 rc4-hmac\n"
-                           "    permitted_enctypes = aes256-cts-hmac-sha1-96 "
-                           "aes128-cts-hmac-sha1-96 rc4-hmac\n"
-                           "\n"
-                           "[realms]\n"
-                           "    %1 = {\n"
-                           "        kdc = %2:%3\n"
-                           "        kpasswd_server = %2:%5\n"
-                           "    }\n"
-                           "\n"
-                           "[domain_realm]\n"
-                           "    .%4 = %1\n"
-                           "    %4 = %1\n")
-                .arg(realm, dcIp)
-                .arg(kdcPort)
-                .arg(result.dnsDomain)
-                .arg(kpasswdPort);
-        if (!writeFile(result.krb5ConfPath, contents.toUtf8(), &error)) {
-            result.error = error;
-            return result;
-        }
+    if (!writeKrb5Conf(result.krb5ConfPath, result.dnsDomain.toUpper(), result.dnsDomain,
+                       dcIp, kdcPort, kpasswdPort, &error)) {
+        result.error = error;
+        return result;
     }
 
     // --- Server configuration --------------------------------------------
@@ -1058,6 +1135,443 @@ ProvisionResult provisionDomain(const ProvisionConfig &config)
         result.error = QStringLiteral("cannot restrict permissions on %1").arg(result.secretsPath);
         return result;
     }
+    if (conf.status() != QSettings::NoError) {
+        result.error = QStringLiteral("cannot write %1").arg(result.configPath);
+        return result;
+    }
+
+    result.ok = true;
+    return result;
+}
+
+// --- Promoting a second DC ------------------------------------------------
+//
+// AD's install-from-media build: a new DC starts from a copy of another DC's
+// directory, so every identity a domain has exactly one of — the domain SID,
+// the domain object's GUID, the SIDs already handed out, krbtgt's key, the
+// policies — is carried over instead of generated again. That is the only way
+// the two stores can agree: a domain with two different domain SIDs, or two
+// different krbtgt keys, is two domains that happen to share a name.
+//
+// The copy keeps the source DC's own Server and NTDS Settings objects, which is
+// what a second DC needs in its store to know who its partner is, and gains
+// this DC's: a computer account under the next free RID, a Server object, and
+// an NTDS Settings object beside the source's in the same site. Everything else
+// in the store is the domain as it was when the copy was taken; the KCC's next
+// pass in this site turns the source DSA into a connection, and the pull
+// agent — pointed at the source by the dc.conf written here — takes the
+// changes made since.
+//
+// What is deliberately not here: a pull of the secrets themselves over the
+// wire. `Drs.cpp` serves the replicated attribute set and not the password
+// material, so a promote that only pulled would leave this DC unable to
+// authenticate an account or issue a TGT under the domain's key. The media
+// copy is what carries them, which is exactly why AD treats install-from-media
+// as carrying secrets and protects it accordingly.
+ProvisionResult promoteDomain(const ProvisionConfig &config)
+{
+    ProvisionResult result;
+
+    const QString source = config.promoteFrom.trimmed().isEmpty()
+        ? QString()
+        : QDir::cleanPath(QDir(config.promoteFrom).absolutePath());
+    if (source.isEmpty() || !QFileInfo(source).isDir()) {
+        result.error = QStringLiteral("a provisioned source directory is required to promote");
+        return result;
+    }
+    QSettings sourceConf(source + QStringLiteral("/dc.conf"), QSettings::IniFormat);
+    const QString sourceRealm = sourceConf.value(QStringLiteral("realm")).toString();
+    const QString netbios = sourceConf.value(QStringLiteral("netbiosDomain")).toString();
+    result.dnsDomain = sourceConf.value(QStringLiteral("dnsDomain")).toString();
+    result.baseDn = sourceConf.value(QStringLiteral("baseDn")).toString();
+    result.domainSid = sourceConf.value(QStringLiteral("domainSid")).toString();
+    const QString siteName =
+        sourceConf.value(QStringLiteral("siteName"), QStringLiteral("Default-First-Site-Name"))
+            .toString();
+    // Paths inside the copy first: a media directory is often copied to another
+    // host, where the absolute store path the source dc.conf recorded does not
+    // exist, and the copy's own tree is then the truth.
+    const auto sourcePath = [&source](const QString &configured, const QString &relative) {
+        const QString local = source + relative;
+        if (QFileInfo::exists(local) || configured.isEmpty())
+            return local;
+        return configured;
+    };
+    const QString sourceStore = sourcePath(
+        sourceConf.value(QStringLiteral("storePath")).toString(),
+        QStringLiteral("/private/directory.json"));
+    const QString sourceSecrets = sourcePath(
+        sourceConf.value(QStringLiteral("secretsPath")).toString(),
+        QStringLiteral("/private/secrets.json"));
+    const QString sourceZone = sourcePath(
+        sourceConf.value(QStringLiteral("zonePath")).toString(),
+        QStringLiteral("/private/dnszone.json"));
+    const QString sourceSysvol = sourcePath(sourceConf.value(QStringLiteral("sysvol")).toString(),
+                                             QStringLiteral("/sysvol/") + result.dnsDomain);
+
+    if (sourceRealm.isEmpty() || result.baseDn.isEmpty() || netbios.isEmpty()
+        || !QFileInfo::exists(sourceStore)) {
+        result.error =
+            QStringLiteral("%1 does not hold a provisioned domain (no realm, base DN or store)")
+                .arg(source);
+        return result;
+    }
+
+    QString error;
+    if (!validateNetbiosDomain(netbios, &error)) {
+        result.error = error;
+        return result;
+    }
+    if (config.adminPassword.isEmpty()) {
+        result.error = QStringLiteral("the password used to pull from the source DC is required");
+        return result;
+    }
+    const QString dcIp = config.dcIp.trimmed().isEmpty() ? QStringLiteral("127.0.0.1")
+                                                         : config.dcIp.trimmed();
+    if (QHostAddress(dcIp).isNull()) {
+        result.error = QStringLiteral("invalid domain controller address: %1").arg(dcIp);
+        return result;
+    }
+
+    QString dcLabel;
+    QString dcHost;
+    if (!resolveControllerHost(result.dnsDomain, config.dcHost, &dcLabel, &dcHost, &error)) {
+        result.error = error;
+        return result;
+    }
+    result.dcHost = dcHost;
+    const ServicePorts ports = servicePorts(config);
+
+    QString target = config.targetDir;
+    if (target.trimmed().isEmpty()) {
+        result.error = QStringLiteral("target directory must not be empty");
+        return result;
+    }
+    target = QDir::cleanPath(QDir(target).absolutePath());
+    if (target == source) {
+        result.error = QStringLiteral("the target must not be the directory being copied from");
+        return result;
+    }
+
+    const QString privateDir = target + QStringLiteral("/private");
+    result.storePath = privateDir + QStringLiteral("/directory.json");
+    result.secretsPath = privateDir + QStringLiteral("/secrets.json");
+    result.configPath = target + QStringLiteral("/dc.conf");
+    result.zonePath = privateDir + QStringLiteral("/dnszone.json");
+    result.sysvolPath = target + QStringLiteral("/sysvol/") + result.dnsDomain;
+    if (QFileInfo::exists(result.storePath) && !config.force) {
+        result.error = QStringLiteral("%1 is already provisioned (use --force to overwrite)")
+                           .arg(target);
+        return result;
+    }
+
+    // --- The media copy ---------------------------------------------------
+    LdapServer store;
+    if (!store.loadFromFile(sourceStore)) {
+        result.error = QStringLiteral("cannot read the copied directory store %1").arg(sourceStore);
+        return result;
+    }
+    const QList<DirectoryObject> objects = store.objects();
+    const auto find = [&objects](const QString &dn) -> const DirectoryObject * {
+        for (const DirectoryObject &object : objects) {
+            if (object.id.compare(dn, Qt::CaseInsensitive) == 0)
+                return &object;
+        }
+        return nullptr;
+    };
+    const DirectoryObject *domain = find(result.baseDn);
+    if (!domain || domain->attributes.value(QStringLiteral("objectSid")).isEmpty()) {
+        result.error = QStringLiteral("the copied store has no domain object at %1")
+                           .arg(result.baseDn);
+        return result;
+    }
+    // The domain object is the authority on the domain's SID, not dc.conf.
+    result.domainSid = domain->attributes.value(QStringLiteral("objectSid"));
+    const QString configDn = QStringLiteral("CN=Configuration,%1").arg(result.baseDn);
+    const QString siteDn = QStringLiteral("CN=%1,CN=Sites,%2").arg(siteName, configDn);
+    if (!find(siteDn)) {
+        result.error = QStringLiteral("the copied store publishes no site %1").arg(siteName);
+        return result;
+    }
+
+    const QString dcDn =
+        QStringLiteral("CN=%1,OU=Domain Controllers,%2").arg(dcLabel, result.baseDn);
+    const QString machineName = dcLabel + QStringLiteral("$");
+    for (const DirectoryObject &object : objects) {
+        if (object.id.compare(dcDn, Qt::CaseInsensitive) == 0
+            || object.attributes.value(QStringLiteral("sAMAccountName"))
+                   .compare(machineName, Qt::CaseInsensitive) == 0) {
+            result.error = QStringLiteral("%1 is already a controller in this domain")
+                               .arg(dcLabel);
+            return result;
+        }
+    }
+
+    // --- This DC's own objects -------------------------------------------
+    // The computer account: the machine account every DC authenticates as, and
+    // the object the KDC reads this DC's service keys from.
+    DirectoryObject dc;
+    dc.id = dcDn;
+    dc.name = dcLabel;
+    dc.type = QStringLiteral("Computer");
+    dc.kind = ObjectKind::Computer;
+    dc.container = QStringLiteral("Domain Controllers");
+    dc.description = QStringLiteral("Domain controller for %1").arg(result.dnsDomain);
+    dc.attributes.insert(QStringLiteral("distinguishedName"), dcDn);
+    dc.attributes.insert(QStringLiteral("objectClass"),
+                         joinAttributeValues({QStringLiteral("top"), QStringLiteral("person"),
+                                              QStringLiteral("organizationalPerson"),
+                                              QStringLiteral("user"),
+                                              QStringLiteral("computer")}));
+    dc.attributes.insert(QStringLiteral("cn"), dcLabel);
+    dc.attributes.insert(QStringLiteral("sAMAccountName"), machineName);
+    dc.attributes.insert(QStringLiteral("dNSHostName"), dcHost);
+    dc.attributes.insert(QStringLiteral("userAccountControl"), QStringLiteral("12288"));
+    dc.attributes.insert(QStringLiteral("operatingSystem"),
+                         QStringLiteral("Monarchy DC (Linux)"));
+    dc.attributes.insert(QStringLiteral("isDomainController"), QStringLiteral("yes"));
+    dc.attributes.insert(QStringLiteral("ntHash"), randomKeyHex());
+    Krb5::storeRandomKeys(dc);
+    dc.attributes.insert(QStringLiteral("msDS-KeyVersionNumber"), QStringLiteral("1"));
+    dc.attributes.insert(
+        QStringLiteral("servicePrincipalName"),
+        QStringLiteral("ldap/%1; ldap/%1.%2; ldap/%1.%2/%2; HOST/%1; HOST/%1.%2; "
+                       "GC/%1; GC/%1.%2; cifs/%1; cifs/%1.%2; DNS/%1.%2; "
+                       "DNS/ns1.%2; RestrictedKrbHost/%1; RestrictedKrbHost/%1.%2")
+            .arg(dcLabel.toLower(), result.dnsDomain));
+    dc.attributes.insert(QStringLiteral("pwdLastSet"),
+                         QString::number(QDateTime::currentDateTimeUtc().toSecsSinceEpoch()));
+    if (!store.addAccount(&dc, &error)) {
+        result.error = QStringLiteral("cannot create the controller account: %1").arg(error);
+        return result;
+    }
+
+    // The Server object and its NTDS Settings object, beside the source DC's in
+    // the same site. Without the DSA the KCC on either side has no vertex to
+    // connect to, and without the Server object the connection has no address.
+    const QString serverDn = QStringLiteral("CN=%1,CN=Servers,%2").arg(dcLabel, siteDn);
+    DirectoryObject server;
+    server.id = serverDn;
+    server.name = dcLabel;
+    server.type = QStringLiteral("Server");
+    server.kind = ObjectKind::Container;
+    server.container = QStringLiteral("Console Root");
+    server.attributes.insert(QStringLiteral("distinguishedName"), serverDn);
+    server.attributes.insert(QStringLiteral("objectClass"),
+                             joinAttributeValues({QStringLiteral("top"),
+                                                  QStringLiteral("server")}));
+    server.attributes.insert(QStringLiteral("cn"), dcLabel);
+    server.attributes.insert(QStringLiteral("dNSHostName"), dcHost);
+    store.addObject(server);
+
+    const QString ntdsSettingsDn = QStringLiteral("CN=NTDS Settings,%1").arg(serverDn);
+    DirectoryObject ntds;
+    ntds.id = ntdsSettingsDn;
+    ntds.name = QStringLiteral("NTDS Settings");
+    ntds.type = QStringLiteral("NTDS Settings");
+    ntds.kind = ObjectKind::Container;
+    ntds.container = serverDn;
+    ntds.attributes.insert(QStringLiteral("distinguishedName"), ntdsSettingsDn);
+    ntds.attributes.insert(QStringLiteral("objectClass"),
+                           joinAttributeValues({QStringLiteral("top"),
+                                                QStringLiteral("nTDSDSA")}));
+    ntds.attributes.insert(QStringLiteral("cn"), QStringLiteral("NTDS Settings"));
+    // options bit 0: this DSA serves the Global Catalog.
+    ntds.attributes.insert(QStringLiteral("options"), QStringLiteral("1"));
+    ntds.attributes.insert(QStringLiteral("invocationId"),
+                           QUuid::createUuid().toString(QUuid::WithoutBraces));
+    ntds.attributes.insert(
+        QStringLiteral("hasMasterNCs"),
+        QStringLiteral("%1; CN=Configuration,%1; CN=Schema,CN=Configuration,%1")
+            .arg(result.baseDn));
+    store.addObject(ntds);
+
+    // A DC is a member of Domain Controllers; every group membership a client
+    // sees is derived from these lists.
+    const QString groupDn =
+        QStringLiteral("CN=Domain Controllers,CN=Users,%1").arg(result.baseDn);
+    if (const DirectoryObject *group = find(groupDn)) {
+        // The members are the object's list, not the joined attribute: the
+        // attribute is derived on the way out, so reading it would drop the
+        // controllers that are already members.
+        QStringList members = group->members;
+        if (!members.contains(dcDn, Qt::CaseInsensitive))
+            members.append(dcDn);
+        if (!store.modifyObject(groupDn,
+                                {{QStringLiteral("member"), joinAttributeValues(members)}})) {
+            result.error = QStringLiteral("cannot add %1 to Domain Controllers").arg(dcLabel);
+            return result;
+        }
+    }
+
+    for (const QString &dir : {target, privateDir, target + QStringLiteral("/var"),
+                               target + QStringLiteral("/var/lib/monarchy")}) {
+        if (!QDir().mkpath(dir)) {
+            result.error = QStringLiteral("cannot create directory %1").arg(dir);
+            return result;
+        }
+    }
+    if (!store.saveToFile(result.storePath)) {
+        result.error = QStringLiteral("cannot write directory store %1").arg(result.storePath);
+        return result;
+    }
+    result.objectCount = store.objects().size();
+
+    // --- Secrets ----------------------------------------------------------
+    // The domain's secrets are the media copy's: same krbtgt key, same account
+    // verifiers, so a ticket issued here opens there and the reverse. What is
+    // this DC's own is the machine GUID, and the credential the pull
+    // authenticates with.
+    QJsonObject secrets;
+    {
+        QFile file(sourceSecrets);
+        if (file.open(QIODevice::ReadOnly))
+            secrets = QJsonDocument::fromJson(file.readAll()).object();
+    }
+    secrets[QStringLiteral("realm")] = result.dnsDomain.toUpper();
+    secrets[QStringLiteral("netbiosDomain")] = netbios;
+    secrets[QStringLiteral("domainSid")] = result.domainSid;
+    secrets[QStringLiteral("machineGuid")] = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    secrets[QStringLiteral("replicaPassword")] = config.adminPassword;
+    if (!writeFile(result.secretsPath,
+                   QJsonDocument(secrets).toJson(QJsonDocument::Indented), &error)) {
+        result.error = error;
+        return result;
+    }
+    if (!QFile::setPermissions(result.secretsPath,
+                               QFileDevice::ReadOwner | QFileDevice::WriteOwner)) {
+        result.error = QStringLiteral("cannot restrict permissions on %1").arg(result.secretsPath);
+        return result;
+    }
+
+    // --- TLS --------------------------------------------------------------
+    result.tlsCertPath = privateDir + QStringLiteral("/ldap.crt");
+    result.tlsKeyPath = privateDir + QStringLiteral("/ldap.key");
+    result.tlsEnabled = generateSelfSignedCertificate(
+        result.tlsCertPath, result.tlsKeyPath, dcHost,
+        {dcHost, result.dnsDomain, dcIp, QStringLiteral("127.0.0.1"),
+         QStringLiteral("localhost")},
+        &result.tlsError);
+
+    // --- SYSVOL -----------------------------------------------------------
+    // The policy tree comes with the copy. Replicating SYSVOL between DCs is a
+    // separate service (FRS/DFSR) and is not what this does.
+    if (!copyTree(sourceSysvol, result.sysvolPath, &error)) {
+        result.error = error;
+        return result;
+    }
+
+    // --- DNS zone ---------------------------------------------------------
+    // The copy's zone, with this DC's locators added and its own A records held
+    // to its address. The source DC's records stay in the zone: a client that
+    // follows either DC reaches a DC.
+    {
+        DnsServer dns;
+        if (QFileInfo::exists(sourceZone)) {
+            QString zoneError;
+            if (!dns.loadZone(sourceZone, &zoneError)) {
+                result.error = zoneError;
+                return result;
+            }
+        } else {
+            dns.loadAdZone(result.dnsDomain, dcHost, dcIp, ports.ldap, ports.gc, siteName,
+                           ports.kpasswd, ports.kdc,
+                           objectGuidFor(result.baseDn).toString(QUuid::WithoutBraces));
+        }
+        // The GUID clients key the locator names on is the domain NC's — the
+        // same value the copy carried, never a function of the SID.
+        const QString domainGuid = objectGuidFor(result.baseDn).toString(QUuid::WithoutBraces);
+        dns.repairAdZoneLocators(dcHost, ports.ldap, ports.gc, siteName, ports.kpasswd,
+                                 ports.kdc, domainGuid);
+        dns.repairAdZoneAddresses(dcHost, dcIp);
+        QString zoneError;
+        if (!dns.saveZone(result.zonePath, &zoneError)) {
+            result.error = zoneError;
+            return result;
+        }
+    }
+
+    result.krb5ConfPath = target + QStringLiteral("/krb5.conf");
+    if (!writeKrb5Conf(result.krb5ConfPath, result.dnsDomain.toUpper(), result.dnsDomain,
+                       dcIp, ports.kdc, ports.kpasswd, &error)) {
+        result.error = error;
+        return result;
+    }
+
+    // --- Server configuration --------------------------------------------
+    const QString replicaHost = config.replicaHost.trimmed().isEmpty()
+        ? sourceConf.value(QStringLiteral("dcHost"),
+                           sourceConf.value(QStringLiteral("dcIp")).toString())
+              .toString()
+        : config.replicaHost.trimmed();
+    const quint16 replicaPort = config.replicaPort != 0
+        ? config.replicaPort
+        : quint16(sourceConf.value(QStringLiteral("drsPort"), 1038).toUInt());
+    if (replicaHost.isEmpty()) {
+        result.error = QStringLiteral("the copied dc.conf names no source DC to pull from "
+                                      "(pass --replica-host)");
+        return result;
+    }
+    QSettings conf(result.configPath, QSettings::IniFormat);
+    conf.setValue(QStringLiteral("realm"), result.dnsDomain.toUpper());
+    conf.setValue(QStringLiteral("domainSid"), result.domainSid);
+    conf.setValue(QStringLiteral("dnsDomain"), result.dnsDomain);
+    conf.setValue(QStringLiteral("netbiosDomain"), netbios);
+    conf.setValue(QStringLiteral("baseDn"), result.baseDn);
+    conf.setValue(QStringLiteral("ldapPort"), ports.ldap);
+    conf.setValue(QStringLiteral("gcPort"), ports.gc);
+    conf.setValue(QStringLiteral("dnsPort"), ports.dns);
+    // Forwarders follow the copy unless the caller names new ones: the upstream
+    // list is a property of the network this DC sits in, not of the domain.
+    QStringList forwarders = config.forwarders;
+    if (forwarders.isEmpty()) {
+        const QVariant raw = sourceConf.value(QStringLiteral("forwarders"));
+        forwarders = raw.typeId() == QMetaType::QStringList
+            ? raw.toStringList()
+            : raw.toString().split(QLatin1Char(','), Qt::SkipEmptyParts);
+        forwarders.erase(std::remove_if(forwarders.begin(), forwarders.end(),
+                                        [](QString &value) {
+                                            value = value.trimmed();
+                                            return value.isEmpty();
+                                        }),
+                         forwarders.end());
+    }
+    if (!forwarders.isEmpty())
+        conf.setValue(QStringLiteral("forwarders"), forwarders.join(QStringLiteral(", ")));
+    conf.setValue(QStringLiteral("samrPort"), ports.samr);
+    conf.setValue(QStringLiteral("lsadPort"), ports.lsad);
+    conf.setValue(QStringLiteral("epmPort"), config.epmPort);
+    conf.setValue(QStringLiteral("smbPort"), config.smbPort);
+    conf.setValue(QStringLiteral("netlogonPort"), config.netlogonPort);
+    conf.setValue(QStringLiteral("drsPort"), config.drsPort);
+    conf.setValue(QStringLiteral("kdcPort"), ports.kdc);
+    conf.setValue(QStringLiteral("kpasswdPort"), ports.kpasswd);
+    conf.setValue(QStringLiteral("krb5ConfPath"), result.krb5ConfPath);
+    conf.setValue(QStringLiteral("dcName"), dcLabel);
+    conf.setValue(QStringLiteral("dcHost"), dcHost);
+    conf.setValue(QStringLiteral("dcIp"), dcIp);
+    conf.setValue(QStringLiteral("siteName"), siteName);
+    conf.setValue(QStringLiteral("storePath"), result.storePath);
+    conf.setValue(QStringLiteral("secretsPath"), result.secretsPath);
+    conf.setValue(QStringLiteral("zonePath"), result.zonePath);
+    conf.setValue(QStringLiteral("sysvol"), result.sysvolPath);
+    if (result.tlsEnabled) {
+        conf.setValue(QStringLiteral("tlsCertPath"), result.tlsCertPath);
+        conf.setValue(QStringLiteral("tlsKeyPath"), result.tlsKeyPath);
+    }
+    // The partner this DC pulls from, and the credential it does so with. The
+    // source's DRS port is named rather than looked up through the endpoint
+    // mapper: a second DC on the same host cannot own 135 as well.
+    conf.setValue(QStringLiteral("replicaNamingContext"), result.baseDn);
+    conf.setValue(QStringLiteral("replicaDomain"), netbios);
+    conf.setValue(QStringLiteral("replicaUser"),
+                  config.replicaUser.trimmed().isEmpty()
+                      ? QStringLiteral("Administrator")
+                      : config.replicaUser.trimmed());
+    conf.setValue(QStringLiteral("replicaHost"), replicaHost);
+    conf.setValue(QStringLiteral("replicaPort"), replicaPort);
+    conf.setValue(QStringLiteral("replicaIntervalSeconds"), 300);
+    conf.sync();
     if (conf.status() != QSettings::NoError) {
         result.error = QStringLiteral("cannot write %1").arg(result.configPath);
         return result;

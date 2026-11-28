@@ -263,6 +263,28 @@ the provisioned zone. Re-running the provisioner refuses to touch an existing
 store unless `--force` is given. `--dc-ip` sets the address published in the
 zone (default `127.0.0.1`).
 
+A second controller for the same domain starts from a copy of the first one's
+directory (AD's install-from-media build):
+
+```sh
+cp -a "${XDG_DATA_HOME:-$HOME/.local/share}/monarchy/Monarchy" /var/lib/monarchy/dc2-media
+sudo -u monarchy-dc ./build/ui/monarchy-provision \
+    --promote-from /var/lib/monarchy/dc2-media \
+    --targetdir /var/lib/monarchy/dc2 \
+    --dc-host dc2 --dc-ip 10.0.0.12 \
+    --replica-host corpdc1.corp.example.com --replica-port 1038 \
+    --adminpass 'Choose-A-Password!'
+```
+
+The copy carries the domain's SIDs, its krbtgt key and its account verifiers,
+so a ticket issued by either controller opens at the other; the promoted
+controller adds only its own computer account, Server object and NTDS Settings
+object, and `--adminpass` is the credential it pulls with. Give the two
+daemons different ports in `dc.conf` when they share a host, and point this
+one's resolver at the domain's zone so it can resolve its partner by name. The
+source DC learns of the new controller when an administrator registers the link
+there (`DsReplicaAdd`) — this side only pulls.
+
 ```sh
 dig @127.0.0.1 -p 1053 SRV _ldap._tcp.dc._msdcs.corp.example.com +short
 # 0 100 1389 corpdc1.corp.example.com.
@@ -836,9 +858,10 @@ the caller names.
 hand, and `STATUS.md` is the 0.1.0 release contract.
 
 Not yet implemented: PKINIT and S4U, the rest of SAMR, pushing a rotated trust
-password to a peer,
-`DsReplicaAdd` and multi-DC replication (two Monarchy DCs, or
-Samba/Windows peers),
+password to a peer, promoting a second controller **over the wire** (a promoted
+DC today starts from a copy of the first one's directory, because the
+replicated attribute set deliberately carries no password material), the
+inter-site half of the KCC, replication with Samba or Windows peers,
 NTLM over raw SMB/DCE, GPO editing and client-side extension processing, the
 DNSP RPC interface and
 DNS zone storage in the directory (`CN=MicrosoftDNS,...`), reverse zones and
