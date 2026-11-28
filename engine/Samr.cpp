@@ -1558,15 +1558,8 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
             return fixed;
         }
         case 5: { // DomainNameInformation: the NetBIOS name, as AD reports it
-            const QByteArray utf16 = Ndr::utf16le(m_config.netbios);
             beginArm(5);
-            fixed.append(char(utf16.size() & 0xff));
-            fixed.append(char((utf16.size() >> 8) & 0xff));
-            fixed.append(char(utf16.size() & 0xff));
-            fixed.append(char((utf16.size() >> 8) & 0xff));
-            putLe32(fixed, utf16.isEmpty() ? 0u : 0x0002e460u);
-            if (!utf16.isEmpty())
-                appendVaryingString(deferred, m_config.netbios);
+            appendCountedString(fixed, deferred, m_config.netbios, strings);
             placeStrings(fixed, deferred, strings);
             putLe32(fixed, kStatusSuccess);
             emit requestReceived(QStringLiteral("QueryInformationDomain(name)"));
@@ -3448,10 +3441,16 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
         // PSAMPR_GET_MEMBERS_BUFFER: pointer, member count, then the two
         // conformant arrays (maximum count plus elements), and the status last.
         // Attributes are ULONGs, as SAMPR_GET_MEMBERS_BUFFER declares them.
-        putLe32(fixed, 0x0002e200u);          // buffer referent
-        putLe32(fixed, quint32(rids.size())); // MemberCount
-        putLe32(fixed, 0x0002e210u);          // Members referent
-        putLe32(fixed, 0x0002e220u);          // Attributes referent
+        // Each referent is the offset of its pointee from the start of the stub
+        // (MS-RPCE 2.2.10.6), not a value that is merely unique: the buffer
+        // names the member count behind it, and each array names its own
+        // maximum count, which begins it.
+        const int membersAt = 16; // behind the pointer, the count and the two arrays' pointers
+        const int attributesAt = membersAt + 4 + int(rids.size()) * 4;
+        putLe32(fixed, 4u);                          // buffer referent: MemberCount
+        putLe32(fixed, quint32(rids.size()));        // MemberCount
+        putLe32(fixed, quint32(membersAt));          // Members referent
+        putLe32(fixed, quint32(attributesAt));       // Attributes referent
         putLe32(fixed, quint32(rids.size())); // Members MaximumCount
         for (quint32 rid : rids)
             putLe32(fixed, rid);
@@ -3503,34 +3502,28 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
             name = found.name;
         const QString comment = found.attributes.value(QStringLiteral("description"));
 
+        QList<QPair<int, int>> strings;
         QByteArray deferred;
         auto beginArm = [&fixed](quint16 tag) {
-            putLe32(fixed, 0x0002e600u + tag); // union referent
+            // The union is behind a pointer here too, and it begins with its
+            // discriminant: the referent is the tag word's own offset.
+            putLe32(fixed, quint32(fixed.size() + 4)); // union referent
             fixed.append(char(tag & 0xff));
             fixed.append(char((tag >> 8) & 0xff));
             fixed.append(char(0));
             fixed.append(char(0));
         };
         // RPC_UNICODE_STRING: Length, MaximumLength and the buffer referent
-        // inline; the characters go after the fixed part of the structure.
-        auto putUnicode = [&fixed, &deferred](const QString &text, quint32 referent) {
-            const QByteArray utf16 = Ndr::utf16le(text);
-            fixed.append(char(utf16.size() & 0xff));
-            fixed.append(char((utf16.size() >> 8) & 0xff));
-            fixed.append(char(utf16.size() & 0xff));
-            fixed.append(char((utf16.size() >> 8) & 0xff));
-            putLe32(fixed, utf16.isEmpty() ? 0u : referent);
-            if (!utf16.isEmpty())
-                appendVaryingString(deferred, text);
-        };
+        // inline; the characters go after the fixed part of the structure and
+        // the referent is patched to where they land (appendCountedString).
         switch (infoClass) {
         case 1:   // GroupGeneralInformation: name, attributes, members, comment
         case 5: { // GroupAllInformation2: the same structure
             beginArm(infoClass);
-            putUnicode(name, 0x0002e610u);
+            appendCountedString(fixed, deferred, name, strings);
             putLe32(fixed, 7u); // SE_GROUP_MANDATORY|ENABLED_BY_DEFAULT|ENABLED
             putLe32(fixed, quint32(found.members.size()));
-            putUnicode(comment, 0x0002e620u);
+            appendCountedString(fixed, deferred, comment, strings);
             placeStrings(fixed, deferred, strings);
             putLe32(fixed, kStatusSuccess);
             emit requestReceived(QStringLiteral("QueryInformationGroup(%1, all)").arg(name));
@@ -3538,7 +3531,7 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
         }
         case 2: { // GroupNameInformation
             beginArm(2);
-            putUnicode(name, 0x0002e630u);
+            appendCountedString(fixed, deferred, name, strings);
             placeStrings(fixed, deferred, strings);
             putLe32(fixed, kStatusSuccess);
             emit requestReceived(QStringLiteral("QueryInformationGroup(%1, name)").arg(name));
@@ -3553,7 +3546,7 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
         }
         case 4: { // GroupAdminCommentInformation
             beginArm(4);
-            putUnicode(comment, 0x0002e640u);
+            appendCountedString(fixed, deferred, comment, strings);
             placeStrings(fixed, deferred, strings);
             putLe32(fixed, kStatusSuccess);
             emit requestReceived(QStringLiteral("QueryInformationGroup(%1, comment)").arg(name));
@@ -3604,34 +3597,25 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
             name = found.name;
         const QString comment = found.attributes.value(QStringLiteral("description"));
 
+        QList<QPair<int, int>> strings;
         QByteArray deferred;
         auto beginArm = [&fixed](quint16 tag) {
-            putLe32(fixed, 0x0002e700u + tag); // union referent
+            putLe32(fixed, quint32(fixed.size() + 4)); // union referent: the tag
             fixed.append(char(tag & 0xff));
             fixed.append(char((tag >> 8) & 0xff));
             fixed.append(char(0));
             fixed.append(char(0));
         };
-        auto putUnicode = [&fixed, &deferred](const QString &text, quint32 referent) {
-            const QByteArray utf16 = Ndr::utf16le(text);
-            fixed.append(char(utf16.size() & 0xff));
-            fixed.append(char((utf16.size() >> 8) & 0xff));
-            fixed.append(char(utf16.size() & 0xff));
-            fixed.append(char((utf16.size() >> 8) & 0xff));
-            putLe32(fixed, utf16.isEmpty() ? 0u : referent);
-            if (!utf16.isEmpty())
-                appendVaryingString(deferred, text);
-        };
         switch (infoClass) {
         case 1: { // AliasGeneralInformation
             beginArm(1);
-            putUnicode(name, 0x0002e710u);
+            appendCountedString(fixed, deferred, name, strings);
             putLe32(fixed, quint32(isBuiltinAlias(alias.dn)
                                        ? builtinMemberSids(alias.rid, m_config.domainSid,
                                                           directory(), found.members)
                                              .size()
                                        : found.members.size()));
-            putUnicode(comment, 0x0002e720u);
+            appendCountedString(fixed, deferred, comment, strings);
             placeStrings(fixed, deferred, strings);
             putLe32(fixed, kStatusSuccess);
             emit requestReceived(QStringLiteral("QueryInformationAlias(%1, general)").arg(name));
@@ -3639,7 +3623,7 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
         }
         case 2: { // AliasNameInformation
             beginArm(2);
-            putUnicode(name, 0x0002e730u);
+            appendCountedString(fixed, deferred, name, strings);
             placeStrings(fixed, deferred, strings);
             putLe32(fixed, kStatusSuccess);
             emit requestReceived(QStringLiteral("QueryInformationAlias(%1, name)").arg(name));
@@ -3647,7 +3631,7 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
         }
         case 3: { // AliasAdminCommentInformation
             beginArm(3);
-            putUnicode(comment, 0x0002e740u);
+            appendCountedString(fixed, deferred, comment, strings);
             placeStrings(fixed, deferred, strings);
             putLe32(fixed, kStatusSuccess);
             emit requestReceived(QStringLiteral("QueryInformationAlias(%1, comment)").arg(name));

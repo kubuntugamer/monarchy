@@ -984,6 +984,25 @@ void SamrTest::samrDirectoryCalls()
         QCOMPARE(reply.mid(8, 8), QByteArray(8, '\0')); // empty lsa_String
     }
 
+    // Class 5 is the domain's NetBIOS name alone. Its buffer pointer names the
+    // characters behind the record, as every deferred pointer must: a value
+    // that is merely unique (0x0002e460 and the like) lands a Windows stub
+    // outside the reply, which is how a 2000 client answered such a pointer.
+    QByteArray domainNameRequest = domainHandle;
+    domainNameRequest.append(char(5));
+    domainNameRequest.append(QByteArray(2, '\0'));
+    const QByteArray domainNameReply =
+        server.handleCall(Samr::OpQueryInformationDomain, domainNameRequest);
+    QCOMPARE(lastWord(domainNameReply), 0u);
+    QCOMPARE(readLe32At(domainNameReply, 0), 4u);
+    QCOMPARE(quint8(domainNameReply.at(4)), quint8(5));
+    const quint32 domainNameAt = readLe32At(domainNameReply, 12);
+    QVERIFY(domainNameAt != 0 && int(domainNameAt) < domainNameReply.size());
+    QCOMPARE(quint16(int(readLe32At(domainNameReply, 8)) & 0xffff),
+             quint16(Ndr::utf16le(config.netbios).size()));
+    QVERIFY(utf16Text(domainNameReply.mid(int(domainNameAt)))
+                .startsWith(config.netbios));
+
     // Class 9 is the server state and class 11 the general record with the
     // lockout policy appended; both used to be refused, which stops the walk a
     // one-call reader makes over the domain.
@@ -1464,6 +1483,13 @@ void SamrTest::samrServesTheBuiltinDomain()
         server.handleCall(Samr::OpQueryInformationAlias, queryAliasStub(aliasHandle, 1));
     QCOMPARE(lastWord(general), 0u);
     QVERIFY(utf16Text(general).contains(QStringLiteral("Administrators")));
+    // The union's referent names its own tag, and the name's pointer names the
+    // conformant array that holds the characters — its maximum count, offset
+    // and actual count, then the UTF-16: offsets from the start of the stub,
+    // not made-up values.
+    QCOMPARE(readLe32At(general, 0), 4u);
+    QCOMPARE(int(readLe32At(general, 12)),
+             int(general.indexOf(Ndr::utf16le(QStringLiteral("Administrators")))) - 12);
     const QByteArray members = server.handleCall(Samr::OpGetMembersInAlias, aliasHandle);
     QCOMPARE(lastWord(members), 0u);
     QCOMPARE(readLe32At(members, 0), 1u);
@@ -1744,6 +1770,25 @@ void SamrTest::samrWritesAccountsAndGroups()
     QCOMPARE(lastWord(members), 0u);
     QCOMPARE(readLe32At(members, 4), 1u);          // MemberCount
     QCOMPARE(readLe32At(members, 20), 1001u);      // the member's RID
+    // Every pointer in the buffer names its pointee: the count behind the
+    // buffer pointer, then each array's maximum count, which begins it.
+    QCOMPARE(readLe32At(members, 0), 4u);
+    QCOMPARE(readLe32At(members, 8), 16u);  // Members maximum count
+    QCOMPARE(readLe32At(members, 16), 1u);  // Members MaximumCount
+    QCOMPARE(readLe32At(members, 12), 24u); // Attributes maximum count
+    QCOMPARE(readLe32At(members, 24), 1u);  // Attributes MaximumCount
+
+    // QueryInformationGroup, the general class: the union is behind a pointer
+    // to its tag, and each string pointer names its characters.
+    QByteArray groupGeneral = groupHandle;
+    groupGeneral.append(QByteArray::fromHex("0100"));
+    const QByteArray groupInfo =
+        server.handleCall(Samr::OpQueryInformationGroup, groupGeneral);
+    QCOMPARE(lastWord(groupInfo), 0u);
+    QCOMPARE(readLe32At(groupInfo, 0), 4u);
+    QCOMPARE(quint8(groupInfo.at(4)), quint8(1));
+    QCOMPARE(int(readLe32At(groupInfo, 12)),
+             int(groupInfo.indexOf(Ndr::utf16le(QStringLiteral("staff")))) - 12);
 
     // SamrRemoveMemberFromForeignDomain names the member by SID and takes it out
     // of every group in the domain. A Windows 2000 client calls it on the way to
@@ -1835,6 +1880,7 @@ void SamrTest::samrWritesAccountsAndGroups()
         server.handleCall(Samr::OpQueryInformationAlias,
                           aliasHandle + QByteArray::fromHex("0100"));
     QCOMPARE(lastWord(aliasGeneral), 0u);
+    QCOMPARE(readLe32At(aliasGeneral, 0), 4u);  // union at the tag that follows
     QCOMPARE(readLe32At(aliasGeneral, 16), 1u); // MemberCount
 
     // The administrative comment is a directory attribute.
