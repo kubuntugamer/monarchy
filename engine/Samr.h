@@ -110,6 +110,11 @@ enum Opnum : quint16 {
     // call `net accounts /domain` makes for its lockout line.
     OpQueryInformationDomain2 = 46,
     OpQueryInformationUser2 = 47,
+    // SamrQueryDisplayInfo2 (48): the display enumeration `net group /domain`
+    // lists the domain's groups with, at level 3. It is the call that ended
+    // that command on a Windows 2000 client with "the network request is not
+    // supported" while the server answered it with an empty stub.
+    OpQueryDisplayInfo2 = 48,
     OpCreateUser2 = 50,
     // Both set-information calls take the same union: 37 is
     // SamrSetInformationUser (the one class 18 hash sets arrive on), 58 is

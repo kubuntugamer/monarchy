@@ -213,6 +213,22 @@ QByteArray enumAliasesStub(const QByteArray &domainHandle)
     return stub;
 }
 
+// SamrQueryDisplayInfo2 (opnum 48): the level, then the window and the size
+// the client will take, each a uint32 after the two padding bytes the level
+// leaves behind.
+QByteArray queryDisplayInfo2Stub(const QByteArray &domainHandle, quint16 level,
+                                 quint32 startIdx, quint32 maxEntries, quint32 bufSize)
+{
+    QByteArray stub = domainHandle;
+    stub.append(char(level & 0xff));
+    stub.append(char((level >> 8) & 0xff));
+    stub.append(QByteArray(2, '\0'));
+    appendLe32(stub, startIdx);
+    appendLe32(stub, maxEntries);
+    appendLe32(stub, bufSize);
+    return stub;
+}
+
 // SamrQueryInformationAlias: the class is a USHORT behind the handle.
 QByteArray queryAliasStub(const QByteArray &aliasHandle, quint16 infoClass)
 {
@@ -599,6 +615,7 @@ private slots:
     void samrDirectoryCalls();
     void samrServesTheDomainPasswordPolicy();
     void samrServesTheBuiltinDomain();
+    void samrPagesTheDomainGroupList();
     void samrWritesAccountsAndGroups();
     void samrWritesBuiltinAliasMembers();
     void samrSetPasswordAndAccountControl();
@@ -1494,6 +1511,103 @@ void SamrTest::samrServesTheBuiltinDomain()
                  Samr::OpCreateAliasInDomain,
                  createStub(builtinHandle, QStringLiteral("not-here"), false))),
              0xc00000bbu);
+}
+
+// `net group /domain` never asks for the group enumeration (opnum 11): it asks
+// for the display information at level 3 and pages with start_idx, and it is
+// that call whose empty answer ended the command. The reply is three
+// referents — total_size, returned_size and the SAMPR_DISPLAYINFO — each naming
+// its own data behind them, then one SAMPR_DISP_ENTRY_FULL_GROUP per group with
+// its index one-based on the whole list.
+void SamrTest::samrPagesTheDomainGroupList()
+{
+    QList<DirectoryObject> objects;
+    auto addGroup = [&objects](const QString &name, quint32 rid, const QString &description,
+                               const QString &groupType) {
+        DirectoryObject object;
+        object.id = QStringLiteral("CN=%1,CN=Users,DC=corp,DC=example,DC=com").arg(name);
+        object.name = name;
+        object.type = QStringLiteral("Group");
+        object.kind = ObjectKind::Group;
+        object.attributes.insert(QStringLiteral("sAMAccountName"), name);
+        object.attributes.insert(QStringLiteral("objectSid"),
+                                 QStringLiteral("S-1-5-21-1-2-3-%1").arg(rid));
+        object.attributes.insert(QStringLiteral("groupType"), groupType);
+        if (!description.isEmpty())
+            object.attributes.insert(QStringLiteral("description"), description);
+        objects.append(object);
+    };
+    addGroup(QStringLiteral("Administrators"), 512, QStringLiteral("Administer the domain"),
+             QStringLiteral("-2147483646"));
+    addGroup(QStringLiteral("Users"), 513, QString(), QStringLiteral("-2147483646"));
+    addGroup(QStringLiteral("Guests"), 514, QString(), QStringLiteral("-2147483646"));
+    // A domain-local group is an alias, which this level does not list.
+    addGroup(QStringLiteral("Remote Desktop Users"), 555, QString(), QStringLiteral("-2147483644"));
+
+    SamrServer server;
+    Samr::Config config;
+    config.realm = QStringLiteral("CORP.EXAMPLE.COM");
+    config.netbios = QStringLiteral("CORP");
+    config.domainSid = QStringLiteral("S-1-5-21-1-2-3");
+    server.setConfig(config);
+    server.setObjectProvider([objects]() { return objects; });
+
+    const QByteArray serverHandle = server.handleCall(Samr::OpConnect, kConnect).left(20);
+    const QByteArray domainHandle =
+        server.handleCall(Samr::OpOpenDomain, openDomainStub(serverHandle)).left(20);
+    QVERIFY(domainHandle.size() == 20);
+
+    const QByteArray reply =
+        server.handleCall(Samr::OpQueryDisplayInfo2,
+                          queryDisplayInfo2Stub(domainHandle, 3, 0, 0xffffffffu, 0x1000));
+    QCOMPARE(lastWord(reply), 0u);
+    // Each pointer is the offset of its pointee from the start of the stub.
+    QCOMPARE(readLe32At(reply, 0), 12u); // total_size
+    QCOMPARE(readLe32At(reply, 4), 16u); // returned_size
+    QCOMPARE(readLe32At(reply, 8), 20u); // the SAMPR_DISPLAYINFO
+    QCOMPARE(readLe32At(reply, 12), 96u);   // three entries at 0x20 bytes
+    QCOMPARE(readLe32At(reply, 16), 1024u); // the 0x20-entry batch offered
+    QCOMPARE(readLe32At(reply, 20), 3u);    // Count
+    QCOMPARE(readLe32At(reply, 24), 28u);   // the entries, behind the count
+
+    // Entry 0: idx, rid, attributes, then the name and the description, whose
+    // characters sit in the blob after the entry array.
+    QCOMPARE(readLe32At(reply, 28), 1u);
+    QCOMPARE(readLe32At(reply, 32), 512u);
+    QCOMPARE(readLe32At(reply, 36), 7u); // SE_GROUP_MANDATORY|ENABLED_BY_DEFAULT|ENABLED
+    QCOMPARE(varyingStringAt(reply, 44), QStringLiteral("Administrators"));
+    QCOMPARE(varyingStringAt(reply, 52), QStringLiteral("Administer the domain"));
+    QCOMPARE(readLe32At(reply, 56), 2u);
+    QCOMPARE(varyingStringAt(reply, 72), QStringLiteral("Users"));
+    QCOMPARE(readLe32At(reply, 84), 3u);
+    QCOMPARE(varyingStringAt(reply, 100), QStringLiteral("Guests"));
+    // The alias has no entry of its own.
+    QVERIFY(!reply.contains(QByteArrayLiteral("R\x00e\x00m\x00o\x00t\x00e\x00")));
+
+    // A second page starts where the client's index says and numbers its
+    // entries on the whole list, so the client can tell it has arrived.
+    const QByteArray page =
+        server.handleCall(Samr::OpQueryDisplayInfo2,
+                          queryDisplayInfo2Stub(domainHandle, 3, 2, 1, 0x1000));
+    QCOMPARE(readLe32At(page, 20), 1u);  // Count
+    QCOMPARE(readLe32At(page, 28), 3u);  // idx of the first entry of this page
+    QCOMPARE(varyingStringAt(page, 44), QStringLiteral("Guests"));
+
+    // The batch the client offers to take limits the page too: 0x40 bytes is
+    // two entries of the 0x20 the DC counts per entry. The size word reports
+    // the batch the client asked for, 0x80, which is what the reference DC
+    // leaves there when the buffer trims the count.
+    const QByteArray limited =
+        server.handleCall(Samr::OpQueryDisplayInfo2,
+                          queryDisplayInfo2Stub(domainHandle, 3, 0, 4, 0x40));
+    QCOMPARE(readLe32At(limited, 20), 2u);
+    QCOMPARE(readLe32At(limited, 16), 128u);
+
+    // A level nothing here has measured is refused rather than guessed at.
+    const QByteArray wrongLevel =
+        server.handleCall(Samr::OpQueryDisplayInfo2,
+                          queryDisplayInfo2Stub(domainHandle, 1, 0, 0xffffffffu, 0x1000));
+    QCOMPARE(lastWord(wrongLevel), 0xc0000003u); // STATUS_INVALID_INFO_CLASS
 }
 
 void SamrTest::samrWritesAccountsAndGroups()

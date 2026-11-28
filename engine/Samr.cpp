@@ -2064,6 +2064,110 @@ QByteArray SamrServer::handleCall(quint16 opnum, const QByteArray &stub,
         emit requestReceived(QStringLiteral("EnumerateAliases (%1)").arg(page.size()));
         return fixed;
     }
+    // SamrQueryDisplayInfo2 (opnum 48): the display enumeration. `net group
+    // /domain` asks for level 3 — the domain's groups — and pages through them
+    // with start_idx, which is the only way that command reads a group list: it
+    // never issues the group enumeration (opnum 11). The reply is three
+    // referents, total_size, returned_size and the SAMPR_DISPLAYINFO, each the
+    // offset of its own word or structure behind them (MS-RPCE 2.2.10.6), then
+    // the status after all of it.
+    case Samr::OpQueryDisplayInfo2: {
+        QByteArray handle;
+        if (!reader.bytes(kHandleSize, &handle))
+            return {};
+        quint16 level = 0;
+        reader.u16(&level);
+        reader.align(4); // the level is a uint16 and start_idx a uint32
+        quint32 startIdx = 0;
+        quint32 maxEntries = 0;
+        quint32 bufSize = 0;
+        reader.u32(&startIdx);
+        reader.u32(&maxEntries);
+        reader.u32(&bufSize);
+
+        Handle domain;
+        if (!lookupHandle(handle, Handle::Domain, &domain)) {
+            putLe32(fixed, 0); // total_size
+            putLe32(fixed, 0); // returned_size
+            putLe32(fixed, 0); // the display information
+            putLe32(fixed, kStatusInvalidHandle);
+            return fixed;
+        }
+        // Level 3 is the one a client here has asked for; the users a client
+        // lists come over the enumeration call (opnum 13). Any other level is
+        // refused rather than guessed at.
+        if (level != 3) {
+            putLe32(fixed, 0);
+            putLe32(fixed, 0);
+            putLe32(fixed, 0);
+            putLe32(fixed, kStatusInvalidInfoClass);
+            emit requestReceived(QStringLiteral("QueryDisplayInfo2 level %1 unsupported")
+                                     .arg(level));
+            return fixed;
+        }
+
+        const QList<DirectoryObject> all =
+            domain.dn == kBuiltinDomainSid ? QList<DirectoryObject>() : groups();
+
+        // How much of the list this reply may carry. The DC box B's guest reads
+        // caps a request at 0x20 entries and then at the batch the client says
+        // it will take, counting 0x20 bytes per entry; the entries carry idx
+        // values, so a client pages on those and gets one page per call.
+        const quint32 entrySize = 0x20;
+        if (maxEntries > 0x20)
+            maxEntries = 0x20;
+        const quint32 batchSize = maxEntries * entrySize;
+        if (batchSize > bufSize)
+            maxEntries = qMin(bufSize / entrySize, maxEntries);
+
+        const int count = int(all.size());
+        const int from = int(qMin<quint32>(startIdx, quint32(count)));
+        QList<DirectoryObject> page;
+        for (int i = from; i < count && int(page.size()) < int(maxEntries); ++i)
+            page.append(all.at(i));
+
+        // The two sizes travel as the DC measures them: total_size counts the
+        // entries this page carries and returned_size the batch the client
+        // asked for, before the buffer trimmed the count. The guest pages on
+        // the entries' own idx values, so both are ours to report this way.
+        const quint32 totalSize = quint32(page.size()) * entrySize;
+        const quint32 returnedSize = page.isEmpty() ? 0u : batchSize;
+
+        const int base = int(fixed.size());
+        putLe32(fixed, quint32(base + 12)); // total_size
+        putLe32(fixed, quint32(base + 16)); // returned_size
+        putLe32(fixed, quint32(base + 20)); // the SAMPR_DISPLAYINFO
+        putLe32(fixed, totalSize);
+        putLe32(fixed, returnedSize);
+        // The display information is the count and a pointer to the entries,
+        // which sit directly behind it.
+        putLe32(fixed, quint32(page.size()));
+        putLe32(fixed, page.isEmpty() ? 0u : quint32(base + 28));
+        QByteArray deferred;
+        QList<QPair<int, int>> strings;
+        for (int i = 0; i < page.size(); ++i) {
+            const DirectoryObject &group = page.at(i);
+            QString name = group.attributes.value(QStringLiteral("sAMAccountName"));
+            if (name.isEmpty())
+                name = group.name;
+            // SAMPR_DISP_ENTRY_FULL_GROUP: idx, rid, attributes, name,
+            // description. The idx is one-based on the whole list, so a page
+            // that starts halfway still numbers its entries where they belong.
+            putLe32(fixed, startIdx + quint32(i) + 1);
+            putLe32(fixed, ridOf(group));
+            putLe32(fixed, 7u); // SE_GROUP_MANDATORY|ENABLED_BY_DEFAULT|ENABLED
+            appendCountedString(fixed, deferred, name, strings);
+            appendCountedString(fixed, deferred,
+                                group.attributes.value(QStringLiteral("description")), strings);
+        }
+        placeStrings(fixed, deferred, strings);
+        putLe32(fixed, kStatusSuccess);
+        emit requestReceived(QStringLiteral("QueryDisplayInfo2(groups %1 of %2 from %3)")
+                                 .arg(page.size())
+                                 .arg(count)
+                                 .arg(startIdx));
+        return fixed;
+    }
     // SamrGetAliasMembership (opnum 16): which domain-local groups a set of
     // SIDs belongs to, as samr_Ids. `net user /domain` asks it after
     // GetGroupsForUser to fill its "Local Group memberships" line, and stops
