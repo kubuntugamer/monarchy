@@ -741,6 +741,10 @@ QByteArray updateRefsRequest(const QByteArray &handle, const QString &ncDn,
     stub.append(QByteArray(28, '\0'));         // Sid slot
     putLe32(stub, quint32(chars.size() / 2));  // NameLen in bytes
     stub.append(chars);
+    // NDR aligns the next deferred body: the DSNAME's characters end on a
+    // half-word when the DN length is odd, and the name starts after it.
+    while (stub.size() % 4 != 0)
+        stub.append('\0');
 
     if (!destDsaName.isEmpty()) {
         const QByteArray nameChars = Ndr::utf16le(destDsaName + QChar(u'\0'));

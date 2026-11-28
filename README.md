@@ -283,8 +283,13 @@ controller adds only its own computer account, Server object and NTDS Settings
 object, and `--adminpass` is the credential it pulls with. Give the two
 daemons different ports in `dc.conf` when they share a host, and point this
 one's resolver at the domain's zone so it can resolve its partner by name. The
-source DC learns of the new controller when an administrator registers the link
-there (`DsReplicaAdd`) — this side only pulls.
+pull itself is one-way, so after the first completed cycle the new controller
+tells the source it replicates from it: `DsReplicaUpdateRefs` naming its own
+DSA by the GUID CNAME it publishes under `_msdcs` (`<ntdsGuid>._msdcs.<domain>`
+→ its host name), which the source keeps as that DSA's `repsTo`. That is the
+same call a stock Samba join sends, and it is what the source's own topology
+and notifications hang off; a registration that fails is reported and retried
+with the next successful pull rather than skipped silently.
 
 `--replica-host` may name the peer by address while the directory publishes it
 by DNS name; the two are compared as machines, not as strings, so the port
