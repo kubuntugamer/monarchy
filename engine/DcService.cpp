@@ -25,8 +25,10 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QHostAddress>
+#include <QHostInfo>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QNetworkInterface>
 #include <QRegularExpression>
 #include <QSettings>
 #include <QStandardPaths>
@@ -445,6 +447,65 @@ QStringList notifyTargetsFrom(const QSettings &config)
     for (const QString &entry : entries)
         targets += entry.split(QRegularExpression(QStringLiteral("[,;\\s]+")), Qt::SkipEmptyParts);
     return targets;
+}
+
+// The addresses a host string names: a literal address is itself, a name is
+// whatever the resolver reports, and a name that does not resolve names none.
+QStringList addressesNamedBy(const QString &host)
+{
+    QStringList addresses;
+    const QString trimmed = host.trimmed();
+    if (trimmed.isEmpty())
+        return addresses;
+    const QHostAddress literal(trimmed);
+    if (!literal.isNull()) {
+        addresses.append(literal.toString());
+        return addresses;
+    }
+    const QList<QHostAddress> resolved = QHostInfo::fromName(trimmed).addresses();
+    for (const QHostAddress &address : resolved)
+        addresses.append(address.toString());
+    return addresses;
+}
+
+// Whether a host string names this machine: a loopback literal, an address on
+// one of this host's interfaces, or a name that is its own or resolves to one
+// of them. This is what lets `127.0.0.1` and the name the directory publishes
+// be recognised as one machine when a second DC runs beside the first.
+bool namesThisMachine(const QString &host)
+{
+    const QString trimmed = host.trimmed();
+    if (trimmed.isEmpty())
+        return false;
+    const QHostAddress literal(trimmed);
+    if (!literal.isNull())
+        return literal.isLoopback() || QNetworkInterface::allAddresses().contains(literal);
+    const QString localName = QHostInfo::localHostName();
+    if (trimmed.compare(localName, Qt::CaseInsensitive) == 0
+        || trimmed.section(QLatin1Char('.'), 0, 0).compare(localName, Qt::CaseInsensitive) == 0)
+        return true;
+    for (const QString &address : addressesNamedBy(trimmed)) {
+        const QHostAddress parsed(address);
+        if (parsed.isLoopback() || QNetworkInterface::allAddresses().contains(parsed))
+            return true;
+    }
+    return false;
+}
+
+// Two host strings as dc.conf and the KCC write them. The operator may name the
+// partner by address while the directory publishes it by name, or the other way
+// round, and both still name one machine; comparing the text alone would make
+// the port the configuration carries apply only to one spelling of it.
+bool namesTheSameMachine(const QString &left, const QString &right)
+{
+    if (left.trimmed().compare(right.trimmed(), Qt::CaseInsensitive) == 0)
+        return true;
+    const QStringList leftAddresses = addressesNamedBy(left);
+    for (const QString &address : addressesNamedBy(right)) {
+        if (leftAddresses.contains(address))
+            return true;
+    }
+    return namesThisMachine(left) && namesThisMachine(right);
 }
 
 } // namespace
@@ -1205,7 +1266,7 @@ bool DcService::start(const QString &dcDir)
                                        const QString &host, quint16 port) {
         if (port != 0 || configuredReplicaHostPort == 0)
             return port;
-        if (host.compare(configuredReplicaHostName, Qt::CaseInsensitive) != 0)
+        if (!namesTheSameMachine(host, configuredReplicaHostName))
             return port;
         return configuredReplicaHostPort;
     };

@@ -3,7 +3,9 @@
 
 #include <QtTest>
 #include <QDateTime>
+#include <QElapsedTimer>
 #include <QFile>
+#include <QHostInfo>
 #include <QMap>
 #include <QProcess>
 #include <QSettings>
@@ -214,6 +216,7 @@ private slots:
     void writerAndReaderAgreeOnForwarders();
     void keepsReplicaLinkAsAConnectionObject();
     void kccAddsTheConnectionASecondDcInTheSiteNeeds();
+    void usesTheConfiguredPortWhenTheLinkNamesThePartnerByName();
     void rotatesATrustPasswordThatIsThirtyDaysOld();
     void commitsClientWritesWhileItRuns();
 };
@@ -724,6 +727,113 @@ void DcServiceTest::kccAddsTheConnectionASecondDcInTheSiteNeeds()
                  QStringLiteral("CN=NTDS Settings,CN=DC2,%1").arg(serversDn));
     }
     QVERIFY2(found, "no KCC connection object for the partner was kept in the store");
+}
+
+// dc.conf names the partner once, by address; the directory publishes it by
+// name. The connection the KCC writes carries the published name and no port,
+// so the port the configuration holds has to apply to that spelling too — the
+// two name one machine. Measured on a promoted DC beside its source: naming the
+// partner `127.0.0.1` left the pull dialling the peer's endpoint mapper on 135
+// and failing, while the same promote with the peer's published name worked.
+void DcServiceTest::usesTheConfiguredPortWhenTheLinkNamesThePartnerByName()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+
+    ProvisionConfig config;
+    config.realm = QStringLiteral("ALIAS.EXAMPLE.ORG");
+    config.netbiosDomain = QStringLiteral("ALIAS");
+    config.adminPassword = QStringLiteral("Secret123!");
+    config.targetDir = dir.path();
+    config.devPorts = true;
+    const ProvisionResult result = provisionDomain(config);
+    QVERIFY2(result.ok, qPrintable(result.error));
+    moveTakenPorts(dir.path());
+
+    // This host's own name, as the partner an on-host second DC publishes would
+    // be — the shape a promoted dc2 sees when its partner is `127.0.0.1`.
+    const QString partnerHost =
+        QHostInfo::localHostName().toLower() + QLatin1Char('.') + result.dnsDomain;
+    const QString configNc = QStringLiteral("CN=Configuration,%1").arg(result.baseDn);
+    const QString serversDn =
+        QStringLiteral("CN=Servers,CN=Default-First-Site-Name,CN=Sites,%1").arg(configNc);
+    {
+        LdapServer store;
+        QVERIFY2(store.loadFromFile(dir.path() + QStringLiteral("/private/directory.json")),
+                 "cannot read the provisioned store");
+        QList<DirectoryObject> objects = store.objects();
+
+        DirectoryObject server;
+        server.id = QStringLiteral("CN=DC2,%1").arg(serversDn);
+        server.name = QStringLiteral("DC2");
+        server.attributes.insert(QStringLiteral("objectClass"), QStringLiteral("top;server"));
+        server.attributes.insert(QStringLiteral("cn"), QStringLiteral("DC2"));
+        server.attributes.insert(QStringLiteral("dNSHostName"), partnerHost);
+        objects.append(server);
+
+        DirectoryObject ntds;
+        ntds.id = QStringLiteral("CN=NTDS Settings,%1").arg(server.id);
+        ntds.name = QStringLiteral("NTDS Settings");
+        ntds.attributes.insert(QStringLiteral("objectClass"), QStringLiteral("top;nTDSDSA"));
+        objects.append(ntds);
+
+        store.setObjects(objects);
+        QVERIFY2(store.saveToFile(dir.path() + QStringLiteral("/private/directory.json")),
+                 "cannot write the store");
+    }
+
+    // The documented invocation: the peer by address, its DRS port beside it.
+    // Nothing listens there, so the pull fails on the port it dialled — which is
+    // what the assertion reads.
+    const quint16 port = freePort();
+    {
+        QSettings conf(dir.path() + QStringLiteral("/dc.conf"), QSettings::IniFormat);
+        conf.setValue(QStringLiteral("replicaHost"), QStringLiteral("127.0.0.1"));
+        conf.setValue(QStringLiteral("replicaPort"), port);
+        conf.setValue(QStringLiteral("replicaIntervalSeconds"), 5);
+        conf.sync();
+    }
+
+    DcService service;
+    QSignalSpy messages(&service, &DcService::statusMessage);
+    QVERIFY2(service.start(dir.path()),
+             "the daemon refused to start with a partner published in its site");
+
+    // The KCC registers the link under the published name, so the source the
+    // pull reports is that name; what this reads is which port it dialled.
+    const QString dialled = QStringLiteral(":%1").arg(port);
+    bool usedTheConfiguredPort = false;
+    bool fellBackToEpm = false;
+    QElapsedTimer waited;
+    waited.start();
+    while (waited.elapsed() < 15000 && !usedTheConfiguredPort) {
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 200);
+        for (const QString &line : spokenMessages(messages)) {
+            if (!line.contains(QStringLiteral("Replication pull from")))
+                continue;
+            if (line.contains(dialled))
+                usedTheConfiguredPort = true;
+            if (line.contains(QStringLiteral(":135")))
+                fellBackToEpm = true;
+        }
+    }
+    const QStringList spoken = spokenMessages(messages);
+    service.stop();
+
+    // The link really was registered under the published name: that overwrite is
+    // the step that used to drop the port, so a run where it never happened
+    // would pass this case without measuring anything.
+    bool registered = false;
+    for (const QString &line : spoken) {
+        if (line.contains(partnerHost) && line.contains(QStringLiteral("registered")))
+            registered = true;
+    }
+    QVERIFY2(registered, "the KCC never registered the partner published in this site");
+    QVERIFY2(usedTheConfiguredPort,
+             qPrintable(QStringLiteral("the pull ignored replicaPort (port %1): %2")
+                            .arg(port)
+                            .arg(spoken.join(QStringLiteral(" | ")))));
+    QVERIFY2(!fellBackToEpm, "the pull fell back to the endpoint mapper on 135");
 }
 
 // A trust's password is not a static secret: the DC that holds the PDC emulator

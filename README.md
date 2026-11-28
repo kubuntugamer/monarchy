@@ -286,6 +286,14 @@ one's resolver at the domain's zone so it can resolve its partner by name. The
 source DC learns of the new controller when an administrator registers the link
 there (`DsReplicaAdd`) — this side only pulls.
 
+`--replica-host` may name the peer by address while the directory publishes it
+by DNS name; the two are compared as machines, not as strings, so the port
+`--replica-port` records applies to the connection the KCC later writes under
+the published name. When the peer already runs a DC on this host, give this
+one the whole unprivileged binding set (`--dev-ports`, which now moves the
+Global Catalog and the mapper and SMB ports too) or set the four ports by hand
+in `dc.conf`.
+
 ```sh
 dig @127.0.0.1 -p 1053 SRV _ldap._tcp.dc._msdcs.corp.example.com +short
 # 0 100 1389 corpdc1.corp.example.com.
