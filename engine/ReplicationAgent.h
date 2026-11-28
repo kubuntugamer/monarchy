@@ -9,6 +9,7 @@
 #include <QHash>
 #include <QList>
 #include <QObject>
+#include <QUuid>
 #include <QString>
 #include <QStringList>
 
@@ -45,6 +46,13 @@ public:
     void setNamingContexts(const QStringList &dns);
     void setSink(Sink sink) { m_sink = std::move(sink); }
 
+    // How this DSA names itself to the source once a pull has succeeded: its
+    // GUID and the GUID CNAME under _msdcs that resolves to it. With that set,
+    // the first completed pull is followed by DsReplicaUpdateRefs for each
+    // naming context, which is the reverse link AD keeps as the source's
+    // repsTo. Left unset, the agent only pulls.
+    void setRegistration(const QUuid &dsaGuid, const QString &dsaName);
+
     QString source() const;
     QStringList namingContexts() const { return m_ncs; }
     quint64 lastUsn() const { return m_cursors.value(m_ncs.value(0), 0); }
@@ -80,6 +88,8 @@ public:
 
 signals:
     void pulled(const QString &summary);
+    void registered(const QString &summary);
+    void registrationFailed(const QString &detail);
 
 private:
     QString m_host;
@@ -93,6 +103,10 @@ private:
     Sink m_sink;
     QHash<QString, quint64> m_cursors;
     quint32 m_cycles = 0;
+    QUuid m_dsaGuid;
+    QString m_dsaName;
+    bool m_registrationSet = false;
+    bool m_registered = false;
 };
 
 #endif // REPLICATIONAGENT_H

@@ -1298,6 +1298,21 @@ bool DcService::start(const QString &dcDir)
     });
     connect(m_replicationAgent, &ReplicationAgent::pulled, this,
             [this](const QString &summary) { emit statusMessage(summary); });
+    connect(m_replicationAgent, &ReplicationAgent::registered, this,
+            [this](const QString &summary) { emit statusMessage(summary); });
+    connect(m_replicationAgent, &ReplicationAgent::registrationFailed, this,
+            [this](const QString &detail) { emit statusMessage(detail); });
+    // After a completed pull this DC tells its source it replicates from it,
+    // naming itself the way AD does: its DSA GUID as a CNAME under _msdcs, not
+    // an address, so the source resolves a name and gets the port from the
+    // endpoint mapper.
+    {
+        const QUuid ownDsa = Drs::sourceDsaGuid(
+            krbRealm.domainSid, dcHost.section(QLatin1Char('.'), 0, 0).toUpper());
+        const QString ownDsaName = ownDsa.toString(QUuid::WithoutBraces).toLower()
+            + QStringLiteral("._msdcs.") + dnsDomain;
+        m_replicationAgent->setRegistration(ownDsa, ownDsaName);
+    }
 
     m_replicaIntervalSeconds =
         qMax(1, dcConfig.value(QStringLiteral("replicaIntervalSeconds"), 300).toInt());
@@ -1802,7 +1817,14 @@ bool DcService::start(const QString &dcDir)
     // AD publishes a reverse zone for the DC's own address; `dig -x` against a
     // domain controller is answered from it, so this DC holds one too.
     const bool reverseRepaired = m_dnsServer->repairReverseZone(dcHost, dcIp);
-    if (addressRepaired || locatorsRepaired || reverseRepaired) {
+    // The DSA's GUID CNAME is the name a partner is given when it is told to
+    // replicate from this DC, so it is published beside the locators.
+    const QUuid ownDsaGuid = Drs::sourceDsaGuid(
+        dcConfig.value(QStringLiteral("domainSid")).toString(),
+        dcHost.section(QLatin1Char('.'), 0, 0).toUpper());
+    const bool aliasPublished =
+        m_dnsServer->publishDsaAlias(ownDsaGuid.toString(QUuid::WithoutBraces), dcHost);
+    if (addressRepaired || locatorsRepaired || reverseRepaired || aliasPublished) {
         QString zoneError;
         if (!m_zonePath.isEmpty() && !m_dnsServer->saveZone(m_zonePath, &zoneError))
             emit statusMessage(tr("Could not persist the repaired zone: %1").arg(zoneError));

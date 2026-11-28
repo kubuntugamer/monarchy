@@ -108,6 +108,12 @@ public:
                              const QString &site, quint16 kpasswdPort = 464,
                              quint16 kdcPort = 88, const QString &domainGuid = QString());
 
+    // The alias AD publishes for a DSA: `<dsaGuid>._msdcs.<zone>` as a CNAME to
+    // the DC's own host name. A partner told to replicate from a new replica is
+    // given this name, never an address, so the name has to resolve here.
+    // Returns true when the zone changed.
+    bool publishDsaAlias(const QString &dsaGuid, const QString &host);
+
     // Holds the DC's own A records (host, ns1 and the zone apex) to the address
     // it is configured with. A zone loaded from disk can carry the address of a
     // machine that has since moved, and dcIp is the authority on where this DC

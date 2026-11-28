@@ -718,6 +718,42 @@ QByteArray getNCChangesRequest(const QByteArray &handle, const QString &ncDn,
     return stub;
 }
 
+QByteArray updateRefsRequest(const QByteArray &handle, const QString &ncDn,
+                             const QUuid &destDsa, const QString &destDsaName,
+                             quint32 options)
+{
+    QByteArray stub = handle.left(kHandleSize);
+    if (stub.size() < kHandleSize)
+        stub.append(QByteArray(kHandleSize - stub.size(), '\0'));
+    putLe32(stub, 1);                 // level: V1
+    putLe32(stub, 0x00020000u);       // naming_context referent
+    stub.append(guidBytes(destDsa));  // dest_dsa_guid
+    putLe32(stub, destDsaName.isEmpty() ? 0u : 0x00020001u);
+    putLe32(stub, options);
+
+    // The deferred DSNAME carries the DN alone: its GUID field is zero and its
+    // SidLen 0, the shape a join sends for a naming context.
+    const QByteArray chars = Ndr::utf16le(ncDn + QChar(u'\0'));
+    putLe32(stub, quint32(chars.size() / 2));
+    putLe32(stub, 60 + quint32(chars.size())); // structLen
+    putLe32(stub, 0);                          // SidLen
+    stub.append(QByteArray(16, '\0'));         // Guid
+    stub.append(QByteArray(28, '\0'));         // Sid slot
+    putLe32(stub, quint32(chars.size() / 2));  // NameLen in bytes
+    stub.append(chars);
+
+    if (!destDsaName.isEmpty()) {
+        const QByteArray nameChars = Ndr::utf16le(destDsaName + QChar(u'\0'));
+        putLe32(stub, quint32(nameChars.size() / 2));
+        putLe32(stub, 0);
+        putLe32(stub, quint32(nameChars.size() / 2));
+        stub.append(nameChars);
+        while (stub.size() % 4 != 0)
+            stub.append('\0');
+    }
+    return stub;
+}
+
 bool parseGetNCChangesReply(const QByteArray &stub, QList<DirectoryObject> *objects,
                             quint64 *usnHigh, bool *moreData, quint32 *werr)
 {
@@ -1253,6 +1289,29 @@ bool DrsClient::callInternal(quint16 opnum, const QString &name, const QByteArra
         return false;
     }
     emit callCompleted(name);
+    return true;
+}
+
+bool DrsClient::updateRefs(const QString &ncDn, const QUuid &destDsa,
+                           const QString &destDsaName, quint32 options, QString *error)
+{
+    QByteArray reply;
+    if (!callInternal(4, QStringLiteral("DsReplicaUpdateRefs"),
+                      DrsWire::updateRefsRequest(m_handle, ncDn, destDsa, destDsaName, options),
+                      &reply, error))
+        return false;
+    if (reply.size() < 4) {
+        if (error)
+            *error = QStringLiteral("DsReplicaUpdateRefs reply could not be parsed");
+        return false;
+    }
+    const quint32 werr = readLe32(reply, 0);
+    if (werr != kWerrOk) {
+        if (error)
+            *error = QStringLiteral("DsReplicaUpdateRefs refused: 0x%1")
+                         .arg(werr, 8, 16, QLatin1Char('0'));
+        return false;
+    }
     return true;
 }
 

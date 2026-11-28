@@ -384,6 +384,23 @@ public:
         return reply;
     }
 
+    QList<ReplicaDestination> replicaDestinations()
+    {
+        DrsServer *server = nullptr;
+        {
+            QMutexLocker lock(&m_serverMutex);
+            server = m_server;
+        }
+        if (!server || !isRunning())
+            return {};
+        QList<ReplicaDestination> found;
+        QMetaObject::invokeMethod(
+            server,
+            [server, &found]() { found = server->replicaDestinations(); },
+            Qt::BlockingQueuedConnection);
+        return found;
+    }
+
     int replicaSourceCount()
     {
         DrsServer *server = nullptr;
@@ -707,6 +724,52 @@ private slots:
         // Each cursor sits at its own NC's high-water mark, and a second pull
         // over the same pair takes nothing.
         QCOMPARE(agent.pullOnce(&error), 0);
+
+        peer.quit();
+        QVERIFY(peer.wait(5000));
+    }
+
+    // The reverse link: once a pull has completed, the agent tells its source
+    // that it replicates from it, naming itself by its DSA GUID CNAME — the
+    // shape a Samba join sends. The source keeps it as repsTo, and it happens
+    // once rather than on every cycle.
+    void aPullAgentRegistersItselfWithTheSource()
+    {
+        DrsServerThread peer([]() { return fixture(); }, config());
+        peer.start();
+        peer.waitUntilListening();
+
+        LdapServer target;
+        ReplicationAgent agent;
+        agent.setSource(QStringLiteral("127.0.0.1"), peer.port());
+        agent.setNamingContext(kBaseDn);
+        agent.setSink([&target](const QList<DirectoryObject> &objects) {
+            return target.applyReplication(objects);
+        });
+        const QUuid dsa = QUuid::fromString(QStringLiteral("00112233-4455-6677-8899-aabbccddeeff"));
+        const QString dsaName =
+            QStringLiteral("00112233-4455-6677-8899-aabbccddeeff._msdcs.corp.example.com");
+        agent.setRegistration(dsa, dsaName);
+
+        QStringList registered;
+        QObject::connect(&agent, &ReplicationAgent::registered,
+                         [&registered](const QString &summary) { registered.append(summary); });
+
+        QString error;
+        QVERIFY2(agent.pullOnce(&error) >= 0, qPrintable(error));
+        QCOMPARE(registered.size(), 1);
+        const QList<ReplicaDestination> destinations = peer.replicaDestinations();
+        QCOMPARE(destinations.size(), 1);
+        QCOMPARE(destinations.first().ncDn, kBaseDn);
+        QCOMPARE(destinations.first().destDsa, dsa);
+        QCOMPARE(destinations.first().destDsaName, dsaName);
+        QCOMPARE(destinations.first().options, DrsWire::kUpdateRefsAddWrite);
+
+        // The registration is once per process: a second cycle that takes
+        // nothing new is still a pull that succeeded.
+        QCOMPARE(agent.pullOnce(&error), 0);
+        QCOMPARE(peer.replicaDestinations().size(), 1);
+        QCOMPARE(registered.size(), 1);
 
         peer.quit();
         QVERIFY(peer.wait(5000));

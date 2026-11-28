@@ -51,6 +51,13 @@ void ReplicationAgent::setCredentials(const QString &domain, const QString &user
     m_credentialsSet = !user.isEmpty() && !password.isEmpty();
 }
 
+void ReplicationAgent::setRegistration(const QUuid &dsaGuid, const QString &dsaName)
+{
+    m_dsaGuid = dsaGuid;
+    m_dsaName = dsaName;
+    m_registrationSet = !dsaGuid.isNull() && !dsaName.isEmpty();
+}
+
 void ReplicationAgent::setNamingContext(const QString &dn)
 {
     setNamingContexts(dn.isEmpty() ? QStringList() : QStringList{dn});
@@ -177,6 +184,36 @@ int ReplicationAgent::pullOnce(QString *error)
     }
 
     m_cycles += cycles;
+
+    // The reverse link, once: a DC that has taken changes from a source tells
+    // that source it replicates from it, which is the announcement AD keeps as
+    // the source's repsTo and what a stock Samba join sends as DsReplicaUpdateRefs.
+    // It waits for a completed pull because a reference to a replica that has
+    // never pulled is a claim this DC cannot make yet.
+    if (m_registrationSet && !m_registered) {
+        bool all = true;
+        QString failure;
+        for (const QString &nc : m_ncs) {
+            QString step;
+            if (!client.updateRefs(nc, m_dsaGuid, m_dsaName, DrsWire::kUpdateRefsAddWrite, &step)) {
+                all = false;
+                failure = step;
+                break;
+            }
+        }
+        if (all) {
+            m_registered = true;
+            emit registered(QStringLiteral("%1 replicates %2 naming context(s) from %3; "
+                                           "the source records it as repsTo")
+                                .arg(m_dsaName)
+                                .arg(m_ncs.size())
+                                .arg(source()));
+        } else {
+            emit registrationFailed(
+                QStringLiteral("The reverse registration with %1 failed: %2")
+                    .arg(source(), failure));
+        }
+    }
 
     client.dsUnbind();
     client.close();

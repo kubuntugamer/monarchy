@@ -539,6 +539,7 @@ private slots:
     void publishesTheDomainGuidLocator();
     void repairsTheDomainGuidLocator();
     void repairsAdZoneLocators();
+    void publishesTheDsaGuidAlias();
     void withdrawsLocatorsForUnboundServices();
     void followsConfiguredAddressOnDiskZone();
     void answersQueriesOverUdp();
@@ -776,6 +777,29 @@ void DnsTest::repairsAdZoneLocators()
     // A zone that already matches is not rewritten, so a start does not bump
     // the serial for nothing.
     QVERIFY(!server.repairAdZoneLocators(host, 389, 3268, site, 464, 8888));
+}
+
+void DnsTest::publishesTheDsaGuidAlias()
+{
+    const QString zone = QStringLiteral("monarchy.example.com");
+    const QString host = QStringLiteral("monarchydc2.monarchy.example.com");
+    const QString guid = QStringLiteral("00112233-4455-6677-8899-aabbccddeeff");
+
+    DnsServer server;
+    server.loadAdZone(zone, host, QStringLiteral("10.0.0.12"), 1389, 3268,
+                      QStringLiteral("Default-First-Site-Name"));
+
+    // A partner told to replicate from this DSA is given the GUID CNAME, so the
+    // name it resolves has to exist and point at this DC's own host name.
+    QVERIFY(server.publishDsaAlias(guid, host));
+    const QString owner = guid + QStringLiteral("._msdcs.") + zone;
+    const QList<DnsServer::Record> alias = server.records(owner, DnsServer::TypeCname);
+    QCOMPARE(alias.size(), 1);
+    int pos = 0;
+    QCOMPARE(readName(alias.first().rdata, pos), host);
+
+    // Publishing it again changes nothing, so a restart does not bump the serial.
+    QVERIFY(!server.publishDsaAlias(guid, host));
 }
 
 void DnsTest::withdrawsLocatorsForUnboundServices()

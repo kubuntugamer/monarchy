@@ -51,6 +51,19 @@ QByteArray getNCChangesRequest(const QByteArray &handle, const QString &ncDn,
 bool parseGetNCChangesReply(const QByteArray &stub, QList<DirectoryObject> *objects,
                             quint64 *usnHigh, bool *moreData, quint32 *werr);
 
+// DRS_ADD_REF | DRS_DEL_REF | DRS_WRIT_REP: what a join puts in
+// DsReplicaUpdateRefs, and what makes the reference the source keeps an active
+// one rather than a note.
+constexpr quint32 kUpdateRefsAddWrite = 0x0000001cu;
+
+// DsReplicaUpdateRefs (opnum 4) level 1: the handle, the naming context as a
+// DSNAME, the destination DSA's GUID, the name that resolves to it — its GUID
+// CNAME under _msdcs — and the options word, then the two deferred bodies in
+// pointer order.
+QByteArray updateRefsRequest(const QByteArray &handle, const QString &ncDn,
+                             const QUuid &destDsa, const QString &destDsaName,
+                             quint32 options);
+
 } // namespace DrsWire
 
 class DrsClient : public QObject
@@ -98,6 +111,13 @@ public:
     bool getNCChanges(const QString &ncDn, quint64 fromUsn,
                       QList<DirectoryObject> *objects, quint64 *usnHigh,
                       bool *moreData, QString *error = nullptr);
+
+    // DsReplicaUpdateRefs (4): tell the peer that this DSA, named by `destDsa`
+    // and the `destDsaName` that resolves to it, replicates `ncDn` from it.
+    // This is the reverse of the link a pull uses, and what a stock Samba join
+    // sends instead of DsReplicaAdd.
+    bool updateRefs(const QString &ncDn, const QUuid &destDsa, const QString &destDsaName,
+                    quint32 options, QString *error = nullptr);
 
     // Any other opnum, for the calls this class does not model yet.
     bool call(quint16 opnum, const QByteArray &stub, QByteArray *replyStub,

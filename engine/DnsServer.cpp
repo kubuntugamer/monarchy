@@ -1061,6 +1061,26 @@ bool DnsServer::repairAdZoneLocators(const QString &host, quint16 ldapPort, quin
     return changed;
 }
 
+bool DnsServer::publishDsaAlias(const QString &dsaGuid, const QString &host)
+{
+    if (m_zone.isEmpty() || dsaGuid.isEmpty() || host.isEmpty())
+        return false;
+    const QString owner = dsaGuid.toLower() + QStringLiteral("._msdcs.") + m_zone;
+    QString target = host.toLower();
+    if (target.endsWith(QLatin1Char('.')))
+        target.chop(1);
+    if (!target.contains(QLatin1Char('.')))
+        target += QLatin1Char('.') + m_zone;
+    const QByteArray rdata = encodeName(target);
+
+    const QList<Record> existing = records(owner, TypeCname);
+    if (existing.size() == 1 && existing.first().rdata == rdata)
+        return false;
+    removeRecord(owner, TypeCname);
+    addRecord(owner, TypeCname, 1200, rdata);
+    return true;
+}
+
 bool DnsServer::repairAdZoneAddresses(const QString &host, const QString &ip)
 {
     if (m_zone.isEmpty())
