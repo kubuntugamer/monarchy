@@ -919,6 +919,19 @@ bool DcService::start(const QString &dcDir)
             persist();
         return ok;
     };
+    // The trust-password write lands on the trusted domain object, and the
+    // inter-realm keys are re-derived with it, so the KDC and the channel keep
+    // one secret.
+    netlogonWrites.updateTrust = [this, persist](const QString &dn,
+                                                 const QMap<QString, QString> &attributes,
+                                                 QString *error) {
+        const bool ok = m_ldapServer->modifyObject(dn, attributes);
+        if (!ok && error)
+            *error = QStringLiteral("trust not found (%1)").arg(dn);
+        if (ok)
+            persist();
+        return ok;
+    };
     m_netlogonServer->setWriteBackend(netlogonWrites);
     connect(m_netlogonServer, &NetlogonServer::requestReceived, this,
             [this](const QString &operation) { emit statusMessage(operation); });

@@ -55,6 +55,13 @@ struct WriteBackend {
     std::function<bool(const QString &dn, const QMap<QString, QString> &attributes,
                        QString *error)>
         updateAccount;
+    // The trust-password write: NetrServerPasswordSet2 naming an interdomain
+    // account rewrites the trust's incoming secret (and the inter-realm keys
+    // derived from it) instead of an account's hash, because a trust is what
+    // the channel was opened with.
+    std::function<bool(const QString &dn, const QMap<QString, QString> &attributes,
+                       QString *error)>
+        updateTrust;
 };
 
 // Opnums from MS-NRPC (Samba's netlogon.idl carries the same numbering in its

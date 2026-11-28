@@ -163,9 +163,14 @@ naming-context split, non-zero exit on any failure) |`
   to return (no forest trust, no transited realms beyond one hop, no SID
   filtering or selective authentication), the internal-encryption query levels
   are refused with `STATUS_INVALID_INFO_CLASS` rather than guessed at, nothing
-  rolls the trust password automatically the way a DC does every 30 days, and
-  the channel has been driven against Samba's client and MIT's KDC, not against
-  a Windows DC. `LsarSetInformationPolicy`
+  rolls the trust password on the 30-day timer a DC uses — the write itself is
+  served: a partner DC that opens the trust channel and calls
+  `NetrServerPasswordSet2` with the interdomain account gets the new secret
+  stored as the trust's incoming one and the inter-realm keys re-derived from
+  it, though the `NL_PASSWORD_VERSION` the client puts in front of the password
+  in the 512-byte buffer is not recorded, because the store keeps one secret
+  per direction — and the channel has been driven against Samba's client and
+  MIT's KDC, not against a Windows DC. `LsarSetInformationPolicy`
   sets the modification time and the audit-full flag and refuses the rest (the
   domain name and SID are reported, not settable), as does
   `LsarSetDomainInformationPolicy` (the Kerberos lifetimes are reported, not
@@ -198,9 +203,13 @@ naming-context split, non-zero exit on any failure) |`
   `Joined 'JOINBOX' to dns domain 'lab.example.org'`. The one step it reports as
   failed is the optional dynamic-DNS update (`NT_STATUS_INVALID_PARAMETER`):
   this DC does not serve DNS updates, and nothing above depends on it. The
-  trust channel a partner's DC would open (`NetrServerAuthenticate3` against the
-  trust account, then `NetrSetTrustedDomainAuthInfo`) is not served; a partner
-  can authenticate its trust channel and read the trust account's RID. The
+  partner's DC opens its trust channel with `NetrServerAuthenticate3` against
+  the trust account and can read the trust account's RID, and the password
+  write that follows — `NetrServerPasswordSet2` with `SEC_CHAN_DOMAIN` naming
+  the interdomain account, the call a PDC uses to rotate a trust's password
+  (MS-NRPC 3.5.4.4.6) — now lands on the trusted domain object, pinned by
+  `trustPasswordSet2RotatesTheIncomingSecret` in `monarchy-netlogon-tests`,
+  whose client half computes the credential and the ciphertext itself. The
   client half is proven by `monarchy-netlogon-tests` alongside the real join,
   and the sealed pipe is measured against the bytes Samba sends, not against the
   server's own encoder.
@@ -290,7 +299,7 @@ either dialect: a GPO is delivered but not edited over the SMB1 path.
   implementations.
 - **PKINIT** (needs an X.509/CMS path and a CA), **S4U2Self/S4U2Proxy**.
 - **Multi-hop/transitive trusts**, transited-realm encoding beyond one hop, SID
-  filtering, selective authentication, trust-password rotation.
+  filtering, selective authentication, automatic trust-password rotation.
 - **Read authorization from the session's identity** (writes now answer to it:
   the PAC on a Kerberos session, the bound account's groups on a password bind,
   and nothing for Anonymous Logon, with AD's SELF right on `unicodePwd`), PAC
@@ -356,8 +365,7 @@ The gaps above are not independent. Working outward from what exists:
 5. ~~LSAD~~ — the policy calls, both translation directions, account rights,
    privileges, secrets and the policy security descriptor, verified against
    Samba's reference NDR decoder and impacket by `scripts/lsad-conformance.py`.
-   Remaining here: trust-password rotation and the trust channel's
-   `NetrSetTrustedDomainAuthInfo` write.
+   Remaining here: the timer that rotates a trust password every 30 days.
 6. ~~Netlogon~~ — secure channel, machine-password write, SamLogon validation
    and the DC locator calls are served and verified (§1). The locator's
    **CLDAP ping over UDP** is answered too: both shapes real clients send —

@@ -896,6 +896,10 @@ DirectoryObject NetlogonServer::findTrustPrincipal(const QString &name) const
                                     flat + QLatin1Char('$'));
         principal.attributes.insert(QStringLiteral("objectSid"),
                                     object.attributes.value(QStringLiteral("securityIdentifier")));
+        // The names a trust-password write needs: the peer realm the inter-realm
+        // keys are salted with, and the flat name the trust is reported by.
+        principal.attributes.insert(QStringLiteral("trustPartner"), partner);
+        principal.attributes.insert(QStringLiteral("flatName"), flat);
         principal.attributes.insert(QStringLiteral("ntHash"),
                                     QString::fromLatin1(ntHash.toHex()));
         principal.attributes.insert(QStringLiteral("userAccountControl"), QStringLiteral("0"));
@@ -1295,7 +1299,43 @@ QByteArray NetlogonServer::serverPasswordSet2(const QByteArray &stub)
         reinterpret_cast<const char16_t *>(passwordBytes.constData()),
         qsizetype(passwordBytes.size() / 2));
 
+    // A PDC changes a trust password with this call too (MS-NRPC 3.5.4.4.6),
+    // naming the interdomain account over an interdomain channel. That account
+    // is not in the user table: what the write changes is the trust's incoming
+    // secret, which is where the channel it authenticates with reads it. The
+    // client also puts an NL_PASSWORD_VERSION immediately in front of the
+    // password in that case; this store keeps one clear secret per direction
+    // and no version, so those twelve bytes are simply not part of the
+    // password.
     const DirectoryObject account = findAccount(accountName);
+    const bool interdomain = channelType == kSecChanDomain || account.id.isEmpty();
+    if (interdomain) {
+        const DirectoryObject trust = findTrustPrincipal(accountName);
+        if (trust.id.isEmpty() || !m_writes.updateTrust)
+            return statusOnly(kStatusNoSuchUser);
+        QMap<QString, QString> updates;
+        updates.insert(QStringLiteral("trustAuthIncoming"),
+                       QStringLiteral("2:") + QString::fromLatin1(password.toUtf8().toHex()));
+        DirectoryObject derived;
+        Krb5::storeTrustKeys(derived, password, m_config.realm,
+                             trust.attributes.value(QStringLiteral("trustPartner")));
+        for (auto it = derived.attributes.constBegin(); it != derived.attributes.constEnd(); ++it)
+            updates.insert(it.key(), it.value());
+        QString trustError;
+        if (!m_writes.updateTrust(trust.id, updates, &trustError)) {
+            if (!qEnvironmentVariableIsEmpty("MONARCHY_RPC_TRACE"))
+                qWarning("Netlogon trust password set for %s refused: %s",
+                         qPrintable(accountName), qPrintable(trustError));
+            return statusOnly(kStatusAccessDenied);
+        }
+        QByteArray rotated = reply;
+        putLe32(rotated, timestamp);
+        putLe32(rotated, kStatusSuccess);
+        emit requestReceived(
+            QStringLiteral("ServerPasswordSet2(%1): trust secret rotated").arg(accountName));
+        return rotated;
+    }
+
     if (account.id.isEmpty() || !m_writes.setNtHash)
         return statusOnly(kStatusNoSuchUser);
     QString error;

@@ -304,12 +304,13 @@ QByteArray uniqueString(const QString &text, quint32 referent)
 
 QByteArray passwordSetRequest(const QString &account, const QString &computer,
                               const QByteArray &credential, quint32 timestamp,
-                              const QByteArray &cipherText, quint32 length)
+                              const QByteArray &cipherText, quint32 length,
+                              quint16 channelType = 2) // SEC_CHAN_WKSTA
 {
     QByteArray stub;
     appendLe32(stub, 0); // NULL server_name
     appendStringArray(stub, account, false);
-    appendLe16(stub, 2); // SEC_CHAN_WKSTA
+    appendLe16(stub, channelType);
     while (stub.size() % 4 != 0) stub.append('\0');
     appendStringArray(stub, computer);
     stub.append(credential);
@@ -518,6 +519,7 @@ private slots:
     void rejectsAChannelCredentialFromTheWrongPassword();
     void dcLocatorNamesThisDc();
     void trustChannelUsesTheTrustSecret();
+    void trustPasswordSet2RotatesTheIncomingSecret();
     void reportsTheTrustAccountRid();
     void answersTheLegacyLocatorCalls();
 };
@@ -1794,6 +1796,98 @@ void NetlogonTest::trustChannelUsesTheTrustSecret()
         authenticateRequest(QStringLiteral("FABRIKAM$"), QStringLiteral("PARTNERDC"),
                             expectedCredential(clientChallenge, outboundKey, flags), flags));
     QCOMPARE(readLe32(refused, refused.size() - 4), quint32(0xc0000064u)); // NO_SUCH_USER
+}
+
+// A PDC rotates a trust password with NetrServerPasswordSet2 too (MS-NRPC
+// 3.5.4.4.6): the interdomain account over an interdomain channel, with an
+// NL_PASSWORD_VERSION in front of the password in the 512-byte buffer. What the
+// write changes is the trust's incoming secret, which is the one the channel
+// was opened with, and the inter-realm keys follow it so the KDC and the
+// channel cannot disagree.
+void NetlogonTest::trustPasswordSet2RotatesTheIncomingSecret()
+{
+    NetlogonServer server;
+    Netlogon::Config config;
+    config.netbios = QStringLiteral("CORP");
+    config.realm = QStringLiteral("CORP.EXAMPLE.COM");
+    config.domainSid = QStringLiteral("S-1-5-21-1-2-3");
+    server.setConfig(config);
+
+    DirectoryObject trust;
+    trust.id = QStringLiteral("CN=FABRIKAM,CN=System,DC=corp,DC=example,DC=com");
+    trust.name = QStringLiteral("FABRIKAM");
+    trust.attributes.insert(QStringLiteral("objectClass"),
+                            QStringLiteral("top;leaf;trustedDomain"));
+    trust.attributes.insert(QStringLiteral("flatName"), QStringLiteral("FABRIKAM"));
+    trust.attributes.insert(QStringLiteral("trustPartner"), QStringLiteral("fabrikam.local"));
+    trust.attributes.insert(QStringLiteral("trustDirection"), QStringLiteral("3"));
+    trust.attributes.insert(QStringLiteral("securityIdentifier"),
+                            QStringLiteral("S-1-5-21-9-8-7"));
+    const QString oldSecret = QStringLiteral("Trust!Secret9");
+    trust.attributes.insert(QStringLiteral("trustAuthIncoming"),
+                            QStringLiteral("2:")
+                                + QString::fromLatin1(oldSecret.toUtf8().toHex()));
+    server.setObjectProvider([trust]() { return QList<DirectoryObject>{trust}; });
+
+    QString writtenDn;
+    QMap<QString, QString> written;
+    Netlogon::WriteBackend writes;
+    writes.updateTrust = [&writtenDn, &written](const QString &dn,
+                                                const QMap<QString, QString> &attributes,
+                                                QString *) {
+        writtenDn = dn;
+        written = attributes;
+        return true;
+    };
+    server.setWriteBackend(writes);
+
+    const QByteArray oldHash = Ntlm::ntowfV1(oldSecret);
+    const QByteArray clientChallenge = QByteArray::fromHex("1020304050607080");
+    const QByteArray challengeReply = server.handleCall(
+        Netlogon::OpServerReqChallenge,
+        challengeRequest(QStringLiteral("PARTNERDC"), clientChallenge));
+    QCOMPARE(readLe32(challengeReply, 8), quint32(0));
+    const quint32 flags = Netlogon::kNegStrongKeys | Netlogon::kNegSupportsAes;
+    const QByteArray sessionKey = expectedSessionKey(
+        oldHash, clientChallenge, challengeReply.left(8), flags);
+    const QByteArray authReply = server.handleCall(
+        Netlogon::OpServerAuthenticate3,
+        authenticateRequest(QStringLiteral("FABRIKAM$"), QStringLiteral("PARTNERDC"),
+                            expectedCredential(clientChallenge, sessionKey, flags), flags));
+    QCOMPARE(readLe32(authReply, authReply.size() - 4), quint32(0));
+
+    const QString newSecret = QStringLiteral("R0tated!Trust77");
+    const QByteArray password = Ndr::utf16le(newSecret) + QByteArray(2, '\0');
+    QByteArray version; // NL_PASSWORD_VERSION: reserved, number, present
+    appendLe32(version, 0);
+    appendLe32(version, 2);
+    appendLe32(version, 0x02231968u);
+    QByteArray plain(512, '\x5a'); // the client fills the unused bytes randomly
+    plain.replace(512 - password.size(), password.size(), password);
+    plain.replace(512 - password.size() - version.size(), version.size(), version);
+
+    const quint32 timestamp = 91;
+    const QByteArray seed = expectedCredential(clientChallenge, sessionKey, flags);
+    const QByteArray reply = server.handleCall(
+        Netlogon::OpServerPasswordSet2,
+        passwordSetRequest(QStringLiteral("FABRIKAM$"), QStringLiteral("PARTNERDC"),
+                           nextCredential(seed, timestamp, sessionKey, flags, false), timestamp,
+                           Krb5::rc4(sessionKey, plain), quint32(password.size()), 3));
+    QCOMPARE(reply.size(), 16);
+    QCOMPARE(readLe32(reply, 8), timestamp);
+    QCOMPARE(readLe32(reply, 12), quint32(0));
+
+    // The write lands on the trusted domain object, and the secret it stores is
+    // the clear one the channel will now be opened with.
+    QCOMPARE(writtenDn, trust.id);
+    QCOMPARE(written.value(QStringLiteral("trustAuthIncoming")),
+             QStringLiteral("2:") + QString::fromLatin1(newSecret.toUtf8().toHex()));
+    DirectoryObject derived;
+    Krb5::storeTrustKeys(derived, newSecret, config.realm, QStringLiteral("fabrikam.local"));
+    QCOMPARE(written.value(QStringLiteral("aes256Key")),
+             derived.attributes.value(QStringLiteral("aes256Key")));
+    QCOMPARE(written.value(QStringLiteral("kerberosSalt")),
+             derived.attributes.value(QStringLiteral("kerberosSalt")));
 }
 
 // NetrLogonGetTrustRid names the disabled account kept for an inbound trust;
