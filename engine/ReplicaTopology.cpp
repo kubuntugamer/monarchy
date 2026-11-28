@@ -3,6 +3,7 @@
 
 #include "ReplicaTopology.h"
 
+#include "Drs.h"
 #include "LdapServer.h"
 #include "resultsmodel.h"
 
@@ -164,6 +165,51 @@ bool remove(LdapServer *ldap, const QString &address, QString *error,
             return ldap->removeObject(dn);
     }
     return true; // no object, nothing to retire
+}
+
+QList<ReplicaDestination> destinations(const QList<DirectoryObject> &objects,
+                                       const QString &selfNtdsDn)
+{
+    QList<ReplicaDestination> found;
+    const QString ntdsDn = selfNtdsDn.isEmpty() ? ntdsSettingsDn(objects) : selfNtdsDn;
+    if (ntdsDn.isEmpty())
+        return found;
+    for (const DirectoryObject &object : objects) {
+        if (object.id.compare(ntdsDn, Qt::CaseInsensitive) != 0)
+            continue;
+        for (const QString &value :
+             splitAttributeValues(object.attributes.value(QStringLiteral("repsTo")))) {
+            ReplicaDestination destination;
+            if (Drs::unpackReplicaDestination(value, &destination))
+                found.append(destination);
+        }
+        break;
+    }
+    return found;
+}
+
+bool storeDestinations(LdapServer *ldap, const QList<ReplicaDestination> &destinations,
+                       QString *error, const QString &selfNtdsDn)
+{
+    if (!ldap) {
+        if (error)
+            *error = QStringLiteral("no directory");
+        return false;
+    }
+    const QString ntdsDn =
+        selfNtdsDn.isEmpty() ? ntdsSettingsDn(ldap->objects()) : selfNtdsDn;
+    if (ntdsDn.isEmpty()) {
+        if (error)
+            *error = QStringLiteral("the store has no NTDS Settings object");
+        return false;
+    }
+    QStringList values;
+    for (const ReplicaDestination &destination : destinations)
+        values.append(Drs::packReplicaDestination(destination));
+    // The attribute is the server's, not a client's: an LDAP modify cannot
+    // reach it, which is the same posture as the trust keys beside it.
+    return ldap->setDerivedAttributes(
+        ntdsDn, {{QStringLiteral("repsTo"), joinAttributeValues(values)}}, error);
 }
 
 QList<ReplicaSource> links(const QList<DirectoryObject> &objects,

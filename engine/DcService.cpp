@@ -144,6 +144,54 @@ void DcService::removeReplicaLink(const QString &address)
     emit statusMessage(tr("Replication link to %1 retired from the directory.").arg(address));
 }
 
+bool DcService::storeReplicaDestination(const ReplicaDestination &destination)
+{
+    if (!m_ldapServer || !m_drsServer)
+        return false;
+    const QString selfDn = ownNtdsSettingsDn();
+    if (selfDn.isEmpty())
+        return false;
+    // Every destination this DSA knows, this one included: the repsTo value is
+    // written whole, so a caller that passed only the new one would drop the
+    // rest.
+    QString error;
+    if (!ReplicaTopology::storeDestinations(m_ldapServer, m_drsServer->replicaDestinations(),
+                                            &error, selfDn)) {
+        emit statusMessage(tr("The replica registered by %1 is not kept across a restart: %2.")
+                               .arg(destination.destDsaName, error));
+        return false;
+    }
+    if (!m_storePath.isEmpty())
+        m_ldapServer->saveToFile(m_storePath);
+    emit statusMessage(
+        tr("%1 replicates %2 from this DC; recorded as repsTo on %3.")
+            .arg(destination.destDsaName, destination.ncDn, selfDn));
+    return true;
+}
+
+void DcService::loadReplicaDestinations()
+{
+    if (!m_ldapServer || !m_drsServer)
+        return;
+    const QString selfDn = ownNtdsSettingsDn();
+    if (selfDn.isEmpty())
+        return;
+    const QList<ReplicaDestination> stored =
+        ReplicaTopology::destinations(m_ldapServer->objects(), selfDn);
+    int restored = 0;
+    m_loadingReplicaDestinations = true;
+    for (const ReplicaDestination &destination : stored) {
+        m_drsServer->addReplicaDestination(destination);
+        ++restored;
+    }
+    m_loadingReplicaDestinations = false;
+    if (restored > 0) {
+        emit statusMessage(tr("Restored %1 replication destination%2 from the directory.")
+                               .arg(restored)
+                               .arg(restored == 1 ? QString() : QStringLiteral("s")));
+    }
+}
+
 // The trust clock: every 30 days the DC that holds the PDC emulator role gives
 // an interdomain trust a new password (MS-ADTS 6.1.6.2) and stores it as the
 // trust's secret, which is what the channel a peer opens authenticates with
@@ -1139,6 +1187,21 @@ bool DcService::start(const QString &dcDir)
     m_drsServer->setAuthenticator(authenticator);
     connect(m_drsServer, &DrsServer::requestReceived, this,
             [this](const QString &operation) { emit statusMessage(operation); });
+    // A destination another DC registered is kept in the directory as this
+    // DSA's repsTo, so the announcement outlives the process that received it.
+    connect(m_drsServer, &DrsServer::replicaDestinationAdded, this,
+            [this](const QString &ncDn, const QString &destDsaName) {
+                if (m_loadingReplicaDestinations)
+                    return;
+                const QList<ReplicaDestination> known = m_drsServer->replicaDestinations();
+                for (const ReplicaDestination &destination : known) {
+                    if (destination.destDsaName.compare(destDsaName, Qt::CaseInsensitive) == 0
+                        && destination.ncDn.compare(ncDn, Qt::CaseInsensitive) == 0) {
+                        storeReplicaDestination(destination);
+                        return;
+                    }
+                }
+            });
     const int drsPort = dcConfig.value(QStringLiteral("drsPort"), 1038).toInt();
     if (!m_drsServer->listen(quint16(drsPort), rpcAddress)) {
         emit statusMessage(tr("DRSR endpoint failed to listen on port %1.")
@@ -1376,6 +1439,8 @@ bool DcService::start(const QString &dcDir)
     // directory, so they are read back here and pulled from again instead of
     // being forgotten with the process that registered them.
     loadReplicaLinks();
+    // The other direction: a replica that announced itself stays a replica.
+    loadReplicaDestinations();
 
     // When neither dc.conf nor the store names a partner, the agent stays idle
     // (empty source) and no timer is armed. Report that so the administrator can

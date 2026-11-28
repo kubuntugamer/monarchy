@@ -340,6 +340,58 @@ private slots:
         QCOMPARE(mine.first().address, link.address);
     }
 
+    // A destination that announced itself with DsReplicaUpdateRefs is kept as
+    // this DSA's repsTo, so the announcement survives a restart, and a list
+    // that names fewer destinations is how one is forgotten.
+    void keepsDestinationsAsRepsTo()
+    {
+        LdapServer ldap;
+        buildStore(&ldap);
+        publishDc(&ldap, QStringLiteral("DC1"), QStringLiteral("dc1.corp.example.com"));
+        const QString selfDn = dsaDn(QStringLiteral("DC1"));
+        QVERIFY(ReplicaTopology::destinations(ldap.objects(), selfDn).isEmpty());
+
+        ReplicaDestination first;
+        first.ncDn = kBaseDn;
+        first.destDsa = QUuid::fromString(QStringLiteral("00112233-4455-6677-8899-aabbccddeeff"));
+        first.destDsaName = QStringLiteral(
+            "00112233-4455-6677-8899-aabbccddeeff._msdcs.corp.example.com");
+        first.options = 0x1cu;
+
+        const ReplicaDestination second = [&first]() {
+            ReplicaDestination other = first;
+            other.ncDn = kConfigNc;
+            return other;
+        }();
+
+        QString error;
+        QVERIFY(ReplicaTopology::storeDestinations(&ldap, {first, second}, &error, selfDn));
+        const QList<ReplicaDestination> restored =
+            ReplicaTopology::destinations(ldap.objects(), selfDn);
+        QCOMPARE(restored.size(), 2);
+        QCOMPARE(restored.at(0).ncDn, kBaseDn);
+        QCOMPARE(restored.at(0).destDsa, first.destDsa);
+        QCOMPARE(restored.at(0).destDsaName, first.destDsaName);
+        QCOMPARE(restored.at(0).options, quint32(0x1c));
+        QCOMPARE(restored.at(1).ncDn, kConfigNc);
+
+        // The value is packed rather than a destination written out in plain
+        // sight, the same way the other binary-shaped attributes are kept.
+        for (const DirectoryObject &object : ldap.objects())
+            QVERIFY(!object.attributes.value(QStringLiteral("repsTo")).contains(first.destDsaName));
+
+        // Fewer destinations is how one leaves: the attribute follows the list.
+        QVERIFY(ReplicaTopology::storeDestinations(&ldap, {first}, &error, selfDn));
+        const QList<ReplicaDestination> kept =
+            ReplicaTopology::destinations(ldap.objects(), selfDn);
+        QCOMPARE(kept.size(), 1);
+        QCOMPARE(kept.first().ncDn, kBaseDn);
+
+        // An empty list takes the attribute off rather than leaving it empty.
+        QVERIFY(ReplicaTopology::storeDestinations(&ldap, {}, &error, selfDn));
+        QVERIFY(ReplicaTopology::destinations(ldap.objects(), selfDn).isEmpty());
+    }
+
     void kccDoesNothingWhenTheSiteHoldsOnlyThisDc()
     {
         LdapServer ldap;

@@ -42,9 +42,29 @@ struct ReplicaSource
     QByteArray schedule;
 };
 
+// A destination a DsReplicaUpdateRefs call registered: the DSA that replicates
+// this naming context from here, named the way the call names it — its GUID and
+// the GUID CNAME under _msdcs that resolves to it. AD keeps one per NC as the
+// source DSA's repsTo.
+struct ReplicaDestination
+{
+    QString ncDn;
+    QUuid destDsa;
+    QString destDsaName;
+    quint32 options = 0;
+};
+
 namespace Drs {
 
 Rpc::Interface interface();
+
+// The repsTo value AD keeps on a source DSA. AD stores an opaque blob; this
+// packs the fields a DsReplicaUpdateRefs call carries so the record survives a
+// restart and still names the destination it was made for: the options word,
+// the destination's GUID, its DNS name, then the naming context, both strings
+// UTF-8 and NUL-terminated.
+QString packReplicaDestination(const ReplicaDestination &destination);
+bool unpackReplicaDestination(const QString &value, ReplicaDestination *destination);
 
 // The canonical MS-DRSR §5.12.2 prefix map: entry id → partial binary OID
 // (DER encoding of the OID with the final sub-identifier's bytes stripped).
@@ -93,12 +113,19 @@ public:
     // naming context is not added twice.
     void addReplicaSource(const ReplicaSource &source);
 
+    // The destinations that replicate from this DC, as DsReplicaUpdateRefs
+    // registered them. The daemon keeps them in the directory and reads them
+    // back at start-up, so this list is also how it recovers one.
+    QList<ReplicaDestination> replicaDestinations() const { return m_replicaDestinations; }
+    void addReplicaDestination(const ReplicaDestination &destination);
+
 signals:
     void requestReceived(const QString &operation);
     void replicaSourceAdded(const QString &address, const QString &ncDn);
     void replicaSourceModified(const QString &previousAddress, const QString &address,
                                const QString &ncDn);
     void replicaSourceRemoved(const QString &address, const QString &ncDn);
+    void replicaDestinationAdded(const QString &ncDn, const QString &destDsaName);
 
 private:
     QByteArray drsBind(const QByteArray &stub);
@@ -125,6 +152,7 @@ private:
     std::function<QList<DirectoryObject>()> m_provider;
     QHash<QUuid, QString> m_handles; // bind handle → principal state
     QList<ReplicaSource> m_replicaSources;
+    QList<ReplicaDestination> m_replicaDestinations;
 };
 
 #endif // DRS_H

@@ -455,6 +455,43 @@ QByteArray crackNamesRequest(const QByteArray &handle, const QString &name)
     return stub;
 }
 
+// A DsReplicaUpdateRefs level-1 request (`drsuapi_DsReplicaUpdateRefsRequest`):
+// the handle, the level, the naming context referent, the destination DSA's
+// GUID, the destination's name referent and the options word, then the two
+// deferred bodies in pointer order — the DSNAME, then the wide string.
+QByteArray updateRefsRequest(const QByteArray &handle, const QString &ncDn,
+                             const QByteArray &destGuid, const QString &destName,
+                             quint32 options)
+{
+    QByteArray out = handle;
+    appendLe32(out, 1u);          // level
+    appendLe32(out, 0x00020004u); // naming_context referent
+    out.append(destGuid.leftJustified(16, '\0', true).left(16));
+    appendLe32(out, destName.isEmpty() ? 0u : 0x00020005u); // dest_dsa_dns_name
+    appendLe32(out, options);
+
+    const quint32 units = quint32(ncDn.size() + 1);
+    appendLe32(out, units); // preCount
+    appendLe32(out, 0u);    // structLen
+    appendLe32(out, 0u);    // SidLen
+    out.append(QByteArray(16 + 28, '\0')); // Guid and the SID slot
+    appendLe32(out, units * 2);            // NameLen in bytes
+    out.append(Ndr::utf16le(ncDn + QChar(u'\0')));
+    while (out.size() % 4 != 0)
+        out.append('\0');
+
+    if (!destName.isEmpty()) {
+        const quint32 nameUnits = quint32(destName.size() + 1);
+        appendLe32(out, nameUnits);
+        appendLe32(out, 0u);
+        appendLe32(out, nameUnits);
+        out.append(Ndr::utf16le(destName + QChar(u'\0')));
+        while (out.size() % 4 != 0)
+            out.append('\0');
+    }
+    return out;
+}
+
 } // namespace
 
 class DrsTest : public QObject
@@ -515,11 +552,17 @@ private slots:
         const QByteArray bindReply = server.handleCall(0, bindRequest());
         const QByteArray handle = bindReply.mid(64, 20);
 
-        for (quint16 opnum : {quint16(2), quint16(4)}) {
-            const QByteArray reply = server.handleCall(opnum, handle);
-            QCOMPARE(reply.size(), 4);
-            QCOMPARE(readLe32(reply, 0), quint32(0));
-        }
+        const QByteArray sync = server.handleCall(2, handle);
+        QCOMPARE(sync.size(), 4);
+        QCOMPARE(readLe32(sync, 0), quint32(0));
+        const QByteArray update = server.handleCall(
+            4, updateRefsRequest(handle, QStringLiteral("DC=corp,DC=example,DC=com"),
+                                 QByteArray(16, '\x11'),
+                                 QStringLiteral("11111111111111111111111111111111._msdcs."
+                                                "corp.example.com"),
+                                 0x1cu));
+        QCOMPARE(update.size(), 4);
+        QCOMPARE(readLe32(update, 0), quint32(0));
 
         // A forged handle is still refused, so these are not unconditional.
         QByteArray forged(20, '\x7f');
@@ -623,6 +666,95 @@ private slots:
         QCOMPARE(readLe32(server.handleCall(6, replicaDelRequest(handle, ncDn, address, 0x8000)), 0),
                  quint32(0x57));
         QCOMPARE(readLe32(server.handleCall(6, QByteArray(20, '\x7f')), 0), quint32(0x000006f7));
+    }
+
+    // DsReplicaUpdateRefs level 1 is the reverse registration: the calling DSA
+    // names itself the destination of a naming context it replicates from this
+    // one. It is the call a stock Samba join makes, so it must record what the
+    // call carries rather than only answering success.
+    void dsUpdateRefsRegistersADestination()
+    {
+        DrsServer server;
+        server.setConfig(config());
+        server.setObjectProvider([this]() { return fixture(); });
+
+        QStringList announced;
+        QObject::connect(&server, &DrsServer::replicaDestinationAdded,
+                         [&announced](const QString &ncDn, const QString &name) {
+                             announced.append(ncDn + QLatin1Char(' ') + name);
+                         });
+
+        const QByteArray handle = server.handleCall(0, bindRequest()).mid(64, 20);
+        const QString ncDn = QStringLiteral("DC=corp,DC=example,DC=com");
+        const QByteArray guid = QByteArray::fromHex("00112233445566778899aabbccddeeff");
+        const QString name = QStringLiteral(
+            "00112233445566778899aabbccddeeff._msdcs.corp.example.com");
+        const QByteArray request = updateRefsRequest(handle, ncDn, guid, name, 0x1cu);
+
+        QCOMPARE(readLe32(server.handleCall(4, request), 0), quint32(0));
+        QCOMPARE(server.replicaDestinations().size(), 1);
+        const ReplicaDestination destination = server.replicaDestinations().first();
+        QCOMPARE(destination.ncDn, ncDn);
+        // A GUID sits on the wire with its first three fields little-endian,
+        // which is what the server's decoder reads back.
+        QCOMPARE(destination.destDsa,
+                 QUuid(0x33221100u, 0x5544u, 0x7766u, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+                       0xee, 0xff));
+        QCOMPARE(destination.destDsaName, name);
+        QCOMPARE(destination.options, quint32(0x1c));
+        QCOMPARE(announced, QStringList{ncDn + QLatin1Char(' ') + name});
+
+        // The same DSA registering the same naming context twice stays one
+        // destination: a join repeats it, and a repeat is not news.
+        QCOMPARE(readLe32(server.handleCall(4, request), 0), quint32(0));
+        QCOMPARE(server.replicaDestinations().size(), 1);
+        QCOMPARE(announced.size(), 1);
+
+        // A naming context this DC does not hold is bad, a name is required,
+        // and a level this method does not have is refused.
+        QCOMPARE(readLe32(server.handleCall(
+                              4, updateRefsRequest(handle,
+                                                   QStringLiteral("DC=other,DC=example,DC=com"),
+                                                   guid, name, 0x1cu)),
+                          0),
+                 quint32(0x000020f8));
+        QCOMPARE(readLe32(server.handleCall(4, updateRefsRequest(handle, ncDn, guid, QString(),
+                                                                0x1cu)),
+                          0),
+                 quint32(0x000020f5));
+        QByteArray otherLevel = handle;
+        appendLe32(otherLevel, 2u);
+        appendLe32(otherLevel, 0u);
+        QCOMPARE(readLe32(server.handleCall(4, otherLevel), 0), quint32(0x000020f5));
+        QCOMPARE(readLe32(server.handleCall(4, QByteArray(20, '\x7f')), 0), quint32(0x000006f7));
+        QCOMPARE(server.replicaDestinations().size(), 1);
+    }
+
+    // The repsTo value this tree keeps for a destination survives a restart:
+    // what packReplicaDestination writes is what unpackReplicaDestination reads,
+    // and a value that is not one is refused rather than half-decoded.
+    void replicaDestinationRoundTripsThroughItsStoredValue()
+    {
+        ReplicaDestination destination;
+        destination.ncDn = QStringLiteral("CN=Configuration,DC=corp,DC=example,DC=com");
+        destination.destDsa = QUuid::fromRfc4122(
+            QByteArray::fromHex("00112233445566778899aabbccddeeff"));
+        destination.destDsaName = QStringLiteral(
+            "00112233445566778899aabbccddeeff._msdcs.corp.example.com");
+        destination.options = 0x1cu;
+
+        const QString packed = Drs::packReplicaDestination(destination);
+        ReplicaDestination read;
+        QVERIFY(Drs::unpackReplicaDestination(packed, &read));
+        QCOMPARE(read.ncDn, destination.ncDn);
+        QCOMPARE(read.destDsa, destination.destDsa);
+        QCOMPARE(read.destDsaName, destination.destDsaName);
+        QCOMPARE(read.options, destination.options);
+        // The value carries no ';', so it survives the store's list separator.
+        QCOMPARE(splitAttributeValues(joinAttributeValues({packed, packed})).size(), 2);
+
+        QVERIFY(!Drs::unpackReplicaDestination(QStringLiteral("not hex"), &read));
+        QVERIFY(!Drs::unpackReplicaDestination(QString(), &read));
     }
 
     // DsReplicaMod changes exactly the fields modify_fields names: the mask the

@@ -99,6 +99,11 @@ private:
     bool storeReplicaLink(const ReplicaSource &link);
     void removeReplicaLink(const QString &address);
     void loadReplicaLinks();
+    // A destination that replicates from this DC is kept the way AD keeps it,
+    // as the repsTo attribute of this DSA, so a partner that announced itself
+    // with DsReplicaUpdateRefs is still a destination after a restart.
+    bool storeReplicaDestination(const ReplicaDestination &destination);
+    void loadReplicaDestinations();
     // The KCC pass: every DSA another DC published in this site is a source this
     // one can reach, so the connections its intrasite topology needs are added
     // here instead of waiting for an administrator to call DsReplicaAdd on each
@@ -142,6 +147,9 @@ private:
     // Store and zone locations resolved from dc.conf at start-up.
     QString m_dcDir;
     QString m_storePath;
+    // True while loadReplicaDestinations() replays what the store holds: the
+    // write-back handler must not treat that as a fresh registration.
+    bool m_loadingReplicaDestinations = false;
     QString m_zonePath;
     QString m_baseDn;
     // This DC's own host name, as dc.conf names it: the Server object it

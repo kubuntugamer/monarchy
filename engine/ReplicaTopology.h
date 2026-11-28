@@ -72,6 +72,19 @@ QList<PublishedDsa> intrasiteDsas(const QList<DirectoryObject> &objects,
 QList<ReplicaSource> intrasiteTopology(const QList<DirectoryObject> &objects,
                                        const QString &selfNtdsDn);
 
+// The destinations another DC announced with DsReplicaUpdateRefs: the DSAs
+// that replicate a naming context from this one. AD keeps them as the source
+// DSA's repsTo, one value per destination, which is where these are read from
+// and written to, so an announcement outlives the process that received it.
+QList<ReplicaDestination> destinations(const QList<DirectoryObject> &objects,
+                                       const QString &selfNtdsDn);
+
+// Replace the repsTo values with exactly `destinations`: a registration adds
+// one and a list that no longer names a destination is how one is forgotten.
+// Empty takes the attribute off the object.
+bool storeDestinations(LdapServer *ldap, const QList<ReplicaDestination> &destinations,
+                       QString *error, const QString &selfNtdsDn = QString());
+
 // Store the connections intrasiteTopology names that are not already there, as
 // the KCC's own: NTDSCONN_OPT_IS_GENERATED set, enabled, and with
 // FLAG_CONFIG_ALLOW_RENAME | FLAG_CONFIG_ALLOW_MOVE. A source an administrator

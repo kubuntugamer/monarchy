@@ -1760,6 +1760,16 @@ QByteArray DrsServer::drsReplicaGetInfo(const QByteArray &stub)
     return writer.take();
 }
 
+// DsReplicaUpdateRefs (opnum 4): a DC announcing that it replicates a naming
+// context from this one. AD keeps the announcement on the source DSA as
+// repsTo, and it is the call a Samba join makes where this tree used to
+// register a link with DsReplicaAdd — the reference implementation names the
+// new DSA by its GUID CNAME under _msdcs and never by an address.
+//
+// Level 1 is what a join sends: the naming context, the destination DSA's GUID,
+// the name that resolves to it, and the options word (DRS_ADD_REF |
+// DRS_DEL_REF | DRS_WRIT_REP = 0x1c). Higher levels carry shapes nobody sends
+// here, so they are refused rather than half-read.
 QByteArray DrsServer::drsUpdateRefs(const QByteArray &stub)
 {
     Ndr::Reader reader(stub);
@@ -1768,7 +1778,70 @@ QByteArray DrsServer::drsUpdateRefs(const QByteArray &stub)
         return QByteArray();
     if (!m_handles.contains(guidFromBytes(handleBytes)))
         return stubReply(kWerrInvalidHandle);
+
+    quint32 level = 0;
+    if (!reader.u32(&level))
+        return QByteArray();
+    if (level != 1)
+        return stubReply(kWerrDrsInvalidParameter);
+
+    quint32 ncReferent = 0;
+    QByteArray destGuidBytes;
+    quint32 nameReferent = 0;
+    quint32 options = 0;
+    if (!reader.u32(&ncReferent) || !reader.bytes(16, &destGuidBytes)
+        || !reader.u32(&nameReferent) || !reader.u32(&options))
+        return QByteArray();
+    if (ncReferent == 0)
+        return stubReply(kWerrDrsInvalidParameter);
+
+    QString ncDn;
+    QUuid ncGuid;
+    QByteArray ncSid;
+    quint32 ncSidLen = 0;
+    if (!readDsName(&reader, &ncDn, &ncGuid, &ncSid, &ncSidLen))
+        return stubReply(kWerrDrsInvalidParameter);
+
+    // The deferred bodies follow in pointer order: the naming context first,
+    // then the destination's name.
+    QString destName;
+    if (nameReferent != 0 && !readDeferredString(&reader, &destName))
+        return stubReply(kWerrDrsInvalidParameter);
+    if (destName.isEmpty())
+        return stubReply(kWerrDrsInvalidParameter);
+
+    // Only the naming contexts this DC holds can name it as a source.
+    const QString schema = QStringLiteral("CN=Schema,CN=Configuration,") + baseDn();
+    const QString configuration = QStringLiteral("CN=Configuration,") + baseDn();
+    if (ncDn.compare(baseDn(), Qt::CaseInsensitive) != 0
+        && ncDn.compare(configuration, Qt::CaseInsensitive) != 0
+        && ncDn.compare(schema, Qt::CaseInsensitive) != 0)
+        return stubReply(kWerrDrsBadNc);
+
+    ReplicaDestination destination;
+    destination.ncDn = ncDn;
+    destination.destDsa = guidFromBytes(destGuidBytes);
+    destination.destDsaName = destName;
+    destination.options = options;
+    addReplicaDestination(destination);
+    emit requestReceived(
+        QStringLiteral("DsReplicaUpdateRefs(%1) replicates %2 from here")
+            .arg(destName, ncDn));
     return stubReply(kWerrOk);
+}
+
+void DrsServer::addReplicaDestination(const ReplicaDestination &destination)
+{
+    for (const ReplicaDestination &known : m_replicaDestinations) {
+        if (known.destDsa == destination.destDsa
+            && known.ncDn.compare(destination.ncDn, Qt::CaseInsensitive) == 0) {
+            // A repeat registration of the same pair refreshes the options
+            // without announcing a destination that was already known.
+            return;
+        }
+    }
+    m_replicaDestinations.append(destination);
+    emit replicaDestinationAdded(destination.ncDn, destination.destDsaName);
 }
 
 // DsGetDomainControllerInfo (opnum 16): this DC described at the requested
@@ -2021,6 +2094,34 @@ QUuid sourceDsaGuid(const QString &domainSid, const QString &dcName)
 {
     return monarchyGuidForSeed(QStringLiteral("monarchy-dsa/") + domainSid
                        + QLatin1Char('/') + dcName);
+}
+
+QString packReplicaDestination(const ReplicaDestination &destination)
+{
+    QByteArray packed;
+    putLe32(packed, destination.options);
+    packed.append(guidBytes(destination.destDsa));
+    packed.append(destination.ncDn.toUtf8());
+    packed.append('\0');
+    packed.append(destination.destDsaName.toUtf8());
+    return QString::fromLatin1(packed.toHex());
+}
+
+bool unpackReplicaDestination(const QString &value, ReplicaDestination *destination)
+{
+    const QByteArray packed = QByteArray::fromHex(value.trimmed().toLatin1());
+    if (!destination || packed.size() < 21)
+        return false;
+    destination->options = quint32(quint8(packed.at(0)))
+        | (quint32(quint8(packed.at(1))) << 8) | (quint32(quint8(packed.at(2))) << 16)
+        | (quint32(quint8(packed.at(3))) << 24);
+    destination->destDsa = guidFromBytes(packed.mid(4, 16));
+    const int ncEnd = packed.indexOf('\0', 20);
+    if (ncEnd < 0)
+        return false;
+    destination->ncDn = QString::fromUtf8(packed.mid(20, ncEnd - 20));
+    destination->destDsaName = QString::fromUtf8(packed.mid(ncEnd + 1));
+    return !destination->ncDn.isEmpty() && !destination->destDsaName.isEmpty();
 }
 
 } // namespace Drs
