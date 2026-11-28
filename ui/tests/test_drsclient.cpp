@@ -26,6 +26,7 @@
 
 #include "Drs.h"
 #include "DrsClient.h"
+#include "Ndr.h"
 #include "LdapServer.h"
 #include "Ntlm.h"
 #include "ReplicationAgent.h"
@@ -773,6 +774,59 @@ private slots:
 
         peer.quit();
         QVERIFY(peer.wait(5000));
+    }
+
+    // The stub a registration sends follows librpc/idl/drsuapi.idl, so a peer
+    // whose reader is Samba's generated one finds the fields where the IDL
+    // puts them: both referents, the GUID and the options word as scalars in
+    // that order, then the identifier (GUID, the fixed 28-byte SID slot, the DN
+    // as a conformant array) and the DNS name as a single-byte string. The
+    // identifier's __ndr_size words are [value] fields and are absent.
+    void theUpdateRefsStubFollowsTheIdlLayout()
+    {
+        const QByteArray handle(20, '\x11');
+        const QUuid dsa = QUuid::fromString(QStringLiteral("00112233-4455-6677-8899-aabbccddeeff"));
+        const QString ncDn = kBaseDn;
+        const QString dsaName = QStringLiteral("00112233-4455-6677-8899-aabbccddeeff._msdcs.corp.example.com");
+        const QByteArray stub = DrsWire::updateRefsRequest(handle, ncDn, dsa, dsaName, 0x1cu);
+
+        auto word = [&stub](int at) {
+            return quint32(quint8(stub.at(at))) | (quint32(quint8(stub.at(at + 1))) << 8)
+                | (quint32(quint8(stub.at(at + 2))) << 16)
+                | (quint32(quint8(stub.at(at + 3))) << 24);
+        };
+
+        QCOMPARE(stub.left(20), handle);
+        QCOMPARE(word(20), 1u);          // level
+        QCOMPARE(word(24), 0x00020000u); // naming_context
+        QCOMPARE(word(28), 0x00020001u); // dest_dsa_dns_name
+        QByteArray dsaBytes;
+        dsaBytes.append(char(dsa.data1 & 0xff));
+        dsaBytes.append(char((dsa.data1 >> 8) & 0xff));
+        dsaBytes.append(char((dsa.data1 >> 16) & 0xff));
+        dsaBytes.append(char((dsa.data1 >> 24) & 0xff));
+        dsaBytes.append(char(dsa.data2 & 0xff));
+        dsaBytes.append(char((dsa.data2 >> 8) & 0xff));
+        dsaBytes.append(char(dsa.data3 & 0xff));
+        dsaBytes.append(char((dsa.data3 >> 8) & 0xff));
+        dsaBytes.append(QByteArray(reinterpret_cast<const char *>(dsa.data4), 8));
+        QCOMPARE(stub.mid(32, 16), dsaBytes);
+        QCOMPARE(word(48), 0x1cu);       // options
+
+        const int body = 52;
+        QCOMPARE(stub.mid(body, 44), QByteArray(44, '\0')); // GUID and SID slot
+        const quint32 dnUnits = quint32(ncDn.size() + 1);
+        QCOMPARE(word(body + 44), dnUnits);
+        const int dnEnd = body + 48 + int(dnUnits) * 2;
+        QCOMPARE(stub.mid(body + 48, int(dnUnits) * 2),
+                 Ndr::utf16le(ncDn + QChar(u'\0')));
+
+        const int nameAt = (dnEnd + 3) & ~3;
+        const QByteArray nameBytes = dsaName.toLatin1() + '\0';
+        QCOMPARE(word(nameAt), quint32(nameBytes.size()));
+        QCOMPARE(word(nameAt + 4), 0u);
+        QCOMPARE(word(nameAt + 8), quint32(nameBytes.size()));
+        QCOMPARE(stub.mid(nameAt + 12, nameBytes.size()), nameBytes);
     }
 
     // A deletion reaches the other store through the same agent, and the store

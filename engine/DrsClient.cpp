@@ -727,31 +727,31 @@ QByteArray updateRefsRequest(const QByteArray &handle, const QString &ncDn,
         stub.append(QByteArray(kHandleSize - stub.size(), '\0'));
     putLe32(stub, 1);                 // level: V1
     putLe32(stub, 0x00020000u);       // naming_context referent
-    stub.append(guidBytes(destDsa));  // dest_dsa_guid
     putLe32(stub, destDsaName.isEmpty() ? 0u : 0x00020001u);
+    stub.append(guidBytes(destDsa));  // dest_dsa_guid
     putLe32(stub, options);
 
-    // The deferred DSNAME carries the DN alone: its GUID field is zero and its
-    // SidLen 0, the shape a join sends for a naming context.
+    // The naming context is a drsuapi_DsReplicaObjectIdentifier: its three
+    // __ndr_size words are [value] fields and so are not on the wire, leaving
+    // the GUID, the fixed 28-byte SID slot and the DN as a conformant array of
+    // UTF-16 characters. A join offers the DN alone, with a zero GUID and SID.
     const QByteArray chars = Ndr::utf16le(ncDn + QChar(u'\0'));
+    stub.append(QByteArray(16 + 28, '\0'));
     putLe32(stub, quint32(chars.size() / 2));
-    putLe32(stub, 60 + quint32(chars.size())); // structLen
-    putLe32(stub, 0);                          // SidLen
-    stub.append(QByteArray(16, '\0'));         // Guid
-    stub.append(QByteArray(28, '\0'));         // Sid slot
-    putLe32(stub, quint32(chars.size() / 2));  // NameLen in bytes
     stub.append(chars);
-    // NDR aligns the next deferred body: the DSNAME's characters end on a
-    // half-word when the DN length is odd, and the name starts after it.
+    // NDR aligns the next deferred body: the characters end on a half-word
+    // when the DN length is odd, and the name starts after it.
     while (stub.size() % 4 != 0)
         stub.append('\0');
 
     if (!destDsaName.isEmpty()) {
-        const QByteArray nameChars = Ndr::utf16le(destDsaName + QChar(u'\0'));
-        putLe32(stub, quint32(nameChars.size() / 2));
+        // [charset(DOS),string]: single bytes, and both counts carry the
+        // terminator.
+        const QByteArray nameBytes = destDsaName.toLatin1() + '\0';
+        putLe32(stub, quint32(nameBytes.size()));
         putLe32(stub, 0);
-        putLe32(stub, quint32(nameChars.size() / 2));
-        stub.append(nameChars);
+        putLe32(stub, quint32(nameBytes.size()));
+        stub.append(nameBytes);
         while (stub.size() % 4 != 0)
             stub.append('\0');
     }

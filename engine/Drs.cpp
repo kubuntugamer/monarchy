@@ -556,6 +556,60 @@ bool readDsName(Ndr::Reader *reader, QString *dn, QUuid *guidOut,
     return true;
 }
 
+// drsuapi_DsReplicaObjectIdentifier as a peer marshals it (librpc/idl/drsuapi.idl):
+// the three __ndr_size words are [value] fields and so never reach the wire,
+// which leaves the GUID, the fixed 28-byte SID slot and the DN as a conformant
+// array of UTF-16 characters. A naming context offered this way carries the DN
+// alone: its GUID and SID are zero.
+bool readObjectIdentifier(Ndr::Reader *reader, QString *dn, QUuid *guidOut)
+{
+    QByteArray guid;
+    QByteArray sid;
+    if (!reader->bytes(16, &guid) || !reader->bytes(28, &sid))
+        return false;
+    *guidOut = guidFromBytes(guid);
+    quint32 count = 0;
+    if (!reader->u32(&count) || count == 0 || count > 4096)
+        return false;
+    QByteArray chars;
+    if (!reader->bytes(int(count) * 2, &chars))
+        return false;
+    reader->align(4);
+    QString value = QString::fromUtf16(reinterpret_cast<const char16_t *>(chars.constData()),
+                                       int(count));
+    while (value.endsWith(QChar(u'\0')))
+        value.chop(1);
+    if (value.isEmpty())
+        return false;
+    *dn = value;
+    return true;
+}
+
+// A deferred `[charset(DOS),string] uint8 *` (the destination's DNS name in
+// drsuapi_DsReplicaUpdateRefsRequest1): single-byte characters, the size and
+// offset words, then the characters with their terminator. Both counts carry
+// the terminator.
+bool readDeferredByteString(Ndr::Reader *reader, QString *text)
+{
+    quint32 maxCount = 0;
+    quint32 offset = 0;
+    quint32 actual = 0;
+    if (!reader->u32(&maxCount) || !reader->u32(&offset) || !reader->u32(&actual))
+        return false;
+    if (maxCount == 0 || maxCount > 8192 || actual == 0 || actual > maxCount)
+        return false;
+    QByteArray bytes;
+    if (!reader->bytes(int(actual), &bytes))
+        return false;
+    reader->align(4);
+    while (bytes.endsWith('\0'))
+        bytes.chop(1);
+    if (bytes.isEmpty())
+        return false;
+    *text = QString::fromLatin1(bytes);
+    return true;
+}
+
 // A deferred LPWSTR body: MaximumCount, Offset, ActualCount, then the UTF-16
 // characters with the terminator. The count carries the terminator because
 // the peers count it too: secretsdump slices the last character off pName
@@ -1786,26 +1840,26 @@ QByteArray DrsServer::drsUpdateRefs(const QByteArray &stub)
         return stubReply(kWerrDrsInvalidParameter);
 
     quint32 ncReferent = 0;
-    QByteArray destGuidBytes;
     quint32 nameReferent = 0;
+    QByteArray destGuidBytes;
     quint32 options = 0;
-    if (!reader.u32(&ncReferent) || !reader.bytes(16, &destGuidBytes)
-        || !reader.u32(&nameReferent) || !reader.u32(&options))
+    // The field order is the IDL's: both pointers, then the GUID, then the
+    // options word (drsuapi_DsReplicaUpdateRefsRequest1).
+    if (!reader.u32(&ncReferent) || !reader.u32(&nameReferent)
+        || !reader.bytes(16, &destGuidBytes) || !reader.u32(&options))
         return QByteArray();
     if (ncReferent == 0)
         return stubReply(kWerrDrsInvalidParameter);
 
     QString ncDn;
     QUuid ncGuid;
-    QByteArray ncSid;
-    quint32 ncSidLen = 0;
-    if (!readDsName(&reader, &ncDn, &ncGuid, &ncSid, &ncSidLen))
+    if (!readObjectIdentifier(&reader, &ncDn, &ncGuid))
         return stubReply(kWerrDrsInvalidParameter);
 
     // The deferred bodies follow in pointer order: the naming context first,
-    // then the destination's name.
+    // then the destination's name, which is a DOS string of single bytes.
     QString destName;
-    if (nameReferent != 0 && !readDeferredString(&reader, &destName))
+    if (nameReferent != 0 && !readDeferredByteString(&reader, &destName))
         return stubReply(kWerrDrsInvalidParameter);
     if (destName.isEmpty())
         return stubReply(kWerrDrsInvalidParameter);

@@ -455,10 +455,13 @@ QByteArray crackNamesRequest(const QByteArray &handle, const QString &name)
     return stub;
 }
 
-// A DsReplicaUpdateRefs level-1 request (`drsuapi_DsReplicaUpdateRefsRequest`):
-// the handle, the level, the naming context referent, the destination DSA's
-// GUID, the destination's name referent and the options word, then the two
-// deferred bodies in pointer order — the DSNAME, then the wide string.
+// A DsReplicaUpdateRefs level-1 request, laid out as librpc/idl/drsuapi.idl
+// declares drsuapi_DsReplicaUpdateRefsRequest1: the handle, the level, the
+// naming context's and the destination name's referents, the destination DSA's
+// GUID and the options word, then the two deferred bodies in pointer order —
+// the object identifier (GUID, the fixed 28-byte SID slot, the DN as a
+// conformant array) and the destination's DNS name as a DOS string. The
+// identifier's __ndr_size words are [value] fields and are not on the wire.
 QByteArray updateRefsRequest(const QByteArray &handle, const QString &ncDn,
                              const QByteArray &destGuid, const QString &destName,
                              quint32 options)
@@ -466,26 +469,23 @@ QByteArray updateRefsRequest(const QByteArray &handle, const QString &ncDn,
     QByteArray out = handle;
     appendLe32(out, 1u);          // level
     appendLe32(out, 0x00020004u); // naming_context referent
-    out.append(destGuid.leftJustified(16, '\0', true).left(16));
     appendLe32(out, destName.isEmpty() ? 0u : 0x00020005u); // dest_dsa_dns_name
+    out.append(destGuid.leftJustified(16, '\0', true).left(16));
     appendLe32(out, options);
 
-    const quint32 units = quint32(ncDn.size() + 1);
-    appendLe32(out, units); // preCount
-    appendLe32(out, 0u);    // structLen
-    appendLe32(out, 0u);    // SidLen
+    const QByteArray chars = Ndr::utf16le(ncDn + QChar(u'\0'));
     out.append(QByteArray(16 + 28, '\0')); // Guid and the SID slot
-    appendLe32(out, units * 2);            // NameLen in bytes
-    out.append(Ndr::utf16le(ncDn + QChar(u'\0')));
+    appendLe32(out, quint32(chars.size() / 2));
+    out.append(chars);
     while (out.size() % 4 != 0)
         out.append('\0');
 
     if (!destName.isEmpty()) {
-        const quint32 nameUnits = quint32(destName.size() + 1);
-        appendLe32(out, nameUnits);
+        const QByteArray bytes = destName.toLatin1() + '\0';
+        appendLe32(out, quint32(bytes.size()));
         appendLe32(out, 0u);
-        appendLe32(out, nameUnits);
-        out.append(Ndr::utf16le(destName + QChar(u'\0')));
+        appendLe32(out, quint32(bytes.size()));
+        out.append(bytes);
         while (out.size() % 4 != 0)
             out.append('\0');
     }
