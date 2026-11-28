@@ -34,15 +34,23 @@ QString linkDn(const QString &ntdsDn, const QString &address);
 
 // Record one link as a connection object. An object already there is left
 // alone, so reading a link back and storing it again changes nothing.
-bool store(LdapServer *ldap, const ReplicaSource &link, QString *error);
+// `selfNtdsDn` is the DSA the connection belongs to; empty takes the store's
+// only one, which is what a single-DC store has.
+bool store(LdapServer *ldap, const ReplicaSource &link, QString *error,
+           const QString &selfNtdsDn = QString());
 
 // Retire the connection object an address names.
-bool remove(LdapServer *ldap, const QString &address, QString *error);
+bool remove(LdapServer *ldap, const QString &address, QString *error,
+            const QString &selfNtdsDn = QString());
 
 // The links the directory holds, one entry per naming context each applies to:
 // a connection object in AD names the source DSA and covers every NC it holds.
+// Only this DSA's own connections are links: a partner's connection objects
+// replicate here too, under its NTDS Settings, and pulling from those would
+// make each DC pull whatever the other happens to hold a link for.
 QList<ReplicaSource> links(const QList<DirectoryObject> &objects,
-                           const QStringList &namingContexts);
+                           const QStringList &namingContexts,
+                           const QString &selfNtdsDn = QString());
 
 // One DSA published in the configuration NC: the host name its Server object
 // carries and the NTDS Settings object that is its vertex.

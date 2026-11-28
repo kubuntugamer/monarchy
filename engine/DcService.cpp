@@ -112,7 +112,7 @@ bool DcService::storeReplicaLink(const ReplicaSource &link)
     if (!m_ldapServer)
         return false;
     QString error;
-    if (!ReplicaTopology::store(m_ldapServer, link, &error)) {
+    if (!ReplicaTopology::store(m_ldapServer, link, &error, ownNtdsSettingsDn())) {
         emit statusMessage(
             tr("The replication link to %1 is not kept across a restart: %2.")
                 .arg(link.address, error));
@@ -121,7 +121,8 @@ bool DcService::storeReplicaLink(const ReplicaSource &link)
     if (!m_storePath.isEmpty())
         m_ldapServer->saveToFile(m_storePath);
     emit statusMessage(tr("Replication link to %1 kept as %2 in the directory.")
-                           .arg(link.address, ReplicaTopology::linkDn(ntdsSettingsDn(), link.address)));
+                           .arg(link.address,
+                                ReplicaTopology::linkDn(ownNtdsSettingsDn(), link.address)));
     return true;
 }
 
@@ -130,7 +131,7 @@ void DcService::removeReplicaLink(const QString &address)
     if (!m_ldapServer)
         return;
     QString error;
-    if (!ReplicaTopology::remove(m_ldapServer, address, &error)) {
+    if (!ReplicaTopology::remove(m_ldapServer, address, &error, ownNtdsSettingsDn())) {
         emit statusMessage(
             tr("The replication link to %1 was retired but its connection object stayed: %2.")
                 .arg(address, error));
@@ -219,7 +220,8 @@ void DcService::loadReplicaLinks()
     }
 
     const QList<ReplicaSource> restored =
-        ReplicaTopology::links(m_ldapServer->objects(), namingContexts);
+        ReplicaTopology::links(m_ldapServer->objects(), namingContexts,
+                               ownNtdsSettingsDn());
     for (const ReplicaSource &link : restored)
         m_drsServer->addReplicaSource(link);
     if (!restored.isEmpty()) {
@@ -1183,12 +1185,37 @@ bool DcService::start(const QString &dcDir)
         ReplicaTopology::splitAddress(address, host, port);
     };
 
+    // The partner dc.conf names, and the port it answers DRS on. A connection
+    // the KCC writes carries the peer's published DNS name and no port, because
+    // AD finds that port through the peer's endpoint mapper. A second DC on the
+    // same host cannot have the mapper's 135 — whichever DC was there first owns
+    // it — so when dc.conf already names this same partner at a port, that port
+    // stands in for the one the connection does not carry.
+    const QString configuredReplicaHost =
+        dcConfig.value(QStringLiteral("replicaHost")).toString().trimmed();
+    QString configuredReplicaHostName;
+    quint16 configuredReplicaHostPort = 0;
+    parseAddress(configuredReplicaHost, &configuredReplicaHostName,
+                 &configuredReplicaHostPort);
+    const quint16 configuredReplicaPort =
+        quint16(dcConfig.value(QStringLiteral("replicaPort"), 0).toUInt());
+    if (configuredReplicaPort != 0)
+        configuredReplicaHostPort = configuredReplicaPort;
+    const auto configuredPortFor = [configuredReplicaHostName, configuredReplicaHostPort](
+                                       const QString &host, quint16 port) {
+        if (port != 0 || configuredReplicaHostPort == 0)
+            return port;
+        if (host.compare(configuredReplicaHostName, Qt::CaseInsensitive) != 0)
+            return port;
+        return configuredReplicaHostPort;
+    };
+
     connect(m_drsServer, &DrsServer::replicaSourceAdded, this,
-            [this, parseAddress](const QString &address, const QString &) {
+            [this, parseAddress, configuredPortFor](const QString &address, const QString &) {
                 QString host;
                 quint16 port = 0;
                 parseAddress(address, &host, &port);
-                m_replicationAgent->setSource(host, port);
+                m_replicationAgent->setSource(host, configuredPortFor(host, port));
                 // One copy for both reads: replicaSources() hands back a list by
                 // value, so a reference taken from a temporary would dangle.
                 const QList<ReplicaSource> links = m_drsServer->replicaSources();
@@ -1210,8 +1237,8 @@ bool DcService::start(const QString &dcDir)
     // is actually pulling from retargets it; editing another link leaves the
     // running pull alone.
     connect(m_drsServer, &DrsServer::replicaSourceModified, this,
-            [this, parseAddress](const QString &previous, const QString &address,
-                                 const QString &) {
+            [this, parseAddress, configuredPortFor](const QString &previous,
+                                                    const QString &address, const QString &) {
                 QString previousHost;
                 quint16 previousPort = 0;
                 parseAddress(previous, &previousHost, &previousPort);
@@ -1220,7 +1247,7 @@ bool DcService::start(const QString &dcDir)
                 QString host;
                 quint16 port = 0;
                 parseAddress(address, &host, &port);
-                m_replicationAgent->setSource(host, port);
+                m_replicationAgent->setSource(host, configuredPortFor(host, port));
                 // A schedule edit arrives on the same signal, so the retargeted
                 // pull reads the link's current cadence rather than the old one.
                 m_replicaSchedule.clear();

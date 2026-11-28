@@ -119,7 +119,8 @@ DirectoryObject connectionObject(const QList<DirectoryObject> &objects, const QS
 
 } // namespace
 
-bool store(LdapServer *ldap, const ReplicaSource &link, QString *error)
+bool store(LdapServer *ldap, const ReplicaSource &link, QString *error,
+           const QString &selfNtdsDn)
 {
     if (!ldap) {
         if (error)
@@ -127,7 +128,7 @@ bool store(LdapServer *ldap, const ReplicaSource &link, QString *error)
         return false;
     }
     const QList<DirectoryObject> objects = ldap->objects();
-    const QString ntdsDn = ntdsSettingsDn(objects);
+    const QString ntdsDn = selfNtdsDn.isEmpty() ? ntdsSettingsDn(objects) : selfNtdsDn;
     if (ntdsDn.isEmpty()) {
         if (error)
             *error = QStringLiteral("the store has no NTDS Settings object");
@@ -142,14 +143,16 @@ bool store(LdapServer *ldap, const ReplicaSource &link, QString *error)
     return true;
 }
 
-bool remove(LdapServer *ldap, const QString &address, QString *error)
+bool remove(LdapServer *ldap, const QString &address, QString *error,
+            const QString &selfNtdsDn)
 {
     if (!ldap) {
         if (error)
             *error = QStringLiteral("no directory");
         return false;
     }
-    const QString ntdsDn = ntdsSettingsDn(ldap->objects());
+    const QString ntdsDn =
+        selfNtdsDn.isEmpty() ? ntdsSettingsDn(ldap->objects()) : selfNtdsDn;
     if (ntdsDn.isEmpty()) {
         if (error)
             *error = QStringLiteral("the store has no NTDS Settings object");
@@ -164,10 +167,11 @@ bool remove(LdapServer *ldap, const QString &address, QString *error)
 }
 
 QList<ReplicaSource> links(const QList<DirectoryObject> &objects,
-                           const QStringList &namingContexts)
+                           const QStringList &namingContexts,
+                           const QString &selfNtdsDn)
 {
     QList<ReplicaSource> restored;
-    const QString ntdsDn = ntdsSettingsDn(objects);
+    const QString ntdsDn = selfNtdsDn.isEmpty() ? ntdsSettingsDn(objects) : selfNtdsDn;
     if (ntdsDn.isEmpty())
         return restored;
 

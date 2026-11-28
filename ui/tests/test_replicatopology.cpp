@@ -301,6 +301,45 @@ private slots:
         }
     }
 
+    // A store with two DSAs — a promoted second controller — has its partner's
+    // connection objects replicated into it as well. Those are the partner's
+    // links, not this DSA's: written back under the partner and pulled from
+    // here, they would have each DC pulling whatever the other holds a link
+    // for, and this DC's own link would sit under the wrong NTDS Settings.
+    void linksBelongToTheDsaThatOwnsThem()
+    {
+        LdapServer ldap;
+        buildStore(&ldap);
+        publishDc(&ldap, QStringLiteral("DC1"), QStringLiteral("dc1.corp.example.com"));
+        publishDc(&ldap, QStringLiteral("DC2"), QStringLiteral("dc2.corp.example.com"));
+
+        ReplicaSource link;
+        link.address = QStringLiteral("dc1.corp.example.com:1038");
+        link.ncDn = kBaseDn;
+        QString error;
+        QVERIFY2(ReplicaTopology::store(&ldap, link, &error, dsaDn(QStringLiteral("DC2"))),
+                 qPrintable(error));
+
+        // The object is under DC2's own settings, not under DC1's.
+        QString stored;
+        for (const DirectoryObject &object : ldap.objects()) {
+            if (object.attributes.value(QStringLiteral("objectClass"))
+                    .contains(QStringLiteral("nTDSConnection"), Qt::CaseInsensitive))
+                stored = object.id;
+        }
+        QCOMPARE(stored,
+                 ReplicaTopology::linkDn(dsaDn(QStringLiteral("DC2")), link.address));
+
+        // DC2 reads its own link back, and does not adopt DC1's.
+        ReplicaSource dc1Link = link;
+        dc1Link.address = QStringLiteral("dc2.corp.example.com:1038");
+        QVERIFY(ReplicaTopology::store(&ldap, dc1Link, &error, dsaDn(QStringLiteral("DC1"))));
+        const QList<ReplicaSource> mine = ReplicaTopology::links(
+            ldap.objects(), {kBaseDn}, dsaDn(QStringLiteral("DC2")));
+        QCOMPARE(mine.size(), 1);
+        QCOMPARE(mine.first().address, link.address);
+    }
+
     void kccDoesNothingWhenTheSiteHoldsOnlyThisDc()
     {
         LdapServer ldap;
