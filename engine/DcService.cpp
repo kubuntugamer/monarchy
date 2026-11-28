@@ -1323,6 +1323,9 @@ bool DcService::start(const QString &dcDir)
     // A Windows 2000 member's logon enumerates the domain through this pipe,
     // and an open that fails stops the logon before any Netlogon call.
     m_smbServer->addPipe(QStringLiteral("browser"), m_browserServer->rpc());
+    // `net group /domain` finishes on the downlevel RAP list rather than the
+    // SAMR one, so the same groups answer both.
+    m_smbServer->setRapGroups([this]() { return m_samrServer->globalGroupNames(); });
 
     // The domain's SYSVOL tree and the NETLOGON scripts it contains, served as
     // the disk shares a member reads its GPOs and logon scripts from. The

@@ -425,6 +425,27 @@ QByteArray pipeTransactMessage(quint16 tid, quint16 fid, quint16 subcommand,
     return smb(Smb1::CmdTrans, tid, g_uid, words, data);
 }
 
+// SMB_COM_TRANSACTION with no Setup words: the pipe is named in the byte block
+// rather than carried as a handle, which is how a Windows 2000 guest reaches
+// RAP on \PIPE\LANMAN (`net group /domain` does this after its SAMR calls).
+QByteArray lanmanTransactMessage(quint16 tid, const QByteArray &rap)
+{
+    QByteArray words(28, '\0');
+    words[0] = char(rap.size() & 0xff);
+    words[1] = char((rap.size() >> 8) & 0xff); // TotalParameterCount
+    words[18] = char(rap.size() & 0xff);
+    words[19] = char((rap.size() >> 8) & 0xff); // ParameterCount
+    const quint16 parameterOffset = quint16(32 + 1 + 28 + 2 + 1 + 26);
+    words[20] = char(parameterOffset & 0xff);
+    words[21] = char((parameterOffset >> 8) & 0xff);
+
+    QByteArray data(1, '\0'); // Pad1
+    data.append(utf16le(QStringLiteral("\\PIPE\\LANMAN")));
+    data.append(QByteArray(2, '\0'));
+    data.append(rap);
+    return smb(Smb1::CmdTrans, tid, g_uid, words, data);
+}
+
 QByteArray readMessage(quint16 tid, quint16 fid, quint32 offset, quint16 count)
 {
     QByteArray words(24, '\0');
@@ -550,6 +571,7 @@ private slots:
     void acceptsTheKerberosTicketAWindows2000MemberOffers();
     void setsTheStateOfAnOpenPipe();
     void answersAChainedTreeConnectAndCreate();
+    void servesTheRapGroupListNetGroupEnumReads();
     void signsAndVerifiesASignedSession();
     void signsAPreExtendedSecuritySessionTheWayTheClientKeysIt();
     void servesTwoSessionsOnOneConnection();
@@ -1205,6 +1227,85 @@ void Smb1Test::setsTheStateOfAnOpenPipe()
     QCOMPARE(readLe16(paramMessage, 45), quint16(0));          // DataCount
     QCOMPARE(paramMessage.mid(int(readLe16(paramMessage, 41)), 2),
              QByteArray("\x05\x00", 2)); // a DCE/RPC 5.0 PDU at ParameterOffset
+}
+
+// `net group /domain` on the Windows 2000 guest takes the SamrQueryDisplayInfo2
+// answer and then asks \PIPE\LANMAN for the group list over RAP, printing the
+// error from that call. This is the answer it needs: opcode 47, NetGroupEnum at
+// level 0, whose records are the 21-byte name and five pad bytes behind it, with
+// the count words in the parameter block (Samba 4.24.7's api_RNetGroupEnum).
+void Smb1Test::servesTheRapGroupListNetGroupEnumReads()
+{
+    const QStringList groups{QStringLiteral("Domain Admins"), QStringLiteral("Domain Users"),
+                             QStringLiteral("Domain Guests")};
+    QScopedPointer<Smb1::Session> session(new Smb1::Session(
+        QHash<QString, RpcServer *>(),
+        [](const Rpc::AuthRequest &, Ntlm::SessionKeys *keys) {
+            *keys = Ntlm::SessionKeys();
+            return true;
+        },
+        QStringLiteral("MONARCHY"), QStringLiteral("DC1"), QStringLiteral("monarchy.test"),
+        QHash<QString, QString>(), Ntlm::kDefaultLmCompatibilityLevel,
+        [groups]() { return groups; }));
+
+    // The request as the guest sends it: the opcode, then the descriptor it
+    // offers and the one it will read back, then the resume context and the
+    // size of the buffer it offers (0xffe0 in the capture).
+    QByteArray rap;
+    putLe16(rap, 47);
+    rap.append("WrLeh\0", 6);
+    rap.append("B21\0", 4);
+    putLe16(rap, 0);      // resume context
+    putLe16(rap, 0xffe0); // receive buffer size
+
+    const QByteArray reply = session->feed(lanmanTransactMessage(1, rap));
+    QCOMPARE(statusOf(reply), quint32(0));
+    const QByteArray message = payloadOf(reply);
+    QCOMPARE(readLe16(message, 33), quint16(8));  // TotalParameterCount
+    QCOMPARE(readLe16(message, 39), quint16(8));  // ParameterCount
+    QCOMPARE(readLe16(message, 41), quint16(56)); // ParameterOffset
+    QCOMPARE(readLe16(message, 35), quint16(78)); // TotalDataCount: three records
+    QCOMPARE(readLe16(message, 45), quint16(78)); // DataCount
+    QCOMPARE(readLe16(message, 47), quint16(64)); // DataOffset: behind the parameters
+
+    // The parameters are the error code, the converter word, the entries
+    // returned and the entries available.
+    const QByteArray params = message.mid(56, 8);
+    QCOMPARE(readLe16(params, 0), quint16(0)); // NERR_Success
+    QCOMPARE(readLe16(params, 2), quint16(0)); // converter
+    QCOMPARE(readLe16(params, 4), quint16(3)); // entries returned
+    QCOMPARE(readLe16(params, 6), quint16(3)); // entries available
+
+    const QByteArray data = message.mid(64, 78);
+    QCOMPARE(QByteArray(data.mid(0, 21)).left(13), QByteArray("Domain Admins"));
+    QCOMPARE(QByteArray(data.mid(26, 21)).left(12), QByteArray("Domain Users"));
+    QCOMPARE(QByteArray(data.mid(52, 21)).left(13), QByteArray("Domain Guests"));
+    // Both NT4 and Windows 2000 put five pad bytes behind the name, so a record
+    // is 26 bytes and the client's next name starts there.
+    QCOMPARE(QByteArray(data.mid(21, 5)), QByteArray(5, '\0'));
+
+    // A guest that offers room for a single record gets one and is told with
+    // NERR_MoreData that the list continues, so it asks again with a resume
+    // context.
+    QByteArray small = rap;
+    small.replace(small.size() - 2, 2, QByteArray("\x1a\0", 2));
+    const QByteArray paged = session->feed(lanmanTransactMessage(1, small));
+    QCOMPARE(statusOf(paged), quint32(0));
+    const QByteArray page = payloadOf(paged);
+    QCOMPARE(readLe16(page.mid(56, 8), 0), quint16(234)); // NERR_MoreData
+    QCOMPARE(readLe16(page.mid(56, 8), 4), quint16(1));   // entries returned
+    QCOMPARE(readLe16(page, 45), quint16(26));            // DataCount
+
+    // An opcode this server does not serve is answered with NERR_notsupported
+    // and no data, the way a member server answers a RAP call it has no list
+    // for; the client prints its own "not supported" rather than a decode.
+    QByteArray unknown = rap;
+    unknown.replace(0, 2, QByteArray("\x32\0", 2)); // NetShareEnum
+    const QByteArray unsupported = session->feed(lanmanTransactMessage(1, unknown));
+    QCOMPARE(statusOf(unsupported), quint32(0));
+    const QByteArray unsupportedMessage = payloadOf(unsupported);
+    QCOMPARE(readLe16(unsupportedMessage.mid(56, 4), 0), quint16(50)); // NERR_notsupported
+    QCOMPARE(readLe16(unsupportedMessage, 35), quint16(0));            // TotalDataCount
 }
 
 // A directory listing, which is the first thing a 2000 workstation does after

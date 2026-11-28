@@ -7,6 +7,7 @@
 #include <QByteArray>
 #include <QHash>
 #include <QString>
+#include <QStringList>
 
 #include <functional>
 
@@ -71,7 +72,8 @@ public:
     Session(QHash<QString, RpcServer *> pipes, Rpc::Authenticator authenticator,
             QString domain, QString serverName, QString dnsDomain,
             QHash<QString, QString> shares = QHash<QString, QString>(),
-            int lmCompatibilityLevel = Ntlm::kDefaultLmCompatibilityLevel);
+            int lmCompatibilityLevel = Ntlm::kDefaultLmCompatibilityLevel,
+            std::function<QStringList()> rapGroups = std::function<QStringList()>());
 
     // A 2000 member authenticates to the pipe share with Kerberos: it holds a
     // ticket for the server and offers an AP-REQ in SPNEGO, and only falls back
@@ -118,10 +120,20 @@ private:
     QByteArray readAndX(const QByteArray &message);
     QByteArray writeAndX(const QByteArray &message);
     QByteArray transact(const QByteArray &message);
+    // A transaction addressed to \PIPE\LANMAN by name rather than through an
+    // open pipe handle, which is how a Windows 2000 client reaches RAP. Empty
+    // when the name is not that pipe, so the caller answers as before.
+    QByteArray rapTransact(const QByteArray &message, const QByteArray &byteBlock,
+                           const QByteArray &parameters);
     // The SMB_COM_TRANSACTION response block, shared by every subcommand that
     // answers with parameters and no data.
     QByteArray transactionReply(const QByteArray &message, const QByteArray &out,
                                bool inData);
+    // The same block for a reply that carries both a parameter and a data
+    // block, which RAP does: its words are in the parameters and its records in
+    // the data.
+    QByteArray transactionReplyBlocks(const QByteArray &message, const QByteArray &parameters,
+                                      const QByteArray &data);
     QByteArray trans2(const QByteArray &message);
     // FIND_FIRST2 / FIND_NEXT2 / FIND_CLOSE2, the TRANS2 half a directory
     // listing needs. MS-CIFS 2.2.6.3.
@@ -158,6 +170,9 @@ private:
 
     QHash<QString, RpcServer *> m_pipes;
     QHash<QString, QString> m_shares;
+    // The global groups a RAP NetGroupEnum answer lists; empty when this server
+    // is not a DC and has no such list to serve.
+    std::function<QStringList()> m_rapGroups;
     Rpc::Authenticator m_authenticator;
     int m_lmCompatibilityLevel = Ntlm::kDefaultLmCompatibilityLevel;
     Rpc::KerberosAcceptor m_kerberosAcceptor;

@@ -496,7 +496,8 @@ QByteArray Smb2Server::handleSmb1(Connection *connection, const QByteArray &mess
         for (auto it = m_shares.constBegin(); it != m_shares.constEnd(); ++it)
             shares.insert(it.key().toLower(), it.value().path);
         connection->smb1 = new Smb1::Session(m_pipes, m_authenticator, m_domain, m_serverName,
-                                             m_dnsDomain, shares, m_lmCompatibilityLevel);
+                                             m_dnsDomain, shares, m_lmCompatibilityLevel,
+                                             m_rapGroups);
         connection->smb1->setKerberosAcceptor(m_kerberosAcceptor);
         connection->smb1->setNotifier(
             [this](const QString &operation) { emit requestReceived(operation); });

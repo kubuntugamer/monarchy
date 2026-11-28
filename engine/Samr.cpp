@@ -1058,6 +1058,19 @@ QList<DirectoryObject> SamrServer::users() const
     return result;
 }
 
+QStringList SamrServer::globalGroupNames() const
+{
+    QStringList names;
+    for (const DirectoryObject &group : groups()) {
+        QString name = group.attributes.value(QStringLiteral("sAMAccountName"));
+        if (name.isEmpty())
+            name = group.name;
+        if (!name.isEmpty())
+            names.append(name);
+    }
+    return names;
+}
+
 QList<DirectoryObject> SamrServer::groups() const
 {
     QList<DirectoryObject> result;

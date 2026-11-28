@@ -76,6 +76,8 @@ add_library(monarchy-ui-core STATIC
     ../engine/Rpc.cpp
     ../engine/Samr.h
     ../engine/Samr.cpp
+    ../engine/Rap.h
+    ../engine/Rap.cpp
     ../engine/Lsad.h
     ../engine/Lsad.cpp
     ../engine/Netlogon.h

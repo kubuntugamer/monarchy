@@ -116,6 +116,13 @@ public:
     void setLmCompatibilityLevel(int level) { m_lmCompatibilityLevel = level; }
     void setDomainNames(const QString &domain, const QString &serverName,
                         const QString &dnsDomain = QString());
+    // The domain's global groups, for the downlevel RAP NetGroupEnum a Windows
+    // 2000 guest asks on \PIPE\LANMAN after its SAMR calls. Without this the
+    // pipe answers that RAP is not served, as it does on a member server.
+    void setRapGroups(std::function<QStringList()> groups)
+    {
+        m_rapGroups = std::move(groups);
+    }
 
     bool listen(quint16 port = 445, const QHostAddress &address = QHostAddress::Any);
     // Windows 2000 reaches SMB over NetBIOS session service (TCP 139) rather
@@ -177,6 +184,7 @@ private:
     QTcpServer *m_netbiosServer = nullptr;
     QList<Connection *> m_connections;
     QHash<QString, RpcServer *> m_pipes;
+    std::function<QStringList()> m_rapGroups;
     struct Share {
         QString path;
         bool readOnly = true;

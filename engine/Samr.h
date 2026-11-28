@@ -169,6 +169,10 @@ public:
     QByteArray handleCall(quint16 opnum, const QByteArray &stub,
                           const QByteArray &sessionKey = QByteArray());
 
+    // The domain's global groups in the order the enumerations return them,
+    // for the downlevel RAP answer `net group /domain` reads after SAMR.
+    QStringList globalGroupNames() const;
+
 signals:
     void requestReceived(const QString &operation);
 

@@ -5,6 +5,7 @@
 
 #include "Gss.h"
 #include "Ntlm.h"
+#include "Rap.h"
 #include "SmbPaths.h"
 
 #include <QCryptographicHash>
@@ -154,9 +155,11 @@ namespace Smb1 {
 
 Session::Session(QHash<QString, RpcServer *> pipes, Rpc::Authenticator authenticator,
                  QString domain, QString serverName, QString dnsDomain,
-                 QHash<QString, QString> shares, int lmCompatibilityLevel)
+                 QHash<QString, QString> shares, int lmCompatibilityLevel,
+                 std::function<QStringList()> rapGroups)
     : m_pipes(std::move(pipes))
     , m_shares(std::move(shares))
+    , m_rapGroups(std::move(rapGroups))
     , m_authenticator(std::move(authenticator))
     , m_domain(std::move(domain))
     , m_serverName(std::move(serverName))
@@ -1203,6 +1206,18 @@ QByteArray Session::transact(const QByteArray &message)
     const quint8 setupCount = header.words.isEmpty() ? 0 : quint8(header.words.at(26));
     const quint16 parameterCount = readLe16(header.words, 18);
     const quint16 parameterOffset = readLe16(header.words, 20);
+    QByteArray parameters;
+    if (parameterOffset < message.size())
+        parameters = message.mid(parameterOffset, int(parameterCount));
+
+    // A transaction with no Setup words names the pipe it is for instead of
+    // carrying a handle: `net group /domain` on a Windows 2000 guest reaches
+    // RAP this way, after its SAMR calls have answered.
+    if (setupCount == 0) {
+        const QByteArray rap = rapTransact(message, header.data, parameters);
+        if (!rap.isEmpty())
+            return rap;
+    }
     if (setupCount < 2)
         return reply(message, kStatusNotSupported, QByteArray(20, '\0'), QByteArray());
     const quint16 subcommand = readLe16(header.words, 28);
@@ -1240,9 +1255,6 @@ QByteArray Session::transact(const QByteArray &message)
     // expects.
     const quint16 dataCount = readLe16(header.words, 22);
     const quint16 dataOffset = readLe16(header.words, 24);
-    QByteArray parameters;
-    if (parameterOffset < message.size())
-        parameters = message.mid(parameterOffset, int(parameterCount));
     QByteArray data;
     if (dataOffset < message.size())
         data = message.mid(dataOffset, int(dataCount));
@@ -1250,6 +1262,84 @@ QByteArray Session::transact(const QByteArray &message)
     QByteArray out = it->pending;
     it->pending.clear();
     return transactionReply(message, out, dataCount > 0);
+}
+
+namespace {
+
+// The name a transaction with no Setup words carries in its byte block: the
+// name itself, behind the pad byte that aligns it. A client that negotiated
+// Unicode sends it as UTF-16, which is what Windows 2000 does; the ASCII form
+// is what an OEM client sends (MS-CIFS 2.2.4.33.1).
+QString transactionName(const QByteArray &block)
+{
+    int at = 0;
+    while (at < 2 && at < block.size() && block.at(at) == '\0')
+        ++at;
+    if (at + 1 < block.size() && block.at(at + 1) == '\0') {
+        QString name;
+        for (int i = at; i + 1 < block.size(); i += 2) {
+            const quint16 unit = quint16(quint8(block.at(i))
+                                         | (quint16(quint8(block.at(i + 1))) << 8));
+            if (!unit)
+                break;
+            name.append(QChar(unit));
+        }
+        return name;
+    }
+    const int end = block.indexOf('\0', at);
+    return QString::fromLatin1(block.mid(at, (end < 0 ? block.size() : end) - at));
+}
+
+// `\\server\PIPE\LANMAN` and `\PIPE\LANMAN` both name the RAP pipe.
+bool isLanmanPipe(const QString &name)
+{
+    const QStringList parts = name.toUpper().split(QLatin1Char('\\'), Qt::SkipEmptyParts);
+    return parts.size() >= 2 && parts.at(parts.size() - 2) == QLatin1String("PIPE")
+           && parts.last() == QLatin1String("LANMAN");
+}
+
+} // namespace
+
+QByteArray Session::rapTransact(const QByteArray &message, const QByteArray &byteBlock,
+                               const QByteArray &parameters)
+{
+    if (!m_rapGroups || !isLanmanPipe(transactionName(byteBlock)))
+        return QByteArray();
+    QString operation;
+    const Rap::Reply answer = Rap::handle(parameters, m_rapGroups(), &operation);
+    if (m_notifier && !operation.isEmpty())
+        m_notifier(operation);
+    return transactionReplyBlocks(message, answer.params, answer.data);
+}
+
+QByteArray Session::transactionReplyBlocks(const QByteArray &message,
+                                          const QByteArray &parameters,
+                                          const QByteArray &data)
+{
+    const quint16 parameterSize = quint16(parameters.size());
+    const quint16 dataSize = quint16(data.size());
+    // The pad byte before the parameters is at 55, so the parameter block starts
+    // at 56 and the data block follows it on an even offset.
+    const quint16 dataOffset = quint16(56 + parameterSize + (parameterSize % 2));
+    QByteArray words;
+    putLe16(words, parameterSize); // TotalParameterCount
+    putLe16(words, dataSize);      // TotalDataCount
+    putLe16(words, 0);             // Reserved1
+    putLe16(words, parameterSize); // ParameterCount
+    putLe16(words, 56);            // ParameterOffset
+    putLe16(words, 0);             // ParameterDisplacement
+    putLe16(words, dataSize);      // DataCount
+    putLe16(words, dataOffset);    // DataOffset
+    putLe16(words, 0);             // DataDisplacement
+    words.append(char(0));         // SetupCount
+    words.append(char(0));         // Reserved2
+
+    QByteArray block(1, '\0'); // the pad byte
+    block.append(parameters);
+    if (parameterSize % 2)
+        block.append(char(0));
+    block.append(data);
+    return reply(message, kStatusSuccess, words, block);
 }
 
 QByteArray Session::transactionReply(const QByteArray &message, const QByteArray &out,
