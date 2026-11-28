@@ -17,10 +17,14 @@ quint16 readLe16(const QByteArray &data, int pos)
     return quint16(quint8(data.at(pos)) | (quint16(quint8(data.at(pos + 1))) << 8));
 }
 
-// The fixed-size record a NetGroupEnum answer carries, copied from what both
-// NT4 and Windows 2000 put on the wire (Samba's api_RNetGroupEnum writes the
-// same): a 21-byte NUL-padded group name and five pad bytes behind it.
-const int kGroupRecordSize = 26;
+// The fixed-size record a NetGroupEnum answer carries: the 21-byte NUL-padded
+// group name and nothing behind it. Samba's api_RNetGroupEnum writes five pad
+// bytes after the name, but Windows 2000 Professional's net.exe steps by the
+// descriptor size it asked for, so the pad desynchronises it: measured on the
+// guest, a 26-byte stride read as B21 renders each name shifted into the
+// previous record's pad ("omain Controllers", "ts" for "Domain Guests"). B21
+// is literal, one 21-byte record per entry.
+const int kGroupRecordSize = 21;
 const int kGroupNameSize = 21;
 
 // One descriptor string: NUL-terminated ASCII starting at `at`, which advances
@@ -73,8 +77,7 @@ Rap::Reply netGroupEnum(const QByteArray &request, int at, const QStringList &gr
         QByteArray name;
         name.reserve(kGroupRecordSize);
         name.append(groups.at(i).toLatin1().left(kGroupNameSize - 1));
-        name.append(QByteArray(kGroupNameSize - name.size(), '\0'));
-        name.append(QByteArray(kGroupRecordSize - kGroupNameSize, '\0'));
+        name.append(QByteArray(kGroupRecordSize - name.size(), '\0'));
         data.append(name);
         ++entries;
     }

@@ -1232,8 +1232,9 @@ void Smb1Test::setsTheStateOfAnOpenPipe()
 // `net group /domain` on the Windows 2000 guest takes the SamrQueryDisplayInfo2
 // answer and then asks \PIPE\LANMAN for the group list over RAP, printing the
 // error from that call. This is the answer it needs: opcode 47, NetGroupEnum at
-// level 0, whose records are the 21-byte name and five pad bytes behind it, with
-// the count words in the parameter block (Samba 4.24.7's api_RNetGroupEnum).
+// level 0, whose records are the descriptor's 21 bytes with nothing behind them,
+// and the count words in the parameter block. The guest's net.exe steps by the
+// descriptor size, so a pad byte would shift every name into its neighbour.
 void Smb1Test::servesTheRapGroupListNetGroupEnumReads()
 {
     const QStringList groups{QStringLiteral("Domain Admins"), QStringLiteral("Domain Users"),
@@ -1264,8 +1265,8 @@ void Smb1Test::servesTheRapGroupListNetGroupEnumReads()
     QCOMPARE(readLe16(message, 33), quint16(8));  // TotalParameterCount
     QCOMPARE(readLe16(message, 39), quint16(8));  // ParameterCount
     QCOMPARE(readLe16(message, 41), quint16(56)); // ParameterOffset
-    QCOMPARE(readLe16(message, 35), quint16(78)); // TotalDataCount: three records
-    QCOMPARE(readLe16(message, 45), quint16(78)); // DataCount
+    QCOMPARE(readLe16(message, 35), quint16(63)); // TotalDataCount: three records
+    QCOMPARE(readLe16(message, 45), quint16(63)); // DataCount
     QCOMPARE(readLe16(message, 47), quint16(64)); // DataOffset: behind the parameters
 
     // The parameters are the error code, the converter word, the entries
@@ -1276,13 +1277,12 @@ void Smb1Test::servesTheRapGroupListNetGroupEnumReads()
     QCOMPARE(readLe16(params, 4), quint16(3)); // entries returned
     QCOMPARE(readLe16(params, 6), quint16(3)); // entries available
 
-    const QByteArray data = message.mid(64, 78);
+    const QByteArray data = message.mid(64, 63);
     QCOMPARE(QByteArray(data.mid(0, 21)).left(13), QByteArray("Domain Admins"));
-    QCOMPARE(QByteArray(data.mid(26, 21)).left(12), QByteArray("Domain Users"));
-    QCOMPARE(QByteArray(data.mid(52, 21)).left(13), QByteArray("Domain Guests"));
-    // Both NT4 and Windows 2000 put five pad bytes behind the name, so a record
-    // is 26 bytes and the client's next name starts there.
-    QCOMPARE(QByteArray(data.mid(21, 5)), QByteArray(5, '\0'));
+    QCOMPARE(QByteArray(data.mid(21, 21)).left(12), QByteArray("Domain Users"));
+    QCOMPARE(QByteArray(data.mid(42, 21)).left(13), QByteArray("Domain Guests"));
+    // A record is the name padded to 21 bytes, so the next name starts there.
+    QCOMPARE(QByteArray(data.mid(13, 8)), QByteArray(8, '\0'));
 
     // A guest that offers room for a single record gets one and is told with
     // NERR_MoreData that the list continues, so it asks again with a resume
@@ -1294,7 +1294,7 @@ void Smb1Test::servesTheRapGroupListNetGroupEnumReads()
     const QByteArray page = payloadOf(paged);
     QCOMPARE(readLe16(page.mid(56, 8), 0), quint16(234)); // NERR_MoreData
     QCOMPARE(readLe16(page.mid(56, 8), 4), quint16(1));   // entries returned
-    QCOMPARE(readLe16(page, 45), quint16(26));            // DataCount
+    QCOMPARE(readLe16(page, 45), quint16(21));            // DataCount
 
     // An opcode this server does not serve is answered with NERR_notsupported
     // and no data, the way a member server answers a RAP call it has no list

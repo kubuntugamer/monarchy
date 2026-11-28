@@ -13,8 +13,9 @@
 // that request.
 //
 // The reply shapes here are copied from the RAP server Samba 4.24.7 serves in
-// source3/smbd/smb1_lanman.c (api_RNetGroupEnum), which is written against what
-// NT4 and Windows 2000 clients read back.
+// source3/smbd/smb1_lanman.c (api_RNetGroupEnum), except where the guest was
+// measured to read differently: the records are the descriptor's 21 bytes and
+// carry no pad, because Windows 2000's net.exe steps by the descriptor size.
 namespace Rap {
 
 // MS-RAP 2.5.4, the RAPOpcode word the request starts with.
